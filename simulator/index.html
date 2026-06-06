@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Pocket Journal Simulator</title>
+    <link rel="stylesheet" href="src/styles.css">
+  </head>
+  <body>
+    <main class="app">
+      <section class="device">
+        <canvas id="display" width="200" height="200" aria-label="Pocket Journal 200 by 200 e-paper display"></canvas>
+      </section>
+      <aside class="panel">
+        <div class="status">
+          <span>State</span>
+          <strong id="stateName">static</strong>
+        </div>
+        <div class="controls">
+          <button id="resetButton" type="button">Reset</button>
+          <button id="backButton" type="button">Back</button>
+        </div>
+        <ol id="history"></ol>
+      </aside>
+    </main>
+    <script type="module" src="src/main.js"></script>
+  </body>
+</html>
+
