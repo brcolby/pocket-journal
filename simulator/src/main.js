@@ -7,6 +7,14 @@ import {
   meta,
   parentOf,
 } from "./ui_model.js";
+import {
+  DISPLAY_HEIGHT,
+  DISPLAY_WIDTH,
+  INK,
+  ONE_BIT_THRESHOLD,
+  PAPER,
+  quantizeRgbaBuffer,
+} from "./display.js";
 
 const canvas = document.querySelector("#display");
 const ctx = canvas.getContext("2d", { alpha: false });
@@ -15,8 +23,11 @@ const history = document.querySelector("#history");
 const resetButton = document.querySelector("#resetButton");
 const backButton = document.querySelector("#backButton");
 
-const FONT = "'Audiowide', ui-monospace, SFMono-Regular, Menlo, monospace";
 const ICON_FONT = "'Material Symbols Rounded'";
+const FONT_ASSET_URL = "assets/fonts/space-mono-bold-1bit.json?v=punctuation-1";
+const BOX_LABEL_SIZE = 15;
+const NOTE_LIST_SIZE = 14;
+const CLOCK_BUTTON_SIZE = 15;
 
 let state = "static";
 let darkMode = false;
@@ -39,11 +50,21 @@ let intervalSeconds = 1500;
 let intervalRound = 1;
 let dirtyRegion = "full refresh";
 const visited = ["static"];
+let fontAsset = null;
+
+function updateDisplayScale() {
+  const device = canvas.parentElement;
+  const availableWidth = device?.clientWidth ?? window.innerWidth;
+  const availableHeight = Math.max(DISPLAY_HEIGHT, window.innerHeight - 64);
+  const scale = Math.max(1, Math.min(4, Math.floor(Math.min(availableWidth, availableHeight) / DISPLAY_WIDTH)));
+  canvas.style.width = `${DISPLAY_WIDTH * scale}px`;
+  canvas.style.height = `${DISPLAY_HEIGHT * scale}px`;
+}
 
 function colors() {
   return darkMode
-    ? { paper: "#111111", ink: "#f8f7ef", muted: "#bfbfb8" }
-    : { paper: "#f8f7ef", ink: "#111111", muted: "#5e5e58" };
+    ? { paper: INK, ink: PAPER, muted: PAPER }
+    : { paper: PAPER, ink: INK, muted: INK };
 }
 
 function setInk() {
@@ -54,15 +75,18 @@ function setInk() {
 
 function clear() {
   const palette = colors();
+  ctx.imageSmoothingEnabled = false;
   ctx.fillStyle = palette.paper;
-  ctx.fillRect(0, 0, 200, 200);
+  ctx.fillRect(0, 0, DISPLAY_WIDTH, DISPLAY_HEIGHT);
   setInk();
   ctx.lineWidth = 2;
   ctx.textBaseline = "top";
 }
 
-function font(size) {
-  ctx.font = `${size}px ${FONT}`;
+function quantizeToOneBit() {
+  const frame = ctx.getImageData(0, 0, DISPLAY_WIDTH, DISPLAY_HEIGHT);
+  quantizeRgbaBuffer(frame.data, ONE_BIT_THRESHOLD);
+  ctx.putImageData(frame, 0, 0);
 }
 
 function iconFont(size) {
@@ -70,24 +94,22 @@ function iconFont(size) {
 }
 
 function textCenter(text, y, size = 16) {
-  font(size);
-  ctx.textBaseline = "top";
-  ctx.textAlign = "center";
-  ctx.fillText(text, 100, y);
+  const rendered = displayText(text);
+  const width = bitmapTextWidth(rendered, size);
+  drawBitmapText(rendered, Math.max(0, Math.round((DISPLAY_WIDTH - width) / 2)), y, size);
 }
 
 function textCenterAt(text, x, y, size = 12) {
-  font(size);
-  ctx.textBaseline = "middle";
-  ctx.textAlign = "center";
-  ctx.fillText(text, x, y);
+  const rendered = displayText(text);
+  const bounds = bitmapTextBounds(rendered, size);
+  const width = bitmapTextWidth(rendered, size);
+  drawBitmapText(rendered, Math.round(x - width / 2), Math.round(y - (bounds.minY + bounds.maxY) / 2), size);
 }
 
 function textLeftCenter(text, x, y, size = 14) {
-  font(size);
-  ctx.textBaseline = "middle";
-  ctx.textAlign = "left";
-  ctx.fillText(text, x, y);
+  const rendered = displayText(text);
+  const bounds = bitmapTextBounds(rendered, size);
+  drawBitmapText(rendered, x, Math.round(y - (bounds.minY + bounds.maxY) / 2), size);
 }
 
 function icon(name, x, y, size = 22) {
@@ -128,10 +150,92 @@ function line(x1, y1, x2, y2) {
   ctx.stroke();
 }
 
+function logicalFontSize(size) {
+  if (size <= 8) {
+    return "1";
+  }
+  if (size <= 14) {
+    return "2";
+  }
+  if (size <= 22) {
+    return "3";
+  }
+  return "4";
+}
+
+function displayText(text) {
+  return String(text).toUpperCase();
+}
+
+function bitmapMetrics(size) {
+  const key = logicalFontSize(size);
+  const metrics = fontAsset?.sizes?.[key];
+  if (!metrics) {
+    return { lineHeight: size, glyphs: {} };
+  }
+  return {
+    ...metrics,
+    lineHeight: metrics.lineHeight ?? metrics.line_height ?? size,
+    glyphs: metrics.glyphs ?? {},
+  };
+}
+
+function bitmapGlyph(char, size) {
+  const metrics = bitmapMetrics(size);
+  return metrics.glyphs[char] ?? metrics.glyphs["?"] ?? null;
+}
+
+function bitmapTextWidth(text, size) {
+  let width = 0;
+  for (const char of text) {
+    width += bitmapGlyph(char, size)?.advance ?? Math.ceil(size / 2);
+  }
+  return width;
+}
+
+function bitmapTextBounds(text, size) {
+  const metrics = bitmapMetrics(size);
+  let minY = Infinity;
+  let maxY = -Infinity;
+  for (const char of text) {
+    const glyph = bitmapGlyph(char, size);
+    if (!glyph || !glyph.rows.some((row) => row.includes("1"))) {
+      continue;
+    }
+    minY = Math.min(minY, glyph.y_offset);
+    maxY = Math.max(maxY, glyph.y_offset + glyph.height);
+  }
+  if (!Number.isFinite(minY) || !Number.isFinite(maxY)) {
+    return { minY: 0, maxY: metrics.lineHeight };
+  }
+  return { minY, maxY };
+}
+
+function drawBitmapText(text, x, y, size) {
+  const palette = colors();
+  ctx.fillStyle = palette.ink;
+  let cursor = x;
+  for (const char of text) {
+    const glyph = bitmapGlyph(char, size);
+    if (!glyph) {
+      cursor += Math.ceil(size / 2);
+      continue;
+    }
+    glyph.rows.forEach((row, rowIndex) => {
+      for (let col = 0; col < row.length; col += 1) {
+        if (row[col] === "1") {
+          ctx.fillRect(cursor + glyph.x_offset + col, y + glyph.y_offset + rowIndex, 1, 1);
+        }
+      }
+    });
+    cursor += glyph.advance;
+  }
+}
+
 function drawDefaultStaticArt() {
   const palette = colors();
   ctx.fillStyle = palette.paper;
-  ctx.fillRect(0, 0, 200, 200);
+  ctx.fillRect(0, 0, DISPLAY_WIDTH, DISPLAY_HEIGHT);
   ctx.strokeStyle = palette.ink;
   ctx.fillStyle = palette.ink;
   ctx.lineWidth = 7;
@@ -148,7 +252,7 @@ function drawDefaultStaticArt() {
 function drawStaticArtRows(rows) {
   const palette = colors();
   ctx.fillStyle = palette.paper;
-  ctx.fillRect(0, 0, 200, 200);
+  ctx.fillRect(0, 0, DISPLAY_WIDTH, DISPLAY_HEIGHT);
   ctx.fillStyle = palette.ink;
   rows.forEach((row, y) => {
     for (let x = 0; x < row.length; x += 1) {
@@ -189,7 +293,7 @@ function drawMenu(items) {
     const height = rowHeight - 4;
     roundedRect(12, y, 176, height, 8);
     icon(item.icon, 38, y + height / 2, 22);
-    textLeftCenter(item.label.toUpperCase(), 64, y + height / 2 + 1, 13);
+    textLeftCenter(item.label, 64, y + height / 2, BOX_LABEL_SIZE);
   });
 }
 
@@ -201,7 +305,7 @@ function drawSettings() {
   ];
   rows.forEach((row) => roundedRect(12, row.y, 176, row.h, 8));
   icon(rows[0].icon, 38, 61, 22);
-  textLeftCenter(rows[0].label, 64, 62, 13);
+  textLeftCenter(rows[0].label, 64, 61, BOX_LABEL_SIZE);
 
   icon("volume_down", 38, 110, 22);
   icon("volume_up", 162, 110, 22);
@@ -210,10 +314,9 @@ function drawSettings() {
   if (width > 0) {
     roundedRect(66, 107, width, 8, 4, true);
   }
-  textCenterAt(String(volume), 100, 127, 9);
 
   icon(rows[2].icon, 38, 159, 22);
-  textLeftCenter(rows[2].label, 64, 160, 13);
+  textLeftCenter(rows[2].label, 64, 159, BOX_LABEL_SIZE);
 }
 
 function drawTimeTemp() {
@@ -259,13 +362,13 @@ function drawNoteList(kind) {
     const y = 44 + index * 48;
     roundedRect(12, y, 176, 38, 8);
     icon(kind === "listen" ? "headphones" : "article", 36, y + 19, 22);
-    textLeftCenter(note.time.toUpperCase(), 62, y + 20, 10);
+    textLeftCenter(noteDisplayTime(note.time), 62, y + 19, NOTE_LIST_SIZE);
   });
 }
 
 function drawListenDetail() {
   backTriangle();
-  textCenter(selectedNote.time.toUpperCase(), 34, 10);
+  textCenter(noteDisplayTime(selectedNote.time), 34, 10);
   icon(listening ? "pause_circle" : "play_circle", 100, 76, 38);
   roundedRect(30, 114, 140, 18, 7);
   const width = Math.floor(listenProgress * 132);
@@ -282,7 +385,7 @@ function drawListenDetail() {
 
 function drawReadDetail() {
   backTriangle();
-  textCenter(selectedNote.time.toUpperCase(), 34, 10);
+  textCenter(noteDisplayTime(selectedNote.time), 34, 10);
   textCenter("TRANSCRIPT", 62, 12);
   const words = selectedNote.transcript.toUpperCase().split(" ");
   const lines = [
@@ -320,6 +423,10 @@ function durationToSeconds(duration) {
   return minutes * 60 + seconds;
 }
 
+function noteDisplayTime(time) {
+  return time.replace(/^[A-Za-z]{3}\s+/, "");
+}
+
 function formatClockMinutes(minutes) {
   const hour = Math.floor(minutes / 60) % 24;
   const minute = minutes % 60;
@@ -330,7 +437,7 @@ function drawAlarm() {
   backTriangle();
   icon("alarm", 100, 54, 34);
   textCenter(formatClockMinutes(alarmMinutes), 84, 26);
-  textCenter(alarmOn ? "ON" : "OFF", 128, 16);
+  textCenter(alarmOn ? "ON" : "OFF", 116, 16);
   drawTripleTimeControls(alarmOn ? "OFF" : "ON", "-30", "+30");
 }
 
@@ -363,9 +470,9 @@ function drawTripleTimeControls(centerLabel, leftLabel, rightLabel) {
   roundedRect(18, 142, 48, 36, 8);
   roundedRect(76, 142, 48, 36, 8);
   roundedRect(134, 142, 48, 36, 8);
-  textCenterAt(leftLabel, 42, 160, 12);
-  textCenterAt(centerLabel, 100, 160, centerLabel.length > 4 ? 8 : 10);
-  textCenterAt(rightLabel, 158, 160, 12);
+  textCenterAt(leftLabel, 42, 160, CLOCK_BUTTON_SIZE);
+  textCenterAt(centerLabel, 100, 160, centerLabel.length > 4 ? 14 : CLOCK_BUTTON_SIZE);
+  textCenterAt(rightLabel, 158, 160, CLOCK_BUTTON_SIZE);
 }
 
 function drawLeaf() {
@@ -408,6 +515,7 @@ function drawState() {
   } else {
     drawLeaf();
   }
+  quantizeToOneBit();
   stateName.textContent = `${state}${darkMode ? " / dark" : " / light"}`;
   history.innerHTML = visited.slice(-20).map((item) => `<li>${item}</li>`).join("");
   history.dataset.dirtyRegion = dirtyRegion;
@@ -565,6 +673,8 @@ canvas.addEventListener("click", (event) => {
   handleCanvasClick(x, y);
 });
 
+window.addEventListener("resize", updateDisplayScale);
+
 resetButton.addEventListener("click", () => {
   state = "static";
   darkMode = false;
@@ -624,15 +734,16 @@ setInterval(() => {
 }, 1000);
 
 async function boot() {
+  updateDisplayScale();
   if (document.fonts) {
     await Promise.all([
-      document.fonts.load(`18px ${FONT}`, "POCKET"),
       document.fonts.load(`24px ${ICON_FONT}`, "settings"),
       document.fonts.load(`24px ${ICON_FONT}`, "timer"),
       document.fonts.load(`24px ${ICON_FONT}`, "calendar_month"),
       document.fonts.ready,
     ]);
   }
+  fontAsset = await fetch(FONT_ASSET_URL).then((response) => response.json());
   drawState();
 }
 

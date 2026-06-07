@@ -1,4 +1,5 @@
 #include "pj_ui.h"
+#include "pj_font_space_mono.h"
 
 #include <ctype.h>
 #include <stdio.h>
@@ -172,83 +173,73 @@ static void draw_round_rect(pj_framebuffer_t *fb, int x, int y, int w, int h)
     fb_set(fb, x + w - 3, y + h - 3, 1);
 }
 
-static const uint8_t *glyph_rows(char c)
+static const pj_font_size_t *font_size_for_scale(int scale)
 {
-    static const uint8_t blank[7] = {0, 0, 0, 0, 0, 0, 0};
-    static const uint8_t question[7] = {14, 17, 1, 2, 4, 0, 4};
-
-    switch ((char)toupper((unsigned char)c)) {
-    case 'A': { static const uint8_t r[7] = {14, 17, 17, 31, 17, 17, 17}; return r; }
-    case 'B': { static const uint8_t r[7] = {30, 17, 17, 30, 17, 17, 30}; return r; }
-    case 'C': { static const uint8_t r[7] = {14, 17, 16, 16, 16, 17, 14}; return r; }
-    case 'D': { static const uint8_t r[7] = {30, 17, 17, 17, 17, 17, 30}; return r; }
-    case 'E': { static const uint8_t r[7] = {31, 16, 16, 30, 16, 16, 31}; return r; }
-    case 'F': { static const uint8_t r[7] = {31, 16, 16, 30, 16, 16, 16}; return r; }
-    case 'G': { static const uint8_t r[7] = {14, 17, 16, 23, 17, 17, 15}; return r; }
-    case 'H': { static const uint8_t r[7] = {17, 17, 17, 31, 17, 17, 17}; return r; }
-    case 'I': { static const uint8_t r[7] = {14, 4, 4, 4, 4, 4, 14}; return r; }
-    case 'J': { static const uint8_t r[7] = {1, 1, 1, 1, 17, 17, 14}; return r; }
-    case 'K': { static const uint8_t r[7] = {17, 18, 20, 24, 20, 18, 17}; return r; }
-    case 'L': { static const uint8_t r[7] = {16, 16, 16, 16, 16, 16, 31}; return r; }
-    case 'M': { static const uint8_t r[7] = {17, 27, 21, 21, 17, 17, 17}; return r; }
-    case 'N': { static const uint8_t r[7] = {17, 25, 21, 19, 17, 17, 17}; return r; }
-    case 'O': { static const uint8_t r[7] = {14, 17, 17, 17, 17, 17, 14}; return r; }
-    case 'P': { static const uint8_t r[7] = {30, 17, 17, 30, 16, 16, 16}; return r; }
-    case 'Q': { static const uint8_t r[7] = {14, 17, 17, 17, 21, 18, 13}; return r; }
-    case 'R': { static const uint8_t r[7] = {30, 17, 17, 30, 20, 18, 17}; return r; }
-    case 'S': { static const uint8_t r[7] = {15, 16, 16, 14, 1, 1, 30}; return r; }
-    case 'T': { static const uint8_t r[7] = {31, 4, 4, 4, 4, 4, 4}; return r; }
-    case 'U': { static const uint8_t r[7] = {17, 17, 17, 17, 17, 17, 14}; return r; }
-    case 'V': { static const uint8_t r[7] = {17, 17, 17, 17, 17, 10, 4}; return r; }
-    case 'W': { static const uint8_t r[7] = {17, 17, 17, 21, 21, 21, 10}; return r; }
-    case 'X': { static const uint8_t r[7] = {17, 17, 10, 4, 10, 17, 17}; return r; }
-    case 'Y': { static const uint8_t r[7] = {17, 17, 10, 4, 4, 4, 4}; return r; }
-    case 'Z': { static const uint8_t r[7] = {31, 1, 2, 4, 8, 16, 31}; return r; }
-    case '0': { static const uint8_t r[7] = {14, 17, 19, 21, 25, 17, 14}; return r; }
-    case '1': { static const uint8_t r[7] = {4, 12, 4, 4, 4, 4, 14}; return r; }
-    case '2': { static const uint8_t r[7] = {14, 17, 1, 2, 4, 8, 31}; return r; }
-    case '3': { static const uint8_t r[7] = {30, 1, 1, 14, 1, 1, 30}; return r; }
-    case '4': { static const uint8_t r[7] = {2, 6, 10, 18, 31, 2, 2}; return r; }
-    case '5': { static const uint8_t r[7] = {31, 16, 16, 30, 1, 1, 30}; return r; }
-    case '6': { static const uint8_t r[7] = {14, 16, 16, 30, 17, 17, 14}; return r; }
-    case '7': { static const uint8_t r[7] = {31, 1, 2, 4, 8, 8, 8}; return r; }
-    case '8': { static const uint8_t r[7] = {14, 17, 17, 14, 17, 17, 14}; return r; }
-    case '9': { static const uint8_t r[7] = {14, 17, 17, 15, 1, 1, 14}; return r; }
-    case ':': { static const uint8_t r[7] = {0, 4, 4, 0, 4, 4, 0}; return r; }
-    case '/': { static const uint8_t r[7] = {1, 1, 2, 4, 8, 16, 16}; return r; }
-    case '-': { static const uint8_t r[7] = {0, 0, 0, 31, 0, 0, 0}; return r; }
-    case '.': { static const uint8_t r[7] = {0, 0, 0, 0, 0, 12, 12}; return r; }
-    case ' ': return blank;
-    default: return question;
+    if (scale < 1) {
+        scale = 1;
+    } else if (scale > PJ_FONT_SPACE_MONO_SIZE_COUNT) {
+        scale = PJ_FONT_SPACE_MONO_SIZE_COUNT;
     }
+    return &PJ_FONT_SPACE_MONO[scale - 1];
+}
+
+static const pj_font_glyph_t *glyph_for_char(const pj_font_size_t *font_size, char c)
+{
+    unsigned char code = (unsigned char)c;
+    if (code < PJ_FONT_SPACE_MONO_FIRST || code > PJ_FONT_SPACE_MONO_LAST) {
+        code = '?';
+    }
+    return &font_size->glyphs[code - PJ_FONT_SPACE_MONO_FIRST];
+}
+
+static int glyph_pixel_is_set(const pj_font_glyph_t *glyph, int x, int y)
+{
+    int bit_index = y * glyph->width + x;
+    return (glyph->data[bit_index / 8] >> (bit_index % 8)) & 1u;
 }
 
 static void draw_char(pj_framebuffer_t *fb, int x, int y, char c, int scale)
 {
-    const uint8_t *rows = glyph_rows(c);
-    for (int row = 0; row < 7; row++) {
-        for (int col = 0; col < 5; col++) {
-            if ((rows[row] >> (4 - col)) & 1u) {
-                fill_rect(fb, x + col * scale, y + row * scale, scale, scale);
+    const pj_font_size_t *font_size = font_size_for_scale(scale);
+    const pj_font_glyph_t *glyph = glyph_for_char(font_size, c);
+    int x0 = x + glyph->x_offset;
+    int y0 = y + glyph->y_offset;
+
+    for (int row = 0; row < glyph->height; row++) {
+        for (int col = 0; col < glyph->width; col++) {
+            if (glyph_pixel_is_set(glyph, col, row)) {
+                fb_set(fb, x0 + col, y0 + row, 1);
             }
         }
     }
 }
 
+static int text_width(const char *text, int scale)
+{
+    const pj_font_size_t *font_size = font_size_for_scale(scale);
+    int width = 0;
+    while (*text != '\0') {
+        width += glyph_for_char(font_size, (char)toupper((unsigned char)*text))->advance;
+        text++;
+    }
+    return width;
+}
+
 static void draw_text(pj_framebuffer_t *fb, int x, int y, const char *text, int scale)
 {
+    const pj_font_size_t *font_size = font_size_for_scale(scale);
     int cursor = x;
     while (*text != '\0') {
-        draw_char(fb, cursor, y, *text, scale);
-        cursor += 6 * scale;
+        char display_char = (char)toupper((unsigned char)*text);
+        draw_char(fb, cursor, y, display_char, scale);
+        cursor += glyph_for_char(font_size, display_char)->advance;
         text++;
     }
 }
 
 static void draw_centered_text(pj_framebuffer_t *fb, int y, const char *text, int scale)
 {
-    int width = (int)strlen(text) * 6 * scale - scale;
-    int x = (PJ_DISPLAY_WIDTH - width) / 2;
+    int x = (PJ_DISPLAY_WIDTH - text_width(text, scale)) / 2;
     draw_text(fb, x < 0 ? 0 : x, y, text, scale);
 }
 
@@ -325,7 +316,7 @@ pj_ui_dirty_region_t pj_ui_dirty_region(const pj_ui_context_t *ctx)
 
 const char *pj_ui_default_font_name(void)
 {
-    return "Audiowide";
+    return "Space Mono Bold";
 }
 
 static void clamp_volume(pj_ui_context_t *ctx)

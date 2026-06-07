@@ -1,9 +1,9 @@
-@import url("https://fonts.googleapis.com/css2?family=Audiowide&family=Material+Symbols+Rounded:opsz,wght,FILL,GRAD@24,400,0,0&display=swap");
+@import url("https://fonts.googleapis.com/css2?family=Space+Mono:wght@700&family=Material+Symbols+Rounded:opsz,wght,FILL,GRAD@24,700,0,0&display=swap");
 
 :root {
   color-scheme: light;
-  --ink: #171717;
-  --paper: #f8f7ef;
+  --ink: #000;
+  --paper: #fff;
   --line: #d3d0c3;
   --panel: #ffffff;
   --accent: #1f6f5b;
@@ -16,7 +16,8 @@
 body {
   margin: 0;
   min-height: 100vh;
-  font-family: Audiowide, ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-family: "Space Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-weight: 700;
   background: #eeeeea;
   color: var(--ink);
 }
@@ -36,14 +37,11 @@ body {
 }
 
 #display {
-  width: min(80vw, 640px);
-  height: min(80vw, 640px);
-  max-width: calc(100vh - 64px);
-  max-height: calc(100vh - 64px);
   image-rendering: pixelated;
-  background: var(--paper);
+  image-rendering: crisp-edges;
+  background: #fff;
   border: 1px solid #111;
-  box-shadow: 0 18px 60px rgb(0 0 0 / 18%);
+  display: block;
   cursor: crosshair;
 }
 
