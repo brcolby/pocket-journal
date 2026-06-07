@@ -59,6 +59,18 @@ class DeviceClient:
     def put_settings(self, settings: dict[str, Any]) -> dict[str, Any] | None:
         return self._request("PUT", "/v1/settings", settings)
 
+    def get_home_design(self) -> dict[str, Any]:
+        return self._request("GET", "/v1/home")
+
+    def put_home_design(self, design: dict[str, Any]) -> dict[str, Any] | None:
+        return self._request("PUT", "/v1/home", design)
+
+    def get_static_art(self) -> dict[str, Any]:
+        return self._request("GET", "/v1/static-art")
+
+    def put_static_art(self, art: dict[str, Any]) -> dict[str, Any] | None:
+        return self._request("PUT", "/v1/static-art", art)
+
     def list_audio(self) -> list[AudioItem]:
         payload = self._request("GET", "/v1/audio")
         return [AudioItem(**item) for item in payload.get("audio", [])]
@@ -79,4 +91,3 @@ class DeviceClient:
 
 def discover_mdns() -> list[dict[str, str]]:
     return []
-

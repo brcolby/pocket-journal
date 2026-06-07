@@ -29,7 +29,7 @@ static void test_state_graph(void)
     assert(pj_ui_handle_touch(&ui, 100, 45, PJ_TOUCH_TAP) == 1);
     assert(pj_ui_current_state(&ui) == PJ_UI_STATE_NOTES);
 
-    assert(pj_ui_handle_touch(&ui, 100, 90, PJ_TOUCH_TAP) == 1);
+    assert(pj_ui_handle_touch(&ui, 100, 102, PJ_TOUCH_TAP) == 1);
     assert(pj_ui_current_state(&ui) == PJ_UI_STATE_LISTEN);
 
     assert(pj_ui_handle_touch(&ui, 8, 8, PJ_TOUCH_TAP) == 1);
@@ -37,6 +37,9 @@ static void test_state_graph(void)
 
     assert(pj_ui_handle_touch(&ui, 8, 8, PJ_TOUCH_TAP) == 1);
     assert(pj_ui_current_state(&ui) == PJ_UI_STATE_HOME);
+
+    assert(pj_ui_handle_touch(&ui, 8, 8, PJ_TOUCH_TAP) == 1);
+    assert(pj_ui_current_state(&ui) == PJ_UI_STATE_TIME_TEMP);
 }
 
 static void test_render_all_states(void)
@@ -60,4 +63,3 @@ int main(void)
     puts("ui tests passed");
     return 0;
 }
-
