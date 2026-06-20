@@ -1,4 +1,7 @@
+# OS/editor
 .DS_Store
+
+# Python
 __pycache__/
 *.py[cod]
 .pytest_cache/
@@ -6,10 +9,23 @@ __pycache__/
 .ruff_cache/
 .venv/
 venv/
+*.egg-info/
+
+# Node/web
+node_modules/
+
+# Build/test output
 build/
 dist/
-*.egg-info/
+coverage/
 firmware/build/
-partner/data/
 simulator/generated/
 
+# Local firmware/tooling config
+eim_config.toml
+firmware/sdkconfig
+firmware/sdkconfig.old
+
+# Runtime data/logs
+.logs/
+partner/data/
