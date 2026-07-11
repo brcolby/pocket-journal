@@ -71,6 +71,7 @@ typedef struct {
     int volume;
     int sync_pending;
     int sync_transferred;
+    int sync_online;
     int battery_percent;
     int temperature_c;
     int hour;
@@ -113,6 +114,7 @@ void pj_ui_set_status(pj_ui_context_t *ctx, int battery_percent, int temperature
 void pj_ui_set_time(pj_ui_context_t *ctx, int hour, int minute, int year, int month, int day);
 void pj_ui_set_notes(pj_ui_context_t *ctx, int count, const char labels[][PJ_UI_NOTE_LABEL_LEN]);
 void pj_ui_set_audio_state(pj_ui_context_t *ctx, int recording, int playback_active);
+void pj_ui_set_sync_state(pj_ui_context_t *ctx, int pending, int transferred, int online);
 int pj_ui_tick(pj_ui_context_t *ctx);
 int pj_ui_is_dirty(const pj_ui_context_t *ctx);
 void pj_ui_mark_displayed(pj_ui_context_t *ctx);

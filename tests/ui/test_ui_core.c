@@ -211,6 +211,27 @@ static void test_settings_dark_mode_toggle(void)
     assert(ui.dirty.partial == 0);
 }
 
+static void test_sync_state_is_board_driven(void)
+{
+    pj_ui_context_t ui;
+    pj_ui_init(&ui);
+    ui.state = PJ_UI_STATE_SYNC;
+    pj_ui_mark_displayed(&ui);
+
+    assert(pj_ui_handle_aux_short(&ui) == 0);
+    pj_ui_set_sync_state(&ui, 4, 2, 1);
+    assert(ui.sync_pending == 4);
+    assert(ui.sync_transferred == 2);
+    assert(ui.sync_online == 1);
+    assert(ui.dirty.partial == 1);
+
+    pj_ui_mark_displayed(&ui);
+    pj_ui_set_sync_state(&ui, -1, -2, 0);
+    assert(ui.sync_pending == 0);
+    assert(ui.sync_transferred == 0);
+    assert(ui.sync_online == 0);
+}
+
 static void test_dirty_lifecycle(void)
 {
     pj_ui_context_t ui;
@@ -313,6 +334,7 @@ int main(void)
     test_aux_double_click_routing();
     test_audio_lifecycle_reconciliation();
     test_settings_dark_mode_toggle();
+    test_sync_state_is_board_driven();
     test_dirty_lifecycle();
     test_partial_render_preserves_outside_region();
     test_no_back_button_pixels();

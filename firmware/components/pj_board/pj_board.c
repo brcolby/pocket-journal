@@ -30,6 +30,7 @@
 #include "esp_sleep.h"
 #include "esp_system.h"
 #include "esp_vfs_fat.h"
+#include "esp_wifi.h"
 #include "cJSON.h"
 #include "driver/gpio.h"
 #include "driver/i2c_master.h"
@@ -43,6 +44,7 @@
 #include "nvs.h"
 #include "nvs_flash.h"
 #include "sdmmc_cmd.h"
+#include "lwip/ip4_addr.h"
 #endif
 
 #define PJ_DEFAULT_TOKEN "dev-token"
@@ -173,6 +175,8 @@ static int g_audio_ready;
 static int g_adc_ready;
 static int g_adc_cali_ready;
 static int g_network_stack_ready;
+static int g_wifi_started;
+static esp_netif_t *g_wifi_sta_netif;
 static pj_aux_input_t g_aux_input;
 static int g_touch_task_started;
 static int g_serial_command_task_started;
@@ -540,15 +544,100 @@ static esp_err_t network_stack_init(void)
     return ESP_OK;
 }
 
+static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id,
+                               void *event_data)
+{
+    (void)arg;
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
+        if (g_wifi_credentials_stored) {
+            ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_connect());
+        }
+        return;
+    }
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        const wifi_event_sta_disconnected_t *event = event_data;
+        g_status.wifi = PJ_BOARD_SERVICE_UNAVAILABLE;
+        (void)snprintf(g_status.ip_addr, sizeof(g_status.ip_addr), "0.0.0.0");
+        (void)snprintf(g_status.last_error, sizeof(g_status.last_error),
+                       "Wi-Fi disconnected (reason %u); reconnecting",
+                       event == NULL ? 0U : (unsigned)event->reason);
+        if (g_wifi_credentials_stored) {
+            esp_err_t err = esp_wifi_connect();
+            if (err != ESP_OK) {
+                ESP_LOGW(TAG, "Wi-Fi reconnect request failed: %s", esp_err_to_name(err));
+            }
+        }
+        return;
+    }
+    if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        const ip_event_got_ip_t *event = event_data;
+        g_status.wifi = PJ_BOARD_SERVICE_READY;
+        if (event != NULL) {
+            (void)snprintf(g_status.ip_addr, sizeof(g_status.ip_addr), IPSTR,
+                           IP2STR(&event->ip_info.ip));
+        }
+        g_status.last_error[0] = '\0';
+        ESP_LOGI(TAG, "Wi-Fi connected: ssid=%s ip=%s", g_wifi_ssid, g_status.ip_addr);
+    }
+}
+
+static esp_err_t wifi_apply_config(void)
+{
+    wifi_config_t config = {0};
+    memcpy(config.sta.ssid, g_wifi_ssid, strlen(g_wifi_ssid));
+    memcpy(config.sta.password, g_wifi_password, strlen(g_wifi_password));
+    config.sta.scan_method = WIFI_ALL_CHANNEL_SCAN;
+    config.sta.sort_method = WIFI_CONNECT_AP_BY_SIGNAL;
+    config.sta.threshold.authmode = WIFI_AUTH_OPEN;
+    config.sta.pmf_cfg.capable = true;
+    config.sta.pmf_cfg.required = false;
+    return esp_wifi_set_config(WIFI_IF_STA, &config);
+}
+
+static esp_err_t wifi_start_or_reconfigure(void)
+{
+    if (!g_wifi_credentials_stored) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    ESP_RETURN_ON_ERROR(network_stack_init(), TAG, "network stack init failed");
+    if (!g_wifi_started) {
+        g_wifi_sta_netif = esp_netif_create_default_wifi_sta();
+        if (g_wifi_sta_netif == NULL) {
+            return ESP_ERR_NO_MEM;
+        }
+        wifi_init_config_t init = WIFI_INIT_CONFIG_DEFAULT();
+        ESP_RETURN_ON_ERROR(esp_wifi_init(&init), TAG, "Wi-Fi driver init failed");
+        ESP_RETURN_ON_ERROR(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
+                                                       wifi_event_handler, NULL),
+                            TAG, "Wi-Fi event handler registration failed");
+        ESP_RETURN_ON_ERROR(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
+                                                       wifi_event_handler, NULL),
+                            TAG, "IP event handler registration failed");
+        ESP_RETURN_ON_ERROR(esp_wifi_set_storage(WIFI_STORAGE_RAM), TAG, "Wi-Fi RAM storage failed");
+        ESP_RETURN_ON_ERROR(esp_wifi_set_mode(WIFI_MODE_STA), TAG, "Wi-Fi station mode failed");
+        ESP_RETURN_ON_ERROR(wifi_apply_config(), TAG, "Wi-Fi station config failed");
+        ESP_RETURN_ON_ERROR(esp_wifi_start(), TAG, "Wi-Fi start failed");
+        g_wifi_started = 1;
+    } else {
+        (void)esp_wifi_disconnect();
+        ESP_RETURN_ON_ERROR(wifi_apply_config(), TAG, "Wi-Fi station reconfiguration failed");
+        ESP_RETURN_ON_ERROR(esp_wifi_connect(), TAG, "Wi-Fi reconnect failed");
+    }
+    g_status.wifi = PJ_BOARD_SERVICE_UNAVAILABLE;
+    (void)snprintf(g_status.last_error, sizeof(g_status.last_error), "Wi-Fi connecting to %s", g_wifi_ssid);
+    return ESP_OK;
+}
+
 static void wifi_apply_provisioning_status(void)
 {
     if (!g_wifi_credentials_stored) {
         return;
     }
     g_status.ble_provisioning = PJ_BOARD_SERVICE_READY;
-    g_status.wifi = PJ_BOARD_SERVICE_UNAVAILABLE;
-    (void)snprintf(g_status.last_error, sizeof(g_status.last_error),
-                   "Wi-Fi credentials stored; Wi-Fi connect/reconnect is staged");
+    if (g_status.wifi != PJ_BOARD_SERVICE_READY) {
+        g_status.wifi = PJ_BOARD_SERVICE_UNAVAILABLE;
+        (void)snprintf(g_status.last_error, sizeof(g_status.last_error), "Wi-Fi credentials stored");
+    }
 }
 
 static void wifi_load_provisioning(void)
@@ -614,7 +703,8 @@ static esp_err_t wifi_save_provisioning(const char *ssid, const char *password, 
     g_wifi_credentials_stored = 1;
     wifi_apply_provisioning_status();
     ESP_LOGI(TAG, "Wi-Fi credentials stored from partner provisioning");
-    return ESP_OK;
+    esp_err_t connect_err = wifi_start_or_reconfigure();
+    return connect_err == ESP_ERR_INVALID_STATE ? ESP_OK : connect_err;
 }
 
 static esp_err_t epd_write_bytes(const uint8_t *data, int len)
@@ -1236,6 +1326,33 @@ static int collect_audio_entries(pj_audio_entry_t *entries, int capacity)
     closedir(dir);
     qsort(entries, (size_t)count, sizeof(entries[0]), audio_entry_compare_newest_first);
     return count;
+}
+
+static void collect_sync_counts(int *pending, int *transferred)
+{
+    *pending = 0;
+    *transferred = 0;
+    pj_audio_entry_t *entries = calloc(PJ_AUDIO_MAX_INDEXED_FILES, sizeof(entries[0]));
+    if (entries == NULL) {
+        return;
+    }
+    int count = collect_audio_entries(entries, PJ_AUDIO_MAX_INDEXED_FILES);
+    for (int i = 0; i < count; i++) {
+        if (entries[i].note.synced) {
+            (*transferred)++;
+        } else {
+            (*pending)++;
+        }
+    }
+    free(entries);
+}
+
+static void refresh_ui_sync_state(pj_ui_context_t *ui)
+{
+    int pending = 0;
+    int transferred = 0;
+    collect_sync_counts(&pending, &transferred);
+    pj_ui_set_sync_state(ui, pending, transferred, g_status.wifi == PJ_BOARD_SERVICE_READY);
 }
 
 static int delete_dir_entries(const char *dir_path, int (*matches)(const char *name))
@@ -2862,6 +2979,15 @@ void pj_board_start_services(const pj_board_profile_t *profile)
     (void)profile;
     (void)pj_board_http_start();
 #ifdef ESP_PLATFORM
+    if (g_wifi_credentials_stored) {
+        esp_err_t wifi_err = wifi_start_or_reconfigure();
+        if (wifi_err != ESP_OK) {
+            g_status.wifi = PJ_BOARD_SERVICE_ERROR;
+            (void)snprintf(g_status.last_error, sizeof(g_status.last_error),
+                           "Wi-Fi start failed: %s", esp_err_to_name(wifi_err));
+            ESP_LOGE(TAG, "%s", g_status.last_error);
+        }
+    }
     ESP_ERROR_CHECK_WITHOUT_ABORT(serial_command_task_start());
 #endif
 }
@@ -2886,6 +3012,7 @@ void pj_board_refresh_status(pj_ui_context_t *ui)
 #ifdef ESP_PLATFORM
     if (g_status.storage == PJ_BOARD_SERVICE_READY) {
         refresh_ui_notes_from_sd(ui);
+        refresh_ui_sync_state(ui);
     }
 #endif
 }
@@ -2895,6 +3022,7 @@ void pj_board_refresh_notes(pj_ui_context_t *ui)
 #ifdef ESP_PLATFORM
     if (ui != NULL && g_status.storage == PJ_BOARD_SERVICE_READY) {
         refresh_ui_notes_from_sd(ui);
+        refresh_ui_sync_state(ui);
     }
 #else
     (void)ui;
@@ -3446,12 +3574,19 @@ static void serial_command_task(void *arg)
             continue;
         }
         if (strcmp(line, "PJ_STATUS") == 0) {
-            printf("PJ_OK {\"device_id\":\"%s\",\"storage\":\"%s\",\"audio\":\"%s\",\"time_set\":%s,\"wifi_provisioned\":%s}\n",
+            int pending_sync = 0;
+            int transferred_sync = 0;
+            collect_sync_counts(&pending_sync, &transferred_sync);
+            printf("PJ_OK {\"device_id\":\"%s\",\"storage\":\"%s\",\"audio\":\"%s\",\"time_set\":%s,\"wifi_provisioned\":%s,\"wifi\":\"%s\",\"ip\":\"%s\",\"pending_sync\":%d,\"transferred_sync\":%d}\n",
                    g_status.device_id,
                    service_name(g_status.storage),
                    service_name(g_status.audio),
                    g_status.time_set ? "true" : "false",
-                   g_wifi_credentials_stored ? "true" : "false");
+                   g_wifi_credentials_stored ? "true" : "false",
+                   service_name(g_status.wifi),
+                   g_status.ip_addr,
+                   pending_sync,
+                   transferred_sync);
             fflush(stdout);
             continue;
         }
@@ -3687,6 +3822,9 @@ static esp_err_t status_handler(httpd_req_t *req)
     if (require_auth(req) != ESP_OK) {
         return ESP_OK;
     }
+    int pending_sync = 0;
+    int transferred_sync = 0;
+    collect_sync_counts(&pending_sync, &transferred_sync);
     char json[768];
     (void)snprintf(json, sizeof(json),
                    "{"
@@ -3705,7 +3843,8 @@ static esp_err_t status_handler(httpd_req_t *req)
                    "\"temperature_c\":%d,"
                    "\"time\":{\"hour\":%d,\"minute\":%d,\"year\":%d,\"month\":%d,\"day\":%d},"
                    "\"storage_mounted\":%s,"
-                   "\"pending_sync\":0,"
+                   "\"pending_sync\":%d,"
+                   "\"transferred_sync\":%d,"
                    "\"last_error\":\"%s\""
                    "}",
                    g_status.device_id,
@@ -3725,6 +3864,8 @@ static esp_err_t status_handler(httpd_req_t *req)
                    g_status.month,
                    g_status.day,
                    g_status.storage_mounted ? "true" : "false",
+                   pending_sync,
+                   transferred_sync,
                    g_status.last_error);
     return send_json(req, json);
 }
@@ -3778,7 +3919,14 @@ static esp_err_t settings_get_handler(httpd_req_t *req)
     if (require_auth(req) != ESP_OK) {
         return ESP_OK;
     }
-    return send_json(req, "{\"theme\":\"light\",\"volume\":5,\"sync_pending\":0}");
+    int pending_sync = 0;
+    int transferred_sync = 0;
+    collect_sync_counts(&pending_sync, &transferred_sync);
+    char json[128];
+    (void)snprintf(json, sizeof(json),
+                   "{\"theme\":\"light\",\"volume\":5,\"sync_pending\":%d,\"sync_transferred\":%d}",
+                   pending_sync, transferred_sync);
+    return send_json(req, json);
 }
 
 static esp_err_t settings_put_handler(httpd_req_t *req)

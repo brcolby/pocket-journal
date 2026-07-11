@@ -621,7 +621,6 @@ void pj_ui_init(pj_ui_context_t *ctx)
     memset(ctx, 0, sizeof(*ctx));
     ctx->state = PJ_UI_STATE_STATIC;
     ctx->volume = 5;
-    ctx->sync_pending = 3;
     ctx->battery_percent = 84;
     ctx->temperature_c = 22;
     ctx->hour = 9;
@@ -781,6 +780,27 @@ void pj_ui_set_status(pj_ui_context_t *ctx, int battery_percent, int temperature
                  PJ_DISPLAY_WIDTH, ctx->state == PJ_UI_STATE_TIME_TEMP ? 54 : PJ_DISPLAY_HEIGHT);
 }
 
+void pj_ui_set_sync_state(pj_ui_context_t *ctx, int pending, int transferred, int online)
+{
+    if (pending < 0) {
+        pending = 0;
+    }
+    if (transferred < 0) {
+        transferred = 0;
+    }
+    online = online != 0;
+    if (ctx->sync_pending == pending && ctx->sync_transferred == transferred &&
+        ctx->sync_online == online) {
+        return;
+    }
+    ctx->sync_pending = pending;
+    ctx->sync_transferred = transferred;
+    ctx->sync_online = online;
+    if (ctx->state == PJ_UI_STATE_SYNC) {
+        mark_partial(ctx, 0, 72, PJ_DISPLAY_WIDTH, 118);
+    }
+}
+
 void pj_ui_set_time(pj_ui_context_t *ctx, int hour, int minute, int year, int month, int day)
 {
     if (ctx->hour == hour && ctx->minute == minute && ctx->year == year && ctx->month == month && ctx->day == day) {
@@ -916,12 +936,6 @@ int pj_ui_handle_aux_short(pj_ui_context_t *ctx)
         mark_partial(ctx, 0, 72, PJ_DISPLAY_WIDTH, 74);
         return 1;
     case PJ_UI_STATE_SYNC:
-        if (ctx->sync_pending > 0) {
-            ctx->sync_pending--;
-            ctx->sync_transferred++;
-            mark_partial(ctx, 0, 80, PJ_DISPLAY_WIDTH, 60);
-            return 1;
-        }
         return 0;
     case PJ_UI_STATE_VOLUME:
         set_state(ctx, PJ_UI_STATE_SETTINGS);
@@ -1267,7 +1281,7 @@ static void draw_sync(const pj_ui_context_t *ctx, pj_framebuffer_t *fb)
     draw_centered_text(fb, 92, text, 2);
     (void)snprintf(text, sizeof(text), "SENT %d", ctx->sync_transferred);
     draw_centered_text(fb, 126, text, 2);
-    draw_centered_text(fb, 170, "AUX SEND", 1);
+    draw_centered_text(fb, 170, ctx->sync_online ? "ONLINE" : "OFFLINE", 1);
 }
 
 static void draw_change_buttons(pj_framebuffer_t *fb)
