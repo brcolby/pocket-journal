@@ -37,6 +37,23 @@ assert.equal(api.pj_sim_display_height(), 200);
 assert.equal(api.pj_sim_framebuffer_bytes(), 5000);
 assert.equal(api.pj_sim_aux_double(), 1);
 assertRendered("record");
+assert.equal(api.pj_sim_record_state(), 1);
+api.pj_sim_set_audio_state(1, 0);
+assert.equal(api.pj_sim_aux_short(), 1);
+assertRendered("home");
+assert.equal(api.pj_sim_record_state(), 2);
+api.pj_sim_set_audio_state(1, 0);
+assert.equal(api.pj_sim_record_state(), 2);
+api.pj_sim_set_audio_state(0, 0);
+assert.equal(api.pj_sim_record_state(), 0);
+assertRendered("home");
+
+api.pj_sim_reset();
+assert.equal(api.pj_sim_aux_double(), 1);
+assertRendered("record");
+api.pj_sim_set_audio_state(0, 0);
+assert.equal(api.pj_sim_record_state(), 0);
+assertRendered("home");
 
 api.pj_sim_reset();
 api.pj_sim_wake();
@@ -63,6 +80,23 @@ assertRendered("listen");
 assert.equal(api.pj_sim_aux_short(), 1);
 assert.equal(api.pj_sim_aux_double(), 0);
 assertRendered("listen");
+
+api.pj_sim_set_audio_state(0, 1);
+assert.equal(api.pj_sim_playback_state(), 1);
+api.pj_sim_set_audio_state(0, 0);
+assert.equal(api.pj_sim_playback_state(), 0);
+assertRendered("listen");
+
+assert.equal(api.pj_sim_aux_short(), 1);
+api.pj_sim_set_audio_state(0, 1);
+assert.equal(api.pj_sim_aux_long(), 1);
+assert.equal(api.pj_sim_playback_state(), 2);
+assertRendered("listen");
+api.pj_sim_set_audio_state(0, 1);
+assert.equal(api.pj_sim_playback_state(), 2);
+api.pj_sim_set_audio_state(0, 0);
+assert.equal(api.pj_sim_playback_state(), 0);
+assertRendered("home");
 
 api.pj_sim_reset();
 api.pj_sim_wake();

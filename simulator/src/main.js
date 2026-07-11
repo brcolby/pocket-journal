@@ -200,6 +200,9 @@ function bindApi(module) {
     tick: module.cwrap("pj_sim_tick", "number", []),
     setStatus: module.cwrap("pj_sim_set_status", null, ["number", "number"]),
     setTime: module.cwrap("pj_sim_set_time", null, ["number", "number", "number", "number", "number"]),
+    setAudioState: module.cwrap("pj_sim_set_audio_state", null, ["number", "number"]),
+    recordState: module.cwrap("pj_sim_record_state", "number", []),
+    playbackState: module.cwrap("pj_sim_playback_state", "number", []),
     setNoteCount: module.cwrap("pj_sim_set_note_count", null, ["number"]),
     setNoteLabel: module.cwrap("pj_sim_set_note_label", null, ["number", "string"]),
     render: module.cwrap("pj_sim_render", null, []),
@@ -459,6 +462,14 @@ window.pocketJournalSimulator = {
   reset: resetSimulator,
   state: () => stateLabel(),
   action: () => actionLine.textContent,
+  audioState: () => api ? { recording: api.recordState(), playback: api.playbackState() } : null,
+  setAudioState: (recording, playback) => dispatchFirmware(
+    "board audio update",
+    () => {
+      api.setAudioState(recording ? 1 : 0, playback ? 1 : 0);
+      return 1;
+    },
+  ),
   debugLog: () => debugDump(),
   flushDebugLog,
   clearDebugLog,

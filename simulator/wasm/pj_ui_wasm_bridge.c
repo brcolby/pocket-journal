@@ -88,6 +88,24 @@ void pj_sim_set_time(int hour, int minute, int year, int month, int day)
 }
 
 EMSCRIPTEN_KEEPALIVE
+void pj_sim_set_audio_state(int recording, int playback_active)
+{
+    pj_ui_set_audio_state(&g_ctx, recording, playback_active);
+}
+
+EMSCRIPTEN_KEEPALIVE
+int pj_sim_record_state(void)
+{
+    return (int)g_ctx.record_state;
+}
+
+EMSCRIPTEN_KEEPALIVE
+int pj_sim_playback_state(void)
+{
+    return (int)g_ctx.playback_state;
+}
+
+EMSCRIPTEN_KEEPALIVE
 void pj_sim_set_note_count(int count)
 {
     if (count < 0) {

@@ -28,20 +28,12 @@ static int state_is_playback(pj_ui_state_t state)
 
 static void set_recording_active(int active)
 {
-    if ((pj_board_status().recording != 0) != (active != 0)) {
-        (void)pj_board_record_toggle();
-    }
+    (void)pj_board_record_set_active(active);
 }
 
 static void set_playback_active(int active, int note_index)
 {
-    if ((pj_board_status().playback_active != 0) != (active != 0)) {
-        if (active) {
-            (void)pj_board_playback_toggle_index(note_index);
-        } else {
-            (void)pj_board_playback_toggle();
-        }
-    }
+    (void)pj_board_playback_set_active(active, note_index);
 }
 
 static void sync_ui_audio_from_board(pj_ui_context_t *ui)
@@ -56,7 +48,6 @@ static void apply_board_state_effects(pj_ui_state_t previous, pj_ui_state_t curr
         set_recording_active(1);
     } else if (previous == PJ_UI_STATE_RECORD && current != PJ_UI_STATE_RECORD) {
         set_recording_active(0);
-        pj_board_refresh_notes(&g_ui);
     } else if (current == PJ_UI_STATE_RECORD && g_ui.record_state == PJ_RECORD_STOPPING &&
                (event->type == PJ_BOARD_EVENT_AUX_SHORT || event->type == PJ_BOARD_EVENT_AUX_LONG)) {
         set_recording_active(0);
