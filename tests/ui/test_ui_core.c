@@ -24,6 +24,32 @@ static void assert_region_clear(const pj_framebuffer_t *fb, int x, int y, int wi
     }
 }
 
+static int count_black_pixels_in_region(const pj_framebuffer_t *fb,
+                                        int x, int y, int width, int height)
+{
+    int count = 0;
+    for (int row = y; row < y + height; row++) {
+        for (int column = x; column < x + width; column++) {
+            count += pj_framebuffer_get(fb, column, row);
+        }
+    }
+    return count;
+}
+
+static int count_pixel_differences_in_region(const pj_framebuffer_t *left,
+                                             const pj_framebuffer_t *right,
+                                             int x, int y, int width, int height)
+{
+    int count = 0;
+    for (int row = y; row < y + height; row++) {
+        for (int column = x; column < x + width; column++) {
+            count += pj_framebuffer_get(left, column, row) !=
+                pj_framebuffer_get(right, column, row);
+        }
+    }
+    return count;
+}
+
 static void seed_notes(pj_ui_context_t *ui)
 {
     const char labels[][PJ_UI_NOTE_LABEL_LEN] = {
@@ -693,6 +719,37 @@ static void test_partial_render_preserves_outside_region(void)
     }
 }
 
+static void test_record_partial_render_replaces_status_through_bottom_edge(void)
+{
+    pj_ui_context_t ui;
+    pj_ui_context_t expected_ui;
+    pj_framebuffer_t before;
+    pj_framebuffer_t partial;
+    pj_framebuffer_t expected;
+    pj_ui_init(&ui);
+    ui.state = PJ_UI_STATE_RECORD;
+    ui.record_state = PJ_RECORD_IDLE;
+    pj_ui_render(&ui, &partial);
+    before = partial;
+    pj_ui_mark_displayed(&ui);
+
+    pj_ui_set_audio_state(&ui, 1, 0);
+    assert(ui.state == PJ_UI_STATE_RECORD);
+    assert(ui.record_state == PJ_RECORD_ACTIVE);
+    assert(ui.dirty.partial == 1);
+    assert(ui.dirty.x == 0 && ui.dirty.y == 32);
+    assert(ui.dirty.width == PJ_DISPLAY_WIDTH);
+    assert(ui.dirty.y + ui.dirty.height == PJ_DISPLAY_HEIGHT);
+    pj_ui_render(&ui, &partial);
+
+    expected_ui = ui;
+    pj_ui_request_full_refresh(&expected_ui);
+    pj_ui_render(&expected_ui, &expected);
+    assert(memcmp(&partial, &expected, sizeof(expected)) == 0);
+    assert(count_pixel_differences_in_region(
+               &before, &partial, 0, 150, PJ_DISPLAY_WIDTH, 50) > 0);
+}
+
 static void test_no_back_button_pixels(void)
 {
     pj_ui_context_t ui;
@@ -753,6 +810,38 @@ static void test_long_note_label_stays_clear_of_pagination_rail(void)
     pj_ui_render(&ui, &fb);
     assert(count_black_pixels(&fb) > 0);
     assert_region_clear(&fb, 145, 8, 7, 46);
+}
+
+static void test_note_detail_title_respects_side_margins(void)
+{
+    pj_ui_context_t ui;
+    pj_framebuffer_t fb;
+    const char labels[][PJ_UI_NOTE_LABEL_LEN] = {
+        "WWWWWWWWWWWWWWWWW",
+    };
+    pj_ui_init(&ui);
+    pj_ui_set_notes(&ui, 1, labels);
+    ui.state = PJ_UI_STATE_NOTE_DETAIL;
+    ui.selected_note = 0;
+
+    pj_ui_render(&ui, &fb);
+    assert(count_black_pixels_in_region(&fb, 8, 12, 184, 36) > 0);
+    assert_region_clear(&fb, 0, 12, 8, 36);
+    assert_region_clear(&fb, 192, 12, 8, 36);
+}
+
+static void test_calendar_divider_stays_above_empty_state(void)
+{
+    pj_ui_context_t ui;
+    pj_framebuffer_t fb;
+    pj_ui_init(&ui);
+    ui.state = PJ_UI_STATE_CALENDAR;
+    pj_ui_render(&ui, &fb);
+
+    for (int x = 36; x <= 164; x++) {
+        assert(pj_framebuffer_get(&fb, x, 76) == 1);
+    }
+    assert_region_clear(&fb, 36, 77, 129, 20);
 }
 
 static void test_polished_scenes_render_stably(void)
@@ -833,9 +922,12 @@ int main(void)
     test_sync_state_is_board_driven();
     test_dirty_lifecycle();
     test_partial_render_preserves_outside_region();
+    test_record_partial_render_replaces_status_through_bottom_edge();
     test_no_back_button_pixels();
     test_static_art_render_and_fallback();
     test_long_note_label_stays_clear_of_pagination_rail();
+    test_note_detail_title_respects_side_margins();
+    test_calendar_divider_stays_above_empty_state();
     test_polished_scenes_render_stably();
     test_render_all_states();
     puts("ui tests passed");
