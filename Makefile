@@ -10,6 +10,7 @@ AUDIO_LEVEL_TEST_BIN := build/test_audio_level
 NOTE_MODEL_TEST_BIN := build/test_note_model
 AUTH_TEST_BIN := build/test_auth
 SETTINGS_TEST_BIN := build/test_settings
+STATIC_ART_TEST_BIN := build/test_static_art
 LVGL_DIR := firmware/managed_components/lvgl__lvgl
 ifneq ($(wildcard $(LVGL_DIR)/src),)
 LVGL_SRCS := $(wildcard $(LVGL_DIR)/src/*.c)
@@ -78,6 +79,12 @@ test-input:
 		tests/board/test_settings.c \
 		-o $(SETTINGS_TEST_BIN)
 	$(SETTINGS_TEST_BIN)
+	$(CC) $(CFLAGS) \
+		-Ifirmware/components/pj_board/include \
+		firmware/components/pj_board/pj_static_art.c \
+		tests/board/test_static_art.c \
+		-o $(STATIC_ART_TEST_BIN)
+	$(STATIC_ART_TEST_BIN)
 
 test-partner:
 	cd partner && PYTHONPATH=src python -m unittest discover -s ../tests/partner -p 'test_*.py'
