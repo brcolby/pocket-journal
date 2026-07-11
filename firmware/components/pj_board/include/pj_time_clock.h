@@ -15,6 +15,8 @@ typedef struct {
 
 int pj_time_clock_civil_valid(int year, int month, int day,
                               int hour, int minute, int second);
+int pj_time_clock_civil_from_day(int32_t local_day,
+                                 int *year, int *month, int *day);
 int pj_time_clock_anchor_set(pj_time_clock_anchor_t *anchor,
                              int year, int month, int day,
                              int hour, int minute, int second,
