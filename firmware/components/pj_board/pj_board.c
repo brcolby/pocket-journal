@@ -7,6 +7,7 @@
 #include "pj_settings.h"
 #include "pj_static_art.h"
 #include "pj_storage.h"
+#include "pj_time_clock.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -36,6 +37,7 @@
 #include "esp_netif.h"
 #include "esp_sleep.h"
 #include "esp_system.h"
+#include "esp_timer.h"
 #include "esp_vfs_fat.h"
 #include "esp_wifi.h"
 #include "cJSON.h"
@@ -175,10 +177,27 @@ static pj_home_layout_t g_home_layout;
 static int g_static_art_valid;
 static int g_static_art_slot = -1;
 static int g_display_warning_logged;
-static int g_time_update_pending;
+static volatile int g_time_update_pending;
+static uint32_t g_time_generation;
 static volatile int g_settings_update_pending;
 static volatile int g_static_art_update_pending;
 static volatile int g_home_layout_update_pending;
+
+typedef struct {
+    int hour;
+    int minute;
+    int year;
+    int month;
+    int day;
+    int time_set;
+    uint32_t generation;
+} board_time_snapshot_t;
+
+static int valid_time_date(int hour, int minute, int year, int month, int day)
+{
+    return year >= 2024 && year <= 2099 &&
+           pj_time_clock_civil_valid(year, month, day, hour, minute, 0);
+}
 
 #ifdef ESP_PLATFORM
 static httpd_handle_t g_http_server;
@@ -253,9 +272,10 @@ static char g_wifi_ssid[PJ_WIFI_SSID_MAX_LEN + 1];
 static char g_wifi_password[PJ_WIFI_PASSWORD_MAX_LEN + 1];
 static int g_wifi_credentials_stored;
 static uint32_t g_record_sequence;
+static portMUX_TYPE g_time_lock = portMUX_INITIALIZER_UNLOCKED;
+static pj_time_clock_anchor_t g_time_clock_anchor;
 
 static esp_err_t rtc_write_status_time(void);
-static int valid_time_date(int hour, int minute, int year, int month, int day);
 typedef struct {
     int pa_level;
     int dout_gpio;
@@ -284,6 +304,7 @@ typedef struct {
     uint32_t raw_clipped;
     int input_channel;
 } audio_process_args_t;
+
 static esp_err_t audio_play_tone_ms(uint32_t duration_ms, const audio_tone_diag_opts_t *opts);
 static esp_err_t audio_mic_check_ms(uint32_t duration_ms, int gain_db, audio_mic_check_result_t *result);
 static esp_err_t serial_command_task_start(void);
@@ -2627,6 +2648,77 @@ static esp_err_t rtc_init(void)
     return ESP_OK;
 }
 
+static uint64_t board_monotonic_ms(void)
+{
+    return (uint64_t)esp_timer_get_time() / 1000u;
+}
+
+static board_time_snapshot_t board_time_snapshot(void)
+{
+    board_time_snapshot_t snapshot;
+    portENTER_CRITICAL(&g_time_lock);
+    snapshot = (board_time_snapshot_t) {
+        .hour = g_status.hour,
+        .minute = g_status.minute,
+        .year = g_status.year,
+        .month = g_status.month,
+        .day = g_status.day,
+        .time_set = g_status.time_set,
+        .generation = g_time_generation,
+    };
+    portEXIT_CRITICAL(&g_time_lock);
+    return snapshot;
+}
+
+static int board_time_publish(int hour, int minute, int year, int month, int day,
+                              int second, uint64_t monotonic_ms)
+{
+    pj_time_clock_anchor_t anchor;
+    if (!pj_time_clock_anchor_set(&anchor, year, month, day, hour, minute, second,
+                                  monotonic_ms)) {
+        return 0;
+    }
+    portENTER_CRITICAL(&g_time_lock);
+    g_status.hour = hour;
+    g_status.minute = minute;
+    g_status.year = year;
+    g_status.month = month;
+    g_status.day = day;
+    g_status.time_set = 1;
+    g_time_clock_anchor = anchor;
+    g_time_generation++;
+    portEXIT_CRITICAL(&g_time_lock);
+    return 1;
+}
+
+static void board_time_mark_pending(void)
+{
+    portENTER_CRITICAL(&g_time_lock);
+    g_time_update_pending = 1;
+    portEXIT_CRITICAL(&g_time_lock);
+}
+
+static int board_time_take_pending(board_time_snapshot_t *snapshot)
+{
+    int pending = 0;
+    portENTER_CRITICAL(&g_time_lock);
+    if (g_time_update_pending && g_status.time_set) {
+        *snapshot = (board_time_snapshot_t) {
+            .hour = g_status.hour,
+            .minute = g_status.minute,
+            .year = g_status.year,
+            .month = g_status.month,
+            .day = g_status.day,
+            .time_set = 1,
+            .generation = g_time_generation,
+        };
+        g_time_update_pending = 0;
+        pending = 1;
+    }
+    portEXIT_CRITICAL(&g_time_lock);
+    return pending;
+}
+
 static int rtc_read_status_time(void)
 {
     if (!g_rtc_ready || g_rtc_dev == NULL) {
@@ -2642,38 +2734,35 @@ static int rtc_read_status_time(void)
     if (err != ESP_OK || (data[0] & 0x80) != 0) {
         return 0;
     }
+    int second = bcd_to_u8(data[0] & 0x7F);
     int minute = bcd_to_u8(data[1] & 0x7F);
     int hour = bcd_to_u8(data[2] & 0x3F);
     int day = bcd_to_u8(data[3] & 0x3F);
     int month = bcd_to_u8(data[5] & 0x1F);
     int year = 2000 + bcd_to_u8(data[6]);
-    if (year < 2024 || year > 2099 || month < 1 || month > 12 ||
-        day < 1 || day > 31 || hour < 0 || hour > 23 || minute < 0 || minute > 59) {
+    if (!valid_time_date(hour, minute, year, month, day) ||
+        second < 0 || second > 59) {
         return 0;
     }
-    g_status.hour = hour;
-    g_status.minute = minute;
-    g_status.year = year;
-    g_status.month = month;
-    g_status.day = day;
-    g_status.time_set = 1;
-    return 1;
+    return board_time_publish(hour, minute, year, month, day, second,
+                              board_monotonic_ms());
 }
 
 static esp_err_t rtc_write_status_time(void)
 {
-    if (!g_rtc_ready || g_rtc_dev == NULL || !g_status.time_set) {
+    board_time_snapshot_t time = board_time_snapshot();
+    if (!g_rtc_ready || g_rtc_dev == NULL || !time.time_set) {
         return ESP_ERR_INVALID_STATE;
     }
     uint8_t data[8] = {
         0x04,
         u8_to_bcd(0),
-        u8_to_bcd((uint8_t)g_status.minute),
-        u8_to_bcd((uint8_t)g_status.hour),
-        u8_to_bcd((uint8_t)g_status.day),
-        u8_to_bcd((uint8_t)board_weekday_from_date(g_status.year, g_status.month, g_status.day)),
-        u8_to_bcd((uint8_t)g_status.month),
-        u8_to_bcd((uint8_t)(g_status.year - 2000)),
+        u8_to_bcd((uint8_t)time.minute),
+        u8_to_bcd((uint8_t)time.hour),
+        u8_to_bcd((uint8_t)time.day),
+        u8_to_bcd((uint8_t)board_weekday_from_date(time.year, time.month, time.day)),
+        u8_to_bcd((uint8_t)time.month),
+        u8_to_bcd((uint8_t)(time.year - 2000)),
     };
     if (!i2c_take(pdMS_TO_TICKS(50))) {
         return ESP_ERR_TIMEOUT;
@@ -3539,6 +3628,31 @@ static esp_err_t audio_mic_check_ms(uint32_t duration_ms, int gain_db, audio_mic
 }
 #endif
 
+#ifndef ESP_PLATFORM
+static board_time_snapshot_t board_time_snapshot(void)
+{
+    return (board_time_snapshot_t) {
+        .hour = g_status.hour,
+        .minute = g_status.minute,
+        .year = g_status.year,
+        .month = g_status.month,
+        .day = g_status.day,
+        .time_set = g_status.time_set,
+        .generation = g_time_generation,
+    };
+}
+
+static int board_time_take_pending(board_time_snapshot_t *snapshot)
+{
+    if (!g_time_update_pending || !g_status.time_set) {
+        return 0;
+    }
+    g_time_update_pending = 0;
+    *snapshot = board_time_snapshot();
+    return 1;
+}
+#endif
+
 pj_board_profile_t pj_board_default_profile(void)
 {
     pj_board_profile_t profile = {
@@ -3577,16 +3691,19 @@ static int set_status_time_from_build(void)
     int hour = 0;
     int minute = 0;
     int second = 0;
-    (void)second;
     if (sscanf(__DATE__, "%3s %d %d", month_name, &day, &year) != 3 ||
         sscanf(__TIME__, "%d:%d:%d", &hour, &minute, &second) != 3) {
         return 0;
     }
     int month = build_month_from_name(month_name);
-    if (year < 2024 || year > 2099 || month < 1 || day < 1 || day > 31 ||
-        hour < 0 || hour > 23 || minute < 0 || minute > 59) {
+    if (!valid_time_date(hour, minute, year, month, day) ||
+        second < 0 || second > 59) {
         return 0;
     }
+#ifdef ESP_PLATFORM
+    return board_time_publish(hour, minute, year, month, day, second,
+                              board_monotonic_ms());
+#else
     g_status.hour = hour;
     g_status.minute = minute;
     g_status.year = year;
@@ -3594,6 +3711,7 @@ static int set_status_time_from_build(void)
     g_status.day = day;
     g_status.time_set = 1;
     return 1;
+#endif
 }
 
 static void init_default_status(const pj_board_profile_t *profile)
@@ -3607,12 +3725,16 @@ static void init_default_status(const pj_board_profile_t *profile)
     g_status.http = PJ_BOARD_SERVICE_DISABLED;
     g_status.battery_percent = 84;
     g_status.temperature_c = 22;
+#ifdef ESP_PLATFORM
+    (void)board_time_publish(9, 41, 2026, 6, 6, 0, board_monotonic_ms());
+#else
     g_status.hour = 9;
     g_status.minute = 41;
     g_status.year = 2026;
     g_status.month = 6;
     g_status.day = 6;
     g_status.time_set = 1;
+#endif
     (void)set_status_time_from_build();
     (void)snprintf(g_status.device_id, sizeof(g_status.device_id), "pj-%s", profile->sku);
     (void)snprintf(g_status.token, sizeof(g_status.token), "%s", PJ_DEFAULT_TOKEN);
@@ -3639,29 +3761,46 @@ static int days_in_month(int year, int month)
     return days[month - 1];
 }
 
-static void advance_status_one_minute(void)
+static int advance_status_one_minute(uint32_t expected_generation)
 {
+#ifdef ESP_PLATFORM
+    portENTER_CRITICAL(&g_time_lock);
+#endif
+    if (!g_status.time_set || g_time_generation != expected_generation) {
+        goto unchanged;
+    }
     g_status.minute++;
+    g_time_generation++;
     if (g_status.minute < 60) {
-        return;
+        goto done;
     }
     g_status.minute = 0;
     g_status.hour++;
     if (g_status.hour < 24) {
-        return;
+        goto done;
     }
     g_status.hour = 0;
     g_status.day++;
     if (g_status.day <= days_in_month(g_status.year, g_status.month)) {
-        return;
+        goto done;
     }
     g_status.day = 1;
     g_status.month++;
     if (g_status.month <= 12) {
-        return;
+        goto done;
     }
     g_status.month = 1;
     g_status.year++;
+done:
+#ifdef ESP_PLATFORM
+    portEXIT_CRITICAL(&g_time_lock);
+#endif
+    return 1;
+unchanged:
+#ifdef ESP_PLATFORM
+    portEXIT_CRITICAL(&g_time_lock);
+#endif
+    return 0;
 }
 
 void pj_board_init(const pj_board_profile_t *profile)
@@ -3818,7 +3957,19 @@ void pj_board_start_services(const pj_board_profile_t *profile)
 
 pj_board_status_t pj_board_status(void)
 {
+#ifdef ESP_PLATFORM
+    pj_board_status_t status = g_status;
+    board_time_snapshot_t time = board_time_snapshot();
+    status.hour = time.hour;
+    status.minute = time.minute;
+    status.year = time.year;
+    status.month = time.month;
+    status.day = time.day;
+    status.time_set = time.time_set;
+    return status;
+#else
     return g_status;
+#endif
 }
 
 static int settings_apply_to_ui(pj_ui_context_t *ui, const pj_settings_t *settings)
@@ -3982,8 +4133,9 @@ void pj_board_refresh_status(pj_ui_context_t *ui)
         (void)storage_refresh_capacity();
     }
 #endif
-    if (g_status.time_set) {
-        pj_ui_set_time(ui, g_status.hour, g_status.minute, g_status.year, g_status.month, g_status.day);
+    pj_board_status_t status = pj_board_status();
+    if (status.time_set) {
+        pj_ui_set_time(ui, status.hour, status.minute, status.year, status.month, status.day);
     }
     pj_ui_set_audio_state(ui, g_status.recording, g_status.playback_active);
     pj_ui_set_status(ui, g_status.battery_percent, g_status.temperature_c);
@@ -4039,21 +4191,25 @@ int pj_board_consume_notes_update(pj_ui_context_t *ui)
 
 int pj_board_tick_time(pj_ui_context_t *ui)
 {
-    if (!g_status.time_set) {
+    board_time_snapshot_t before = board_time_snapshot();
+    if (!before.time_set) {
         return 0;
     }
-    advance_status_one_minute();
-    pj_ui_set_time(ui, g_status.hour, g_status.minute, g_status.year, g_status.month, g_status.day);
+    if (!advance_status_one_minute(before.generation)) {
+        return 0;
+    }
+    board_time_snapshot_t time = board_time_snapshot();
+    pj_ui_set_time(ui, time.hour, time.minute, time.year, time.month, time.day);
     return 1;
 }
 
 int pj_board_consume_time_update(pj_ui_context_t *ui)
 {
-    if (!g_time_update_pending || !g_status.time_set) {
+    board_time_snapshot_t time;
+    if (!board_time_take_pending(&time)) {
         return 0;
     }
-    g_time_update_pending = 0;
-    pj_ui_set_time(ui, g_status.hour, g_status.minute, g_status.year, g_status.month, g_status.day);
+    pj_ui_set_time(ui, time.hour, time.minute, time.year, time.month, time.day);
     return 1;
 }
 
@@ -4174,6 +4330,7 @@ void pj_board_enter_sleep(void)
     ESP_ERROR_CHECK_WITHOUT_ABORT(gpio_wakeup_enable(BOOT_BUTTON_PIN, GPIO_INTR_LOW_LEVEL));
     ESP_ERROR_CHECK_WITHOUT_ABORT(esp_sleep_enable_gpio_wakeup());
     esp_light_sleep_start();
+    (void)rtc_read_status_time();
     uint32_t wake_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
     if (gpio_get_level(BOOT_BUTTON_PIN) == 0) {
         pj_aux_input_resume_pressed(&g_aux_input, wake_ms);
@@ -4504,24 +4661,14 @@ static int json_int_field(const char *json, const char *field, int *value)
     return 1;
 }
 
-static int valid_time_date(int hour, int minute, int year, int month, int day)
-{
-    return hour >= 0 && hour <= 23 &&
-           minute >= 0 && minute <= 59 &&
-           year >= 2024 && year <= 2099 &&
-           month >= 1 && month <= 12 &&
-           day >= 1 && day <= 31;
-}
-
 static void board_set_time_date(int hour, int minute, int year, int month, int day, const char *source)
 {
-    g_status.hour = hour;
-    g_status.minute = minute;
-    g_status.year = year;
-    g_status.month = month;
-    g_status.day = day;
-    g_status.time_set = 1;
-    g_time_update_pending = 1;
+    if (!board_time_publish(hour, minute, year, month, day, 0,
+                            board_monotonic_ms())) {
+        ESP_LOGE(TAG, "Rejected invalid time/date from %s", source);
+        return;
+    }
+    board_time_mark_pending();
     ESP_ERROR_CHECK_WITHOUT_ABORT(rtc_write_status_time());
     ESP_LOGI(TAG, "Time/date updated from %s: %02d:%02d %04d-%02d-%02d",
              source, hour, minute, year, month, day);
@@ -4960,14 +5107,11 @@ static esp_err_t time_get_handler(httpd_req_t *req)
     if (require_auth(req) != ESP_OK) {
         return ESP_OK;
     }
+    board_time_snapshot_t time = board_time_snapshot();
     char json[96];
     (void)snprintf(json, sizeof(json),
                    "{\"hour\":%d,\"minute\":%d,\"year\":%d,\"month\":%d,\"day\":%d}",
-                   g_status.hour,
-                   g_status.minute,
-                   g_status.year,
-                   g_status.month,
-                   g_status.day);
+                   time.hour, time.minute, time.year, time.month, time.day);
     return send_json(req, json);
 }
 
@@ -4977,11 +5121,12 @@ static esp_err_t time_put_handler(httpd_req_t *req)
         return ESP_OK;
     }
     char body[192];
-    int hour = g_status.hour;
-    int minute = g_status.minute;
-    int year = g_status.year;
-    int month = g_status.month;
-    int day = g_status.day;
+    board_time_snapshot_t time = board_time_snapshot();
+    int hour = time.hour;
+    int minute = time.minute;
+    int year = time.year;
+    int month = time.month;
+    int day = time.day;
     if (!read_body(req, body, sizeof(body))) {
         httpd_resp_set_status(req, "400 Bad Request");
         return send_json(req, "{\"error\":\"expected hour/minute/month/day integers; optional year\"}");
