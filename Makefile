@@ -11,6 +11,7 @@ NOTE_MODEL_TEST_BIN := build/test_note_model
 AUTH_TEST_BIN := build/test_auth
 SETTINGS_TEST_BIN := build/test_settings
 STATIC_ART_TEST_BIN := build/test_static_art
+HOME_LAYOUT_TEST_BIN := build/test_home_layout
 LVGL_DIR := firmware/managed_components/lvgl__lvgl
 ifneq ($(wildcard $(LVGL_DIR)/src),)
 LVGL_SRCS := $(wildcard $(LVGL_DIR)/src/*.c)
@@ -42,6 +43,7 @@ test-ui: check-lvgl-managed
 	$(CC) $(CFLAGS) $(LVGL_CFLAGS) \
 		-Ifirmware/components/pj_ui/include \
 		$(LVGL_SRCS) \
+		firmware/components/pj_ui/pj_home_layout.c \
 		firmware/components/pj_ui/pj_ui.c \
 		tests/ui/test_ui_core.c \
 		-o $(UI_TEST_BIN)
@@ -85,6 +87,12 @@ test-input:
 		tests/board/test_static_art.c \
 		-o $(STATIC_ART_TEST_BIN)
 	$(STATIC_ART_TEST_BIN)
+	$(CC) $(CFLAGS) \
+		-Ifirmware/components/pj_ui/include \
+		firmware/components/pj_ui/pj_home_layout.c \
+		tests/board/test_home_layout.c \
+		-o $(HOME_LAYOUT_TEST_BIN)
+	$(HOME_LAYOUT_TEST_BIN)
 
 test-partner:
 	cd partner && PYTHONPATH=src python -m unittest discover -s ../tests/partner -p 'test_*.py'
@@ -116,6 +124,7 @@ generate-simulator-wasm: check-lvgl-managed
 	$(EMCC) -std=c11 -O2 $(LVGL_CFLAGS) \
 		-Ifirmware/components/pj_ui/include \
 		$(LVGL_SRCS) \
+		firmware/components/pj_ui/pj_home_layout.c \
 		firmware/components/pj_ui/pj_ui.c \
 		simulator/wasm/pj_ui_wasm_bridge.c \
 		-o $(SIM_WASM_JS) \
