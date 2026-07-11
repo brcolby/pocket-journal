@@ -298,6 +298,19 @@ static void test_audio_lifecycle_reconciliation(void)
     pj_ui_set_audio_state(&ui, 0, 0);
     assert(ui.playback_state == PJ_PLAYBACK_IDLE);
     assert(pj_ui_current_state(&ui) == PJ_UI_STATE_LISTEN);
+
+    pj_ui_init(&ui);
+    ui.state = PJ_UI_STATE_RECORD;
+    ui.record_state = PJ_RECORD_ACTIVE;
+    assert(pj_ui_handle_aux_short(&ui) == 1);
+    assert(pj_ui_current_state(&ui) == PJ_UI_STATE_HOME);
+    assert(ui.record_state == PJ_RECORD_STOPPING);
+    pj_ui_set_audio_state(&ui, 1, 0);
+    assert(ui.record_state == PJ_RECORD_STOPPING);
+    assert(pj_ui_handle_aux_short(&ui) == 0);
+    assert(pj_ui_current_state(&ui) == PJ_UI_STATE_HOME);
+    pj_ui_set_audio_state(&ui, 0, 0);
+    assert(ui.record_state == PJ_RECORD_IDLE);
 }
 
 static void test_settings_dark_mode_toggle(void)

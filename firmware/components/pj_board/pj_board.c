@@ -2985,17 +2985,17 @@ static void record_task_exit(int note_ready)
     if (note_ready) {
         g_notes_update_pending = 1;
     }
+    g_record_task = NULL;
     g_status.recording = 0;
     g_audio_state_update_pending = 1;
-    g_record_task = NULL;
     vTaskDelete(NULL);
 }
 
 static void playback_task_exit(void)
 {
+    g_playback_task = NULL;
     g_status.playback_active = 0;
     g_audio_state_update_pending = 1;
-    g_playback_task = NULL;
     vTaskDelete(NULL);
 }
 
@@ -3141,7 +3141,11 @@ static void record_task(void *arg)
                                         &g_audio_process_task);
         if (created != pdPASS) {
             g_audio_process_task = NULL;
-            note_ready = audio_process_recording(process_args);
+            ESP_LOGW(TAG, "Audio processing task start failed; preserving raw recording");
+            note_ready = rename(temporary_path, g_active_recording_path) == 0;
+            if (note_ready) {
+                write_recording_metadata(g_active_recording_path, data_bytes);
+            }
             free(process_args);
         }
     } else {
@@ -4151,51 +4155,67 @@ void pj_board_enter_sleep(void)
 }
 
 
-int pj_board_record_toggle(void)
+int pj_board_record_set_active(int active)
 {
+    active = active != 0;
+    if (!active) {
+#ifdef ESP_PLATFORM
+        if (!g_status.recording) {
+            return 1;
+        }
+        g_record_stop_requested = 1;
+        ESP_LOGI(TAG, "Recording stop requested");
+#else
+        g_status.recording = 0;
+#endif
+        return 1;
+    }
     if (g_status.storage != PJ_BOARD_SERVICE_READY || g_status.audio != PJ_BOARD_SERVICE_READY) {
 #ifdef ESP_PLATFORM
-        ESP_LOGW(TAG, "Record toggle ignored: storage/audio unavailable");
+        ESP_LOGW(TAG, "Record command ignored: storage/audio unavailable");
 #endif
         return 0;
     }
 #ifdef ESP_PLATFORM
-    if (!g_status.recording) {
-        if (g_status.playback_active || g_playback_task != NULL) {
-            ESP_LOGW(TAG, "Record start ignored: playback active");
-            return 0;
-        }
-        if (g_audio_process_task != NULL) {
-            ESP_LOGW(TAG, "Record start ignored: previous recording still processing");
-            return 0;
-        }
-        if (g_record_task != NULL) {
-            ESP_LOGW(TAG, "Record start ignored: previous recording still stopping");
-            return 0;
-        }
-        if (!storage_preflight(PJ_STORAGE_RECORD_START_BYTES, "recording")) {
-            ESP_LOGW(TAG, "Record start ignored: %s", g_status.last_error);
-            return 0;
-        }
-        next_recording_path(g_active_recording_path, sizeof(g_active_recording_path));
-        g_record_stop_requested = 0;
-        g_status.recording = 1;
-        BaseType_t created = xTaskCreate(record_task, "pj-record", PJ_AUDIO_RECORD_TASK_STACK, NULL, 5, &g_record_task);
-        if (created != pdPASS) {
-            g_status.recording = 0;
-            g_record_task = NULL;
-            ESP_LOGE(TAG, "Record start failed: task create failed");
-            return 0;
-        }
-        ESP_LOGI(TAG, "Recording started: %s", g_active_recording_path);
-    } else {
-        g_record_stop_requested = 1;
-        ESP_LOGI(TAG, "Recording stop requested");
+    if (g_status.recording) {
+        return 1;
     }
+    if (g_status.playback_active || g_playback_task != NULL) {
+        ESP_LOGW(TAG, "Record start ignored: playback active");
+        return 0;
+    }
+    if (g_audio_process_task != NULL) {
+        ESP_LOGW(TAG, "Record start ignored: previous recording still processing");
+        return 0;
+    }
+    if (g_record_task != NULL) {
+        ESP_LOGW(TAG, "Record start ignored: previous recording still stopping");
+        return 0;
+    }
+    if (!storage_preflight(PJ_STORAGE_RECORD_START_BYTES, "recording")) {
+        ESP_LOGW(TAG, "Record start ignored: %s", g_status.last_error);
+        return 0;
+    }
+    next_recording_path(g_active_recording_path, sizeof(g_active_recording_path));
+    g_record_stop_requested = 0;
+    g_status.recording = 1;
+    BaseType_t created = xTaskCreate(record_task, "pj-record", PJ_AUDIO_RECORD_TASK_STACK, NULL, 5, &g_record_task);
+    if (created != pdPASS) {
+        g_status.recording = 0;
+        g_record_task = NULL;
+        ESP_LOGE(TAG, "Record start failed: task create failed");
+        return 0;
+    }
+    ESP_LOGI(TAG, "Recording started: %s", g_active_recording_path);
 #else
-    g_status.recording = !g_status.recording;
+    g_status.recording = 1;
 #endif
     return 1;
+}
+
+int pj_board_record_toggle(void)
+{
+    return pj_board_record_set_active(!g_status.recording);
 }
 
 int pj_board_playback_toggle(void)
@@ -4203,51 +4223,68 @@ int pj_board_playback_toggle(void)
     return pj_board_playback_toggle_index(0);
 }
 
-int pj_board_playback_toggle_index(int note_index)
+int pj_board_playback_set_active(int active, int note_index)
 {
+    active = active != 0;
+    if (!active) {
+#ifdef ESP_PLATFORM
+        if (!g_status.playback_active) {
+            return 1;
+        }
+        g_playback_stop_requested = 1;
+        ESP_LOGI(TAG, "Playback stop requested");
+#else
+        g_status.playback_active = 0;
+#endif
+        return 1;
+    }
     if (g_status.storage != PJ_BOARD_SERVICE_READY || g_status.audio != PJ_BOARD_SERVICE_READY) {
 #ifdef ESP_PLATFORM
-        ESP_LOGW(TAG, "Playback toggle ignored: storage/audio unavailable");
+        ESP_LOGW(TAG, "Playback command ignored: storage/audio unavailable");
 #endif
         return 0;
     }
 #ifdef ESP_PLATFORM
-    if (!g_status.playback_active) {
-        if (g_status.recording || g_record_task != NULL || g_audio_process_task != NULL) {
-            ESP_LOGW(TAG, "Playback start ignored: recording or audio processing active");
-            return 0;
-        }
-        if (g_playback_task != NULL) {
-            ESP_LOGW(TAG, "Playback start ignored: previous playback still stopping");
-            return 0;
-        }
-        if (note_index < 0) {
-            note_index = 0;
-        }
-        char filename[96];
-        if (!audio_filename_for_index(note_index, filename, sizeof(filename))) {
-            ESP_LOGW(TAG, "Playback toggle ignored: WAV index %d unavailable", note_index);
-            return 0;
-        }
-        (void)snprintf(g_active_playback_path, sizeof(g_active_playback_path), PJ_AUDIO_DIR "/%s", filename);
-        g_playback_stop_requested = 0;
-        g_status.playback_active = 1;
-        BaseType_t created = xTaskCreate(playback_task, "pj-play", PJ_AUDIO_PLAYBACK_TASK_STACK, NULL, 5, &g_playback_task);
-        if (created != pdPASS) {
-            g_status.playback_active = 0;
-            g_playback_task = NULL;
-            ESP_LOGE(TAG, "Playback start failed: task create failed");
-            return 0;
-        }
-        ESP_LOGI(TAG, "Playback started: %s", g_active_playback_path);
-    } else {
-        g_playback_stop_requested = 1;
-        ESP_LOGI(TAG, "Playback stop requested");
+    if (g_status.playback_active) {
+        return 1;
     }
+    if (g_status.recording || g_record_task != NULL || g_audio_process_task != NULL) {
+        ESP_LOGW(TAG, "Playback start ignored: recording or audio processing active");
+        return 0;
+    }
+    if (g_playback_task != NULL) {
+        ESP_LOGW(TAG, "Playback start ignored: previous playback still stopping");
+        return 0;
+    }
+    if (note_index < 0) {
+        note_index = 0;
+    }
+    char filename[96];
+    if (!audio_filename_for_index(note_index, filename, sizeof(filename))) {
+        ESP_LOGW(TAG, "Playback start ignored: WAV index %d unavailable", note_index);
+        return 0;
+    }
+    (void)snprintf(g_active_playback_path, sizeof(g_active_playback_path), PJ_AUDIO_DIR "/%s", filename);
+    g_playback_stop_requested = 0;
+    g_status.playback_active = 1;
+    BaseType_t created = xTaskCreate(playback_task, "pj-play", PJ_AUDIO_PLAYBACK_TASK_STACK, NULL, 5, &g_playback_task);
+    if (created != pdPASS) {
+        g_status.playback_active = 0;
+        g_playback_task = NULL;
+        ESP_LOGE(TAG, "Playback start failed: task create failed");
+        return 0;
+    }
+    ESP_LOGI(TAG, "Playback started: %s", g_active_playback_path);
 #else
-    g_status.playback_active = !g_status.playback_active;
+    (void)note_index;
+    g_status.playback_active = 1;
 #endif
     return 1;
+}
+
+int pj_board_playback_toggle_index(int note_index)
+{
+    return pj_board_playback_set_active(!g_status.playback_active, note_index);
 }
 
 int pj_board_wipe_recordings(pj_ui_context_t *ui)
