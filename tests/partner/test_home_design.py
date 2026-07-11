@@ -6,6 +6,7 @@ import json
 import unittest
 
 from pocket_journal_partner.cli import _load_home_design, _load_static_art
+from pocket_journal_partner.home_design import normalize_home_design
 
 
 class HomeDesignTests(unittest.TestCase):
@@ -15,13 +16,38 @@ class HomeDesignTests(unittest.TestCase):
             path.write_text(json.dumps({
                 "title": "Pocket",
                 "slots": [
-                    {"label": "Notes", "icon": "stylus_note", "state": "notes"},
-                    {"label": "Sync", "icon": "sync", "state": "sync"},
+                    {"label": "Notes", "icon": "notebook", "state": "notes"},
+                    {"label": "Sync", "icon": "wifi", "state": "sync"},
                 ],
             }), encoding="utf-8")
             design = _load_home_design(str(path))
             self.assertEqual(design["title"], "Pocket")
             self.assertEqual(design["slots"][1]["state"], "sync")
+
+    def test_preserves_four_slot_order(self) -> None:
+        design = normalize_home_design({
+            "title": "Daily tools",
+            "slots": [
+                {"label": "Capture", "icon": "microphone", "state": "record"},
+                {"label": "Read", "icon": "read_me", "state": "read"},
+                {"label": "Timer", "icon": "timer", "state": "timer"},
+                {"label": "Network", "icon": "wifi", "state": "sync"},
+            ],
+        })
+        self.assertEqual([slot["state"] for slot in design["slots"]], ["record", "read", "timer", "sync"])
+
+    def test_rejects_unknown_or_oversized_slots(self) -> None:
+        with self.assertRaisesRegex(ValueError, "unsupported home destination"):
+            normalize_home_design({
+                "slots": [{"label": "Missing", "icon": "notebook", "state": "removed"}],
+            })
+        with self.assertRaisesRegex(ValueError, "between one and four"):
+            normalize_home_design({
+                "slots": [
+                    {"label": str(index), "icon": "notebook", "state": "notes"}
+                    for index in range(5)
+                ],
+            })
 
     def test_loads_static_art_rows(self) -> None:
         with TemporaryDirectory() as tmp:

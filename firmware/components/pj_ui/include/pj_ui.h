@@ -3,6 +3,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "pj_home_layout.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -94,6 +96,7 @@ typedef struct {
     int alarm_minute;
     int note_page;
     int selected_note;
+    pj_home_layout_t home_layout;
     char note_labels[PJ_UI_MAX_NOTES][PJ_UI_NOTE_LABEL_LEN];
     uint8_t static_art[PJ_FRAMEBUFFER_BYTES];
     int static_art_valid;
@@ -120,6 +123,8 @@ void pj_ui_set_notes(pj_ui_context_t *ctx, int count, const char labels[][PJ_UI_
 void pj_ui_set_audio_state(pj_ui_context_t *ctx, int recording, int playback_active);
 void pj_ui_set_sync_state(pj_ui_context_t *ctx, int pending, int transferred, int online);
 void pj_ui_set_static_art(pj_ui_context_t *ctx, const uint8_t *pixels, size_t pixel_bytes);
+int pj_ui_set_home_layout(pj_ui_context_t *ctx, const pj_home_layout_t *layout);
+void pj_ui_restore_default_home(pj_ui_context_t *ctx);
 int pj_ui_tick(pj_ui_context_t *ctx);
 int pj_ui_is_dirty(const pj_ui_context_t *ctx);
 void pj_ui_mark_displayed(pj_ui_context_t *ctx);
