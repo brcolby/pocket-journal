@@ -10,6 +10,7 @@
 #include "pj_static_art.h"
 #include "pj_storage.h"
 #include "pj_time_clock.h"
+#include "pj_time_controller.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -87,9 +88,6 @@
 #define PJ_NVS_HOME_LAYOUT "home_layout"
 #define PJ_NVS_TIME_STATE "time_state"
 #define PJ_NVS_WAKE_PLAN "wake_plan"
-#define PJ_TIME_CHECKPOINT_MS (15ull * 60ull * 1000ull)
-#define PJ_TIME_PERSIST_RETRY_MS (60ull * 1000ull)
-#define PJ_TIME_SNOOZE_MS (10ull * 60ull * 1000ull)
 #define PJ_STATIC_ART_SLOT_COUNT 2
 #define PJ_WIFI_SSID_MAX_LEN 32
 #define PJ_WIFI_PASSWORD_MAX_LEN 64
@@ -289,18 +287,15 @@ static uint32_t g_record_sequence;
 static portMUX_TYPE g_time_lock = portMUX_INITIALIZER_UNLOCKED;
 static portMUX_TYPE g_audio_state_lock = portMUX_INITIALIZER_UNLOCKED;
 static pj_time_clock_anchor_t g_time_clock_anchor;
-static pj_time_state_t g_time_state;
-static uint32_t g_time_boot_id;
-static uint64_t g_time_last_persist_ms;
-static uint64_t g_time_last_retry_ms;
-static uint64_t g_time_last_preempt_alert_id;
-static int g_time_state_ready;
-static int g_time_persist_dirty;
+static pj_time_controller_t g_time_controller;
+static pj_time_controller_diagnostic_t g_time_last_diagnostic;
 static int g_time_wall_trusted;
 static pj_rtc_wake_plan_t g_rtc_wake_plan;
 static int g_rtc_ext1_enabled;
 static int g_rtc_wake_hardware_verified;
 static int g_timer_wakeup_enabled;
+static int g_rtc_wake_restored;
+static int g_rtc_wake_metadata_blocked;
 
 typedef struct {
     uint64_t alert_id;
@@ -317,10 +312,9 @@ static esp_err_t rtc_write_status_time(void);
 static uint64_t board_monotonic_ms(void);
 static int board_time_model_clock(pj_time_clock_t *clock);
 static int time_state_initialize(void);
-static int time_state_persist(int force);
-static int time_state_reconcile_alarm(const pj_time_clock_t *clock);
 static int time_state_project(pj_ui_context_t *ui);
 static int rtc_wake_sync(void);
+static pj_rtc_wake_result_t rtc_wake_disarm_board(uint8_t *flags, int force);
 static int settings_codec_volume_snapshot(void);
 static void alert_audio_project(const pj_time_alert_t *alert,
                                 pj_time_conflict_action_t action);
@@ -1346,56 +1340,53 @@ static esp_err_t settings_save(const pj_settings_t *settings)
     return err;
 }
 
-typedef enum {
-    PJ_TIME_LOAD_IO_ERROR = -2,
-    PJ_TIME_LOAD_INVALID = -1,
-    PJ_TIME_LOAD_NOT_FOUND = 0,
-    PJ_TIME_LOAD_VALID = 1,
-} time_state_load_result_t;
-
-static time_state_load_result_t time_state_load_record(pj_time_state_t *state)
+static pj_time_controller_load_result_t time_controller_load_record(
+    void *context, uint8_t record[PJ_TIME_STATE_RECORD_BYTES])
 {
-    uint8_t record[PJ_TIME_STATE_RECORD_BYTES];
-    size_t record_size = sizeof(record);
+    (void)context;
+    size_t record_size = PJ_TIME_STATE_RECORD_BYTES;
     nvs_handle_t nvs;
     esp_err_t err = nvs_open(PJ_NVS_NAMESPACE, NVS_READONLY, &nvs);
     if (err == ESP_ERR_NVS_NOT_FOUND) {
-        return PJ_TIME_LOAD_NOT_FOUND;
+        return PJ_TIME_CONTROLLER_LOAD_NOT_FOUND;
     }
     if (err != ESP_OK) {
-        return PJ_TIME_LOAD_IO_ERROR;
+        return PJ_TIME_CONTROLLER_LOAD_IO_ERROR;
     }
     err = nvs_get_blob(nvs, PJ_NVS_TIME_STATE, record, &record_size);
     nvs_close(nvs);
     if (err == ESP_ERR_NVS_NOT_FOUND) {
-        return PJ_TIME_LOAD_NOT_FOUND;
+        return PJ_TIME_CONTROLLER_LOAD_NOT_FOUND;
     }
     if (err != ESP_OK) {
-        return PJ_TIME_LOAD_IO_ERROR;
+        return PJ_TIME_CONTROLLER_LOAD_IO_ERROR;
     }
-    if (record_size != sizeof(record) ||
-        !pj_time_state_decode(record, sizeof(record), state)) {
-        return PJ_TIME_LOAD_INVALID;
+    if (record_size != PJ_TIME_STATE_RECORD_BYTES) {
+        return PJ_TIME_CONTROLLER_LOAD_CORRUPT;
     }
-    return PJ_TIME_LOAD_VALID;
+    return PJ_TIME_CONTROLLER_LOAD_VALID;
 }
 
-static esp_err_t time_state_save_record(const pj_time_state_t *state)
+static pj_time_controller_save_result_t time_controller_save_record(
+    void *context, const uint8_t record[PJ_TIME_STATE_RECORD_BYTES])
 {
-    uint8_t record[PJ_TIME_STATE_RECORD_BYTES];
-    if (pj_time_state_encode(state, record, sizeof(record)) != sizeof(record)) {
-        return ESP_ERR_INVALID_STATE;
-    }
+    (void)context;
     nvs_handle_t nvs;
     esp_err_t err = nvs_open(PJ_NVS_NAMESPACE, NVS_READWRITE, &nvs);
     if (err == ESP_OK) {
-        err = nvs_set_blob(nvs, PJ_NVS_TIME_STATE, record, sizeof(record));
+        err = nvs_set_blob(nvs, PJ_NVS_TIME_STATE, record,
+                           PJ_TIME_STATE_RECORD_BYTES);
         if (err == ESP_OK) {
             err = nvs_commit(nvs);
         }
         nvs_close(nvs);
     }
-    return err;
+    if (err == ESP_OK) {
+        return PJ_TIME_CONTROLLER_SAVE_OK;
+    }
+    return err == ESP_ERR_NVS_NOT_ENOUGH_SPACE
+        ? PJ_TIME_CONTROLLER_SAVE_PERMANENT_ERROR
+        : PJ_TIME_CONTROLLER_SAVE_TRANSIENT_ERROR;
 }
 
 static int rtc_wake_plan_save(void *context, const pj_rtc_wake_plan_t *plan)
@@ -3166,13 +3157,19 @@ static int board_time_publish(int hour, int minute, int year, int month, int day
     return 1;
 }
 
-static int board_time_model_clock(pj_time_clock_t *clock)
+static int board_time_model_clock_for_boot(uint32_t boot_id,
+                                           pj_time_clock_t *clock)
 {
     pj_time_clock_anchor_t anchor;
     portENTER_CRITICAL(&g_time_lock);
     anchor = g_time_clock_anchor;
     portEXIT_CRITICAL(&g_time_lock);
-    return pj_time_clock_snapshot(&anchor, g_time_boot_id, board_monotonic_ms(), clock);
+    return pj_time_clock_snapshot(&anchor, boot_id, board_monotonic_ms(), clock);
+}
+
+static int board_time_model_clock(pj_time_clock_t *clock)
+{
+    return board_time_model_clock_for_boot(g_time_controller.boot_id, clock);
 }
 
 static void board_time_mark_pending(void)
@@ -3270,140 +3267,154 @@ static esp_err_t rtc_write_status_time(void)
     return err;
 }
 
-static int time_state_anchor_boot_collision(const pj_time_state_t *state, uint32_t boot_id)
+static uint32_t time_controller_next_boot_id(void *context)
 {
-    return boot_id == 0 || state->snooze.anchor_boot_id == boot_id ||
-           state->timer.anchor_boot_id == boot_id ||
-           state->interval.anchor_boot_id == boot_id ||
-           state->stopwatch_anchor_boot_id == boot_id;
+    (void)context;
+    return esp_random();
 }
 
-static int time_state_persisted_wall_anchor(const pj_time_state_t *state,
-                                            int64_t *wall_ms)
+static int time_controller_clock(void *context, uint32_t boot_id,
+                                 pj_time_clock_t *clock)
 {
-    int found = 0;
-#define CHECK_ANCHOR(running, value) do { \
-        if (running) { \
-            if (found && *wall_ms != (value)) { \
-                return 0; \
-            } \
-            *wall_ms = (value); \
-            found = 1; \
-        } \
-    } while (0)
-    CHECK_ANCHOR(state->snooze.running, state->snooze.anchor_wall_utc_ms);
-    CHECK_ANCHOR(state->timer.running, state->timer.anchor_wall_utc_ms);
-    CHECK_ANCHOR(state->interval.running, state->interval.anchor_wall_utc_ms);
-    CHECK_ANCHOR(state->stopwatch_running, state->stopwatch_anchor_wall_utc_ms);
-#undef CHECK_ANCHOR
-    return found;
+    (void)context;
+    return board_time_model_clock_for_boot(boot_id, clock);
 }
 
-static int time_state_reconcile_alarm(const pj_time_clock_t *clock)
+static int time_controller_alarm_settings(
+    void *context, pj_time_controller_alarm_settings_t *settings)
 {
-    pj_settings_t settings;
-    if (!settings_take(portMAX_DELAY)) {
+    (void)context;
+    if (settings == NULL || !settings_take(portMAX_DELAY)) {
         return 0;
     }
-    settings = g_settings;
+    *settings = (pj_time_controller_alarm_settings_t) {
+        .enabled = g_settings.alarm_enabled,
+        .hour = g_settings.alarm_hour,
+        .minute = g_settings.alarm_minute,
+    };
     settings_give();
-    if (g_time_state.alarm_enabled == settings.alarm_enabled &&
-        g_time_state.alarm_hour == settings.alarm_hour &&
-        g_time_state.alarm_minute == settings.alarm_minute) {
-        return 0;
-    }
-    return pj_time_alarm_configure(&g_time_state, settings.alarm_enabled,
-                                   settings.alarm_hour, settings.alarm_minute, clock);
+    return 1;
 }
 
-static int time_state_persist(int force)
+static int time_controller_wall_time_trusted(void *context)
 {
-    if (!g_time_state_ready) {
-        return 0;
+    (void)context;
+    int trusted;
+    portENTER_CRITICAL(&g_time_lock);
+    trusted = g_time_wall_trusted;
+    portEXIT_CRITICAL(&g_time_lock);
+    return trusted;
+}
+
+static pj_time_activity_t time_controller_activity(void *context)
+{
+    (void)context;
+    return board_time_activity();
+}
+
+static pj_time_controller_wake_result_t time_controller_schedule_wake(
+    void *context, const pj_time_wake_deadline_t *deadline)
+{
+    (void)context;
+    if (!g_rtc_ready) {
+        return PJ_TIME_CONTROLLER_WAKE_UNAVAILABLE;
     }
-    uint64_t now = board_monotonic_ms();
-    if (!force) {
-        if (g_time_persist_dirty && now - g_time_last_retry_ms < PJ_TIME_PERSIST_RETRY_MS) {
-            return 0;
-        }
-        if (!g_time_persist_dirty && now - g_time_last_persist_ms < PJ_TIME_CHECKPOINT_MS) {
-            return 0;
-        }
+    if (!g_rtc_wake_restored) {
+        return PJ_TIME_CONTROLLER_WAKE_UNAVAILABLE;
     }
-    esp_err_t err = time_state_save_record(&g_time_state);
-    if (err != ESP_OK) {
-        g_time_persist_dirty = 1;
-        g_time_last_retry_ms = now;
-        (void)snprintf(g_status.last_error, sizeof(g_status.last_error),
-                       "time state save failed: %s", esp_err_to_name(err));
+    if (g_rtc_wake_metadata_blocked) {
+        return PJ_TIME_CONTROLLER_WAKE_ERROR;
+    }
+    if (deadline == NULL) {
+        return rtc_wake_disarm_board(NULL, 0) == PJ_RTC_WAKE_OK
+            ? PJ_TIME_CONTROLLER_WAKE_OK
+            : PJ_TIME_CONTROLLER_WAKE_ERROR;
+    }
+    return rtc_wake_sync() >= 0 ? PJ_TIME_CONTROLLER_WAKE_OK
+                                : PJ_TIME_CONTROLLER_WAKE_ERROR;
+}
+
+static void time_controller_project_media(void *context,
+                                          const pj_time_alert_t *alert,
+                                          pj_time_conflict_action_t action)
+{
+    (void)context;
+    if (alert != NULL && action == PJ_TIME_PREEMPT_PLAYBACK) {
+        (void)pj_board_playback_set_active(0, 0);
+    }
+    alert_audio_project(alert, action);
+}
+
+static void time_controller_publish_status(
+    void *context, const pj_time_controller_result_t *result)
+{
+    (void)context;
+    if (result->diagnostic == g_time_last_diagnostic) {
+        return;
+    }
+    g_time_last_diagnostic = result->diagnostic;
+    const char *message = NULL;
+    switch (result->diagnostic) {
+    case PJ_TIME_CONTROLLER_DIAGNOSTIC_LOAD_CORRUPT:
+        message = "time state was corrupt; defaults restored";
+        break;
+    case PJ_TIME_CONTROLLER_DIAGNOSTIC_LOAD_INCOMPATIBLE:
+        message = "time state version unsupported; defaults restored";
+        break;
+    case PJ_TIME_CONTROLLER_DIAGNOSTIC_LOAD_IO_ERROR:
+        message = "time state read failed; persistence left untouched";
+        break;
+    case PJ_TIME_CONTROLLER_DIAGNOSTIC_SAVE_TRANSIENT:
+    case PJ_TIME_CONTROLLER_DIAGNOSTIC_SAVE_PERMANENT:
+        message = "time state save failed; retry pending";
+        break;
+    case PJ_TIME_CONTROLLER_DIAGNOSTIC_WAKE_ERROR:
+        message = "time alert wake scheduling failed";
+        break;
+    case PJ_TIME_CONTROLLER_DIAGNOSTIC_TIME_UNCERTAIN:
+        message = "time recovery uncertain; open a time app and acknowledge TIME?";
+        break;
+    case PJ_TIME_CONTROLLER_DIAGNOSTIC_CLOCK_ERROR:
+        message = "time controller clock unavailable";
+        break;
+    case PJ_TIME_CONTROLLER_DIAGNOSTIC_SETTINGS_ERROR:
+        message = "time controller settings unavailable";
+        break;
+    case PJ_TIME_CONTROLLER_DIAGNOSTIC_BOOT_ID_ERROR:
+        message = "time controller boot identity unavailable";
+        break;
+    case PJ_TIME_CONTROLLER_DIAGNOSTIC_NONE:
+    default:
+        break;
+    }
+    if (message != NULL) {
+        (void)snprintf(g_status.last_error, sizeof(g_status.last_error), "%s",
+                       message);
         ESP_LOGW(TAG, "%s", g_status.last_error);
-        return -1;
     }
-    g_time_persist_dirty = 0;
-    g_time_last_persist_ms = now;
-    return 1;
 }
 
 static int time_state_initialize(void)
 {
-    pj_time_state_t loaded;
-    time_state_load_result_t load_result = time_state_load_record(&loaded);
-    if (load_result == PJ_TIME_LOAD_IO_ERROR) {
-        (void)snprintf(g_status.last_error, sizeof(g_status.last_error),
-                       "time state read failed; persistence left untouched");
-        ESP_LOGE(TAG, "%s", g_status.last_error);
-        return 0;
+    pj_time_controller_io_t io = {
+        .load = time_controller_load_record,
+        .save = time_controller_save_record,
+        .next_boot_id = time_controller_next_boot_id,
+        .clock = time_controller_clock,
+        .alarm_settings = time_controller_alarm_settings,
+        .wall_time_trusted = time_controller_wall_time_trusted,
+        .activity = time_controller_activity,
+        .schedule_wake = time_controller_schedule_wake,
+        .project_media = time_controller_project_media,
+        .publish_status = time_controller_publish_status,
+    };
+    pj_time_controller_result_t result;
+    int ready = pj_time_controller_init(&g_time_controller, &io, &result);
+    if (ready) {
+        ESP_LOGI(TAG, "Time controller initialized with boot id %u",
+                 (unsigned)g_time_controller.boot_id);
     }
-    int restored = load_result == PJ_TIME_LOAD_VALID;
-    if (restored) {
-        g_time_state = loaded;
-    } else if (load_result == PJ_TIME_LOAD_INVALID) {
-        (void)snprintf(g_status.last_error, sizeof(g_status.last_error),
-                       "time state was corrupt; reinitializing defaults");
-        ESP_LOGW(TAG, "%s", g_status.last_error);
-    }
-    do {
-        g_time_boot_id = esp_random();
-    } while (time_state_anchor_boot_collision(restored ? &loaded : &g_time_state,
-                                              g_time_boot_id));
-
-    pj_time_clock_t clock;
-    if (!board_time_model_clock(&clock)) {
-        return 0;
-    }
-    if (!restored) {
-        pj_time_state_defaults(&g_time_state, &clock);
-    } else {
-        int64_t persisted_wall_ms = 0;
-        int wall_trusted = 0;
-        portENTER_CRITICAL(&g_time_lock);
-        wall_trusted = g_time_wall_trusted;
-        portEXIT_CRITICAL(&g_time_lock);
-        if (wall_trusted &&
-            time_state_persisted_wall_anchor(&g_time_state, &persisted_wall_ms) &&
-            clock.wall_utc_ms >= persisted_wall_ms) {
-            clock.reboot_elapsed_valid = 1;
-            clock.reboot_elapsed_ms = (uint64_t)(clock.wall_utc_ms - persisted_wall_ms);
-        }
-        (void)pj_time_advance(&g_time_state, &clock);
-        if (g_time_state.recovery_time_uncertain) {
-            (void)snprintf(g_status.last_error, sizeof(g_status.last_error),
-                           "time recovery uncertain; open a time app and acknowledge TIME?");
-            ESP_LOGW(TAG, "%s", g_status.last_error);
-        }
-    }
-    (void)time_state_reconcile_alarm(&clock);
-    g_time_state_ready = pj_time_state_valid(&g_time_state);
-    if (!g_time_state_ready) {
-        (void)snprintf(g_status.last_error, sizeof(g_status.last_error),
-                       "time state initialization failed validation");
-        ESP_LOGE(TAG, "%s", g_status.last_error);
-        return 0;
-    }
-    (void)time_state_persist(1);
-    ESP_LOGI(TAG, "Time state %s with boot id %u",
-             restored ? "restored" : "initialized", (unsigned)g_time_boot_id);
-    return 1;
+    return ready;
 }
 
 static const char *rtc_wake_result_name(pj_rtc_wake_result_t result)
@@ -3448,14 +3459,11 @@ static pj_rtc_wake_result_t rtc_wake_disarm_board(uint8_t *flags, int force)
 
 static int rtc_wake_sync(void)
 {
-    if (!g_rtc_ready || !g_time_state_ready) {
+    const pj_time_state_t *state = pj_time_controller_state(&g_time_controller);
+    if (!g_rtc_ready || state == NULL || g_rtc_wake_metadata_blocked) {
         return -1;
     }
-    int trusted = 0;
-    portENTER_CRITICAL(&g_time_lock);
-    trusted = g_time_wall_trusted;
-    portEXIT_CRITICAL(&g_time_lock);
-    if (!trusted) {
+    if (!g_time_controller.wall_time_trusted) {
         (void)rtc_wake_disarm_board(NULL, 0);
         return -1;
     }
@@ -3463,13 +3471,8 @@ static int rtc_wake_sync(void)
     if (!board_time_model_clock(&clock)) {
         return -1;
     }
-    int changed = pj_time_advance(&g_time_state, &clock);
-    changed |= time_state_reconcile_alarm(&clock);
-    if (changed) {
-        (void)time_state_persist(1);
-    }
     pj_rtc_wake_plan_t plan;
-    if (!pj_rtc_wake_plan(&g_time_state, &clock, &plan)) {
+    if (!pj_rtc_wake_plan(state, &clock, &plan)) {
         return -1;
     }
     if (plan.state != PJ_RTC_WAKE_ARMED) {
@@ -3501,7 +3504,7 @@ static int rtc_wake_sync(void)
     pj_time_clock_t verify_clock;
     pj_rtc_wake_plan_t verify_plan;
     if (!board_time_model_clock(&verify_clock) ||
-        !pj_rtc_wake_plan(&g_time_state, &verify_clock, &verify_plan) ||
+        !pj_rtc_wake_plan(state, &verify_clock, &verify_plan) ||
         verify_plan.state != PJ_RTC_WAKE_ARMED || verify_plan.token != plan.token) {
         (void)rtc_wake_disarm_board(NULL, 1);
         ESP_LOGW(TAG, "RTC wake target changed during setup; sleep deferred");
@@ -3545,6 +3548,8 @@ static void rtc_wake_restore(void)
             rtc_sequence_give();
         }
         g_rtc_wake_hardware_verified = 0;
+        g_rtc_wake_metadata_blocked = 1;
+        g_rtc_wake_restored = 1;
         return;
     }
     if (load_result == RTC_WAKE_LOAD_INVALID) {
@@ -3555,6 +3560,7 @@ static void rtc_wake_restore(void)
         persisted.version = PJ_RTC_WAKE_PLAN_VERSION;
     }
     g_rtc_wake_plan = persisted;
+    g_rtc_wake_metadata_blocked = 0;
     g_rtc_wake_hardware_verified = 0;
     uint8_t flags = 0;
     pj_rtc_wake_result_t result = rtc_wake_disarm_board(&flags, 1);
@@ -3564,12 +3570,14 @@ static void rtc_wake_restore(void)
         ESP_LOGI(TAG, "Recovered RTC wake flags=0x%02x token=%08x; model remains authoritative",
                  flags, (unsigned)persisted.token);
     }
+    g_rtc_wake_restored = 1;
     (void)rtc_wake_sync();
 }
 
 static int time_state_project(pj_ui_context_t *ui)
 {
-    if (!g_time_state_ready || ui == NULL) {
+    const pj_time_state_t *state = pj_time_controller_state(&g_time_controller);
+    if (state == NULL || ui == NULL) {
         return 0;
     }
     pj_settings_t settings;
@@ -3579,21 +3587,21 @@ static int time_state_project(pj_ui_context_t *ui)
     settings = g_settings;
     settings_give();
     pj_ui_time_projection_t projection = {
-        .alarm_enabled = g_time_state.alarm_enabled,
-        .alarm_hour = g_time_state.alarm_hour,
-        .alarm_minute = g_time_state.alarm_minute,
-        .stopwatch_running = g_time_state.stopwatch_running,
-        .stopwatch_elapsed_ms = pj_time_stopwatch_elapsed(&g_time_state),
-        .timer_running = g_time_state.timer.running,
-        .timer_remaining_ms = g_time_state.timer.remaining_ms != 0 ?
-            g_time_state.timer.remaining_ms : (uint64_t)settings.timer_seconds * 1000u,
-        .interval_running = g_time_state.interval.running,
-        .interval_remaining_ms = g_time_state.interval.remaining_ms != 0 ?
-            g_time_state.interval.remaining_ms : (uint64_t)settings.interval_seconds * 1000u,
-        .interval_phase = g_time_state.interval_phase,
-        .recovery_time_uncertain = g_time_state.recovery_time_uncertain,
+        .alarm_enabled = state->alarm_enabled,
+        .alarm_hour = state->alarm_hour,
+        .alarm_minute = state->alarm_minute,
+        .stopwatch_running = state->stopwatch_running,
+        .stopwatch_elapsed_ms = pj_time_stopwatch_elapsed(state),
+        .timer_running = state->timer.running,
+        .timer_remaining_ms = state->timer.remaining_ms != 0 ?
+            state->timer.remaining_ms : (uint64_t)settings.timer_seconds * 1000u,
+        .interval_running = state->interval.running,
+        .interval_remaining_ms = state->interval.remaining_ms != 0 ?
+            state->interval.remaining_ms : (uint64_t)settings.interval_seconds * 1000u,
+        .interval_phase = state->interval_phase,
+        .recovery_time_uncertain = state->recovery_time_uncertain,
     };
-    const pj_time_alert_t *alert = pj_time_active_alert(&g_time_state);
+    const pj_time_alert_t *alert = pj_time_active_alert(state);
     pj_time_conflict_action_t action = PJ_TIME_PRESENT;
     if (alert != NULL) {
         projection.active_alert = *alert;
@@ -3601,15 +3609,7 @@ static int time_state_project(pj_ui_context_t *ui)
         action = pj_time_alert_conflict_action((pj_time_alert_source_t)alert->source,
                                                activity);
         projection.alert_audio_deferred = action == PJ_TIME_VISUAL_DEFER_AUDIO;
-        if (action == PJ_TIME_PREEMPT_PLAYBACK &&
-            g_time_last_preempt_alert_id != alert->id) {
-            g_time_last_preempt_alert_id = alert->id;
-            (void)pj_board_playback_set_active(0, 0);
-        }
-    } else {
-        g_time_last_preempt_alert_id = 0;
     }
-    alert_audio_project(alert, action);
     pj_ui_set_time_projection(ui, &projection);
     return 1;
 }
@@ -4765,7 +4765,13 @@ void pj_board_init(const pj_board_profile_t *profile)
             } else {
                 ESP_LOGW(TAG, "PCF85063 RTC initialized but time is not set; using firmware build time %04d-%02d-%02d %02d:%02d",
                          g_status.year, g_status.month, g_status.day, g_status.hour, g_status.minute);
-                ESP_ERROR_CHECK_WITHOUT_ABORT(rtc_write_status_time());
+                esp_err_t write_err = rtc_write_status_time();
+                ESP_ERROR_CHECK_WITHOUT_ABORT(write_err);
+                if (write_err == ESP_OK) {
+                    portENTER_CRITICAL(&g_time_lock);
+                    g_time_wall_trusted = 1;
+                    portEXIT_CRITICAL(&g_time_lock);
+                }
             }
         } else {
             ESP_LOGW(TAG, "PCF85063 RTC init failed");
@@ -5033,7 +5039,11 @@ void pj_board_refresh_status(pj_ui_context_t *ui)
 #ifdef ESP_PLATFORM
     battery_refresh_status();
     shtc3_refresh_status();
-    (void)rtc_read_status_time();
+    int controller_trusted = g_time_controller.wall_time_trusted;
+    if (rtc_read_status_time() &&
+        pj_time_controller_ready(&g_time_controller) && !controller_trusted) {
+        board_time_mark_pending();
+    }
     if (g_status.storage_mounted) {
         (void)storage_refresh_capacity();
     }
@@ -5116,15 +5126,14 @@ int pj_board_consume_time_update(pj_ui_context_t *ui)
     }
     pj_ui_set_time(ui, time.hour, time.minute, time.year, time.month, time.day);
 #ifdef ESP_PLATFORM
-    if (g_time_state_ready) {
-        pj_time_clock_t clock;
-        if (board_time_model_clock(&clock)) {
-            (void)pj_time_advance(&g_time_state, &clock);
-            (void)time_state_reconcile_alarm(&clock);
-            (void)time_state_persist(1);
-            (void)rtc_wake_sync();
-            (void)time_state_project(ui);
+    if (pj_time_controller_ready(&g_time_controller)) {
+        pj_time_controller_result_t result;
+        if (!pj_time_controller_time_changed(
+                &g_time_controller, time_controller_wall_time_trusted(NULL),
+                &result)) {
+            board_time_mark_pending();
         }
+        (void)time_state_project(ui);
     }
 #endif
     return 1;
@@ -5133,84 +5142,78 @@ int pj_board_consume_time_update(pj_ui_context_t *ui)
 void pj_board_refresh_time_state(pj_ui_context_t *ui)
 {
 #ifdef ESP_PLATFORM
-    if (!g_time_state_ready) {
+    if (!pj_time_controller_ready(&g_time_controller)) {
         return;
     }
-    pj_time_clock_t clock;
-    if (!board_time_model_clock(&clock)) {
-        return;
-    }
-    int changed = pj_time_advance(&g_time_state, &clock);
-    changed |= time_state_reconcile_alarm(&clock);
-    if (changed) {
-        (void)time_state_persist(1);
-        (void)rtc_wake_sync();
-    }
+    pj_time_controller_result_t result;
+    (void)pj_time_controller_update(&g_time_controller, &result);
     (void)time_state_project(ui);
 #else
     (void)ui;
 #endif
 }
 
+#ifdef ESP_PLATFORM
+static int time_controller_command_from_ui(
+    const pj_ui_time_command_t *source, pj_time_controller_command_t *target)
+{
+    static const pj_time_controller_command_type_t types[] = {
+        [PJ_UI_TIME_COMMAND_ALERT_DISMISS] =
+            PJ_TIME_CONTROLLER_COMMAND_ALERT_DISMISS,
+        [PJ_UI_TIME_COMMAND_ALARM_SNOOZE] =
+            PJ_TIME_CONTROLLER_COMMAND_ALARM_SNOOZE,
+        [PJ_UI_TIME_COMMAND_RECOVERY_ACKNOWLEDGE] =
+            PJ_TIME_CONTROLLER_COMMAND_RECOVERY_ACKNOWLEDGE,
+        [PJ_UI_TIME_COMMAND_STOPWATCH_START] =
+            PJ_TIME_CONTROLLER_COMMAND_STOPWATCH_START,
+        [PJ_UI_TIME_COMMAND_STOPWATCH_PAUSE] =
+            PJ_TIME_CONTROLLER_COMMAND_STOPWATCH_PAUSE,
+        [PJ_UI_TIME_COMMAND_STOPWATCH_RESET] =
+            PJ_TIME_CONTROLLER_COMMAND_STOPWATCH_RESET,
+        [PJ_UI_TIME_COMMAND_TIMER_START] =
+            PJ_TIME_CONTROLLER_COMMAND_TIMER_START,
+        [PJ_UI_TIME_COMMAND_TIMER_PAUSE] =
+            PJ_TIME_CONTROLLER_COMMAND_TIMER_PAUSE,
+        [PJ_UI_TIME_COMMAND_TIMER_RESET] =
+            PJ_TIME_CONTROLLER_COMMAND_TIMER_RESET,
+        [PJ_UI_TIME_COMMAND_INTERVAL_START] =
+            PJ_TIME_CONTROLLER_COMMAND_INTERVAL_START,
+        [PJ_UI_TIME_COMMAND_INTERVAL_PAUSE] =
+            PJ_TIME_CONTROLLER_COMMAND_INTERVAL_PAUSE,
+        [PJ_UI_TIME_COMMAND_INTERVAL_RESET] =
+            PJ_TIME_CONTROLLER_COMMAND_INTERVAL_RESET,
+    };
+    if (source == NULL || target == NULL || source->type <= 0 ||
+        (size_t)source->type >= sizeof(types) / sizeof(types[0]) ||
+        types[source->type] == 0) {
+        return 0;
+    }
+    *target = (pj_time_controller_command_t) {
+        .type = types[source->type],
+        .alert_id = source->alert_id,
+        .duration_ms = source->duration_ms,
+        .secondary_duration_ms = source->secondary_duration_ms,
+    };
+    return 1;
+}
+#endif
+
 int pj_board_apply_time_actions(pj_ui_context_t *ui)
 {
 #ifdef ESP_PLATFORM
-    if (!g_time_state_ready || ui == NULL) {
+    if (!pj_time_controller_ready(&g_time_controller) || ui == NULL) {
         return 0;
     }
-    pj_time_clock_t clock;
-    if (!board_time_model_clock(&clock)) {
+    pj_ui_time_command_t ui_command;
+    pj_time_controller_command_t command;
+    if (!pj_ui_consume_time_command(ui, &ui_command) ||
+        !time_controller_command_from_ui(&ui_command, &command)) {
         return 0;
     }
-    pj_time_state_t before = g_time_state;
-    (void)pj_time_advance(&g_time_state, &clock);
-    (void)time_state_reconcile_alarm(&clock);
-
-    pj_ui_time_command_t command;
-    if (pj_ui_consume_time_command(ui, &command)) {
-        if (command.type == PJ_UI_TIME_COMMAND_ALERT_DISMISS) {
-            (void)pj_time_alert_dismiss(&g_time_state, command.alert_id);
-        } else if (command.type == PJ_UI_TIME_COMMAND_ALARM_SNOOZE) {
-            (void)pj_time_alarm_snooze(&g_time_state, command.alert_id,
-                                       PJ_TIME_SNOOZE_MS, &clock);
-        } else if (command.type == PJ_UI_TIME_COMMAND_RECOVERY_ACKNOWLEDGE) {
-            pj_time_recovery_acknowledge(&g_time_state);
-        } else if (command.type == PJ_UI_TIME_COMMAND_STOPWATCH_START) {
-            (void)pj_time_stopwatch_start(&g_time_state, &clock);
-        } else if (command.type == PJ_UI_TIME_COMMAND_STOPWATCH_PAUSE) {
-            (void)pj_time_stopwatch_pause(&g_time_state, &clock);
-        } else if (command.type == PJ_UI_TIME_COMMAND_STOPWATCH_RESET) {
-            pj_time_stopwatch_reset(&g_time_state);
-        } else if (command.type == PJ_UI_TIME_COMMAND_TIMER_START) {
-            (void)pj_time_timer_start(&g_time_state, command.duration_ms, &clock);
-        } else if (command.type == PJ_UI_TIME_COMMAND_TIMER_PAUSE) {
-            (void)pj_time_timer_pause(&g_time_state, &clock);
-        } else if (command.type == PJ_UI_TIME_COMMAND_TIMER_RESET) {
-            pj_time_timer_reset(&g_time_state);
-        } else if (command.type == PJ_UI_TIME_COMMAND_INTERVAL_START) {
-            if (!g_time_state.interval.running && g_time_state.interval.remaining_ms != 0 &&
-                command.duration_ms / 1000u ==
-                    (g_time_state.interval.remaining_ms / 1000u +
-                     (g_time_state.interval.remaining_ms % 1000u != 0))) {
-                (void)pj_time_interval_resume(&g_time_state, &clock);
-            } else {
-                (void)pj_time_interval_start(&g_time_state, command.duration_ms,
-                                             command.secondary_duration_ms, &clock);
-            }
-        } else if (command.type == PJ_UI_TIME_COMMAND_INTERVAL_PAUSE) {
-            (void)pj_time_interval_pause(&g_time_state, &clock);
-        } else if (command.type == PJ_UI_TIME_COMMAND_INTERVAL_RESET) {
-            pj_time_interval_reset(&g_time_state);
-        }
-    }
-
-    int changed = memcmp(&before, &g_time_state, sizeof(before)) != 0;
-    if (changed) {
-        (void)time_state_persist(1);
-        (void)rtc_wake_sync();
-    }
+    pj_time_controller_result_t result;
+    (void)pj_time_controller_apply(&g_time_controller, &command, &result);
     (void)time_state_project(ui);
-    return changed;
+    return result.state_changed;
 #else
     (void)ui;
     return 0;
@@ -5220,32 +5223,11 @@ int pj_board_apply_time_actions(pj_ui_context_t *ui)
 int pj_board_update_time_state(pj_ui_context_t *ui)
 {
 #ifdef ESP_PLATFORM
-    if (!g_time_state_ready || ui == NULL) {
+    if (!pj_time_controller_ready(&g_time_controller) || ui == NULL) {
         return 0;
     }
-    pj_time_clock_t clock;
-    if (!board_time_model_clock(&clock)) {
-        return 0;
-    }
-    pj_time_state_t before = g_time_state;
-    (void)pj_time_advance(&g_time_state, &clock);
-    (void)time_state_reconcile_alarm(&clock);
-    int changed = memcmp(&before, &g_time_state, sizeof(before)) != 0;
-    int transition = memcmp(&before.active_alert, &g_time_state.active_alert,
-                            sizeof(before.active_alert)) != 0 ||
-                     before.pending_count != g_time_state.pending_count ||
-                     before.timer.running != g_time_state.timer.running ||
-                     before.interval.running != g_time_state.interval.running ||
-                     before.interval_phase != g_time_state.interval_phase ||
-                     before.snooze.running != g_time_state.snooze.running;
-    if (transition) {
-        (void)time_state_persist(1);
-    } else if (changed || g_time_persist_dirty) {
-        (void)time_state_persist(0);
-    }
-    if (transition) {
-        (void)rtc_wake_sync();
-    }
+    pj_time_controller_result_t result;
+    (void)pj_time_controller_update(&g_time_controller, &result);
     (void)time_state_project(ui);
     return pj_ui_is_dirty(ui);
 #else
@@ -5364,10 +5346,12 @@ void pj_board_enter_sleep(void)
 #ifdef ESP_PLATFORM
     int rtc_schedule = rtc_wake_sync();
     uint64_t wake_delay_ms = UINT64_MAX;
-    if (g_time_state_ready) {
+    const pj_time_state_t *time_state =
+        pj_time_controller_state(&g_time_controller);
+    if (time_state != NULL) {
         pj_time_clock_t clock;
         if (board_time_model_clock(&clock)) {
-            wake_delay_ms = pj_time_next_wake_delay_ms(&g_time_state, &clock);
+            wake_delay_ms = pj_time_next_wake_delay_ms(time_state, &clock);
         }
     }
     if (wake_delay_ms == 0) {
@@ -5437,18 +5421,18 @@ void pj_board_enter_sleep(void)
     if (clear_result != PJ_RTC_WAKE_OK) {
         ESP_LOGW(TAG, "RTC wake clear failed at %s", rtc_wake_result_name(clear_result));
     }
-    (void)rtc_read_status_time();
-    if (g_time_state_ready) {
-        pj_time_clock_t clock;
-        if (board_time_model_clock(&clock)) {
-            pj_time_state_t before = g_time_state;
-            (void)pj_time_advance(&g_time_state, &clock);
-            (void)time_state_reconcile_alarm(&clock);
-            if (memcmp(&before, &g_time_state, sizeof(before)) != 0) {
-                (void)time_state_persist(1);
+    int time_changed = rtc_read_status_time();
+    if (pj_time_controller_ready(&g_time_controller)) {
+        pj_time_controller_result_t result;
+        if (time_changed) {
+            if (!pj_time_controller_time_changed(
+                    &g_time_controller, time_controller_wall_time_trusted(NULL),
+                    &result)) {
+                board_time_mark_pending();
             }
+        } else {
+            (void)pj_time_controller_update(&g_time_controller, &result);
         }
-        (void)rtc_wake_sync();
     }
     uint32_t wake_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
     if (gpio_get_level(BOOT_BUTTON_PIN) == 0) {
@@ -5794,7 +5778,6 @@ static void board_set_time_date(int hour, int minute, int year, int month, int d
         ESP_LOGE(TAG, "Rejected invalid time/date from %s", source);
         return;
     }
-    board_time_mark_pending();
     esp_err_t err = rtc_write_status_time();
     if (err == ESP_OK) {
         portENTER_CRITICAL(&g_time_lock);
@@ -5806,6 +5789,7 @@ static void board_set_time_date(int hour, int minute, int year, int month, int d
                        source, esp_err_to_name(err));
         ESP_LOGW(TAG, "%s", g_status.last_error);
     }
+    board_time_mark_pending();
     ESP_LOGI(TAG, "Time/date updated from %s: %02d:%02d %04d-%02d-%02d",
              source, hour, minute, year, month, day);
 }
