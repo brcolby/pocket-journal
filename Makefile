@@ -12,6 +12,7 @@ AUTH_TEST_BIN := build/test_auth
 SETTINGS_TEST_BIN := build/test_settings
 STATIC_ART_TEST_BIN := build/test_static_art
 HOME_LAYOUT_TEST_BIN := build/test_home_layout
+STORAGE_TEST_BIN := build/test_storage
 LVGL_DIR := firmware/managed_components/lvgl__lvgl
 ifneq ($(wildcard $(LVGL_DIR)/src),)
 LVGL_SRCS := $(wildcard $(LVGL_DIR)/src/*.c)
@@ -93,6 +94,12 @@ test-input:
 		tests/board/test_home_layout.c \
 		-o $(HOME_LAYOUT_TEST_BIN)
 	$(HOME_LAYOUT_TEST_BIN)
+	$(CC) $(CFLAGS) \
+		-Ifirmware/components/pj_board/include \
+		firmware/components/pj_board/pj_storage.c \
+		tests/board/test_storage.c \
+		-o $(STORAGE_TEST_BIN)
+	$(STORAGE_TEST_BIN)
 
 test-partner:
 	cd partner && PYTHONPATH=src python -m unittest discover -s ../tests/partner -p 'test_*.py'
