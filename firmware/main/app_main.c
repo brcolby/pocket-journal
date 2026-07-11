@@ -138,6 +138,9 @@ void app_main(void)
             render_and_flush_if_dirty(&g_ui);
             if (pj_ui_current_state(&g_ui) == PJ_UI_STATE_STATIC) {
                 pj_board_enter_sleep();
+                if (pj_board_update_time_state(&g_ui)) {
+                    render_and_flush_if_dirty(&g_ui);
+                }
             }
         }
 
