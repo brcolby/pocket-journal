@@ -46,13 +46,26 @@ class ConfigTests(unittest.TestCase):
         def fake_request(method, path, body=None):
             calls.append((method, path, body))
             if method == "GET":
-                return {"audio": [{"audio_id": "rec.wav", "filename": "rec.wav", "size": 88, "data_bytes": 44}]}
+                return {"audio": [{
+                    "audio_id": "rec.wav",
+                    "filename": "rec.wav",
+                    "label": "REC",
+                    "size": 88,
+                    "data_bytes": 44,
+                    "created_at": "2026-07-11T09:34:00",
+                    "duration_ms": 1,
+                    "synced": True,
+                    "transcript_uploaded": True,
+                    "transcript_path": "/sdcard/pj/transcripts/rec.wav.json",
+                }]}
             return {"deleted": 1}
 
         client._request = fake_request  # type: ignore[method-assign]
 
         audio = client.list_audio()
         self.assertEqual(audio[0].data_bytes, 44)
+        self.assertTrue(audio[0].synced)
+        self.assertEqual(audio[0].duration_ms, 1)
         self.assertEqual(client.wipe_recordings(), {"deleted": 1})
 
         self.assertEqual(calls[0], ("GET", "/v1/audio", None))

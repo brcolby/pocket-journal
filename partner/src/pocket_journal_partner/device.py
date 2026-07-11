@@ -38,10 +38,14 @@ def _looks_like_usb_serial_port(device: str) -> bool:
 class AudioItem:
     audio_id: str
     filename: str
+    label: str | None = None
     size: int | None = None
     data_bytes: int | None = None
     created_at: str | None = None
+    duration_ms: int | None = None
+    synced: bool = False
     transcript_uploaded: bool = False
+    transcript_path: str | None = None
 
 
 class DeviceClient:

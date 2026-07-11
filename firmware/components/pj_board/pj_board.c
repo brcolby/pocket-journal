@@ -1,6 +1,7 @@
 #include "pj_board.h"
 #include "pj_audio_level.h"
 #include "pj_aux_input.h"
+#include "pj_note_model.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -29,6 +30,7 @@
 #include "esp_sleep.h"
 #include "esp_system.h"
 #include "esp_vfs_fat.h"
+#include "cJSON.h"
 #include "driver/gpio.h"
 #include "driver/i2c_master.h"
 #include "driver/i2s_std.h"
@@ -129,6 +131,7 @@
 #define PJ_HTTP_MAX_URI_HANDLERS 16
 #define PJ_AUDIO_DIR "/sdcard/pj/audio"
 #define PJ_TRANSCRIPT_DIR "/sdcard/pj/transcripts"
+#define PJ_NOTE_DIR "/sdcard/pj/notes"
 #define PJ_AUDIO_MAX_INDEXED_FILES 16
 #define PJ_SERIAL_COMMAND_TASK_STACK 4096
 #endif
@@ -190,6 +193,9 @@ static TaskHandle_t g_audio_process_task;
 static TaskHandle_t g_playback_task;
 static char g_active_recording_path[128];
 static char g_active_playback_path[128];
+static int g_ui_note_audio_indices[PJ_UI_MAX_NOTES];
+static int g_ui_note_audio_count;
+static int g_ui_note_transcript_view;
 static char g_wifi_ssid[PJ_WIFI_SSID_MAX_LEN + 1];
 static char g_wifi_password[PJ_WIFI_PASSWORD_MAX_LEN + 1];
 static int g_wifi_credentials_stored;
@@ -903,6 +909,7 @@ static esp_err_t storage_init(void)
         mkdir("/sdcard/pj", 0775);
         mkdir(PJ_AUDIO_DIR, 0775);
         mkdir(PJ_TRANSCRIPT_DIR, 0775);
+        mkdir(PJ_NOTE_DIR, 0775);
         int stale_audio_files = cleanup_audio_temp_files();
         if (stale_audio_files > 0) {
             ESP_LOGW(TAG, "Removed %d interrupted audio capture file(s)", stale_audio_files);
@@ -953,12 +960,166 @@ static void label_from_filename(char *out, size_t out_size, const char *filename
 typedef struct {
     char filename[96];
     char label[PJ_UI_NOTE_LABEL_LEN];
+    char transcript_label[PJ_UI_NOTE_LABEL_LEN];
     long size_bytes;
     uint32_t data_bytes;
     uint32_t sample_rate;
     uint16_t channels;
     uint16_t bits;
+    pj_note_metadata_t note;
 } pj_audio_entry_t;
+
+static void note_sidecar_path(char *out, size_t out_size, const char *filename)
+{
+    (void)snprintf(out, out_size, PJ_NOTE_DIR "/%s.json", filename);
+}
+
+static void transcript_path_for_audio(char *out, size_t out_size, const char *filename)
+{
+    (void)snprintf(out, out_size, PJ_TRANSCRIPT_DIR "/%s.json", filename);
+}
+
+static cJSON *json_read_file(const char *path, size_t max_bytes)
+{
+    struct stat st;
+    if (stat(path, &st) != 0 || st.st_size <= 0 || (size_t)st.st_size > max_bytes) {
+        return NULL;
+    }
+    FILE *file = fopen(path, "rb");
+    if (file == NULL) {
+        return NULL;
+    }
+    char *body = malloc((size_t)st.st_size + 1U);
+    if (body == NULL) {
+        fclose(file);
+        return NULL;
+    }
+    size_t read = fread(body, 1, (size_t)st.st_size, file);
+    fclose(file);
+    body[read] = '\0';
+    cJSON *json = read == (size_t)st.st_size ? cJSON_Parse(body) : NULL;
+    free(body);
+    return json;
+}
+
+static int json_write_file_atomic(const char *path, const char *body, size_t body_size)
+{
+    char temporary_path[256];
+    if (snprintf(temporary_path, sizeof(temporary_path), "%s.tmp", path) >= (int)sizeof(temporary_path)) {
+        return 0;
+    }
+    FILE *file = fopen(temporary_path, "wb");
+    if (file == NULL) {
+        return 0;
+    }
+    int written = fwrite(body, 1, body_size, file) == body_size;
+    int flushed = fflush(file) == 0;
+    int closed = fclose(file) == 0;
+    if (!written || !flushed || !closed) {
+        remove(temporary_path);
+        return 0;
+    }
+    remove(path);
+    if (rename(temporary_path, path) != 0) {
+        remove(temporary_path);
+        return 0;
+    }
+    return 1;
+}
+
+static int note_metadata_write(const pj_note_metadata_t *note)
+{
+    cJSON *json = cJSON_CreateObject();
+    if (json == NULL) {
+        return 0;
+    }
+    cJSON_AddStringToObject(json, "filename", note->filename);
+    cJSON_AddStringToObject(json, "created_at", note->created_at);
+    cJSON_AddNumberToObject(json, "duration_ms", note->duration_ms);
+    cJSON_AddBoolToObject(json, "synced", note->synced != 0);
+    cJSON_AddStringToObject(json, "transcript_path", note->transcript_path);
+    char *body = cJSON_PrintUnformatted(json);
+    cJSON_Delete(json);
+    if (body == NULL) {
+        return 0;
+    }
+    char path[256];
+    note_sidecar_path(path, sizeof(path), note->filename);
+    int written = json_write_file_atomic(path, body, strlen(body));
+    cJSON_free(body);
+    return written;
+}
+
+static int note_metadata_load(pj_note_metadata_t *note)
+{
+    char path[256];
+    note_sidecar_path(path, sizeof(path), note->filename);
+    cJSON *json = json_read_file(path, 2048);
+    if (json == NULL) {
+        return 0;
+    }
+    cJSON *created_at = cJSON_GetObjectItemCaseSensitive(json, "created_at");
+    cJSON *duration_ms = cJSON_GetObjectItemCaseSensitive(json, "duration_ms");
+    cJSON *synced = cJSON_GetObjectItemCaseSensitive(json, "synced");
+    cJSON *transcript_path = cJSON_GetObjectItemCaseSensitive(json, "transcript_path");
+    if (cJSON_IsString(created_at) && created_at->valuestring != NULL) {
+        (void)snprintf(note->created_at, sizeof(note->created_at), "%s", created_at->valuestring);
+    }
+    if (cJSON_IsNumber(duration_ms) && duration_ms->valuedouble >= 0) {
+        note->duration_ms = (uint32_t)duration_ms->valuedouble;
+    }
+    note->synced = cJSON_IsTrue(synced);
+    if (cJSON_IsString(transcript_path) && transcript_path->valuestring != NULL) {
+        (void)snprintf(note->transcript_path, sizeof(note->transcript_path), "%s",
+                       transcript_path->valuestring);
+    }
+    cJSON_Delete(json);
+    return 1;
+}
+
+static int transcript_label_for_audio(const char *filename, char *label, size_t label_size,
+                                      char *path, size_t path_size)
+{
+    transcript_path_for_audio(path, path_size, filename);
+    cJSON *json = json_read_file(path, 8192);
+    if (json == NULL) {
+        return 0;
+    }
+    cJSON *text = cJSON_GetObjectItemCaseSensitive(json, "text");
+    if (!cJSON_IsString(text) || text->valuestring == NULL || text->valuestring[0] == '\0') {
+        cJSON_Delete(json);
+        return 0;
+    }
+    size_t used = 0;
+    int pending_space = 0;
+    for (const char *cursor = text->valuestring; *cursor != '\0' && used + 1 < label_size; cursor++) {
+        unsigned char ch = (unsigned char)*cursor;
+        if (isspace(ch)) {
+            pending_space = used > 0;
+            continue;
+        }
+        if (pending_space && used + 1 < label_size) {
+            label[used++] = ' ';
+        }
+        label[used++] = (char)toupper(ch);
+        pending_space = 0;
+    }
+    label[used] = '\0';
+    cJSON_Delete(json);
+    return used > 0;
+}
+
+static void write_recording_metadata(const char *final_path, uint32_t data_bytes)
+{
+    const char *filename = strrchr(final_path, '/');
+    filename = filename == NULL ? final_path : filename + 1;
+    pj_note_metadata_t note;
+    if (!pj_note_metadata_from_audio(&note, filename, data_bytes, PJ_AUDIO_SAMPLE_RATE,
+                                     PJ_AUDIO_CHANNELS, PJ_AUDIO_BITS_PER_SAMPLE) ||
+        !note_metadata_write(&note)) {
+        ESP_LOGW(TAG, "Recording retained without metadata sidecar: %s", final_path);
+    }
+}
 
 static uint16_t read_le16(const uint8_t *data)
 {
@@ -1017,6 +1178,32 @@ static int probe_audio_entry(const char *filename, pj_audio_entry_t *entry)
     entry->sample_rate = sample_rate;
     entry->channels = channels;
     entry->bits = bits;
+    if (!pj_note_metadata_from_audio(&entry->note, filename, data_bytes, sample_rate, channels, bits)) {
+        return 0;
+    }
+    pj_note_metadata_t derived = entry->note;
+    int metadata_loaded = note_metadata_load(&entry->note);
+    pj_note_metadata_t loaded = entry->note;
+    (void)snprintf(entry->note.filename, sizeof(entry->note.filename), "%s", derived.filename);
+    entry->note.duration_ms = derived.duration_ms;
+    if (entry->note.created_at[0] == '\0') {
+        (void)snprintf(entry->note.created_at, sizeof(entry->note.created_at), "%s", derived.created_at);
+    }
+    char transcript_path[PJ_NOTE_TRANSCRIPT_PATH_LEN];
+    if (transcript_label_for_audio(filename, entry->transcript_label,
+                                   sizeof(entry->transcript_label), transcript_path,
+                                   sizeof(transcript_path))) {
+        entry->note.synced = 1;
+        (void)snprintf(entry->note.transcript_path, sizeof(entry->note.transcript_path), "%s",
+                       transcript_path);
+    } else {
+        entry->note.synced = 0;
+        entry->note.transcript_path[0] = '\0';
+    }
+    if ((!metadata_loaded || memcmp(&loaded, &entry->note, sizeof(entry->note)) != 0) &&
+        !note_metadata_write(&entry->note)) {
+        ESP_LOGW(TAG, "Note metadata write failed: %s", filename);
+    }
     return 1;
 }
 
@@ -1095,14 +1282,18 @@ static int audio_filename_for_index(int target_index, char *out, size_t out_size
         return 0;
     }
     int count = collect_audio_entries(entries, PJ_AUDIO_MAX_INDEXED_FILES);
-    if (target_index < 0 || target_index >= count) {
+    int audio_index = target_index;
+    if (target_index >= 0 && target_index < g_ui_note_audio_count) {
+        audio_index = g_ui_note_audio_indices[target_index];
+    }
+    if (audio_index < 0 || audio_index >= count) {
         free(entries);
         return 0;
     }
-    (void)snprintf(out, out_size, "%s", entries[target_index].filename);
-    ESP_LOGI(TAG, "Playback index %d resolved to %s data_bytes=%u size=%ld",
-             target_index, entries[target_index].filename,
-             (unsigned)entries[target_index].data_bytes, entries[target_index].size_bytes);
+    (void)snprintf(out, out_size, "%s", entries[audio_index].filename);
+    ESP_LOGI(TAG, "Playback UI index %d resolved to audio index %d: %s data_bytes=%u size=%ld",
+             target_index, audio_index, entries[audio_index].filename,
+             (unsigned)entries[audio_index].data_bytes, entries[audio_index].size_bytes);
     free(entries);
     return 1;
 }
@@ -1137,19 +1328,33 @@ static void refresh_ui_notes_from_sd(pj_ui_context_t *ui)
     pj_audio_entry_t *entries = calloc(PJ_AUDIO_MAX_INDEXED_FILES, sizeof(entries[0]));
     memset(labels, 0, sizeof(labels));
     if (entries == NULL) {
+        g_ui_note_audio_count = 0;
         pj_ui_set_notes(ui, 0, labels);
         return;
     }
     int count = collect_audio_entries(entries, PJ_AUDIO_MAX_INDEXED_FILES);
-    if (count > PJ_UI_MAX_NOTES) {
-        count = PJ_UI_MAX_NOTES;
+    pj_ui_state_t state = pj_ui_current_state(ui);
+    if (state == PJ_UI_STATE_READ) {
+        g_ui_note_transcript_view = 1;
+    } else if (state == PJ_UI_STATE_LISTEN) {
+        g_ui_note_transcript_view = 0;
     }
-    for (int i = 0; i < count; i++) {
-        (void)snprintf(labels[i], sizeof(labels[i]), "%s", entries[i].label);
+    int transcript_view = g_ui_note_transcript_view;
+    int displayed = 0;
+    for (int i = 0; i < count && displayed < PJ_UI_MAX_NOTES; i++) {
+        if (transcript_view && (!entries[i].note.synced || entries[i].transcript_label[0] == '\0')) {
+            continue;
+        }
+        const char *label = transcript_view ? entries[i].transcript_label : entries[i].label;
+        (void)snprintf(labels[displayed], sizeof(labels[displayed]), "%s", label);
+        g_ui_note_audio_indices[displayed] = i;
+        displayed++;
     }
+    g_ui_note_audio_count = displayed;
     free(entries);
-    ESP_LOGI(TAG, "Audio note list refreshed: playable=%d", count);
-    pj_ui_set_notes(ui, count, labels);
+    ESP_LOGI(TAG, "%s note list refreshed: visible=%d playable=%d",
+             transcript_view ? "Transcript" : "Audio", displayed, count);
+    pj_ui_set_notes(ui, displayed, labels);
 }
 
 static int i2c_take(TickType_t timeout)
@@ -1750,6 +1955,8 @@ static int audio_process_recording(audio_process_args_t *args)
         return 0;
     }
 
+    write_recording_metadata(args->final_path, args->data_bytes);
+
     ESP_LOGI(TAG, "Audio processing complete: %s input_channel=%d raw_peak=%u raw_avg_abs=%u raw_clipped=%u "
              "filtered_peak=%u robust_peak=%u filtered_avg_abs=%u filtered_clipped=%u "
              "normalize_gain_x100=%u peak=%u avg_abs=%u",
@@ -2059,6 +2266,9 @@ static void record_task(void *arg)
     } else {
         ESP_LOGW(TAG, "Audio processing task allocation failed; preserving raw recording");
         note_ready = rename(temporary_path, g_active_recording_path) == 0;
+        if (note_ready) {
+            write_recording_metadata(g_active_recording_path, data_bytes);
+        }
     }
     record_task_exit(note_ready);
 }
@@ -2979,11 +3189,15 @@ int pj_board_wipe_recordings(pj_ui_context_t *ui)
     }
     int audio_deleted = delete_dir_entries(PJ_AUDIO_DIR, is_audio_filename);
     int transcripts_deleted = delete_dir_entries(PJ_TRANSCRIPT_DIR, is_transcript_filename);
+    int notes_deleted = delete_dir_entries(PJ_NOTE_DIR, is_transcript_filename);
+    g_ui_note_audio_count = 0;
+    g_ui_note_transcript_view = 0;
     g_notes_update_pending = 1;
     if (ui != NULL) {
         refresh_ui_notes_from_sd(ui);
     }
-    ESP_LOGI(TAG, "Wiped recordings: audio=%d transcripts=%d", audio_deleted, transcripts_deleted);
+    ESP_LOGI(TAG, "Wiped recordings: audio=%d transcripts=%d metadata=%d",
+             audio_deleted, transcripts_deleted, notes_deleted);
     return audio_deleted;
 #else
     char labels[PJ_UI_MAX_NOTES][PJ_UI_NOTE_LABEL_LEN] = {0};
@@ -3618,12 +3832,30 @@ static esp_err_t audio_list_handler(httpd_req_t *req)
     if (entries != NULL) {
         int count = collect_audio_entries(entries, PJ_AUDIO_MAX_INDEXED_FILES);
         for (int i = 0; i < count; i++) {
-            char item[320];
-            (void)snprintf(item, sizeof(item),
-                           "%s{\"audio_id\":\"%s\",\"filename\":\"%s\",\"label\":\"%s\",\"size\":%ld,\"data_bytes\":%u}",
-                           emitted ? "," : "", entries[i].filename, entries[i].filename, entries[i].label,
-                           entries[i].size_bytes, (unsigned)entries[i].data_bytes);
-            esp_err_t err = httpd_resp_sendstr_chunk(req, item);
+            cJSON *item = cJSON_CreateObject();
+            if (item == NULL) {
+                continue;
+            }
+            cJSON_AddStringToObject(item, "audio_id", entries[i].filename);
+            cJSON_AddStringToObject(item, "filename", entries[i].filename);
+            cJSON_AddStringToObject(item, "label", entries[i].label);
+            cJSON_AddNumberToObject(item, "size", entries[i].size_bytes);
+            cJSON_AddNumberToObject(item, "data_bytes", entries[i].data_bytes);
+            cJSON_AddStringToObject(item, "created_at", entries[i].note.created_at);
+            cJSON_AddNumberToObject(item, "duration_ms", entries[i].note.duration_ms);
+            cJSON_AddBoolToObject(item, "synced", entries[i].note.synced != 0);
+            cJSON_AddBoolToObject(item, "transcript_uploaded", entries[i].note.synced != 0);
+            cJSON_AddStringToObject(item, "transcript_path", entries[i].note.transcript_path);
+            char *encoded = cJSON_PrintUnformatted(item);
+            cJSON_Delete(item);
+            if (encoded == NULL) {
+                continue;
+            }
+            esp_err_t err = emitted ? httpd_resp_sendstr_chunk(req, ",") : ESP_OK;
+            if (err == ESP_OK) {
+                err = httpd_resp_sendstr_chunk(req, encoded);
+            }
+            cJSON_free(encoded);
             if (err != ESP_OK) {
                 free(entries);
                 ESP_RETURN_ON_ERROR(err, TAG, "audio list item send failed");
@@ -3702,21 +3934,43 @@ static esp_err_t transcript_put_handler(httpd_req_t *req)
         drain_body(req);
         return send_json(req, "{\"error\":\"invalid transcript id\"}");
     }
+    pj_audio_entry_t entry;
+    if (!probe_audio_entry(id + 1, &entry)) {
+        httpd_resp_set_status(req, "404 Not Found");
+        drain_body(req);
+        return send_json(req, "{\"error\":\"audio not found\"}");
+    }
     char body[1024];
+    if (req->content_len <= 0 || req->content_len >= (int)sizeof(body)) {
+        drain_body(req);
+        httpd_resp_set_status(req, "400 Bad Request");
+        return send_json(req, "{\"error\":\"invalid transcript body\"}");
+    }
     if (!read_body(req, body, sizeof(body))) {
         httpd_resp_set_status(req, "400 Bad Request");
         return send_json(req, "{\"error\":\"invalid transcript body\"}");
     }
-    char path[176];
-    (void)snprintf(path, sizeof(path), "/sdcard/pj/transcripts/%s.json", id + 1);
-    FILE *file = fopen(path, "w");
-    if (file != NULL) {
-        fputs(body, file);
-        fclose(file);
-        ESP_LOGI(TAG, "Transcript stored: %s", path);
-    } else {
-        ESP_LOGW(TAG, "Transcript store failed: %s", path);
+    cJSON *json = cJSON_Parse(body);
+    cJSON *text = json == NULL ? NULL : cJSON_GetObjectItemCaseSensitive(json, "text");
+    if (!cJSON_IsObject(json) || !cJSON_IsString(text) || text->valuestring == NULL ||
+        text->valuestring[0] == '\0') {
+        cJSON_Delete(json);
+        httpd_resp_set_status(req, "400 Bad Request");
+        return send_json(req, "{\"error\":\"transcript must be a JSON object with non-empty text\"}");
     }
+    cJSON_Delete(json);
+    char path[PJ_NOTE_TRANSCRIPT_PATH_LEN];
+    transcript_path_for_audio(path, sizeof(path), id + 1);
+    if (!json_write_file_atomic(path, body, strlen(body))) {
+        ESP_LOGW(TAG, "Transcript store failed: %s", path);
+        httpd_resp_set_status(req, "500 Internal Server Error");
+        return send_json(req, "{\"error\":\"transcript store failed\"}");
+    }
+    if (!probe_audio_entry(id + 1, &entry)) {
+        ESP_LOGW(TAG, "Transcript stored but note metadata refresh failed: %s", id + 1);
+    }
+    g_notes_update_pending = 1;
+    ESP_LOGI(TAG, "Transcript stored and note marked synced: %s", path);
     return send_json(req, "{\"uploaded\":true}");
 }
 

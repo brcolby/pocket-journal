@@ -7,6 +7,7 @@ EMCC ?= emcc
 UI_TEST_BIN := build/test_ui_core
 AUX_INPUT_TEST_BIN := build/test_aux_input
 AUDIO_LEVEL_TEST_BIN := build/test_audio_level
+NOTE_MODEL_TEST_BIN := build/test_note_model
 LVGL_DIR := firmware/managed_components/lvgl__lvgl
 ifneq ($(wildcard $(LVGL_DIR)/src),)
 LVGL_SRCS := $(wildcard $(LVGL_DIR)/src/*.c)
@@ -57,6 +58,12 @@ test-input:
 		tests/board/test_audio_level.c \
 		-o $(AUDIO_LEVEL_TEST_BIN)
 	$(AUDIO_LEVEL_TEST_BIN)
+	$(CC) $(CFLAGS) \
+		-Ifirmware/components/pj_board/include \
+		firmware/components/pj_board/pj_note_model.c \
+		tests/board/test_note_model.c \
+		-o $(NOTE_MODEL_TEST_BIN)
+	$(NOTE_MODEL_TEST_BIN)
 
 test-partner:
 	cd partner && PYTHONPATH=src python -m unittest discover -s ../tests/partner -p 'test_*.py'

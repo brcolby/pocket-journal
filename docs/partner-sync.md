@@ -49,6 +49,8 @@ By default the partner stores data under `~/.pocket-journal`:
 - `transcripts/<device-id>/`: transcript JSON files.
 - `sync-log.jsonl`: append-only sync results.
 
+Device note metadata is durable under `/sdcard/pj/notes`. Partner sync skips notes already reported as `synced`, so repeated sync runs only transcribe new recordings.
+
 For sandboxed or test runs, pass `--data-dir <path>` to commands that need the paired-device config.
 
 ## Home Design JSON

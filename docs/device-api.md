@@ -91,13 +91,13 @@ GET /v1/audio/{audio_id}
 DELETE /v1/audio
 ```
 
-Lists, downloads, or wipes retained WAV recordings from the TF card. `DELETE /v1/audio` also removes transcript JSON sidecars and returns the number of audio files deleted. It returns `409 Conflict` while recording or playback is active.
+Lists, downloads, or wipes retained WAV recordings from the TF card. List items include `created_at`, `duration_ms`, `synced`, and `transcript_path`; legacy WAVs receive deterministic metadata derived from their filename and header. `DELETE /v1/audio` also removes transcript and note metadata JSON sidecars and returns the number of audio files deleted. It returns `409 Conflict` while recording or playback is active.
 
 ```http
 PUT /v1/transcripts/{audio_id}
 ```
 
-Uploads a transcription for a recording.
+Uploads a JSON transcription containing non-empty `text` for an existing recording. A successful upload atomically stores the transcript and marks the note synced; the READ view is populated from these transcript records.
 
 ```http
 PUT /v1/calendar/today

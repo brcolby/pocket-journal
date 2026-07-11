@@ -16,6 +16,8 @@ def sync_device_audio(
 ) -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
     for item in client.list_audio():
+        if item.synced or item.transcript_uploaded:
+            continue
         audio_path = client.download_audio(item, store.audio_dir(device_id))
         transcript = backend.transcribe(audio_path)
         store.save_transcript(device_id, item.audio_id, transcript)
@@ -30,4 +32,3 @@ def sync_device_audio(
         store.append_sync_log(entry)
         results.append(entry)
     return results
-
