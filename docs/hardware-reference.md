@@ -147,6 +147,12 @@ deep sleep unless the documented modem-sleep/automatic-light-sleep integration
 is used. Reinitialize or validate display, touch, audio, SD, and network state
 after any deeper sleep mode that powers down their domains.
 
+The PCF85063ATL `INT` output is routed as `RTC_INT` to ESP32-S3 GPIO5. Durable
+alarms, timers, snoozes, and intervals use that active-low signal as an
+external light-sleep wake source. The ESP32-S3 internal RTC timer remains a
+short-deadline fallback and independent cross-check while the device stays in
+the same boot.
+
 ## Change Checklist
 
 Before changing the board driver:

@@ -4741,6 +4741,26 @@ int pj_board_poll_event(pj_board_event_t *event)
 void pj_board_enter_sleep(void)
 {
 #ifdef ESP_PLATFORM
+    uint64_t wake_delay_ms = UINT64_MAX;
+    if (g_time_state_ready) {
+        pj_time_clock_t clock;
+        if (board_time_model_clock(&clock)) {
+            wake_delay_ms = pj_time_next_wake_delay_ms(&g_time_state, &clock);
+        }
+    }
+    if (wake_delay_ms == 0) {
+        ESP_LOGI(TAG, "Sleep deferred because a time alert is due");
+        return;
+    }
+    if (wake_delay_ms != UINT64_MAX) {
+        ESP_ERROR_CHECK_WITHOUT_ABORT(
+            esp_sleep_enable_timer_wakeup(wake_delay_ms * 1000u));
+        ESP_LOGI(TAG, "Time-alert wake armed in %llu ms",
+                 (unsigned long long)wake_delay_ms);
+    } else {
+        ESP_ERROR_CHECK_WITHOUT_ABORT(
+            esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_TIMER));
+    }
     if (g_display_ready) {
         gpio_set_level(EPD_PWR_PIN, 1);
         g_epd_shadow_valid = 0;
@@ -4750,6 +4770,7 @@ void pj_board_enter_sleep(void)
     ESP_ERROR_CHECK_WITHOUT_ABORT(gpio_wakeup_enable(BOOT_BUTTON_PIN, GPIO_INTR_LOW_LEVEL));
     ESP_ERROR_CHECK_WITHOUT_ABORT(esp_sleep_enable_gpio_wakeup());
     esp_light_sleep_start();
+    esp_sleep_wakeup_cause_t wake_cause = esp_sleep_get_wakeup_cause();
     (void)rtc_read_status_time();
     uint32_t wake_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
     if (gpio_get_level(BOOT_BUTTON_PIN) == 0) {
@@ -4758,7 +4779,8 @@ void pj_board_enter_sleep(void)
         pj_aux_input_init(&g_aux_input, 1, wake_ms);
     }
     gpio_set_level(EPD_PWR_PIN, 0);
-    ESP_LOGI(TAG, "Woke from light sleep");
+    ESP_LOGI(TAG, "Woke from light sleep via %s",
+             wake_cause == ESP_SLEEP_WAKEUP_TIMER ? "time alert" : "GPIO");
 #endif
 }
 

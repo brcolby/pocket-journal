@@ -561,6 +561,59 @@ const pj_time_alert_t *pj_time_active_alert(const pj_time_state_t *state)
         NULL : &state->active_alert;
 }
 
+static uint64_t countdown_wake_delay(const pj_time_countdown_t *countdown,
+                                     const pj_time_clock_t *clock)
+{
+    if (!countdown->running) {
+        return UINT64_MAX;
+    }
+    uint8_t uncertain = 0;
+    uint64_t elapsed = elapsed_since(countdown->anchor_boot_id,
+                                     countdown->anchor_monotonic_ms,
+                                     clock, &uncertain);
+    if (uncertain) {
+        return 0;
+    }
+    return elapsed >= countdown->remaining_ms ? 0 :
+           countdown->remaining_ms - elapsed;
+}
+
+uint64_t pj_time_next_wake_delay_ms(const pj_time_state_t *state,
+                                    const pj_time_clock_t *clock)
+{
+    if (!pj_time_state_valid(state) || !pj_time_clock_valid(clock)) {
+        return UINT64_MAX;
+    }
+    if (state->active_alert.source != PJ_TIME_ALERT_NONE) {
+        return 0;
+    }
+    uint64_t delay = UINT64_MAX;
+#define MIN_DELAY(value) do { \
+        uint64_t candidate = (value); \
+        if (candidate < delay) { \
+            delay = candidate; \
+        } \
+    } while (0)
+    MIN_DELAY(countdown_wake_delay(&state->snooze, clock));
+    MIN_DELAY(countdown_wake_delay(&state->timer, clock));
+    MIN_DELAY(countdown_wake_delay(&state->interval, clock));
+    if (state->alarm_enabled) {
+        uint32_t target_second = (uint32_t)state->alarm_hour * 3600u +
+                                 (uint32_t)state->alarm_minute * 60u;
+        uint32_t seconds = target_second > clock->local_second ?
+            target_second - clock->local_second :
+            86400u - clock->local_second + target_second;
+        uint64_t alarm_delay = (uint64_t)seconds * 1000u;
+        if (clock->wall_utc_ms >= 0) {
+            uint64_t fraction = (uint64_t)clock->wall_utc_ms % 1000u;
+            alarm_delay = alarm_delay > fraction ? alarm_delay - fraction : 0;
+        }
+        MIN_DELAY(alarm_delay);
+    }
+#undef MIN_DELAY
+    return delay;
+}
+
 int pj_time_alert_dismiss(pj_time_state_t *state, uint64_t alert_id)
 {
     if (!pj_time_state_valid(state) || alert_id == 0 ||

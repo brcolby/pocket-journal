@@ -114,6 +114,8 @@ void pj_time_recovery_acknowledge(pj_time_state_t *state);
 int pj_time_advance(pj_time_state_t *state, const pj_time_clock_t *clock);
 uint64_t pj_time_stopwatch_elapsed(const pj_time_state_t *state);
 const pj_time_alert_t *pj_time_active_alert(const pj_time_state_t *state);
+uint64_t pj_time_next_wake_delay_ms(const pj_time_state_t *state,
+                                    const pj_time_clock_t *clock);
 int pj_time_alert_dismiss(pj_time_state_t *state, uint64_t alert_id);
 int pj_time_alarm_snooze(pj_time_state_t *state, uint64_t alert_id, uint64_t duration_ms,
                          const pj_time_clock_t *clock);
