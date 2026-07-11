@@ -65,6 +65,8 @@ section in status reports and handoffs.
   hardware evidence unless the user explicitly approves closure for that bead.
 - Update the bead notes with the exact completed implementation, validation
   commands, tested firmware or commit, and the remaining human check.
+- Add or retain the `human` label when the bead is waiting only on human
+  validation, so `bd human list` can surface it explicitly.
 - In handoffs, group these beads under `Human Validation Required` with the
   bead id, what the human should check, and what evidence would allow closure.
 - Do not mix human-validation beads into the normal ready-work list unless the
