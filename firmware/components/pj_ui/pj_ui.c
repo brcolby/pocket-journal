@@ -25,6 +25,7 @@
 #include <string.h>
 
 #define PJ_PI 3.14159265358979323846
+#define PJ_UI_MAX_DURATION_SECONDS 86400
 
 #if defined(PJ_UI_USE_LVGL)
 #define PJ_LVGL_PALETTE_BYTES 8
@@ -839,9 +840,6 @@ void pj_ui_sleep(pj_ui_context_t *ctx)
     }
     ctx->record_state = PJ_RECORD_IDLE;
     ctx->playback_state = PJ_PLAYBACK_IDLE;
-    ctx->stopwatch_running = 0;
-    ctx->timer_running = 0;
-    ctx->interval_running = 0;
     set_state(ctx, PJ_UI_STATE_STATIC);
 }
 
@@ -1031,6 +1029,17 @@ int pj_ui_consume_time_command(pj_ui_context_t *ctx, pj_ui_time_command_t *comma
     return 1;
 }
 
+static void queue_time_command(pj_ui_context_t *ctx, pj_ui_time_command_type_t type,
+                               uint64_t duration_ms, uint64_t secondary_duration_ms)
+{
+    if (ctx->time_command.type != PJ_UI_TIME_COMMAND_NONE) {
+        return;
+    }
+    ctx->time_command.type = type;
+    ctx->time_command.duration_ms = duration_ms;
+    ctx->time_command.secondary_duration_ms = secondary_duration_ms;
+}
+
 int pj_ui_handle_aux_long(pj_ui_context_t *ctx)
 {
     if (active_alert_present(ctx)) {
@@ -1095,7 +1104,6 @@ int pj_ui_handle_aux_short(pj_ui_context_t *ctx)
         mark_partial(ctx, 0, 144, PJ_DISPLAY_WIDTH, 40);
         return 1;
     case PJ_UI_STATE_TIME:
-        ctx->stopwatch_running = 1;
         set_state(ctx, PJ_UI_STATE_STOPWATCH);
         return 1;
     case PJ_UI_STATE_ALARM:
@@ -1104,6 +1112,8 @@ int pj_ui_handle_aux_short(pj_ui_context_t *ctx)
         return 1;
     case PJ_UI_STATE_STOPWATCH:
         ctx->stopwatch_running = !ctx->stopwatch_running;
+        queue_time_command(ctx, ctx->stopwatch_running ? PJ_UI_TIME_COMMAND_STOPWATCH_START :
+                           PJ_UI_TIME_COMMAND_STOPWATCH_PAUSE, 0, 0);
         mark_partial(ctx, 0, 40, PJ_DISPLAY_WIDTH, 96);
         return 1;
     case PJ_UI_STATE_TIMER:
@@ -1111,10 +1121,17 @@ int pj_ui_handle_aux_short(pj_ui_context_t *ctx)
             ctx->timer_seconds = ctx->timer_preset_seconds;
         }
         ctx->timer_running = !ctx->timer_running;
+        queue_time_command(ctx, ctx->timer_running ? PJ_UI_TIME_COMMAND_TIMER_START :
+                           PJ_UI_TIME_COMMAND_TIMER_PAUSE,
+                           (uint64_t)ctx->timer_seconds * 1000u, 0);
         mark_partial(ctx, 0, 40, PJ_DISPLAY_WIDTH, 96);
         return 1;
     case PJ_UI_STATE_INTERVAL:
         ctx->interval_running = !ctx->interval_running;
+        queue_time_command(ctx, ctx->interval_running ? PJ_UI_TIME_COMMAND_INTERVAL_START :
+                           PJ_UI_TIME_COMMAND_INTERVAL_PAUSE,
+                           (uint64_t)ctx->interval_seconds * 1000u,
+                           5ull * 60ull * 1000ull);
         mark_partial(ctx, 0, 72, PJ_DISPLAY_WIDTH, 74);
         return 1;
     case PJ_UI_STATE_SYNC:
@@ -1194,6 +1211,12 @@ int pj_ui_handle_touch(pj_ui_context_t *ctx, int x, int y, pj_touch_kind_t kind)
             return 0;
         }
         ctx->time_command.alert_id = ctx->active_alert.id;
+        return 1;
+    }
+
+    if (ctx->recovery_time_uncertain && kind == PJ_TOUCH_TAP && x >= 140 && y < 32 &&
+        ctx->state >= PJ_UI_STATE_ALARM && ctx->state <= PJ_UI_STATE_INTERVAL) {
+        queue_time_command(ctx, PJ_UI_TIME_COMMAND_RECOVERY_ACKNOWLEDGE, 0, 0);
         return 1;
     }
 
@@ -1307,6 +1330,7 @@ int pj_ui_handle_touch(pj_ui_context_t *ctx, int x, int y, pj_touch_kind_t kind)
         if (y >= 138 && x >= 128) {
             ctx->stopwatch_seconds = 0;
             ctx->stopwatch_running = 0;
+            queue_time_command(ctx, PJ_UI_TIME_COMMAND_STOPWATCH_RESET, 0, 0);
             mark_partial(ctx, 0, 40, PJ_DISPLAY_WIDTH, 96);
             return 1;
         }
@@ -1320,12 +1344,19 @@ int pj_ui_handle_touch(pj_ui_context_t *ctx, int x, int y, pj_touch_kind_t kind)
                 }
             } else if (x < 132) {
                 ctx->timer_seconds += 30;
+                if (ctx->timer_seconds > PJ_UI_MAX_DURATION_SECONDS) {
+                    ctx->timer_seconds = PJ_UI_MAX_DURATION_SECONDS;
+                }
             } else {
                 ctx->timer_seconds = ctx->timer_preset_seconds;
                 ctx->timer_running = 0;
+                queue_time_command(ctx, PJ_UI_TIME_COMMAND_TIMER_RESET, 0, 0);
             }
             if (x < 132) {
                 ctx->timer_preset_seconds = ctx->timer_seconds;
+                queue_time_command(ctx, ctx->timer_running ? PJ_UI_TIME_COMMAND_TIMER_START :
+                                   PJ_UI_TIME_COMMAND_TIMER_RESET,
+                                   (uint64_t)ctx->timer_seconds * 1000u, 0);
             }
             mark_partial(ctx, 0, 40, PJ_DISPLAY_WIDTH, 96);
             return 1;
@@ -1340,13 +1371,21 @@ int pj_ui_handle_touch(pj_ui_context_t *ctx, int x, int y, pj_touch_kind_t kind)
                 }
             } else if (x < 132) {
                 ctx->interval_seconds += 60;
+                if (ctx->interval_seconds > PJ_UI_MAX_DURATION_SECONDS) {
+                    ctx->interval_seconds = PJ_UI_MAX_DURATION_SECONDS;
+                }
             } else {
                 ctx->interval_seconds = ctx->interval_preset_seconds;
                 ctx->interval_round = 0;
                 ctx->interval_running = 0;
+                queue_time_command(ctx, PJ_UI_TIME_COMMAND_INTERVAL_RESET, 0, 0);
             }
             if (x < 132) {
                 ctx->interval_preset_seconds = ctx->interval_seconds;
+                queue_time_command(ctx, ctx->interval_running ? PJ_UI_TIME_COMMAND_INTERVAL_START :
+                                   PJ_UI_TIME_COMMAND_INTERVAL_RESET,
+                                   (uint64_t)ctx->interval_seconds * 1000u,
+                                   5ull * 60ull * 1000ull);
             }
             mark_partial(ctx, 0, 24, PJ_DISPLAY_WIDTH, 120);
             return 1;
@@ -1682,6 +1721,11 @@ static void render_scene(const pj_ui_context_t *ctx, pj_framebuffer_t *fb)
             draw_centered_text(fb, 90, "UNKNOWN", 2);
             break;
         }
+    }
+
+    if (!active_alert_present(ctx) && ctx->recovery_time_uncertain &&
+        ctx->state >= PJ_UI_STATE_ALARM && ctx->state <= PJ_UI_STATE_INTERVAL) {
+        draw_text(fb, 150, 8, "TIME?", 1);
     }
 
     if (ctx->dark_mode && !(ctx->state == PJ_UI_STATE_STATIC && ctx->static_art_valid)) {

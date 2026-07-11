@@ -82,6 +82,10 @@
 #define PJ_NVS_INTERVAL_SECONDS "intvl_sec"
 #define PJ_NVS_STATIC_ART_SLOT "art_slot"
 #define PJ_NVS_HOME_LAYOUT "home_layout"
+#define PJ_NVS_TIME_STATE "time_state"
+#define PJ_TIME_CHECKPOINT_MS (15ull * 60ull * 1000ull)
+#define PJ_TIME_PERSIST_RETRY_MS (60ull * 1000ull)
+#define PJ_TIME_SNOOZE_MS (10ull * 60ull * 1000ull)
 #define PJ_STATIC_ART_SLOT_COUNT 2
 #define PJ_WIFI_SSID_MAX_LEN 32
 #define PJ_WIFI_PASSWORD_MAX_LEN 64
@@ -273,9 +277,48 @@ static char g_wifi_password[PJ_WIFI_PASSWORD_MAX_LEN + 1];
 static int g_wifi_credentials_stored;
 static uint32_t g_record_sequence;
 static portMUX_TYPE g_time_lock = portMUX_INITIALIZER_UNLOCKED;
+static portMUX_TYPE g_audio_state_lock = portMUX_INITIALIZER_UNLOCKED;
 static pj_time_clock_anchor_t g_time_clock_anchor;
+static pj_time_state_t g_time_state;
+static uint32_t g_time_boot_id;
+static uint64_t g_time_last_persist_ms;
+static uint64_t g_time_last_retry_ms;
+static uint64_t g_time_last_preempt_alert_id;
+static int g_time_state_ready;
+static int g_time_persist_dirty;
+static int g_time_wall_trusted;
 
 static esp_err_t rtc_write_status_time(void);
+static uint64_t board_monotonic_ms(void);
+static int board_time_model_clock(pj_time_clock_t *clock);
+static int time_state_initialize(void);
+static int time_state_persist(int force);
+static int time_state_reconcile_alarm(const pj_time_clock_t *clock);
+static int time_state_project(pj_ui_context_t *ui);
+
+static void board_audio_state_set(int recording, int playback_active)
+{
+    portENTER_CRITICAL(&g_audio_state_lock);
+    if (recording >= 0) {
+        g_status.recording = recording;
+    }
+    if (playback_active >= 0) {
+        g_status.playback_active = playback_active;
+    }
+    portEXIT_CRITICAL(&g_audio_state_lock);
+}
+
+static pj_time_activity_t board_time_activity(void)
+{
+    int recording;
+    int playback_active;
+    portENTER_CRITICAL(&g_audio_state_lock);
+    recording = g_status.recording;
+    playback_active = g_status.playback_active;
+    portEXIT_CRITICAL(&g_audio_state_lock);
+    return recording ? PJ_TIME_ACTIVITY_RECORDING :
+           playback_active ? PJ_TIME_ACTIVITY_PLAYBACK : PJ_TIME_ACTIVITY_IDLE;
+}
 typedef struct {
     int pa_level;
     int dout_gpio;
@@ -1053,6 +1096,58 @@ static esp_err_t settings_save(const pj_settings_t *settings)
         err = nvs_commit(nvs);
     }
     nvs_close(nvs);
+    return err;
+}
+
+typedef enum {
+    PJ_TIME_LOAD_IO_ERROR = -2,
+    PJ_TIME_LOAD_INVALID = -1,
+    PJ_TIME_LOAD_NOT_FOUND = 0,
+    PJ_TIME_LOAD_VALID = 1,
+} time_state_load_result_t;
+
+static time_state_load_result_t time_state_load_record(pj_time_state_t *state)
+{
+    uint8_t record[PJ_TIME_STATE_RECORD_BYTES];
+    size_t record_size = sizeof(record);
+    nvs_handle_t nvs;
+    esp_err_t err = nvs_open(PJ_NVS_NAMESPACE, NVS_READONLY, &nvs);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        return PJ_TIME_LOAD_NOT_FOUND;
+    }
+    if (err != ESP_OK) {
+        return PJ_TIME_LOAD_IO_ERROR;
+    }
+    err = nvs_get_blob(nvs, PJ_NVS_TIME_STATE, record, &record_size);
+    nvs_close(nvs);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        return PJ_TIME_LOAD_NOT_FOUND;
+    }
+    if (err != ESP_OK) {
+        return PJ_TIME_LOAD_IO_ERROR;
+    }
+    if (record_size != sizeof(record) ||
+        !pj_time_state_decode(record, sizeof(record), state)) {
+        return PJ_TIME_LOAD_INVALID;
+    }
+    return PJ_TIME_LOAD_VALID;
+}
+
+static esp_err_t time_state_save_record(const pj_time_state_t *state)
+{
+    uint8_t record[PJ_TIME_STATE_RECORD_BYTES];
+    if (pj_time_state_encode(state, record, sizeof(record)) != sizeof(record)) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    nvs_handle_t nvs;
+    esp_err_t err = nvs_open(PJ_NVS_NAMESPACE, NVS_READWRITE, &nvs);
+    if (err == ESP_OK) {
+        err = nvs_set_blob(nvs, PJ_NVS_TIME_STATE, record, sizeof(record));
+        if (err == ESP_OK) {
+            err = nvs_commit(nvs);
+        }
+        nvs_close(nvs);
+    }
     return err;
 }
 
@@ -2671,7 +2766,7 @@ static board_time_snapshot_t board_time_snapshot(void)
 }
 
 static int board_time_publish(int hour, int minute, int year, int month, int day,
-                              int second, uint64_t monotonic_ms)
+                              int second, uint64_t monotonic_ms, int trusted)
 {
     pj_time_clock_anchor_t anchor;
     if (!pj_time_clock_anchor_set(&anchor, year, month, day, hour, minute, second,
@@ -2686,9 +2781,19 @@ static int board_time_publish(int hour, int minute, int year, int month, int day
     g_status.day = day;
     g_status.time_set = 1;
     g_time_clock_anchor = anchor;
+    g_time_wall_trusted = trusted != 0;
     g_time_generation++;
     portEXIT_CRITICAL(&g_time_lock);
     return 1;
+}
+
+static int board_time_model_clock(pj_time_clock_t *clock)
+{
+    pj_time_clock_anchor_t anchor;
+    portENTER_CRITICAL(&g_time_lock);
+    anchor = g_time_clock_anchor;
+    portEXIT_CRITICAL(&g_time_lock);
+    return pj_time_clock_snapshot(&anchor, g_time_boot_id, board_monotonic_ms(), clock);
 }
 
 static void board_time_mark_pending(void)
@@ -2745,7 +2850,7 @@ static int rtc_read_status_time(void)
         return 0;
     }
     return board_time_publish(hour, minute, year, month, day, second,
-                              board_monotonic_ms());
+                              board_monotonic_ms(), 1);
 }
 
 static esp_err_t rtc_write_status_time(void)
@@ -2774,6 +2879,187 @@ static esp_err_t rtc_write_status_time(void)
     }
     i2c_give();
     return err;
+}
+
+static int time_state_anchor_boot_collision(const pj_time_state_t *state, uint32_t boot_id)
+{
+    return boot_id == 0 || state->snooze.anchor_boot_id == boot_id ||
+           state->timer.anchor_boot_id == boot_id ||
+           state->interval.anchor_boot_id == boot_id ||
+           state->stopwatch_anchor_boot_id == boot_id;
+}
+
+static int time_state_persisted_wall_anchor(const pj_time_state_t *state,
+                                            int64_t *wall_ms)
+{
+    int found = 0;
+#define CHECK_ANCHOR(running, value) do { \
+        if (running) { \
+            if (found && *wall_ms != (value)) { \
+                return 0; \
+            } \
+            *wall_ms = (value); \
+            found = 1; \
+        } \
+    } while (0)
+    CHECK_ANCHOR(state->snooze.running, state->snooze.anchor_wall_utc_ms);
+    CHECK_ANCHOR(state->timer.running, state->timer.anchor_wall_utc_ms);
+    CHECK_ANCHOR(state->interval.running, state->interval.anchor_wall_utc_ms);
+    CHECK_ANCHOR(state->stopwatch_running, state->stopwatch_anchor_wall_utc_ms);
+#undef CHECK_ANCHOR
+    return found;
+}
+
+static int time_state_reconcile_alarm(const pj_time_clock_t *clock)
+{
+    pj_settings_t settings;
+    if (!settings_take(portMAX_DELAY)) {
+        return 0;
+    }
+    settings = g_settings;
+    settings_give();
+    if (g_time_state.alarm_enabled == settings.alarm_enabled &&
+        g_time_state.alarm_hour == settings.alarm_hour &&
+        g_time_state.alarm_minute == settings.alarm_minute) {
+        return 0;
+    }
+    return pj_time_alarm_configure(&g_time_state, settings.alarm_enabled,
+                                   settings.alarm_hour, settings.alarm_minute, clock);
+}
+
+static int time_state_persist(int force)
+{
+    if (!g_time_state_ready) {
+        return 0;
+    }
+    uint64_t now = board_monotonic_ms();
+    if (!force) {
+        if (g_time_persist_dirty && now - g_time_last_retry_ms < PJ_TIME_PERSIST_RETRY_MS) {
+            return 0;
+        }
+        if (!g_time_persist_dirty && now - g_time_last_persist_ms < PJ_TIME_CHECKPOINT_MS) {
+            return 0;
+        }
+    }
+    esp_err_t err = time_state_save_record(&g_time_state);
+    if (err != ESP_OK) {
+        g_time_persist_dirty = 1;
+        g_time_last_retry_ms = now;
+        (void)snprintf(g_status.last_error, sizeof(g_status.last_error),
+                       "time state save failed: %s", esp_err_to_name(err));
+        ESP_LOGW(TAG, "%s", g_status.last_error);
+        return -1;
+    }
+    g_time_persist_dirty = 0;
+    g_time_last_persist_ms = now;
+    return 1;
+}
+
+static int time_state_initialize(void)
+{
+    pj_time_state_t loaded;
+    time_state_load_result_t load_result = time_state_load_record(&loaded);
+    if (load_result == PJ_TIME_LOAD_IO_ERROR) {
+        (void)snprintf(g_status.last_error, sizeof(g_status.last_error),
+                       "time state read failed; persistence left untouched");
+        ESP_LOGE(TAG, "%s", g_status.last_error);
+        return 0;
+    }
+    int restored = load_result == PJ_TIME_LOAD_VALID;
+    if (restored) {
+        g_time_state = loaded;
+    } else if (load_result == PJ_TIME_LOAD_INVALID) {
+        (void)snprintf(g_status.last_error, sizeof(g_status.last_error),
+                       "time state was corrupt; reinitializing defaults");
+        ESP_LOGW(TAG, "%s", g_status.last_error);
+    }
+    do {
+        g_time_boot_id = esp_random();
+    } while (time_state_anchor_boot_collision(restored ? &loaded : &g_time_state,
+                                              g_time_boot_id));
+
+    pj_time_clock_t clock;
+    if (!board_time_model_clock(&clock)) {
+        return 0;
+    }
+    if (!restored) {
+        pj_time_state_defaults(&g_time_state, &clock);
+    } else {
+        int64_t persisted_wall_ms = 0;
+        int wall_trusted = 0;
+        portENTER_CRITICAL(&g_time_lock);
+        wall_trusted = g_time_wall_trusted;
+        portEXIT_CRITICAL(&g_time_lock);
+        if (wall_trusted &&
+            time_state_persisted_wall_anchor(&g_time_state, &persisted_wall_ms) &&
+            clock.wall_utc_ms >= persisted_wall_ms) {
+            clock.reboot_elapsed_valid = 1;
+            clock.reboot_elapsed_ms = (uint64_t)(clock.wall_utc_ms - persisted_wall_ms);
+        }
+        (void)pj_time_advance(&g_time_state, &clock);
+        if (g_time_state.recovery_time_uncertain) {
+            (void)snprintf(g_status.last_error, sizeof(g_status.last_error),
+                           "time recovery uncertain; open a time app and acknowledge TIME?");
+            ESP_LOGW(TAG, "%s", g_status.last_error);
+        }
+    }
+    (void)time_state_reconcile_alarm(&clock);
+    g_time_state_ready = pj_time_state_valid(&g_time_state);
+    if (!g_time_state_ready) {
+        (void)snprintf(g_status.last_error, sizeof(g_status.last_error),
+                       "time state initialization failed validation");
+        ESP_LOGE(TAG, "%s", g_status.last_error);
+        return 0;
+    }
+    (void)time_state_persist(1);
+    ESP_LOGI(TAG, "Time state %s with boot id %u",
+             restored ? "restored" : "initialized", (unsigned)g_time_boot_id);
+    return 1;
+}
+
+static int time_state_project(pj_ui_context_t *ui)
+{
+    if (!g_time_state_ready || ui == NULL) {
+        return 0;
+    }
+    pj_settings_t settings;
+    if (!settings_take(portMAX_DELAY)) {
+        return 0;
+    }
+    settings = g_settings;
+    settings_give();
+    pj_ui_time_projection_t projection = {
+        .alarm_enabled = g_time_state.alarm_enabled,
+        .alarm_hour = g_time_state.alarm_hour,
+        .alarm_minute = g_time_state.alarm_minute,
+        .stopwatch_running = g_time_state.stopwatch_running,
+        .stopwatch_elapsed_ms = pj_time_stopwatch_elapsed(&g_time_state),
+        .timer_running = g_time_state.timer.running,
+        .timer_remaining_ms = g_time_state.timer.remaining_ms != 0 ?
+            g_time_state.timer.remaining_ms : (uint64_t)settings.timer_seconds * 1000u,
+        .interval_running = g_time_state.interval.running,
+        .interval_remaining_ms = g_time_state.interval.remaining_ms != 0 ?
+            g_time_state.interval.remaining_ms : (uint64_t)settings.interval_seconds * 1000u,
+        .interval_phase = g_time_state.interval_phase,
+        .recovery_time_uncertain = g_time_state.recovery_time_uncertain,
+    };
+    const pj_time_alert_t *alert = pj_time_active_alert(&g_time_state);
+    if (alert != NULL) {
+        projection.active_alert = *alert;
+        pj_time_activity_t activity = board_time_activity();
+        pj_time_conflict_action_t action = pj_time_alert_conflict_action(
+            (pj_time_alert_source_t)alert->source, activity);
+        projection.alert_audio_deferred = action == PJ_TIME_VISUAL_DEFER_AUDIO;
+        if (action == PJ_TIME_PREEMPT_PLAYBACK &&
+            g_time_last_preempt_alert_id != alert->id) {
+            g_time_last_preempt_alert_id = alert->id;
+            (void)pj_board_playback_set_active(0, 0);
+        }
+    } else {
+        g_time_last_preempt_alert_id = 0;
+    }
+    pj_ui_set_time_projection(ui, &projection);
+    return 1;
 }
 
 static void wav_put_le16(uint8_t *data, uint16_t value)
@@ -3106,7 +3392,7 @@ static void record_task_exit(int note_ready)
         g_notes_update_pending = 1;
     }
     g_record_task = NULL;
-    g_status.recording = 0;
+    board_audio_state_set(0, -1);
     g_audio_state_update_pending = 1;
     vTaskDelete(NULL);
 }
@@ -3114,7 +3400,7 @@ static void record_task_exit(int note_ready)
 static void playback_task_exit(void)
 {
     g_playback_task = NULL;
-    g_status.playback_active = 0;
+    board_audio_state_set(-1, 0);
     g_audio_state_update_pending = 1;
     vTaskDelete(NULL);
 }
@@ -3702,7 +3988,7 @@ static int set_status_time_from_build(void)
     }
 #ifdef ESP_PLATFORM
     return board_time_publish(hour, minute, year, month, day, second,
-                              board_monotonic_ms());
+                              board_monotonic_ms(), 0);
 #else
     g_status.hour = hour;
     g_status.minute = minute;
@@ -3726,7 +4012,7 @@ static void init_default_status(const pj_board_profile_t *profile)
     g_status.battery_percent = 84;
     g_status.temperature_c = 22;
 #ifdef ESP_PLATFORM
-    (void)board_time_publish(9, 41, 2026, 6, 6, 0, board_monotonic_ms());
+    (void)board_time_publish(9, 41, 2026, 6, 6, 0, board_monotonic_ms(), 0);
 #else
     g_status.hour = 9;
     g_status.minute = 41;
@@ -3884,6 +4170,9 @@ void pj_board_init(const pj_board_profile_t *profile)
         }
     } else {
         ESP_LOGW(TAG, "I2C init failed: %s", esp_err_to_name(i2c_err));
+    }
+    if (!time_state_initialize()) {
+        ESP_LOGE(TAG, "Durable time state is unavailable");
     }
 
     esp_err_t display_err = display_init();
@@ -4076,6 +4365,7 @@ int pj_board_consume_settings_update(pj_ui_context_t *ui)
     }
     g_settings_update_pending = 0;
     pj_board_refresh_settings(ui);
+    pj_board_refresh_time_state(ui);
     return 1;
 }
 
@@ -4210,7 +4500,137 @@ int pj_board_consume_time_update(pj_ui_context_t *ui)
         return 0;
     }
     pj_ui_set_time(ui, time.hour, time.minute, time.year, time.month, time.day);
+#ifdef ESP_PLATFORM
+    if (g_time_state_ready) {
+        pj_time_clock_t clock;
+        if (board_time_model_clock(&clock)) {
+            (void)pj_time_advance(&g_time_state, &clock);
+            (void)time_state_reconcile_alarm(&clock);
+            (void)time_state_persist(1);
+            (void)time_state_project(ui);
+        }
+    }
+#endif
     return 1;
+}
+
+void pj_board_refresh_time_state(pj_ui_context_t *ui)
+{
+#ifdef ESP_PLATFORM
+    if (!g_time_state_ready) {
+        return;
+    }
+    pj_time_clock_t clock;
+    if (!board_time_model_clock(&clock)) {
+        return;
+    }
+    int changed = pj_time_advance(&g_time_state, &clock);
+    changed |= time_state_reconcile_alarm(&clock);
+    if (changed) {
+        (void)time_state_persist(1);
+    }
+    (void)time_state_project(ui);
+#else
+    (void)ui;
+#endif
+}
+
+int pj_board_apply_time_actions(pj_ui_context_t *ui)
+{
+#ifdef ESP_PLATFORM
+    if (!g_time_state_ready || ui == NULL) {
+        return 0;
+    }
+    pj_time_clock_t clock;
+    if (!board_time_model_clock(&clock)) {
+        return 0;
+    }
+    pj_time_state_t before = g_time_state;
+    (void)pj_time_advance(&g_time_state, &clock);
+    (void)time_state_reconcile_alarm(&clock);
+
+    pj_ui_time_command_t command;
+    if (pj_ui_consume_time_command(ui, &command)) {
+        if (command.type == PJ_UI_TIME_COMMAND_ALERT_DISMISS) {
+            (void)pj_time_alert_dismiss(&g_time_state, command.alert_id);
+        } else if (command.type == PJ_UI_TIME_COMMAND_ALARM_SNOOZE) {
+            (void)pj_time_alarm_snooze(&g_time_state, command.alert_id,
+                                       PJ_TIME_SNOOZE_MS, &clock);
+        } else if (command.type == PJ_UI_TIME_COMMAND_RECOVERY_ACKNOWLEDGE) {
+            pj_time_recovery_acknowledge(&g_time_state);
+        } else if (command.type == PJ_UI_TIME_COMMAND_STOPWATCH_START) {
+            (void)pj_time_stopwatch_start(&g_time_state, &clock);
+        } else if (command.type == PJ_UI_TIME_COMMAND_STOPWATCH_PAUSE) {
+            (void)pj_time_stopwatch_pause(&g_time_state, &clock);
+        } else if (command.type == PJ_UI_TIME_COMMAND_STOPWATCH_RESET) {
+            pj_time_stopwatch_reset(&g_time_state);
+        } else if (command.type == PJ_UI_TIME_COMMAND_TIMER_START) {
+            (void)pj_time_timer_start(&g_time_state, command.duration_ms, &clock);
+        } else if (command.type == PJ_UI_TIME_COMMAND_TIMER_PAUSE) {
+            (void)pj_time_timer_pause(&g_time_state, &clock);
+        } else if (command.type == PJ_UI_TIME_COMMAND_TIMER_RESET) {
+            pj_time_timer_reset(&g_time_state);
+        } else if (command.type == PJ_UI_TIME_COMMAND_INTERVAL_START) {
+            if (!g_time_state.interval.running && g_time_state.interval.remaining_ms != 0 &&
+                command.duration_ms / 1000u ==
+                    (g_time_state.interval.remaining_ms / 1000u +
+                     (g_time_state.interval.remaining_ms % 1000u != 0))) {
+                (void)pj_time_interval_resume(&g_time_state, &clock);
+            } else {
+                (void)pj_time_interval_start(&g_time_state, command.duration_ms,
+                                             command.secondary_duration_ms, &clock);
+            }
+        } else if (command.type == PJ_UI_TIME_COMMAND_INTERVAL_PAUSE) {
+            (void)pj_time_interval_pause(&g_time_state, &clock);
+        } else if (command.type == PJ_UI_TIME_COMMAND_INTERVAL_RESET) {
+            pj_time_interval_reset(&g_time_state);
+        }
+    }
+
+    int changed = memcmp(&before, &g_time_state, sizeof(before)) != 0;
+    if (changed) {
+        (void)time_state_persist(1);
+    }
+    (void)time_state_project(ui);
+    return changed;
+#else
+    (void)ui;
+    return 0;
+#endif
+}
+
+int pj_board_update_time_state(pj_ui_context_t *ui)
+{
+#ifdef ESP_PLATFORM
+    if (!g_time_state_ready || ui == NULL) {
+        return 0;
+    }
+    pj_time_clock_t clock;
+    if (!board_time_model_clock(&clock)) {
+        return 0;
+    }
+    pj_time_state_t before = g_time_state;
+    (void)pj_time_advance(&g_time_state, &clock);
+    (void)time_state_reconcile_alarm(&clock);
+    int changed = memcmp(&before, &g_time_state, sizeof(before)) != 0;
+    int transition = memcmp(&before.active_alert, &g_time_state.active_alert,
+                            sizeof(before.active_alert)) != 0 ||
+                     before.pending_count != g_time_state.pending_count ||
+                     before.timer.running != g_time_state.timer.running ||
+                     before.interval.running != g_time_state.interval.running ||
+                     before.interval_phase != g_time_state.interval_phase ||
+                     before.snooze.running != g_time_state.snooze.running;
+    if (transition) {
+        (void)time_state_persist(1);
+    } else if (changed || g_time_persist_dirty) {
+        (void)time_state_persist(0);
+    }
+    (void)time_state_project(ui);
+    return pj_ui_is_dirty(ui);
+#else
+    (void)ui;
+    return 0;
+#endif
 }
 
 int pj_board_display_framebuffer(const pj_framebuffer_t *fb, const pj_ui_dirty_region_t *dirty)
@@ -4386,10 +4806,10 @@ int pj_board_record_set_active(int active)
     }
     next_recording_path(g_active_recording_path, sizeof(g_active_recording_path));
     g_record_stop_requested = 0;
-    g_status.recording = 1;
+    board_audio_state_set(1, -1);
     BaseType_t created = xTaskCreate(record_task, "pj-record", PJ_AUDIO_RECORD_TASK_STACK, NULL, 5, &g_record_task);
     if (created != pdPASS) {
-        g_status.recording = 0;
+        board_audio_state_set(0, -1);
         g_record_task = NULL;
         ESP_LOGE(TAG, "Record start failed: task create failed");
         return 0;
@@ -4454,10 +4874,10 @@ int pj_board_playback_set_active(int active, int note_index)
     }
     (void)snprintf(g_active_playback_path, sizeof(g_active_playback_path), PJ_AUDIO_DIR "/%s", filename);
     g_playback_stop_requested = 0;
-    g_status.playback_active = 1;
+    board_audio_state_set(-1, 1);
     BaseType_t created = xTaskCreate(playback_task, "pj-play", PJ_AUDIO_PLAYBACK_TASK_STACK, NULL, 5, &g_playback_task);
     if (created != pdPASS) {
-        g_status.playback_active = 0;
+        board_audio_state_set(-1, 0);
         g_playback_task = NULL;
         ESP_LOGE(TAG, "Playback start failed: task create failed");
         return 0;
@@ -4664,12 +5084,22 @@ static int json_int_field(const char *json, const char *field, int *value)
 static void board_set_time_date(int hour, int minute, int year, int month, int day, const char *source)
 {
     if (!board_time_publish(hour, minute, year, month, day, 0,
-                            board_monotonic_ms())) {
+                            board_monotonic_ms(), 0)) {
         ESP_LOGE(TAG, "Rejected invalid time/date from %s", source);
         return;
     }
     board_time_mark_pending();
-    ESP_ERROR_CHECK_WITHOUT_ABORT(rtc_write_status_time());
+    esp_err_t err = rtc_write_status_time();
+    if (err == ESP_OK) {
+        portENTER_CRITICAL(&g_time_lock);
+        g_time_wall_trusted = 1;
+        portEXIT_CRITICAL(&g_time_lock);
+    } else {
+        (void)snprintf(g_status.last_error, sizeof(g_status.last_error),
+                       "RTC write failed after %s time update: %s",
+                       source, esp_err_to_name(err));
+        ESP_LOGW(TAG, "%s", g_status.last_error);
+    }
     ESP_LOGI(TAG, "Time/date updated from %s: %02d:%02d %04d-%02d-%02d",
              source, hour, minute, year, month, day);
 }

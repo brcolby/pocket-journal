@@ -103,6 +103,7 @@ static void handle_board_event(pj_ui_context_t *ui, const pj_board_event_t *even
     }
     apply_board_state_effects(previous, pj_ui_current_state(ui), event);
     (void)pj_board_store_settings_from_ui(ui);
+    (void)pj_board_apply_time_actions(ui);
 }
 
 void app_main(void)
@@ -119,6 +120,7 @@ void app_main(void)
     pj_board_refresh_static_art(&g_ui);
     pj_ui_wake(&g_ui);
     pj_board_refresh_status(&g_ui);
+    pj_board_refresh_time_state(&g_ui);
     pj_ui_request_full_refresh(&g_ui);
     render_and_flush_if_dirty(&g_ui);
 
@@ -142,7 +144,7 @@ void app_main(void)
         second_ticks++;
         if (second_ticks >= 20) {
             second_ticks = 0;
-            if (pj_ui_tick(&g_ui)) {
+            if (pj_board_update_time_state(&g_ui)) {
                 render_and_flush_if_dirty(&g_ui);
             }
             clock_seconds++;

@@ -63,12 +63,24 @@ typedef enum {
 typedef enum {
     PJ_UI_TIME_COMMAND_NONE = 0,
     PJ_UI_TIME_COMMAND_ALERT_DISMISS,
-    PJ_UI_TIME_COMMAND_ALARM_SNOOZE
+    PJ_UI_TIME_COMMAND_ALARM_SNOOZE,
+    PJ_UI_TIME_COMMAND_RECOVERY_ACKNOWLEDGE,
+    PJ_UI_TIME_COMMAND_STOPWATCH_START,
+    PJ_UI_TIME_COMMAND_STOPWATCH_PAUSE,
+    PJ_UI_TIME_COMMAND_STOPWATCH_RESET,
+    PJ_UI_TIME_COMMAND_TIMER_START,
+    PJ_UI_TIME_COMMAND_TIMER_PAUSE,
+    PJ_UI_TIME_COMMAND_TIMER_RESET,
+    PJ_UI_TIME_COMMAND_INTERVAL_START,
+    PJ_UI_TIME_COMMAND_INTERVAL_PAUSE,
+    PJ_UI_TIME_COMMAND_INTERVAL_RESET
 } pj_ui_time_command_type_t;
 
 typedef struct {
     pj_ui_time_command_type_t type;
     uint64_t alert_id;
+    uint64_t duration_ms;
+    uint64_t secondary_duration_ms;
 } pj_ui_time_command_t;
 
 typedef struct {
