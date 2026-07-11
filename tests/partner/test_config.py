@@ -3,13 +3,17 @@ from __future__ import annotations
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from contextlib import redirect_stderr
+from contextlib import redirect_stdout
 from io import StringIO
+import json
+import stat
+from urllib import error
 from unittest.mock import patch
 import unittest
 
 from pocket_journal_partner import cli
 from pocket_journal_partner.config import DeviceProfile, PartnerConfig
-from pocket_journal_partner.device import DeviceClient, DeviceError, SerialDeviceClient, resolve_serial_port
+from pocket_journal_partner.device import AudioItem, DeviceClient, DeviceError, SerialDeviceClient, resolve_serial_port
 
 
 class ConfigTests(unittest.TestCase):
@@ -27,6 +31,7 @@ class ConfigTests(unittest.TestCase):
             config.save(path)
             loaded = PartnerConfig.load(path)
             self.assertEqual(loaded.devices["pj-test"].token, "token")
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
 
     def test_time_endpoint_payload(self) -> None:
         calls = []
@@ -63,6 +68,67 @@ class ConfigTests(unittest.TestCase):
             client.status()
 
         self.assertEqual(captured, [("Bearer pairing-token", 3.0)])
+
+    def test_http_client_rejects_unsafe_connection_configuration(self) -> None:
+        for base_url, token in (
+            ("device.local", "token"),
+            ("ftp://device.local", "token"),
+            ("http://user:password@device.local", "token"),
+            ("http://device.local", ""),
+        ):
+            with self.subTest(base_url=base_url, token=token), self.assertRaises(DeviceError):
+                DeviceClient(base_url, token)
+
+    def test_http_errors_are_actionable_and_never_include_token(self) -> None:
+        client = DeviceClient("http://device.local", "super-secret-token")
+        for code, expected in (
+            (401, "authentication failed"),
+            (404, "capability is not supported"),
+            (409, "device is busy"),
+            (500, "HTTP 500"),
+        ):
+            with self.subTest(code=code):
+                failure = error.HTTPError(client._url("/v1/status"), code, "error", {}, None)
+                with patch("pocket_journal_partner.device.request.urlopen", side_effect=failure):
+                    with self.assertRaises(DeviceError) as raised:
+                        client.status()
+                failure.close()
+                self.assertIn(expected, str(raised.exception))
+                self.assertNotIn("super-secret-token", str(raised.exception))
+
+    def test_provision_output_does_not_expose_generated_token_or_password(self) -> None:
+        with TemporaryDirectory() as tmp:
+            stdout = StringIO()
+            with redirect_stdout(stdout):
+                exit_code = cli.main([
+                    "provision",
+                    "--ssid", "Lab",
+                    "--password", "very-secret-password",
+                    "--mock",
+                    "--data-dir", tmp,
+                ])
+            output = stdout.getvalue()
+            stored = json.loads((Path(tmp) / "config.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(exit_code, 0)
+        self.assertTrue(stored["devices"])
+        token = next(iter(stored["devices"].values()))["token"]
+        self.assertNotIn(token, output)
+        self.assertNotIn("very-secret-password", output)
+        self.assertNotIn("token", json.loads(output))
+
+    def test_audio_paths_escape_ids_and_contain_device_filenames(self) -> None:
+        calls = []
+        client = DeviceClient("http://device.local", "token")
+        client._request = lambda method, path, body=None: calls.append((method, path, body)) or b"RIFF"  # type: ignore[method-assign]
+        with TemporaryDirectory() as tmp:
+            target = Path(tmp)
+            result = client.download_audio(
+                AudioItem("folder/rec.wav", "../rec.wav"),
+                target,
+            )
+        self.assertEqual(result.name, "rec.wav")
+        self.assertEqual(calls[0][1], "/v1/audio/folder%2Frec.wav")
 
     def test_audio_payloads_and_wipe_endpoint(self) -> None:
         calls = []
@@ -161,6 +227,22 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(device_id, "usb")
         self.assertIsInstance(client, SerialDeviceClient)
         self.assertEqual(client.port, "/dev/cu.usbmodem1101")
+
+    def test_explicit_lan_connection_does_not_require_stored_profile(self) -> None:
+        parser = cli.build_parser()
+        args = parser.parse_args([
+            "device", "status",
+            "--device", "pj-explicit",
+            "--base-url", "http://device.local",
+            "--token", "override-token",
+        ])
+
+        device_id, client = cli._control_client_from_args(args)
+
+        self.assertEqual(device_id, "pj-explicit")
+        self.assertIsInstance(client, DeviceClient)
+        self.assertEqual(client.base_url, "http://device.local")
+        self.assertEqual(client.token, "override-token")
 
     def test_cli_device_error_is_user_facing(self) -> None:
         original = cli.cmd_discover

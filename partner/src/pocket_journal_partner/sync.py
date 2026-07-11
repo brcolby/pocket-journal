@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 from .device import DeviceClient
@@ -18,9 +19,13 @@ def sync_device_audio(
     for item in client.list_audio():
         if item.synced or item.transcript_uploaded:
             continue
-        audio_path = client.download_audio(item, store.audio_dir(device_id))
-        transcript = backend.transcribe(audio_path)
-        store.save_transcript(device_id, item.audio_id, transcript)
+        audio_path = store.audio_dir(device_id) / Path(item.filename).name
+        if not audio_path.exists():
+            audio_path = client.download_audio(item, store.audio_dir(device_id))
+        transcript = store.load_transcript(device_id, item.audio_id)
+        if transcript is None:
+            transcript = backend.transcribe(audio_path)
+            store.save_transcript(device_id, item.audio_id, transcript)
         client.upload_transcript(item.audio_id, transcript)
         entry = {
             "device_id": device_id,

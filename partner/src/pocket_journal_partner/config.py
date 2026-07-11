@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 import json
 import os
+import tempfile
 
 
 def default_data_dir() -> Path:
@@ -41,7 +42,23 @@ class PartnerConfig:
                 for key, profile in sorted(self.devices.items())
             }
         }
-        path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        serialized = json.dumps(data, indent=2, sort_keys=True) + "\n"
+        temp_path: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                "w",
+                encoding="utf-8",
+                dir=path.parent,
+                prefix=f".{path.name}.",
+                delete=False,
+            ) as handle:
+                temp_path = Path(handle.name)
+                handle.write(serialized)
+            os.chmod(temp_path, 0o600)
+            os.replace(temp_path, path)
+        finally:
+            if temp_path is not None and temp_path.exists():
+                temp_path.unlink()
 
 
 def config_path(data_dir: Path | None = None) -> Path:
@@ -54,4 +71,3 @@ def load_config(data_dir: Path | None = None) -> PartnerConfig:
 
 def save_config(config: PartnerConfig, data_dir: Path | None = None) -> None:
     config.save(config_path(data_dir))
-

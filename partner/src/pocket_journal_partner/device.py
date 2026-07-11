@@ -50,6 +50,13 @@ class AudioItem:
 
 class DeviceClient:
     def __init__(self, base_url: str, token: str, timeout: float = 20.0) -> None:
+        parsed = parse.urlparse(base_url)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise DeviceError("device base URL must be an http:// or https:// URL with a host")
+        if parsed.username is not None or parsed.password is not None:
+            raise DeviceError("device base URL must not contain credentials")
+        if not token:
+            raise DeviceError("device bearer token is missing; provision the device again")
         self.base_url = base_url.rstrip("/")
         self.token = token
         self.timeout = timeout
@@ -71,10 +78,21 @@ class DeviceClient:
                     return None
                 content_type = response.headers.get("Content-Type", "")
                 if "application/json" in content_type:
-                    return json.loads(payload.decode("utf-8"))
+                    try:
+                        return json.loads(payload.decode("utf-8"))
+                    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                        raise DeviceError(f"{method} {path} failed: device returned invalid JSON") from exc
                 return payload
         except error.HTTPError as exc:
-            raise DeviceError(f"{method} {path} failed: HTTP {exc.code}") from exc
+            if exc.code == 401:
+                detail = "authentication failed; verify the paired device token"
+            elif exc.code == 404:
+                detail = "capability is not supported by this firmware"
+            elif exc.code == 409:
+                detail = "device is busy; stop recording or playback and retry"
+            else:
+                detail = f"HTTP {exc.code}"
+            raise DeviceError(f"{method} {path} failed: {detail}") from exc
         except error.URLError as exc:
             raise DeviceError(f"{method} {path} failed: {exc.reason}") from exc
 
@@ -115,20 +133,36 @@ class DeviceClient:
 
     def list_audio(self) -> list[AudioItem]:
         payload = self._request("GET", "/v1/audio")
-        return [AudioItem(**item) for item in payload.get("audio", [])]
+        if not isinstance(payload, dict) or not isinstance(payload.get("audio", []), list):
+            raise DeviceError("GET /v1/audio failed: device returned an invalid recording list")
+        try:
+            return [AudioItem(**item) for item in payload.get("audio", [])]
+        except (TypeError, KeyError) as exc:
+            raise DeviceError("GET /v1/audio failed: device returned invalid recording metadata") from exc
 
     def wipe_recordings(self) -> dict[str, Any] | None:
         return self._request("DELETE", "/v1/audio")
 
     def download_audio(self, item: AudioItem, target_dir: Path) -> Path:
         target_dir.mkdir(parents=True, exist_ok=True)
-        data = self._request("GET", f"/v1/audio/{parse.quote(item.audio_id)}")
-        path = target_dir / item.filename
-        path.write_bytes(data)
+        data = self._request("GET", f"/v1/audio/{parse.quote(item.audio_id, safe='')}")
+        if not isinstance(data, bytes):
+            raise DeviceError(f"GET recording {item.audio_id!r} failed: device returned non-audio content")
+        filename = Path(item.filename).name
+        if not filename or filename in {".", ".."}:
+            raise DeviceError(f"device returned an invalid filename for audio {item.audio_id!r}")
+        path = target_dir / filename
+        partial = path.with_name(f".{path.name}.part")
+        try:
+            partial.write_bytes(data)
+            partial.replace(path)
+        finally:
+            if partial.exists():
+                partial.unlink()
         return path
 
     def upload_transcript(self, audio_id: str, transcript: dict[str, Any]) -> None:
-        self._request("PUT", f"/v1/transcripts/{parse.quote(audio_id)}", transcript)
+        self._request("PUT", f"/v1/transcripts/{parse.quote(audio_id, safe='')}", transcript)
 
     def upload_calendar_today(self, payload: dict[str, Any]) -> None:
         self._request("PUT", "/v1/calendar/today", payload)
@@ -168,7 +202,10 @@ class SerialDeviceClient:
                         continue
                     line = raw.decode("utf-8", errors="replace").strip()
                     if line.startswith("PJ_OK "):
-                        return json.loads(line[6:])
+                        try:
+                            return json.loads(line[6:])
+                        except json.JSONDecodeError as exc:
+                            raise DeviceError("USB command failed: device returned invalid JSON") from exc
                     if line.startswith("PJ_ERR "):
                         try:
                             payload = json.loads(line[7:])
@@ -327,6 +364,10 @@ def discover_mdns() -> list[dict[str, str]]:
     try:
         ServiceBrowser(zeroconf, "_pocket-journal._tcp.local.", listener)
         time.sleep(2)
-        return listener.devices
+        unique = {
+            (device["device_id"], device["base_url"]): device
+            for device in listener.devices
+        }
+        return sorted(unique.values(), key=lambda device: (device["device_id"], device["base_url"]))
     finally:
         zeroconf.close()
