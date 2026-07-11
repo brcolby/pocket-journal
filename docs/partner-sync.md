@@ -39,7 +39,7 @@ pj recordings wipe --yes
 
 `pj provision --serial-port ...` stores Wi-Fi credentials and a generated API bearer token on the device, then writes the paired device profile into the local partner config.
 
-Without `--serial-port`, provisioning discovers a device advertising as `PJ-XXXXXX` and uses the Pocket Journal GATT service. Credentials are written as separate bounded values, then committed asynchronously so the BLE request does not block on NVS or Wi-Fi startup.
+Without `--serial-port`, provisioning discovers a device advertising as `PJ-XXXXXX` and uses the Pocket Journal GATT service. The SSID, password, token, and commit characteristics require an encrypted paired BLE connection before firmware accepts writes. The current firmware uses LE Secure Connections with bonding and no-display/no-input pairing; this prevents unauthenticated plaintext credential writes, but a product-owner passkey or display-confirmation UX is still required before claiming MITM-resistant first-time provisioning. Credentials are written as separate bounded values, then committed asynchronously so the BLE request does not block on NVS or Wi-Fi startup.
 
 | Value | UUID |
 | --- | --- |

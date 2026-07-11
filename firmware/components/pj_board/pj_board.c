@@ -55,6 +55,7 @@
 #include "mdns.h"
 #include "host/ble_hs.h"
 #include "host/ble_hs_mbuf.h"
+#include "host/ble_sm.h"
 #include "host/ble_uuid.h"
 #include "host/util/util.h"
 #include "nimble/ble.h"
@@ -1173,10 +1174,18 @@ static int ble_write_string(struct ble_gatt_access_ctxt *ctxt, char *out, size_t
     return 0;
 }
 
+static int ble_connection_encrypted(uint16_t conn_handle)
+{
+    struct ble_gap_conn_desc desc;
+    if (ble_gap_conn_find(conn_handle, &desc) != 0) {
+        return 0;
+    }
+    return desc.sec_state.encrypted && desc.sec_state.key_size >= 16;
+}
+
 static int ble_provision_access(uint16_t conn_handle, uint16_t attr_handle,
                                 struct ble_gatt_access_ctxt *ctxt, void *arg)
 {
-    (void)conn_handle;
     (void)attr_handle;
     intptr_t field = (intptr_t)arg;
     if (field == PJ_BLE_FIELD_STATUS && ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR) {
@@ -1188,6 +1197,10 @@ static int ble_provision_access(uint16_t conn_handle, uint16_t attr_handle,
     }
     if (ctxt->op != BLE_GATT_ACCESS_OP_WRITE_CHR) {
         return BLE_ATT_ERR_WRITE_NOT_PERMITTED;
+    }
+    if (!ble_connection_encrypted(conn_handle)) {
+        (void)snprintf(g_ble_state, sizeof(g_ble_state), "pairing-required");
+        return BLE_ATT_ERR_INSUFFICIENT_AUTHEN;
     }
     if (field == PJ_BLE_FIELD_SSID) {
         return ble_write_string(ctxt, g_ble_ssid, sizeof(g_ble_ssid));
@@ -1230,13 +1243,17 @@ static const struct ble_gatt_svc_def g_ble_services[] = {
         .uuid = &g_ble_service_uuid.u,
         .characteristics = (struct ble_gatt_chr_def[]) {
             {.uuid = &g_ble_ssid_uuid.u, .access_cb = ble_provision_access,
-             .arg = (void *)(intptr_t)PJ_BLE_FIELD_SSID, .flags = BLE_GATT_CHR_F_WRITE},
+             .arg = (void *)(intptr_t)PJ_BLE_FIELD_SSID,
+             .flags = BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_WRITE_ENC},
             {.uuid = &g_ble_password_uuid.u, .access_cb = ble_provision_access,
-             .arg = (void *)(intptr_t)PJ_BLE_FIELD_PASSWORD, .flags = BLE_GATT_CHR_F_WRITE},
+             .arg = (void *)(intptr_t)PJ_BLE_FIELD_PASSWORD,
+             .flags = BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_WRITE_ENC},
             {.uuid = &g_ble_token_uuid.u, .access_cb = ble_provision_access,
-             .arg = (void *)(intptr_t)PJ_BLE_FIELD_TOKEN, .flags = BLE_GATT_CHR_F_WRITE},
+             .arg = (void *)(intptr_t)PJ_BLE_FIELD_TOKEN,
+             .flags = BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_WRITE_ENC},
             {.uuid = &g_ble_commit_uuid.u, .access_cb = ble_provision_access,
-             .arg = (void *)(intptr_t)PJ_BLE_FIELD_COMMIT, .flags = BLE_GATT_CHR_F_WRITE},
+             .arg = (void *)(intptr_t)PJ_BLE_FIELD_COMMIT,
+             .flags = BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_WRITE_ENC},
             {.uuid = &g_ble_status_uuid.u, .access_cb = ble_provision_access,
              .arg = (void *)(intptr_t)PJ_BLE_FIELD_STATUS, .flags = BLE_GATT_CHR_F_READ},
             {0},
@@ -1290,7 +1307,16 @@ static int ble_gap_event(struct ble_gap_event *event, void *arg)
         if (event->connect.status != 0) {
             ble_advertise();
         } else {
-            (void)snprintf(g_ble_state, sizeof(g_ble_state), "connected");
+            (void)snprintf(g_ble_state, sizeof(g_ble_state), "pairing-required");
+        }
+    } else if (event->type == BLE_GAP_EVENT_ENC_CHANGE) {
+        struct ble_gap_conn_desc desc;
+        if (event->enc_change.status == 0 &&
+            ble_gap_conn_find(event->enc_change.conn_handle, &desc) == 0 &&
+            desc.sec_state.encrypted) {
+            (void)snprintf(g_ble_state, sizeof(g_ble_state), "paired");
+        } else {
+            (void)snprintf(g_ble_state, sizeof(g_ble_state), "pairing-required");
         }
     } else if (event->type == BLE_GAP_EVENT_DISCONNECT ||
                event->type == BLE_GAP_EVENT_ADV_COMPLETE) {
@@ -1338,6 +1364,11 @@ static esp_err_t ble_provisioning_start(void)
         return ESP_FAIL;
     }
     ble_hs_cfg.sync_cb = ble_on_sync;
+    ble_hs_cfg.sm_io_cap = BLE_SM_IO_CAP_NO_IO;
+    ble_hs_cfg.sm_bonding = 1;
+    ble_hs_cfg.sm_mitm = 0;
+    ble_hs_cfg.sm_sc = 1;
+    ble_hs_cfg.sm_sc_only = 1;
     if (xTaskCreate(ble_host_task, "pj-nimble", 4096, NULL, 5, NULL) != pdPASS) {
         return ESP_ERR_NO_MEM;
     }

@@ -4,6 +4,7 @@ from dataclasses import dataclass
 import asyncio
 import json
 import secrets
+from typing import Any
 
 
 SERVICE_UUID = "7e400001-b5a3-f393-e0a9-e50e24dcca9e"
@@ -14,11 +15,42 @@ COMMIT_UUID = "7e400005-b5a3-f393-e0a9-e50e24dcca9e"
 STATUS_UUID = "7e400006-b5a3-f393-e0a9-e50e24dcca9e"
 
 
+class BleProvisioningError(RuntimeError):
+    pass
+
+
 @dataclass
 class ProvisionedDevice:
     device_id: str
     ble_name: str
     token: str
+
+
+async def _ensure_secure_session(client: Any) -> None:
+    pair = getattr(client, "pair", None)
+    if not callable(pair):
+        return
+    try:
+        paired = await pair()
+    except Exception as exc:
+        raise BleProvisioningError(
+            "BLE provisioning requires secure pairing; re-enter provisioning mode and approve pairing"
+        ) from exc
+    if paired is False:
+        raise BleProvisioningError("BLE secure pairing was rejected; credentials were not sent")
+
+
+async def _write_secure(client: Any, uuid: str, data: bytes) -> None:
+    try:
+        await client.write_gatt_char(uuid, data, response=True)
+    except Exception as exc:
+        detail = str(exc).lower()
+        if "auth" in detail or "encrypt" in detail or "pair" in detail:
+            raise BleProvisioningError(
+                "BLE provisioning requires an encrypted paired connection; "
+                "pair with the Pocket Journal device and retry"
+            ) from exc
+        raise
 
 
 async def provision_wifi(ble_name: str | None, ssid: str, password: str, *, mock: bool = False) -> ProvisionedDevice:
@@ -46,10 +78,11 @@ async def provision_wifi(ble_name: str | None, ssid: str, password: str, *, mock
     token = secrets.token_urlsafe(24)
     async with bleak.BleakClient(device) as client:
         initial = json.loads(bytes(await client.read_gatt_char(STATUS_UUID)).decode("utf-8"))
-        await client.write_gatt_char(SSID_UUID, ssid.encode("utf-8"), response=True)
-        await client.write_gatt_char(PASSWORD_UUID, password.encode("utf-8"), response=True)
-        await client.write_gatt_char(TOKEN_UUID, token.encode("utf-8"), response=True)
-        await client.write_gatt_char(COMMIT_UUID, b"\x01", response=True)
+        await _ensure_secure_session(client)
+        await _write_secure(client, SSID_UUID, ssid.encode("utf-8"))
+        await _write_secure(client, PASSWORD_UUID, password.encode("utf-8"))
+        await _write_secure(client, TOKEN_UUID, token.encode("utf-8"))
+        await _write_secure(client, COMMIT_UUID, b"\x01")
         status = initial
         for _ in range(25):
             status = json.loads(bytes(await client.read_gatt_char(STATUS_UUID)).decode("utf-8"))
