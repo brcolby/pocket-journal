@@ -108,8 +108,14 @@ def cmd_sync(args: argparse.Namespace) -> int:
     session = _lan_session_from_args(args)
     session.require("audio.sync")
     results = sync_device_audio(session.device_id, session.client, store, backend)  # type: ignore[arg-type]
-    _print_json(session.envelope({"synced": results, "count": len(results)}))
-    return 0
+    uploaded_count = sum(result.get("status") == "uploaded" for result in results)
+    failed_count = sum(result.get("status") == "failed" for result in results)
+    _print_json(session.envelope({
+        "results": results,
+        "uploaded_count": uploaded_count,
+        "failed_count": failed_count,
+    }))
+    return 1 if failed_count else 0
 
 
 def cmd_calendar_sync(args: argparse.Namespace) -> int:
