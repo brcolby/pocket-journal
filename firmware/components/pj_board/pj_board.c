@@ -46,6 +46,14 @@
 #include "sdmmc_cmd.h"
 #include "lwip/ip4_addr.h"
 #include "mdns.h"
+#include "host/ble_hs.h"
+#include "host/ble_hs_mbuf.h"
+#include "host/ble_uuid.h"
+#include "host/util/util.h"
+#include "nimble/ble.h"
+#include "nimble/nimble_port.h"
+#include "services/gap/ble_svc_gap.h"
+#include "services/gatt/ble_svc_gatt.h"
 #endif
 
 #define PJ_DEFAULT_TOKEN "dev-token"
@@ -179,6 +187,13 @@ static int g_network_stack_ready;
 static int g_wifi_started;
 static esp_netif_t *g_wifi_sta_netif;
 static int g_mdns_started;
+static int g_ble_started;
+static uint8_t g_ble_addr_type;
+static TaskHandle_t g_ble_provision_task;
+static char g_ble_ssid[PJ_WIFI_SSID_MAX_LEN + 1];
+static char g_ble_password[PJ_WIFI_PASSWORD_MAX_LEN + 1];
+static char g_ble_token[sizeof(g_status.token)];
+static char g_ble_state[24] = "idle";
 static pj_aux_input_t g_aux_input;
 static int g_touch_task_started;
 static int g_serial_command_task_started;
@@ -733,6 +748,239 @@ static esp_err_t wifi_save_provisioning(const char *ssid, const char *password, 
     ESP_LOGI(TAG, "Wi-Fi credentials stored from partner provisioning");
     esp_err_t connect_err = wifi_start_or_reconfigure();
     return connect_err == ESP_ERR_INVALID_STATE ? ESP_OK : connect_err;
+}
+
+enum {
+    PJ_BLE_FIELD_SSID = 1,
+    PJ_BLE_FIELD_PASSWORD,
+    PJ_BLE_FIELD_TOKEN,
+    PJ_BLE_FIELD_COMMIT,
+    PJ_BLE_FIELD_STATUS,
+};
+
+typedef struct {
+    char ssid[PJ_WIFI_SSID_MAX_LEN + 1];
+    char password[PJ_WIFI_PASSWORD_MAX_LEN + 1];
+    char token[sizeof(g_status.token)];
+} ble_provision_args_t;
+
+static const ble_uuid128_t g_ble_service_uuid = BLE_UUID128_INIT(
+    0x9e, 0xca, 0xdc, 0x24, 0x0e, 0xe5, 0xa9, 0xe0,
+    0x93, 0xf3, 0xa3, 0xb5, 0x01, 0x00, 0x40, 0x7e);
+static const ble_uuid128_t g_ble_ssid_uuid = BLE_UUID128_INIT(
+    0x9e, 0xca, 0xdc, 0x24, 0x0e, 0xe5, 0xa9, 0xe0,
+    0x93, 0xf3, 0xa3, 0xb5, 0x02, 0x00, 0x40, 0x7e);
+static const ble_uuid128_t g_ble_password_uuid = BLE_UUID128_INIT(
+    0x9e, 0xca, 0xdc, 0x24, 0x0e, 0xe5, 0xa9, 0xe0,
+    0x93, 0xf3, 0xa3, 0xb5, 0x03, 0x00, 0x40, 0x7e);
+static const ble_uuid128_t g_ble_token_uuid = BLE_UUID128_INIT(
+    0x9e, 0xca, 0xdc, 0x24, 0x0e, 0xe5, 0xa9, 0xe0,
+    0x93, 0xf3, 0xa3, 0xb5, 0x04, 0x00, 0x40, 0x7e);
+static const ble_uuid128_t g_ble_commit_uuid = BLE_UUID128_INIT(
+    0x9e, 0xca, 0xdc, 0x24, 0x0e, 0xe5, 0xa9, 0xe0,
+    0x93, 0xf3, 0xa3, 0xb5, 0x05, 0x00, 0x40, 0x7e);
+static const ble_uuid128_t g_ble_status_uuid = BLE_UUID128_INIT(
+    0x9e, 0xca, 0xdc, 0x24, 0x0e, 0xe5, 0xa9, 0xe0,
+    0x93, 0xf3, 0xa3, 0xb5, 0x06, 0x00, 0x40, 0x7e);
+
+static void ble_provision_task(void *arg)
+{
+    ble_provision_args_t *args = arg;
+    esp_err_t err = wifi_save_provisioning(args->ssid, args->password, args->token);
+    if (err == ESP_OK) {
+        (void)snprintf(g_ble_state, sizeof(g_ble_state), "stored");
+        g_status.ble_provisioning = PJ_BOARD_SERVICE_READY;
+    } else {
+        (void)snprintf(g_ble_state, sizeof(g_ble_state), "error-%s", esp_err_to_name(err));
+        g_status.ble_provisioning = PJ_BOARD_SERVICE_ERROR;
+    }
+    memset(args, 0, sizeof(*args));
+    free(args);
+    g_ble_provision_task = NULL;
+    vTaskDelete(NULL);
+}
+
+static int ble_write_string(struct ble_gatt_access_ctxt *ctxt, char *out, size_t out_size)
+{
+    uint16_t length = 0;
+    if (ble_hs_mbuf_to_flat(ctxt->om, out, (uint16_t)(out_size - 1U), &length) != 0) {
+        return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
+    }
+    out[length] = '\0';
+    return 0;
+}
+
+static int ble_provision_access(uint16_t conn_handle, uint16_t attr_handle,
+                                struct ble_gatt_access_ctxt *ctxt, void *arg)
+{
+    (void)conn_handle;
+    (void)attr_handle;
+    intptr_t field = (intptr_t)arg;
+    if (field == PJ_BLE_FIELD_STATUS && ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR) {
+        char json[128];
+        int length = snprintf(json, sizeof(json),
+                              "{\"device_id\":\"%s\",\"state\":\"%s\",\"wifi\":\"%s\"}",
+                              g_status.device_id, g_ble_state, service_name(g_status.wifi));
+        return os_mbuf_append(ctxt->om, json, (uint16_t)length) == 0 ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
+    }
+    if (ctxt->op != BLE_GATT_ACCESS_OP_WRITE_CHR) {
+        return BLE_ATT_ERR_WRITE_NOT_PERMITTED;
+    }
+    if (field == PJ_BLE_FIELD_SSID) {
+        return ble_write_string(ctxt, g_ble_ssid, sizeof(g_ble_ssid));
+    }
+    if (field == PJ_BLE_FIELD_PASSWORD) {
+        return ble_write_string(ctxt, g_ble_password, sizeof(g_ble_password));
+    }
+    if (field == PJ_BLE_FIELD_TOKEN) {
+        return ble_write_string(ctxt, g_ble_token, sizeof(g_ble_token));
+    }
+    if (field != PJ_BLE_FIELD_COMMIT || OS_MBUF_PKTLEN(ctxt->om) != 1 ||
+        ctxt->om->om_data[0] != 1 || g_ble_ssid[0] == '\0' || g_ble_token[0] == '\0') {
+        return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
+    }
+    if (g_ble_provision_task != NULL) {
+        return BLE_ATT_ERR_UNLIKELY;
+    }
+    ble_provision_args_t *args = malloc(sizeof(*args));
+    if (args == NULL) {
+        return BLE_ATT_ERR_INSUFFICIENT_RES;
+    }
+    (void)snprintf(args->ssid, sizeof(args->ssid), "%s", g_ble_ssid);
+    (void)snprintf(args->password, sizeof(args->password), "%s", g_ble_password);
+    (void)snprintf(args->token, sizeof(args->token), "%s", g_ble_token);
+    (void)snprintf(g_ble_state, sizeof(g_ble_state), "applying");
+    if (xTaskCreate(ble_provision_task, "pj-ble-provision", 4096, args, 4,
+                    &g_ble_provision_task) != pdPASS) {
+        free(args);
+        g_ble_provision_task = NULL;
+        return BLE_ATT_ERR_INSUFFICIENT_RES;
+    }
+    memset(g_ble_password, 0, sizeof(g_ble_password));
+    memset(g_ble_token, 0, sizeof(g_ble_token));
+    return 0;
+}
+
+static const struct ble_gatt_svc_def g_ble_services[] = {
+    {
+        .type = BLE_GATT_SVC_TYPE_PRIMARY,
+        .uuid = &g_ble_service_uuid.u,
+        .characteristics = (struct ble_gatt_chr_def[]) {
+            {.uuid = &g_ble_ssid_uuid.u, .access_cb = ble_provision_access,
+             .arg = (void *)(intptr_t)PJ_BLE_FIELD_SSID, .flags = BLE_GATT_CHR_F_WRITE},
+            {.uuid = &g_ble_password_uuid.u, .access_cb = ble_provision_access,
+             .arg = (void *)(intptr_t)PJ_BLE_FIELD_PASSWORD, .flags = BLE_GATT_CHR_F_WRITE},
+            {.uuid = &g_ble_token_uuid.u, .access_cb = ble_provision_access,
+             .arg = (void *)(intptr_t)PJ_BLE_FIELD_TOKEN, .flags = BLE_GATT_CHR_F_WRITE},
+            {.uuid = &g_ble_commit_uuid.u, .access_cb = ble_provision_access,
+             .arg = (void *)(intptr_t)PJ_BLE_FIELD_COMMIT, .flags = BLE_GATT_CHR_F_WRITE},
+            {.uuid = &g_ble_status_uuid.u, .access_cb = ble_provision_access,
+             .arg = (void *)(intptr_t)PJ_BLE_FIELD_STATUS, .flags = BLE_GATT_CHR_F_READ},
+            {0},
+        },
+    },
+    {0},
+};
+
+static int ble_gap_event(struct ble_gap_event *event, void *arg);
+
+static void ble_advertise(void)
+{
+    struct ble_hs_adv_fields fields = {0};
+    fields.flags = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
+    const char *name = ble_svc_gap_device_name();
+    fields.uuids128 = (ble_uuid128_t *)&g_ble_service_uuid;
+    fields.num_uuids128 = 1;
+    fields.uuids128_is_complete = 1;
+    int rc = ble_gap_adv_set_fields(&fields);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "BLE advertising fields failed: %d", rc);
+        return;
+    }
+    struct ble_hs_adv_fields response = {0};
+    response.name = (uint8_t *)name;
+    response.name_len = strlen(name);
+    response.name_is_complete = 1;
+    rc = ble_gap_adv_rsp_set_fields(&response);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "BLE scan response fields failed: %d", rc);
+        return;
+    }
+    struct ble_gap_adv_params params = {0};
+    params.conn_mode = BLE_GAP_CONN_MODE_UND;
+    params.disc_mode = BLE_GAP_DISC_MODE_GEN;
+    rc = ble_gap_adv_start(g_ble_addr_type, NULL, BLE_HS_FOREVER, &params,
+                           ble_gap_event, NULL);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "BLE advertising start failed: %d", rc);
+        return;
+    }
+    (void)snprintf(g_ble_state, sizeof(g_ble_state), "advertising");
+    g_status.ble_provisioning = PJ_BOARD_SERVICE_READY;
+    ESP_LOGI(TAG, "BLE provisioning advertising as %s", name);
+}
+
+static int ble_gap_event(struct ble_gap_event *event, void *arg)
+{
+    (void)arg;
+    if (event->type == BLE_GAP_EVENT_CONNECT) {
+        if (event->connect.status != 0) {
+            ble_advertise();
+        } else {
+            (void)snprintf(g_ble_state, sizeof(g_ble_state), "connected");
+        }
+    } else if (event->type == BLE_GAP_EVENT_DISCONNECT ||
+               event->type == BLE_GAP_EVENT_ADV_COMPLETE) {
+        ble_advertise();
+    }
+    return 0;
+}
+
+static void ble_on_sync(void)
+{
+    if (ble_hs_util_ensure_addr(0) != 0 || ble_hs_id_infer_auto(0, &g_ble_addr_type) != 0) {
+        g_status.ble_provisioning = PJ_BOARD_SERVICE_ERROR;
+        (void)snprintf(g_ble_state, sizeof(g_ble_state), "address-error");
+        return;
+    }
+    ble_advertise();
+}
+
+static void ble_host_task(void *arg)
+{
+    (void)arg;
+    nimble_port_run();
+    vTaskDelete(NULL);
+}
+
+static esp_err_t ble_provisioning_start(void)
+{
+    if (g_ble_started) {
+        return ESP_OK;
+    }
+    esp_err_t err = nimble_port_init();
+    if (err != ESP_OK) {
+        return err;
+    }
+    ble_svc_gap_init();
+    ble_svc_gatt_init();
+    char name[20];
+    (void)snprintf(name, sizeof(name), "PJ-%.6s", g_status.device_id + 3);
+    for (char *cursor = name; *cursor != '\0'; cursor++) {
+        *cursor = (char)toupper((unsigned char)*cursor);
+    }
+    if (ble_svc_gap_device_name_set(name) != 0 ||
+        ble_gatts_count_cfg(g_ble_services) != 0 ||
+        ble_gatts_add_svcs(g_ble_services) != 0) {
+        return ESP_FAIL;
+    }
+    ble_hs_cfg.sync_cb = ble_on_sync;
+    if (xTaskCreate(ble_host_task, "pj-nimble", 4096, NULL, 5, NULL) != pdPASS) {
+        return ESP_ERR_NO_MEM;
+    }
+    g_ble_started = 1;
+    g_status.ble_provisioning = PJ_BOARD_SERVICE_READY;
+    return ESP_OK;
 }
 
 static esp_err_t epd_write_bytes(const uint8_t *data, int len)
@@ -1931,13 +2179,13 @@ static esp_err_t rtc_write_status_time(void)
     return err;
 }
 
-static void put_le16(uint8_t *data, uint16_t value)
+static void wav_put_le16(uint8_t *data, uint16_t value)
 {
     data[0] = (uint8_t)(value & 0xFF);
     data[1] = (uint8_t)(value >> 8);
 }
 
-static void put_le32(uint8_t *data, uint32_t value)
+static void wav_put_le32(uint8_t *data, uint32_t value)
 {
     data[0] = (uint8_t)(value & 0xFF);
     data[1] = (uint8_t)((value >> 8) & 0xFF);
@@ -1955,13 +2203,13 @@ static int wav_write_header(FILE *file, uint32_t data_bytes, uint16_t channels, 
     uint16_t bits = PJ_AUDIO_BITS_PER_SAMPLE;
     uint16_t block_align = (uint16_t)(channels * (bits / 8));
     uint32_t byte_rate = sample_rate * block_align;
-    put_le32(&header[4], 36u + data_bytes);
-    put_le16(&header[22], channels);
-    put_le32(&header[24], sample_rate);
-    put_le32(&header[28], byte_rate);
-    put_le16(&header[32], block_align);
-    put_le16(&header[34], bits);
-    put_le32(&header[40], data_bytes);
+    wav_put_le32(&header[4], 36u + data_bytes);
+    wav_put_le16(&header[22], channels);
+    wav_put_le32(&header[24], sample_rate);
+    wav_put_le32(&header[28], byte_rate);
+    wav_put_le16(&header[32], block_align);
+    wav_put_le16(&header[34], bits);
+    wav_put_le32(&header[40], data_bytes);
     long pos = ftell(file);
     if (pos < 0 || fseek(file, 0, SEEK_SET) != 0) {
         return 0;
@@ -3007,6 +3255,13 @@ void pj_board_start_services(const pj_board_profile_t *profile)
     (void)profile;
     (void)pj_board_http_start();
 #ifdef ESP_PLATFORM
+    esp_err_t ble_err = ble_provisioning_start();
+    if (ble_err != ESP_OK) {
+        g_status.ble_provisioning = PJ_BOARD_SERVICE_ERROR;
+        (void)snprintf(g_status.last_error, sizeof(g_status.last_error),
+                       "BLE provisioning start failed: %s", esp_err_to_name(ble_err));
+        ESP_LOGE(TAG, "%s", g_status.last_error);
+    }
     if (g_wifi_credentials_stored) {
         esp_err_t wifi_err = wifi_start_or_reconfigure();
         if (wifi_err != ESP_OK) {

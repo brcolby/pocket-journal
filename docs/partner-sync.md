@@ -36,7 +36,20 @@ pj device sync-time
 pj recordings wipe --yes
 ```
 
-`pj provision --serial-port ...` stores Wi-Fi credentials and a generated API bearer token on the device, then writes the paired device profile into the local partner config. Actual Wi-Fi connection/reconnect is still firmware work tracked separately.
+`pj provision --serial-port ...` stores Wi-Fi credentials and a generated API bearer token on the device, then writes the paired device profile into the local partner config.
+
+Without `--serial-port`, provisioning discovers a device advertising as `PJ-XXXXXX` and uses the Pocket Journal GATT service. Credentials are written as separate bounded values, then committed asynchronously so the BLE request does not block on NVS or Wi-Fi startup.
+
+| Value | UUID |
+| --- | --- |
+| Service | `7e400001-b5a3-f393-e0a9-e50e24dcca9e` |
+| SSID | `7e400002-b5a3-f393-e0a9-e50e24dcca9e` |
+| Password | `7e400003-b5a3-f393-e0a9-e50e24dcca9e` |
+| API token | `7e400004-b5a3-f393-e0a9-e50e24dcca9e` |
+| Commit | `7e400005-b5a3-f393-e0a9-e50e24dcca9e` |
+| Status | `7e400006-b5a3-f393-e0a9-e50e24dcca9e` |
+
+The status characteristic returns the device id, provisioning state, and current Wi-Fi state. After credentials are stored, firmware connects as a station, reconnects after disconnects, and advertises `_pocket-journal._tcp.local.` over mDNS.
 
 Only one process can own the USB serial port. Quit `idf.py monitor` with `Ctrl+]` before running the partner utility over USB-C.
 
