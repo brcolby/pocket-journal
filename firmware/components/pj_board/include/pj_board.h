@@ -1,6 +1,7 @@
 #pragma once
 
 #include "pj_ui.h"
+#include "pj_storage.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -57,6 +58,10 @@ typedef struct {
     int battery_percent;
     int temperature_c;
     int storage_mounted;
+    uint64_t storage_total_bytes;
+    uint64_t storage_free_bytes;
+    pj_storage_health_t storage_health;
+    unsigned storage_recovery_count;
     int recording;
     int playback_active;
     int hour;
@@ -96,6 +101,7 @@ int pj_board_record_toggle(void);
 int pj_board_playback_toggle(void);
 int pj_board_playback_toggle_index(int note_index);
 int pj_board_wipe_recordings(pj_ui_context_t *ui);
+int pj_board_storage_recover(void);
 int pj_board_http_start(void);
 
 #ifdef __cplusplus
