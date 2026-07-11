@@ -206,7 +206,7 @@ static void test_aux_primary_actions(void)
     ui.state = PJ_UI_STATE_TIME;
     assert(pj_ui_handle_aux_short(&ui) == 1);
     assert(pj_ui_current_state(&ui) == PJ_UI_STATE_STOPWATCH);
-    assert(ui.stopwatch_running == 1);
+    assert(ui.stopwatch_running == 0);
 }
 
 static void test_aux_double_click_routing(void)
@@ -439,6 +439,95 @@ static void test_active_alert_gates_background_actions(void)
     assert(pj_ui_current_state(&ui) == PJ_UI_STATE_HOME);
 }
 
+static void test_sleep_preserves_durable_time_activity(void)
+{
+    pj_ui_context_t ui;
+    pj_ui_init(&ui);
+    ui.state = PJ_UI_STATE_HOME;
+    ui.stopwatch_running = 1;
+    ui.timer_running = 1;
+    ui.interval_running = 1;
+
+    pj_ui_sleep(&ui);
+    assert(pj_ui_current_state(&ui) == PJ_UI_STATE_STATIC);
+    assert(ui.stopwatch_running == 1);
+    assert(ui.timer_running == 1);
+    assert(ui.interval_running == 1);
+}
+
+static void test_recovery_notice_emits_acknowledgement(void)
+{
+    pj_ui_context_t ui;
+    pj_ui_init(&ui);
+    ui.state = PJ_UI_STATE_TIMER;
+    pj_ui_time_projection_t projection = {0};
+    projection.timer_remaining_ms = 30000;
+    projection.recovery_time_uncertain = 1;
+    pj_ui_set_time_projection(&ui, &projection);
+
+    assert(pj_ui_handle_touch(&ui, 170, 16, PJ_TOUCH_TAP) == 1);
+    pj_ui_time_command_t command;
+    assert(pj_ui_consume_time_command(&ui, &command) == 1);
+    assert(command.type == PJ_UI_TIME_COMMAND_RECOVERY_ACKNOWLEDGE);
+}
+
+static void test_time_controls_emit_explicit_commands(void)
+{
+    pj_ui_context_t ui;
+    pj_ui_time_command_t command;
+    pj_ui_init(&ui);
+
+    ui.state = PJ_UI_STATE_STOPWATCH;
+    ui.stopwatch_running = 1;
+    ui.stopwatch_seconds = 42;
+    assert(pj_ui_handle_touch(&ui, 170, 160, PJ_TOUCH_TAP) == 1);
+    assert(pj_ui_consume_time_command(&ui, &command) == 1);
+    assert(command.type == PJ_UI_TIME_COMMAND_STOPWATCH_RESET);
+
+    ui.state = PJ_UI_STATE_TIMER;
+    ui.timer_running = 0;
+    ui.timer_seconds = 90;
+    assert(pj_ui_handle_aux_short(&ui) == 1);
+    assert(pj_ui_consume_time_command(&ui, &command) == 1);
+    assert(command.type == PJ_UI_TIME_COMMAND_TIMER_START);
+    assert(command.duration_ms == 90000);
+    assert(pj_ui_handle_aux_short(&ui) == 1);
+    assert(pj_ui_consume_time_command(&ui, &command) == 1);
+    assert(command.type == PJ_UI_TIME_COMMAND_TIMER_PAUSE);
+    assert(pj_ui_handle_touch(&ui, 170, 160, PJ_TOUCH_TAP) == 1);
+    assert(pj_ui_consume_time_command(&ui, &command) == 1);
+    assert(command.type == PJ_UI_TIME_COMMAND_TIMER_RESET);
+
+    ui.state = PJ_UI_STATE_INTERVAL;
+    ui.interval_running = 0;
+    ui.interval_seconds = 120;
+    assert(pj_ui_handle_aux_short(&ui) == 1);
+    assert(pj_ui_consume_time_command(&ui, &command) == 1);
+    assert(command.type == PJ_UI_TIME_COMMAND_INTERVAL_START);
+    assert(command.duration_ms == 120000);
+    assert(command.secondary_duration_ms == 300000);
+    assert(pj_ui_handle_aux_short(&ui) == 1);
+    assert(pj_ui_consume_time_command(&ui, &command) == 1);
+    assert(command.type == PJ_UI_TIME_COMMAND_INTERVAL_PAUSE);
+    assert(pj_ui_handle_touch(&ui, 170, 160, PJ_TOUCH_TAP) == 1);
+    assert(pj_ui_consume_time_command(&ui, &command) == 1);
+    assert(command.type == PJ_UI_TIME_COMMAND_INTERVAL_RESET);
+
+    ui.state = PJ_UI_STATE_TIMER;
+    ui.timer_seconds = 86400;
+    assert(pj_ui_handle_touch(&ui, 100, 160, PJ_TOUCH_TAP) == 1);
+    assert(ui.timer_seconds == 86400);
+    assert(pj_ui_consume_time_command(&ui, &command) == 1);
+    assert(command.duration_ms == 86400000);
+
+    ui.state = PJ_UI_STATE_INTERVAL;
+    ui.interval_seconds = 86400;
+    assert(pj_ui_handle_touch(&ui, 100, 160, PJ_TOUCH_TAP) == 1);
+    assert(ui.interval_seconds == 86400);
+    assert(pj_ui_consume_time_command(&ui, &command) == 1);
+    assert(command.duration_ms == 86400000);
+}
+
 static void test_alert_overlay_commands_keep_model_authoritative(void)
 {
     pj_ui_context_t ui;
@@ -636,6 +725,9 @@ int main(void)
     test_timer_presets_are_not_runtime_counters();
     test_time_projection_and_alert_repaint();
     test_active_alert_gates_background_actions();
+    test_sleep_preserves_durable_time_activity();
+    test_recovery_notice_emits_acknowledgement();
+    test_time_controls_emit_explicit_commands();
     test_alert_overlay_commands_keep_model_authoritative();
     test_sync_state_is_board_driven();
     test_dirty_lifecycle();
