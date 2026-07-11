@@ -54,6 +54,22 @@ cp -rf source dest          # NOT: cp -r source dest
 - Firmware builds and flashes performed for development or validation are not releases.
 - Creating or pushing a firmware release tag, or publishing a release from that tag, requires explicit human approval for that release.
 
+## Human Validation Bead Policy
+
+When implementation, automated tests, simulator checks, or development firmware
+validation are complete but final hardware or product-owner validation is still
+required, keep the bead open and move it into an explicit human-validation
+section in status reports and handoffs.
+
+- Do not close beads on software-only, simulator-only, or agent-observed
+  hardware evidence unless the user explicitly approves closure for that bead.
+- Update the bead notes with the exact completed implementation, validation
+  commands, tested firmware or commit, and the remaining human check.
+- In handoffs, group these beads under `Human Validation Required` with the
+  bead id, what the human should check, and what evidence would allow closure.
+- Do not mix human-validation beads into the normal ready-work list unless the
+  next action is still agent-executable without new human evidence.
+
 <!-- BEGIN BEADS INTEGRATION v:1 profile:minimal hash:970c3bf2 -->
 ## Beads Issue Tracker
 
