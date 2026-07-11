@@ -61,8 +61,14 @@ validation are complete but final hardware or product-owner validation is still
 required, keep the bead open and move it into an explicit human-validation
 section in status reports and handoffs.
 
-- Do not close beads on software-only, simulator-only, or agent-observed
-  hardware evidence unless the user explicitly approves closure for that bead.
+- Automatically close a bead when all acceptance criteria are satisfied and no
+  physical hardware, perceptual, safety, release, or product-owner validation is
+  required. Software-only, simulator, build, static-analysis, and automated-test
+  evidence is sufficient when the bead's scope and acceptance criteria do not
+  require hardware or a human judgment.
+- Do not close a bead when any acceptance criterion or known residual risk still
+  requires physical hardware, perceptual, safety, release, or product-owner
+  validation. Keep it open unless the user explicitly approves closure.
 - Update the bead notes with the exact completed implementation, validation
   commands, tested firmware or commit, and the remaining human check.
 - Add or retain the `human` label when the bead is waiting only on human
