@@ -81,12 +81,6 @@ static const state_meta_t STATE_META[PJ_UI_STATE_COUNT] = {
     [PJ_UI_STATE_NOTE_DETAIL] = {PJ_UI_STATE_NOTE_DETAIL, "note_detail", "NOTE", PJ_UI_STATE_HOME},
 };
 
-static const tile_t HOME_TILES[] = {
-    {"", "NOTE", PJ_UI_STATE_NOTES, 8, 8, 118, 184},
-    {"", "TIME", PJ_UI_STATE_TIME, 134, 8, 58, 86},
-    {"", "SET", PJ_UI_STATE_SETTINGS, 134, 106, 58, 86},
-};
-
 static const tile_t NOTES_TILES[] = {
     {"", "REC", PJ_UI_STATE_RECORD, 8, 8, 184, 84},
     {"", "PLAY", PJ_UI_STATE_LISTEN, 8, 104, 88, 88},
@@ -117,6 +111,42 @@ static int weekday_from_date(int year, int month, int day)
     int j = year / 100;
     int h = (day + (13 * (month + 1)) / 5 + k + k / 4 + j / 4 + 5 * j) % 7;
     return (h + 6) % 7;
+}
+
+static pj_ui_state_t state_from_destination(const char *destination)
+{
+    if (destination == NULL) {
+        return PJ_UI_STATE_HOME;
+    }
+    for (int state = PJ_UI_STATE_NOTES; state < PJ_UI_STATE_NOTE_DETAIL; state++) {
+        if (strcmp(destination, STATE_META[state].name) == 0) {
+            return (pj_ui_state_t)state;
+        }
+    }
+    return PJ_UI_STATE_HOME;
+}
+
+static size_t home_tiles(const pj_ui_context_t *ctx, tile_t tiles[PJ_HOME_MAX_SLOTS])
+{
+    static const int x[PJ_HOME_MAX_SLOTS] = {8, 104, 8, 104};
+    static const int y[PJ_HOME_MAX_SLOTS] = {20, 20, 110, 110};
+    static const int h[PJ_HOME_MAX_SLOTS] = {82, 82, 82, 82};
+    size_t count = ctx->home_layout.slot_count;
+    if (count > PJ_HOME_MAX_SLOTS) {
+        count = PJ_HOME_MAX_SLOTS;
+    }
+    for (size_t i = 0; i < count; i++) {
+        tiles[i] = (tile_t) {
+            .label = ctx->home_layout.slots[i].label,
+            .icon = ctx->home_layout.slots[i].icon,
+            .next = state_from_destination(ctx->home_layout.slots[i].destination),
+            .x = x[i],
+            .y = y[i],
+            .w = 88,
+            .h = h[i],
+        };
+    }
+    return count;
 }
 
 static const char *weekday_name(int weekday)
@@ -600,7 +630,15 @@ static void draw_tiles(pj_framebuffer_t *fb, const tile_t *tiles, size_t count)
         if (!lvgl_widgets_active()) {
             draw_round_rect_width(fb, tiles[i].x, tiles[i].y, tiles[i].w, tiles[i].h, 12, 3);
         }
-        draw_icon(fb, tiles[i].icon, tiles[i].x + tiles[i].w / 2, tiles[i].y + tiles[i].h / 2, icon_size);
+        int icon_y = tiles[i].y + tiles[i].h / 2;
+        if (tiles[i].label[0] != '\0') {
+            icon_y -= 7;
+        }
+        draw_icon(fb, tiles[i].icon, tiles[i].x + tiles[i].w / 2, icon_y, icon_size);
+        if (tiles[i].label[0] != '\0') {
+            draw_text_center_at(fb, tiles[i].x + tiles[i].w / 2,
+                                tiles[i].y + tiles[i].h - 9, tiles[i].label, 1);
+        }
     }
 }
 
@@ -639,7 +677,34 @@ void pj_ui_init(pj_ui_context_t *ctx)
     ctx->playback_state = PJ_PLAYBACK_IDLE;
     ctx->note_count = 0;
     ctx->selected_note = 0;
+    pj_home_layout_defaults(&ctx->home_layout);
     mark_full(ctx);
+}
+
+int pj_ui_set_home_layout(pj_ui_context_t *ctx, const pj_home_layout_t *layout)
+{
+    pj_home_layout_t canonical;
+    if (ctx == NULL || !pj_home_layout_canonical_copy(&canonical, layout)) {
+        return 0;
+    }
+    if (memcmp(&ctx->home_layout, &canonical, sizeof(canonical)) == 0) {
+        return 1;
+    }
+    ctx->home_layout = canonical;
+    if (ctx->state == PJ_UI_STATE_HOME) {
+        mark_full(ctx);
+    }
+    return 1;
+}
+
+void pj_ui_restore_default_home(pj_ui_context_t *ctx)
+{
+    if (ctx == NULL) {
+        return;
+    }
+    pj_home_layout_t fallback;
+    pj_home_layout_defaults(&fallback);
+    (void)pj_ui_set_home_layout(ctx, &fallback);
 }
 
 pj_ui_state_t pj_ui_current_state(const pj_ui_context_t *ctx)
@@ -1034,12 +1099,15 @@ int pj_ui_handle_touch(pj_ui_context_t *ctx, int x, int y, pj_touch_kind_t kind)
     case PJ_UI_STATE_TIME_TEMP:
         set_state(ctx, PJ_UI_STATE_HOME);
         return 1;
-    case PJ_UI_STATE_HOME:
-        if (tile_hit(HOME_TILES, sizeof(HOME_TILES) / sizeof(HOME_TILES[0]), x, y, &next)) {
+    case PJ_UI_STATE_HOME: {
+        tile_t tiles[PJ_HOME_MAX_SLOTS];
+        size_t tile_count = home_tiles(ctx, tiles);
+        if (tile_hit(tiles, tile_count, x, y, &next)) {
             set_state(ctx, next);
             return 1;
         }
         break;
+    }
     case PJ_UI_STATE_NOTES:
         if (tile_hit(NOTES_TILES, sizeof(NOTES_TILES) / sizeof(NOTES_TILES[0]), x, y, &next)) {
             if (next == PJ_UI_STATE_RECORD) {
@@ -1377,9 +1445,13 @@ static void render_scene(const pj_ui_context_t *ctx, pj_framebuffer_t *fb)
     case PJ_UI_STATE_TIME_TEMP:
         draw_time_temp(ctx, fb);
         break;
-    case PJ_UI_STATE_HOME:
-        draw_tiles(fb, HOME_TILES, sizeof(HOME_TILES) / sizeof(HOME_TILES[0]));
+    case PJ_UI_STATE_HOME: {
+        tile_t tiles[PJ_HOME_MAX_SLOTS];
+        size_t tile_count = home_tiles(ctx, tiles);
+        draw_text_center_at(fb, PJ_DISPLAY_WIDTH / 2, 13, ctx->home_layout.title, 1);
+        draw_tiles(fb, tiles, tile_count);
         break;
+    }
     case PJ_UI_STATE_NOTES:
         draw_tiles(fb, NOTES_TILES, sizeof(NOTES_TILES) / sizeof(NOTES_TILES[0]));
         break;
@@ -1759,9 +1831,12 @@ static void lvgl_add_widgets(const pj_ui_context_t *ctx)
     int color_index = ctx->dark_mode ? 0 : 1;
 
     switch (ctx->state) {
-    case PJ_UI_STATE_HOME:
-        lvgl_tile_buttons(HOME_TILES, sizeof(HOME_TILES) / sizeof(HOME_TILES[0]), color_index);
+    case PJ_UI_STATE_HOME: {
+        tile_t tiles[PJ_HOME_MAX_SLOTS];
+        size_t tile_count = home_tiles(ctx, tiles);
+        lvgl_tile_buttons(tiles, tile_count, color_index);
         break;
+    }
     case PJ_UI_STATE_NOTES:
         lvgl_tile_buttons(NOTES_TILES, sizeof(NOTES_TILES) / sizeof(NOTES_TILES[0]), color_index);
         break;

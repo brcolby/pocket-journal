@@ -2,6 +2,7 @@
 #include "pj_audio_level.h"
 #include "pj_aux_input.h"
 #include "pj_auth.h"
+#include "pj_home_layout.h"
 #include "pj_note_model.h"
 #include "pj_settings.h"
 #include "pj_static_art.h"
@@ -75,6 +76,7 @@
 #define PJ_NVS_TIMER_SECONDS "timer_sec"
 #define PJ_NVS_INTERVAL_SECONDS "intvl_sec"
 #define PJ_NVS_STATIC_ART_SLOT "art_slot"
+#define PJ_NVS_HOME_LAYOUT "home_layout"
 #define PJ_STATIC_ART_SLOT_COUNT 2
 #define PJ_WIFI_SSID_MAX_LEN 32
 #define PJ_WIFI_PASSWORD_MAX_LEN 64
@@ -163,12 +165,14 @@
 static pj_board_status_t g_status;
 static pj_settings_t g_settings;
 static pj_static_art_t g_static_art;
+static pj_home_layout_t g_home_layout;
 static int g_static_art_valid;
 static int g_static_art_slot = -1;
 static int g_display_warning_logged;
 static int g_time_update_pending;
 static volatile int g_settings_update_pending;
 static volatile int g_static_art_update_pending;
+static volatile int g_home_layout_update_pending;
 
 #ifdef ESP_PLATFORM
 static httpd_handle_t g_http_server;
@@ -192,6 +196,7 @@ static SemaphoreHandle_t g_i2c_lock;
 static SemaphoreHandle_t g_audio_lock;
 static SemaphoreHandle_t g_settings_lock;
 static SemaphoreHandle_t g_static_art_lock;
+static SemaphoreHandle_t g_home_layout_lock;
 static sdmmc_card_t *g_sd_card;
 static uint8_t g_epd_buffer[PJ_FRAMEBUFFER_BYTES];
 static pj_framebuffer_t g_epd_shadow_fb;
@@ -727,6 +732,90 @@ static void static_art_give(void)
     if (g_static_art_lock != NULL) {
         xSemaphoreGive(g_static_art_lock);
     }
+}
+
+static int home_layout_take(TickType_t timeout)
+{
+    return g_home_layout_lock == NULL || xSemaphoreTake(g_home_layout_lock, timeout) == pdTRUE;
+}
+
+static void home_layout_give(void)
+{
+    if (g_home_layout_lock != NULL) {
+        xSemaphoreGive(g_home_layout_lock);
+    }
+}
+
+static void home_layout_load(void)
+{
+    pj_home_layout_defaults(&g_home_layout);
+    nvs_handle_t nvs;
+    if (nvs_open(PJ_NVS_NAMESPACE, NVS_READONLY, &nvs) != ESP_OK) {
+        return;
+    }
+    size_t record_size = 0;
+    esp_err_t err = nvs_get_blob(nvs, PJ_NVS_HOME_LAYOUT, NULL, &record_size);
+    if (err == ESP_OK && record_size == PJ_HOME_RECORD_BYTES) {
+        uint8_t *record = malloc(record_size);
+        pj_home_layout_t *loaded = malloc(sizeof(*loaded));
+        int read_ok = record != NULL && loaded != NULL &&
+                      nvs_get_blob(nvs, PJ_NVS_HOME_LAYOUT, record, &record_size) == ESP_OK;
+        if (read_ok && pj_home_layout_decode_or_default(record, record_size, loaded)) {
+            ESP_LOGI(TAG, "Home layout loaded from NVS: title=%s slots=%u",
+                     loaded->title, (unsigned)loaded->slot_count);
+        } else {
+            ESP_LOGW(TAG, "Stored home layout failed record validation; using built-in layout");
+        }
+        if (loaded != NULL) {
+            if (!read_ok) {
+                pj_home_layout_defaults(loaded);
+            }
+            g_home_layout = *loaded;
+        }
+        free(loaded);
+        free(record);
+    } else if (err != ESP_ERR_NVS_NOT_FOUND) {
+        ESP_LOGW(TAG, "Stored home layout has invalid size; using built-in layout");
+    }
+    nvs_close(nvs);
+}
+
+static esp_err_t home_layout_save(const pj_home_layout_t *layout)
+{
+    uint8_t *record = malloc(PJ_HOME_RECORD_BYTES);
+    if (record == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+    if (pj_home_layout_encode_record(layout, record, PJ_HOME_RECORD_BYTES) != PJ_HOME_RECORD_BYTES) {
+        free(record);
+        return ESP_ERR_INVALID_ARG;
+    }
+    nvs_handle_t nvs;
+    esp_err_t err = nvs_open(PJ_NVS_NAMESPACE, NVS_READWRITE, &nvs);
+    if (err == ESP_OK) {
+        err = nvs_set_blob(nvs, PJ_NVS_HOME_LAYOUT, record, PJ_HOME_RECORD_BYTES);
+        if (err == ESP_OK) {
+            err = nvs_commit(nvs);
+        }
+        nvs_close(nvs);
+    }
+    free(record);
+    return err;
+}
+
+static esp_err_t home_layout_replace(const pj_home_layout_t *layout)
+{
+    pj_home_layout_t canonical;
+    if (!pj_home_layout_canonical_copy(&canonical, layout) || !home_layout_take(portMAX_DELAY)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    esp_err_t err = home_layout_save(&canonical);
+    if (err == ESP_OK) {
+        g_home_layout = canonical;
+        g_home_layout_update_pending = 1;
+    }
+    home_layout_give();
+    return err;
 }
 
 static void static_art_slot_path(int slot, char *path, size_t path_size)
@@ -3406,6 +3495,7 @@ void pj_board_init(const pj_board_profile_t *profile)
 {
     init_default_status(profile);
     pj_settings_defaults(&g_settings);
+    pj_home_layout_defaults(&g_home_layout);
 
 #ifdef ESP_PLATFORM
     esp_err_t err = nvs_flash_init();
@@ -3425,6 +3515,11 @@ void pj_board_init(const pj_board_profile_t *profile)
         ESP_LOGW(TAG, "Settings mutex allocation failed");
     }
     settings_load();
+    g_home_layout_lock = xSemaphoreCreateMutex();
+    if (g_home_layout_lock == NULL) {
+        ESP_LOGW(TAG, "Home layout mutex allocation failed");
+    }
+    home_layout_load();
     g_static_art_lock = xSemaphoreCreateMutex();
     if (g_static_art_lock == NULL) {
         ESP_LOGW(TAG, "Static art mutex allocation failed");
@@ -3682,6 +3777,26 @@ int pj_board_consume_static_art_update(pj_ui_context_t *ui)
     }
     static_art_give();
     return 1;
+}
+
+void pj_board_refresh_home_layout(pj_ui_context_t *ui)
+{
+    if (ui == NULL || !home_layout_take(portMAX_DELAY)) {
+        return;
+    }
+    (void)pj_ui_set_home_layout(ui, &g_home_layout);
+    home_layout_give();
+}
+
+int pj_board_consume_home_layout_update(pj_ui_context_t *ui)
+{
+    if (!g_home_layout_update_pending || ui == NULL || !home_layout_take(portMAX_DELAY)) {
+        return 0;
+    }
+    g_home_layout_update_pending = 0;
+    int applied = pj_ui_set_home_layout(ui, &g_home_layout);
+    home_layout_give();
+    return applied;
 }
 
 void pj_board_refresh_status(pj_ui_context_t *ui)
@@ -4288,6 +4403,18 @@ static void serial_command_task(void *arg)
             fflush(stdout);
             continue;
         }
+        if (strcmp(line, "PJ_HOME_RESET") == 0) {
+            pj_home_layout_t fallback;
+            pj_home_layout_defaults(&fallback);
+            esp_err_t err = home_layout_replace(&fallback);
+            if (err == ESP_OK) {
+                printf("PJ_OK {\"home_reset\":true}\n");
+            } else {
+                printf("PJ_ERR {\"error\":\"home reset failed: %s\"}\n", esp_err_to_name(err));
+            }
+            fflush(stdout);
+            continue;
+        }
         if (strncmp(line, "PJ_AUDIO_TONE", 13) == 0) {
             audio_tone_diag_opts_t tone_opts = {
                 .pa_level = PJ_AUDIO_TONE_DEFAULT_INT,
@@ -4737,12 +4864,159 @@ static esp_err_t home_get_handler(httpd_req_t *req)
     if (require_auth(req) != ESP_OK) {
         return ESP_OK;
     }
-    return send_json(req,
-                     "{\"title\":\"Pocket Journal\",\"slots\":["
-                     "{\"label\":\"Notes\",\"icon\":\"stylus_note\",\"state\":\"notes\"},"
-                     "{\"label\":\"Time\",\"icon\":\"schedule\",\"state\":\"time\"},"
-                     "{\"label\":\"Settings\",\"icon\":\"settings\",\"state\":\"settings\"}"
-                     "]}");
+    pj_home_layout_t *layout = malloc(sizeof(*layout));
+    if (layout == NULL || !home_layout_take(portMAX_DELAY)) {
+        free(layout);
+        httpd_resp_set_status(req, "503 Service Unavailable");
+        return send_json(req, "{\"error\":\"home layout busy\"}");
+    }
+    *layout = g_home_layout;
+    home_layout_give();
+
+    cJSON *root = cJSON_CreateObject();
+    cJSON *slots = root == NULL ? NULL : cJSON_AddArrayToObject(root, "slots");
+    if (root != NULL) {
+        cJSON_AddStringToObject(root, "title", layout->title);
+    }
+    for (uint8_t i = 0; slots != NULL && i < layout->slot_count; i++) {
+        cJSON *slot = cJSON_CreateObject();
+        if (slot == NULL || !cJSON_AddItemToArray(slots, slot)) {
+            cJSON_Delete(slot);
+            slots = NULL;
+            break;
+        }
+        cJSON_AddStringToObject(slot, "label", layout->slots[i].label);
+        cJSON_AddStringToObject(slot, "icon", layout->slots[i].icon);
+        cJSON_AddStringToObject(slot, "state", layout->slots[i].destination);
+    }
+    free(layout);
+    char *body = slots == NULL ? NULL : cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (body == NULL) {
+        httpd_resp_set_status(req, "503 Service Unavailable");
+        return send_json(req, "{\"error\":\"home layout response out of memory\"}");
+    }
+    esp_err_t err = send_json(req, body);
+    cJSON_free(body);
+    return err;
+}
+
+static int json_has_exact_keys(const cJSON *object, const char *const *keys, size_t key_count)
+{
+    int seen[4] = {0};
+    size_t count = 0;
+    for (const cJSON *item = object == NULL ? NULL : object->child; item != NULL; item = item->next) {
+        size_t index = 0;
+        while (index < key_count && strcmp(item->string, keys[index]) != 0) {
+            index++;
+        }
+        if (index == key_count || seen[index]) {
+            return 0;
+        }
+        seen[index] = 1;
+        count++;
+    }
+    return count == key_count;
+}
+
+static int home_parse_layout(const cJSON *json, pj_home_layout_t *layout, int *reset)
+{
+    static const char *const RESET_KEYS[] = {"reset"};
+    static const char *const ROOT_KEYS[] = {"title", "slots"};
+    static const char *const SLOT_KEYS[] = {"label", "icon", "state"};
+    if (!cJSON_IsObject(json) || layout == NULL || reset == NULL) {
+        return 0;
+    }
+    cJSON *reset_item = cJSON_GetObjectItemCaseSensitive(json, "reset");
+    if (reset_item != NULL) {
+        if (!json_has_exact_keys(json, RESET_KEYS, 1) || !cJSON_IsTrue(reset_item)) {
+            return 0;
+        }
+        pj_home_layout_defaults(layout);
+        *reset = 1;
+        return 1;
+    }
+    if (!json_has_exact_keys(json, ROOT_KEYS, 2)) {
+        return 0;
+    }
+    cJSON *title = cJSON_GetObjectItemCaseSensitive(json, "title");
+    cJSON *slots = cJSON_GetObjectItemCaseSensitive(json, "slots");
+    int slot_count = cJSON_IsArray(slots) ? cJSON_GetArraySize(slots) : 0;
+    if (!cJSON_IsString(title) || title->valuestring == NULL ||
+        slot_count < 1 || slot_count > PJ_HOME_MAX_SLOTS ||
+        strlen(title->valuestring) >= PJ_HOME_TITLE_LEN) {
+        return 0;
+    }
+    memset(layout, 0, sizeof(*layout));
+    (void)snprintf(layout->title, sizeof(layout->title), "%s", title->valuestring);
+    layout->slot_count = (uint8_t)slot_count;
+    for (int i = 0; i < slot_count; i++) {
+        cJSON *slot = cJSON_GetArrayItem(slots, i);
+        if (!cJSON_IsObject(slot) || !json_has_exact_keys(slot, SLOT_KEYS, 3)) {
+            return 0;
+        }
+        cJSON *label = cJSON_GetObjectItemCaseSensitive(slot, "label");
+        cJSON *icon = cJSON_GetObjectItemCaseSensitive(slot, "icon");
+        cJSON *state = cJSON_GetObjectItemCaseSensitive(slot, "state");
+        if (!cJSON_IsString(label) || !cJSON_IsString(icon) || !cJSON_IsString(state) ||
+            label->valuestring == NULL || icon->valuestring == NULL || state->valuestring == NULL ||
+            strlen(label->valuestring) >= PJ_HOME_LABEL_LEN ||
+            strlen(icon->valuestring) >= PJ_HOME_ICON_LEN ||
+            strlen(state->valuestring) >= PJ_HOME_DESTINATION_LEN) {
+            return 0;
+        }
+        (void)snprintf(layout->slots[i].label, sizeof(layout->slots[i].label), "%s", label->valuestring);
+        (void)snprintf(layout->slots[i].icon, sizeof(layout->slots[i].icon), "%s", icon->valuestring);
+        (void)snprintf(layout->slots[i].destination, sizeof(layout->slots[i].destination), "%s", state->valuestring);
+    }
+    *reset = 0;
+    return pj_home_layout_valid(layout);
+}
+
+static esp_err_t home_put_handler(httpd_req_t *req)
+{
+    if (require_auth(req) != ESP_OK) {
+        return ESP_OK;
+    }
+    if (req->content_len <= 0 || req->content_len >= 1024) {
+        drain_body(req);
+        httpd_resp_set_status(req, "400 Bad Request");
+        return send_json(req, "{\"error\":\"invalid home layout body\"}");
+    }
+    char *body = malloc((size_t)req->content_len + 1u);
+    pj_home_layout_t *layout = malloc(sizeof(*layout));
+    if (body == NULL || layout == NULL) {
+        free(layout);
+        free(body);
+        drain_body(req);
+        httpd_resp_set_status(req, "503 Service Unavailable");
+        return send_json(req, "{\"error\":\"home layout update out of memory\"}");
+    }
+    if (!read_body(req, body, (size_t)req->content_len + 1u)) {
+        free(layout);
+        free(body);
+        httpd_resp_set_status(req, "400 Bad Request");
+        return send_json(req, "{\"error\":\"invalid home layout body\"}");
+    }
+    cJSON *json = cJSON_Parse(body);
+    free(body);
+    int reset = 0;
+    if (!home_parse_layout(json, layout, &reset)) {
+        cJSON_Delete(json);
+        free(layout);
+        httpd_resp_set_status(req, "400 Bad Request");
+        return send_json(req, "{\"error\":\"unsupported or invalid home layout\"}");
+    }
+    cJSON_Delete(json);
+    esp_err_t err = home_layout_replace(layout);
+    free(layout);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "HTTP home layout save failed: %s", esp_err_to_name(err));
+        httpd_resp_set_status(req, "500 Internal Server Error");
+        return send_json(req, "{\"error\":\"home layout store failed\"}");
+    }
+    ESP_LOGI(TAG, "Home layout persisted%s; UI apply queued", reset ? " (built-in reset)" : "");
+    return home_get_handler(req);
 }
 
 static esp_err_t update_ok_handler(httpd_req_t *req)
@@ -5125,7 +5399,7 @@ int pj_board_http_start(void)
     REGISTER_URI_OR_FAIL("/v1/settings", HTTP_GET, settings_get_handler);
     REGISTER_URI_OR_FAIL("/v1/settings", HTTP_PUT, settings_put_handler);
     REGISTER_URI_OR_FAIL("/v1/home", HTTP_GET, home_get_handler);
-    REGISTER_URI_OR_FAIL("/v1/home", HTTP_PUT, update_ok_handler);
+    REGISTER_URI_OR_FAIL("/v1/home", HTTP_PUT, home_put_handler);
     REGISTER_URI_OR_FAIL("/v1/static-art", HTTP_GET, static_art_get_handler);
     REGISTER_URI_OR_FAIL("/v1/static-art", HTTP_PUT, static_art_put_handler);
     REGISTER_URI_OR_FAIL("/v1/audio", HTTP_GET, audio_list_handler);

@@ -12,6 +12,7 @@ from .ble import provision_wifi
 from .calendar import calendar_payload_for_day
 from .config import DeviceProfile, load_config, save_config
 from .device import DeviceClient, DeviceError, SerialDeviceClient, discover_mdns, resolve_serial_port
+from .home_design import normalize_home_design
 from .operations import DeviceSession
 from .storage import PartnerStore
 from .sync import sync_device_audio
@@ -283,20 +284,10 @@ def cmd_home_get(args: argparse.Namespace) -> int:
 
 def _load_home_design(path: str) -> dict:
     payload = json.loads(Path(path).read_text(encoding="utf-8"))
-    slots = payload.get("slots")
-    if not isinstance(slots, list) or not slots:
-        raise SystemExit("home design JSON must include a non-empty slots array")
-    normalized_slots = []
-    for slot in slots[:5]:
-        if not isinstance(slot, dict):
-            raise SystemExit("each home slot must be an object")
-        label = str(slot.get("label", "")).strip()
-        icon = str(slot.get("icon", "")).strip()
-        state = str(slot.get("state", "")).strip()
-        if not label or not icon or not state:
-            raise SystemExit("each home slot needs label, icon, and state")
-        normalized_slots.append({"label": label, "icon": icon, "state": state})
-    return {"title": str(payload.get("title", "Pocket Journal")), "slots": normalized_slots}
+    try:
+        return normalize_home_design(payload)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
 
 
 def cmd_home_set(args: argparse.Namespace) -> int:

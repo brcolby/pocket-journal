@@ -1,4 +1,4 @@
-idf_component_register(SRCS "pj_ui.c"
+idf_component_register(SRCS "pj_ui.c" "pj_home_layout.c"
                     INCLUDE_DIRS "include"
                     REQUIRES lvgl__lvgl)
 

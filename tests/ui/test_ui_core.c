@@ -2,6 +2,7 @@
 
 #include <assert.h>
 #include <stdio.h>
+#include <string.h>
 
 static int count_black_pixels(const pj_framebuffer_t *fb)
 {
@@ -74,6 +75,107 @@ static void test_empty_notes_do_not_open_detail(void)
     ui.state = PJ_UI_STATE_READ;
     assert(pj_ui_handle_touch(&ui, 20, 20, PJ_TOUCH_TAP) == 0);
     assert(pj_ui_current_state(&ui) == PJ_UI_STATE_READ);
+}
+
+static void test_custom_home_slots_render_and_route_in_order(void)
+{
+    pj_ui_context_t ui;
+    pj_ui_init(&ui);
+    pj_home_layout_t layout = {0};
+    strcpy(layout.title, "Daily tools");
+    layout.slot_count = 4;
+    layout.slots[0] = (pj_home_slot_t) {"Capture", "microphone", "record"};
+    layout.slots[1] = (pj_home_slot_t) {"Read", "read_me", "read"};
+    layout.slots[2] = (pj_home_slot_t) {"Timer", "timer", "timer"};
+    layout.slots[3] = (pj_home_slot_t) {"Network", "wifi", "sync"};
+    assert(pj_ui_set_home_layout(&ui, &layout) == 1);
+
+    ui.state = PJ_UI_STATE_HOME;
+    pj_framebuffer_t fb;
+    pj_ui_render(&ui, &fb);
+    assert(count_black_pixels(&fb) > 1000);
+
+    assert(pj_ui_handle_touch(&ui, 20, 40, PJ_TOUCH_TAP) == 1);
+    assert(pj_ui_current_state(&ui) == PJ_UI_STATE_RECORD);
+    ui.state = PJ_UI_STATE_HOME;
+    assert(pj_ui_handle_touch(&ui, 120, 40, PJ_TOUCH_TAP) == 1);
+    assert(pj_ui_current_state(&ui) == PJ_UI_STATE_READ);
+    ui.state = PJ_UI_STATE_HOME;
+    assert(pj_ui_handle_touch(&ui, 20, 130, PJ_TOUCH_TAP) == 1);
+    assert(pj_ui_current_state(&ui) == PJ_UI_STATE_TIMER);
+    ui.state = PJ_UI_STATE_HOME;
+    assert(pj_ui_handle_touch(&ui, 120, 130, PJ_TOUCH_TAP) == 1);
+    assert(pj_ui_current_state(&ui) == PJ_UI_STATE_SYNC);
+
+    pj_ui_restore_default_home(&ui);
+    assert(strcmp(ui.home_layout.title, "Pocket Journal") == 0);
+    assert(ui.home_layout.slot_count == 3);
+}
+
+static void test_compiled_home_fallback_routes_every_slot(void)
+{
+    pj_ui_context_t ui;
+    pj_ui_init(&ui);
+    ui.state = PJ_UI_STATE_HOME;
+    assert(pj_ui_handle_touch(&ui, 20, 40, PJ_TOUCH_TAP) == 1);
+    assert(pj_ui_current_state(&ui) == PJ_UI_STATE_NOTES);
+    ui.state = PJ_UI_STATE_HOME;
+    assert(pj_ui_handle_touch(&ui, 120, 40, PJ_TOUCH_TAP) == 1);
+    assert(pj_ui_current_state(&ui) == PJ_UI_STATE_TIME);
+    ui.state = PJ_UI_STATE_HOME;
+    assert(pj_ui_handle_touch(&ui, 20, 130, PJ_TOUCH_TAP) == 1);
+    assert(pj_ui_current_state(&ui) == PJ_UI_STATE_SETTINGS);
+}
+
+static void test_every_supported_home_destination_routes(void)
+{
+    static const struct {
+        const char *destination;
+        pj_ui_state_t state;
+    } routes[] = {
+        {"notes", PJ_UI_STATE_NOTES},
+        {"record", PJ_UI_STATE_RECORD},
+        {"listen", PJ_UI_STATE_LISTEN},
+        {"read", PJ_UI_STATE_READ},
+        {"time", PJ_UI_STATE_TIME},
+        {"alarm", PJ_UI_STATE_ALARM},
+        {"stopwatch", PJ_UI_STATE_STOPWATCH},
+        {"timer", PJ_UI_STATE_TIMER},
+        {"interval", PJ_UI_STATE_INTERVAL},
+        {"settings", PJ_UI_STATE_SETTINGS},
+        {"sync", PJ_UI_STATE_SYNC},
+        {"volume", PJ_UI_STATE_VOLUME},
+        {"calendar", PJ_UI_STATE_CALENDAR},
+    };
+    for (size_t i = 0; i < sizeof(routes) / sizeof(routes[0]); i++) {
+        pj_ui_context_t ui;
+        pj_ui_init(&ui);
+        pj_home_layout_t layout = {0};
+        strcpy(layout.title, "Route test");
+        layout.slot_count = 1;
+        layout.slots[0] = (pj_home_slot_t) {"Open", "notebook", ""};
+        strcpy(layout.slots[0].destination, routes[i].destination);
+        assert(pj_ui_set_home_layout(&ui, &layout) == 1);
+        ui.state = PJ_UI_STATE_HOME;
+        assert(pj_ui_handle_touch(&ui, 20, 40, PJ_TOUCH_TAP) == 1);
+        assert(pj_ui_current_state(&ui) == routes[i].state);
+    }
+}
+
+static void test_home_layout_setter_canonicalizes_inactive_slots(void)
+{
+    pj_ui_context_t ui;
+    pj_ui_init(&ui);
+    pj_home_layout_t layout;
+    memset(&layout, 0xcc, sizeof(layout));
+    memset(layout.title, 0, sizeof(layout.title));
+    strcpy(layout.title, "One tool");
+    layout.slot_count = 1;
+    memset(&layout.slots[0], 0, sizeof(layout.slots[0]));
+    layout.slots[0] = (pj_home_slot_t) {"Notes", "notebook", "notes"};
+    assert(pj_ui_set_home_layout(&ui, &layout) == 1);
+    const uint8_t zero_slot[sizeof(ui.home_layout.slots[1])] = {0};
+    assert(memcmp(&ui.home_layout.slots[1], zero_slot, sizeof(zero_slot)) == 0);
 }
 
 static void test_aux_primary_actions(void)
@@ -398,6 +500,10 @@ int main(void)
 {
     test_state_graph();
     test_empty_notes_do_not_open_detail();
+    test_custom_home_slots_render_and_route_in_order();
+    test_compiled_home_fallback_routes_every_slot();
+    test_every_supported_home_destination_routes();
+    test_home_layout_setter_canonicalizes_inactive_slots();
     test_aux_primary_actions();
     test_aux_double_click_routing();
     test_audio_lifecycle_reconciliation();
