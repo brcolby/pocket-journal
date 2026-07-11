@@ -45,6 +45,7 @@
 #include "nvs_flash.h"
 #include "sdmmc_cmd.h"
 #include "lwip/ip4_addr.h"
+#include "mdns.h"
 #endif
 
 #define PJ_DEFAULT_TOKEN "dev-token"
@@ -177,6 +178,7 @@ static int g_adc_cali_ready;
 static int g_network_stack_ready;
 static int g_wifi_started;
 static esp_netif_t *g_wifi_sta_netif;
+static int g_mdns_started;
 static pj_aux_input_t g_aux_input;
 static int g_touch_task_started;
 static int g_serial_command_task_started;
@@ -544,6 +546,26 @@ static esp_err_t network_stack_init(void)
     return ESP_OK;
 }
 
+static esp_err_t mdns_start(void)
+{
+    if (g_mdns_started) {
+        return ESP_OK;
+    }
+    ESP_RETURN_ON_ERROR(mdns_init(), TAG, "mDNS init failed");
+    ESP_RETURN_ON_ERROR(mdns_hostname_set(g_status.device_id), TAG, "mDNS hostname failed");
+    ESP_RETURN_ON_ERROR(mdns_instance_name_set("Pocket Journal"), TAG, "mDNS instance failed");
+    mdns_txt_item_t txt[] = {
+        {"device_id", g_status.device_id},
+        {"path", "/v1/status"},
+    };
+    ESP_RETURN_ON_ERROR(mdns_service_add(g_status.device_id, "_pocket-journal", "_tcp", 80,
+                                         txt, sizeof(txt) / sizeof(txt[0])),
+                        TAG, "mDNS service registration failed");
+    g_mdns_started = 1;
+    ESP_LOGI(TAG, "mDNS advertised: %s.local _pocket-journal._tcp", g_status.device_id);
+    return ESP_OK;
+}
+
 static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id,
                                void *event_data)
 {
@@ -578,6 +600,12 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
         }
         g_status.last_error[0] = '\0';
         ESP_LOGI(TAG, "Wi-Fi connected: ssid=%s ip=%s", g_wifi_ssid, g_status.ip_addr);
+        esp_err_t mdns_err = mdns_start();
+        if (mdns_err != ESP_OK) {
+            (void)snprintf(g_status.last_error, sizeof(g_status.last_error),
+                           "mDNS start failed: %s", esp_err_to_name(mdns_err));
+            ESP_LOGW(TAG, "%s", g_status.last_error);
+        }
     }
 }
 

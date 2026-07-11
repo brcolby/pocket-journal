@@ -1,3 +1,4 @@
 dependencies:
   espressif/esp_codec_dev: "1.5.10"
   espressif/cjson: "1.*"
+  espressif/mdns: "1.11.*"
