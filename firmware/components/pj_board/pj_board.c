@@ -79,6 +79,7 @@
 #define PJ_WIFI_SSID_MAX_LEN 32
 #define PJ_WIFI_PASSWORD_MAX_LEN 64
 #define EPD_SPI_NUM SPI2_HOST
+#define PJ_EPD_SPI_CLOCK_HZ (20 * 1000 * 1000)
 #define ESP32_I2C_DEV_NUM I2C_NUM_0
 #define EPD_DC_PIN GPIO_NUM_10
 #define EPD_CS_PIN GPIO_NUM_11
@@ -1398,7 +1399,7 @@ static esp_err_t display_init(void)
     };
     spi_device_interface_config_t devcfg = {
         .spics_io_num = -1,
-        .clock_speed_hz = 40 * 1000 * 1000,
+        .clock_speed_hz = PJ_EPD_SPI_CLOCK_HZ,
         .mode = 0,
         .queue_size = 4,
     };
