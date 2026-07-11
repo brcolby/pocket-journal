@@ -578,26 +578,86 @@ static uint64_t countdown_wake_delay(const pj_time_countdown_t *countdown,
            countdown->remaining_ms - elapsed;
 }
 
-uint64_t pj_time_next_wake_delay_ms(const pj_time_state_t *state,
+static uint64_t wake_fingerprint(uint8_t source, const pj_time_clock_t *clock,
+                                 uint64_t delay)
+{
+    uint64_t target = delay;
+    if (clock->wall_utc_ms >= 0 && delay <= (uint64_t)(INT64_MAX - clock->wall_utc_ms)) {
+        target = (uint64_t)clock->wall_utc_ms + delay;
+    }
+    uint64_t hash = 1469598103934665603ull;
+    hash ^= source;
+    hash *= 1099511628211ull;
+    for (unsigned shift = 0; shift < 64; shift += 8) {
+        hash ^= (uint8_t)(target >> shift);
+        hash *= 1099511628211ull;
+    }
+    return hash == 0 ? 1 : hash;
+}
+
+static void wake_consider(pj_time_wake_deadline_t *deadline, uint64_t delay,
+                          uint8_t source, const pj_time_clock_t *clock)
+{
+    uint64_t fingerprint = wake_fingerprint(source, clock, delay);
+    if (delay < deadline->delay_ms) {
+        deadline->delay_ms = delay;
+        deadline->source_mask = source;
+        deadline->fingerprint = fingerprint;
+    } else if (delay == deadline->delay_ms) {
+        deadline->source_mask |= source;
+        deadline->fingerprint ^= fingerprint;
+        if (deadline->fingerprint == 0) {
+            deadline->fingerprint = 1;
+        }
+    }
+}
+
+static int alarm_occurrence_pending(const pj_time_state_t *state,
                                     const pj_time_clock_t *clock)
 {
-    if (!pj_time_state_valid(state) || !pj_time_clock_valid(clock)) {
-        return UINT64_MAX;
-    }
-    if (state->active_alert.source != PJ_TIME_ALERT_NONE) {
+    int64_t now = local_minute(clock);
+    int64_t previous = state->alarm_last_local_minute;
+    if (!state->alarm_enabled || now <= previous) {
         return 0;
     }
-    uint64_t delay = UINT64_MAX;
-#define MIN_DELAY(value) do { \
-        uint64_t candidate = (value); \
-        if (candidate < delay) { \
-            delay = candidate; \
-        } \
-    } while (0)
-    MIN_DELAY(countdown_wake_delay(&state->snooze, clock));
-    MIN_DELAY(countdown_wake_delay(&state->timer, clock));
-    MIN_DELAY(countdown_wake_delay(&state->interval, clock));
+    int64_t minute_of_day = (int64_t)state->alarm_hour * 60 + state->alarm_minute;
+    int64_t due_day = now / 1440;
+    int64_t due = due_day * 1440 + minute_of_day;
+    if (due > now) {
+        due -= 1440;
+        due_day--;
+    }
+    uint64_t occurrence = ((uint64_t)state->alarm_generation << 32u) |
+        (uint32_t)due_day;
+    return due > previous && occurrence > state->alarm_last_occurrence;
+}
+
+int pj_time_next_wake(const pj_time_state_t *state, const pj_time_clock_t *clock,
+                      pj_time_wake_deadline_t *deadline)
+{
+    if (!pj_time_state_valid(state) || !pj_time_clock_valid(clock) || deadline == NULL) {
+        return 0;
+    }
+    *deadline = (pj_time_wake_deadline_t) {.delay_ms = UINT64_MAX};
+    if (state->active_alert.source != PJ_TIME_ALERT_NONE) {
+        uint8_t source = state->active_alert.source == PJ_TIME_ALERT_TIMER ?
+            PJ_TIME_WAKE_TIMER : state->active_alert.source == PJ_TIME_ALERT_INTERVAL ?
+            PJ_TIME_WAKE_INTERVAL : state->active_alert.reason == PJ_TIME_ALERT_SNOOZE ?
+            PJ_TIME_WAKE_SNOOZE : PJ_TIME_WAKE_ALARM;
+        wake_consider(deadline, 0, source, clock);
+        return 1;
+    }
+    wake_consider(deadline, countdown_wake_delay(&state->snooze, clock),
+                  PJ_TIME_WAKE_SNOOZE, clock);
+    wake_consider(deadline, countdown_wake_delay(&state->timer, clock),
+                  PJ_TIME_WAKE_TIMER, clock);
+    wake_consider(deadline, countdown_wake_delay(&state->interval, clock),
+                  PJ_TIME_WAKE_INTERVAL, clock);
     if (state->alarm_enabled) {
+        if (alarm_occurrence_pending(state, clock)) {
+            wake_consider(deadline, 0, PJ_TIME_WAKE_ALARM, clock);
+            return 1;
+        }
         uint32_t target_second = (uint32_t)state->alarm_hour * 3600u +
                                  (uint32_t)state->alarm_minute * 60u;
         uint32_t seconds = target_second > clock->local_second ?
@@ -608,10 +668,20 @@ uint64_t pj_time_next_wake_delay_ms(const pj_time_state_t *state,
             uint64_t fraction = (uint64_t)clock->wall_utc_ms % 1000u;
             alarm_delay = alarm_delay > fraction ? alarm_delay - fraction : 0;
         }
-        MIN_DELAY(alarm_delay);
+        wake_consider(deadline, alarm_delay, PJ_TIME_WAKE_ALARM, clock);
     }
-#undef MIN_DELAY
-    return delay;
+    if (deadline->delay_ms == UINT64_MAX) {
+        deadline->source_mask = 0;
+        deadline->fingerprint = 0;
+    }
+    return 1;
+}
+
+uint64_t pj_time_next_wake_delay_ms(const pj_time_state_t *state,
+                                    const pj_time_clock_t *clock)
+{
+    pj_time_wake_deadline_t deadline;
+    return pj_time_next_wake(state, clock, &deadline) ? deadline.delay_ms : UINT64_MAX;
 }
 
 int pj_time_alert_dismiss(pj_time_state_t *state, uint64_t alert_id)

@@ -352,6 +352,13 @@ static void test_next_wake_delay(void)
     assert(pj_time_alarm_configure(&state, 1, 7, 0, &clock));
     assert(pj_time_next_wake_delay_ms(&state, &clock) == 500);
 
+    pj_time_clock_t crossed_alarm = clock;
+    crossed_alarm.monotonic_ms += 500;
+    crossed_alarm.wall_utc_ms += 500;
+    crossed_alarm.local_second += 1;
+    assert(pj_time_next_wake_delay_ms(&state, &crossed_alarm) == 0);
+    assert(pj_time_alarm_configure(&state, 0, 7, 0, &clock));
+
     assert(pj_time_timer_start(&state, 30000, &clock));
     pj_time_clock_t later = clock;
     later.monotonic_ms += 5000;

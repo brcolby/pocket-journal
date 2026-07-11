@@ -15,6 +15,7 @@ STATIC_ART_TEST_BIN := build/test_static_art
 HOME_LAYOUT_TEST_BIN := build/test_home_layout
 STORAGE_TEST_BIN := build/test_storage
 TIME_CLOCK_TEST_BIN := build/test_time_clock
+RTC_WAKE_TEST_BIN := build/test_rtc_wake
 LVGL_DIR := firmware/managed_components/lvgl__lvgl
 ifneq ($(wildcard $(LVGL_DIR)/src),)
 LVGL_SRCS := $(wildcard $(LVGL_DIR)/src/*.c)
@@ -116,6 +117,15 @@ test-input:
 		tests/board/test_time_clock.c \
 		-o $(TIME_CLOCK_TEST_BIN)
 	$(TIME_CLOCK_TEST_BIN)
+	$(CC) $(CFLAGS) \
+		-Ifirmware/components/pj_board/include \
+		-Ifirmware/components/pj_ui/include \
+		firmware/components/pj_ui/pj_time_model.c \
+		firmware/components/pj_board/pj_time_clock.c \
+		firmware/components/pj_board/pj_rtc_wake.c \
+		tests/board/test_rtc_wake.c \
+		-o $(RTC_WAKE_TEST_BIN)
+	$(RTC_WAKE_TEST_BIN)
 
 test-partner:
 	cd partner && PYTHONPATH=src python -m unittest discover -s ../tests/partner -p 'test_*.py'
