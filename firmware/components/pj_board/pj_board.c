@@ -4,6 +4,7 @@
 #include "pj_auth.h"
 #include "pj_note_model.h"
 #include "pj_settings.h"
+#include "pj_static_art.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -14,6 +15,7 @@
 #include <limits.h>
 #include <strings.h>
 #include <sys/stat.h>
+#include <unistd.h>
 #endif
 
 #ifdef ESP_PLATFORM
@@ -72,6 +74,8 @@
 #define PJ_NVS_ALARM_MINUTE "alarm_min"
 #define PJ_NVS_TIMER_SECONDS "timer_sec"
 #define PJ_NVS_INTERVAL_SECONDS "intvl_sec"
+#define PJ_NVS_STATIC_ART_SLOT "art_slot"
+#define PJ_STATIC_ART_SLOT_COUNT 2
 #define PJ_WIFI_SSID_MAX_LEN 32
 #define PJ_WIFI_PASSWORD_MAX_LEN 64
 #define EPD_SPI_NUM SPI2_HOST
@@ -157,9 +161,13 @@
 
 static pj_board_status_t g_status;
 static pj_settings_t g_settings;
+static pj_static_art_t g_static_art;
+static int g_static_art_valid;
+static int g_static_art_slot = -1;
 static int g_display_warning_logged;
 static int g_time_update_pending;
 static volatile int g_settings_update_pending;
+static volatile int g_static_art_update_pending;
 
 #ifdef ESP_PLATFORM
 static httpd_handle_t g_http_server;
@@ -182,6 +190,7 @@ static QueueHandle_t g_board_event_queue;
 static SemaphoreHandle_t g_i2c_lock;
 static SemaphoreHandle_t g_audio_lock;
 static SemaphoreHandle_t g_settings_lock;
+static SemaphoreHandle_t g_static_art_lock;
 static sdmmc_card_t *g_sd_card;
 static uint8_t g_epd_buffer[PJ_FRAMEBUFFER_BYTES];
 static pj_framebuffer_t g_epd_shadow_fb;
@@ -705,6 +714,145 @@ static void settings_give(void)
     if (g_settings_lock != NULL) {
         xSemaphoreGive(g_settings_lock);
     }
+}
+
+static int static_art_take(TickType_t timeout)
+{
+    return g_static_art_lock == NULL || xSemaphoreTake(g_static_art_lock, timeout) == pdTRUE;
+}
+
+static void static_art_give(void)
+{
+    if (g_static_art_lock != NULL) {
+        xSemaphoreGive(g_static_art_lock);
+    }
+}
+
+static void static_art_slot_path(int slot, char *path, size_t path_size)
+{
+    (void)snprintf(path, path_size, "%s/static-art-%d.bin", g_status.storage_path, slot);
+}
+
+static int static_art_read_slot(int slot, pj_static_art_t *art)
+{
+    if (slot < 0 || slot >= PJ_STATIC_ART_SLOT_COUNT || art == NULL) {
+        return 0;
+    }
+    char path[64];
+    static_art_slot_path(slot, path, sizeof(path));
+    FILE *file = fopen(path, "rb");
+    if (file == NULL) {
+        return 0;
+    }
+    uint8_t *record = malloc(PJ_STATIC_ART_RECORD_BYTES);
+    if (record == NULL) {
+        fclose(file);
+        return 0;
+    }
+    size_t got = fread(record, 1, PJ_STATIC_ART_RECORD_BYTES, file);
+    int extra = fgetc(file);
+    fclose(file);
+    int valid = got == PJ_STATIC_ART_RECORD_BYTES && extra == EOF &&
+                pj_static_art_decode_record(record, got, art);
+    free(record);
+    return valid;
+}
+
+static void static_art_load(void)
+{
+    int preferred_slot = -1;
+    nvs_handle_t nvs;
+    if (nvs_open(PJ_NVS_NAMESPACE, NVS_READONLY, &nvs) == ESP_OK) {
+        uint8_t stored_slot = 0;
+        if (nvs_get_u8(nvs, PJ_NVS_STATIC_ART_SLOT, &stored_slot) == ESP_OK &&
+            stored_slot < PJ_STATIC_ART_SLOT_COUNT) {
+            preferred_slot = stored_slot;
+        }
+        nvs_close(nvs);
+    }
+
+    int candidates[PJ_STATIC_ART_SLOT_COUNT] = {
+        preferred_slot,
+        preferred_slot == 0 ? 1 : 0,
+    };
+    if (preferred_slot < 0) {
+        candidates[0] = 0;
+        candidates[1] = 1;
+    }
+    for (int i = 0; i < PJ_STATIC_ART_SLOT_COUNT; i++) {
+        if (static_art_read_slot(candidates[i], &g_static_art)) {
+            g_static_art_slot = candidates[i];
+            g_static_art_valid = 1;
+            ESP_LOGI(TAG, "Static art loaded from microSD slot %d", g_static_art_slot);
+            return;
+        }
+    }
+    if (preferred_slot >= 0) {
+        ESP_LOGW(TAG, "Stored static art slots failed record validation");
+    }
+}
+
+static esp_err_t static_art_save(const pj_static_art_t *art, int *saved_slot)
+{
+    uint8_t *record = malloc(PJ_STATIC_ART_RECORD_BYTES);
+    if (record == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+    if (pj_static_art_encode_record(art, record, PJ_STATIC_ART_RECORD_BYTES) == 0) {
+        free(record);
+        return ESP_ERR_INVALID_ARG;
+    }
+    int next_slot = g_static_art_slot == 0 ? 1 : 0;
+    char path[64];
+    static_art_slot_path(next_slot, path, sizeof(path));
+    FILE *file = fopen(path, "wb");
+    if (file == NULL) {
+        free(record);
+        return ESP_FAIL;
+    }
+    size_t written = fwrite(record, 1, PJ_STATIC_ART_RECORD_BYTES, file);
+    int write_failed = written != PJ_STATIC_ART_RECORD_BYTES;
+    if (fflush(file) != 0) {
+        write_failed = 1;
+    }
+    if (fsync(fileno(file)) != 0) {
+        write_failed = 1;
+    }
+    if (fclose(file) != 0) {
+        write_failed = 1;
+    }
+    if (write_failed) {
+        free(record);
+        return ESP_FAIL;
+    }
+
+    pj_static_art_t *verified = malloc(sizeof(*verified));
+    if (verified == NULL) {
+        free(record);
+        return ESP_ERR_NO_MEM;
+    }
+    if (!static_art_read_slot(next_slot, verified) ||
+        memcmp(verified->pixels, art->pixels, sizeof(verified->pixels)) != 0) {
+        free(verified);
+        free(record);
+        return ESP_ERR_INVALID_CRC;
+    }
+    free(verified);
+
+    nvs_handle_t nvs;
+    esp_err_t err = nvs_open(PJ_NVS_NAMESPACE, NVS_READWRITE, &nvs);
+    if (err == ESP_OK) {
+        err = nvs_set_u8(nvs, PJ_NVS_STATIC_ART_SLOT, (uint8_t)next_slot);
+        if (err == ESP_OK) {
+            err = nvs_commit(nvs);
+        }
+        nvs_close(nvs);
+    }
+    if (err == ESP_OK && saved_slot != NULL) {
+        *saved_slot = next_slot;
+    }
+    free(record);
+    return err;
 }
 
 static int nvs_read_i32(nvs_handle_t nvs, const char *key, int *value)
@@ -3276,6 +3424,10 @@ void pj_board_init(const pj_board_profile_t *profile)
         ESP_LOGW(TAG, "Settings mutex allocation failed");
     }
     settings_load();
+    g_static_art_lock = xSemaphoreCreateMutex();
+    if (g_static_art_lock == NULL) {
+        ESP_LOGW(TAG, "Static art mutex allocation failed");
+    }
 
     uint8_t mac[6] = {0};
     if (esp_read_mac(mac, ESP_MAC_WIFI_STA) == ESP_OK) {
@@ -3340,6 +3492,7 @@ void pj_board_init(const pj_board_profile_t *profile)
     if (storage_err == ESP_OK) {
         g_status.storage = PJ_BOARD_SERVICE_READY;
         ESP_LOGI(TAG, "microSD mounted at %s", g_status.storage_path);
+        static_art_load();
         esp_err_t audio_err = audio_init();
         if (audio_err == ESP_OK) {
             g_status.audio = PJ_BOARD_SERVICE_READY;
@@ -3503,6 +3656,30 @@ int pj_board_consume_settings_update(pj_ui_context_t *ui)
     }
     g_settings_update_pending = 0;
     pj_board_refresh_settings(ui);
+    return 1;
+}
+
+void pj_board_refresh_static_art(pj_ui_context_t *ui)
+{
+    if (ui == NULL || !static_art_take(portMAX_DELAY)) {
+        return;
+    }
+    if (g_static_art_valid) {
+        pj_ui_set_static_art(ui, g_static_art.pixels, sizeof(g_static_art.pixels));
+    }
+    static_art_give();
+}
+
+int pj_board_consume_static_art_update(pj_ui_context_t *ui)
+{
+    if (!g_static_art_update_pending || ui == NULL || !static_art_take(portMAX_DELAY)) {
+        return 0;
+    }
+    g_static_art_update_pending = 0;
+    if (g_static_art_valid) {
+        pj_ui_set_static_art(ui, g_static_art.pixels, sizeof(g_static_art.pixels));
+    }
+    static_art_give();
     return 1;
 }
 
@@ -4581,7 +4758,155 @@ static esp_err_t static_art_get_handler(httpd_req_t *req)
     if (require_auth(req) != ESP_OK) {
         return ESP_OK;
     }
-    return send_json(req, "{\"width\":200,\"height\":200,\"encoding\":\"rows\",\"rows\":[]}");
+    pj_static_art_t *art = malloc(sizeof(*art));
+    if (art == NULL) {
+        httpd_resp_set_status(req, "503 Service Unavailable");
+        return send_json(req, "{\"error\":\"static art read out of memory\"}");
+    }
+    if (!static_art_take(portMAX_DELAY)) {
+        free(art);
+        httpd_resp_set_status(req, "503 Service Unavailable");
+        return send_json(req, "{\"error\":\"static art store busy\"}");
+    }
+    int valid = g_static_art_valid;
+    if (valid) {
+        *art = g_static_art;
+    }
+    static_art_give();
+    if (!valid) {
+        free(art);
+        httpd_resp_set_status(req, "404 Not Found");
+        return send_json(req, "{\"error\":\"static art not set\"}");
+    }
+
+    httpd_resp_set_type(req, "application/json");
+    esp_err_t err = httpd_resp_sendstr_chunk(req,
+        "{\"width\":200,\"height\":200,\"encoding\":\"rows\",\"rows\":[");
+    char row[PJ_STATIC_ART_WIDTH + 4];
+    for (int y = 0; err == ESP_OK && y < PJ_STATIC_ART_HEIGHT; y++) {
+        size_t offset = 0;
+        if (y > 0) {
+            row[offset++] = ',';
+        }
+        row[offset++] = '\"';
+        for (int x = 0; x < PJ_STATIC_ART_WIDTH; x++) {
+            row[offset++] = pj_static_art_pixel(art, x, y) ? '1' : '0';
+        }
+        row[offset++] = '\"';
+        row[offset] = '\0';
+        err = httpd_resp_sendstr_chunk(req, row);
+    }
+    free(art);
+    if (err == ESP_OK) {
+        err = httpd_resp_sendstr_chunk(req, "]}");
+    }
+    if (err == ESP_OK) {
+        err = httpd_resp_sendstr_chunk(req, NULL);
+    }
+    return err;
+}
+
+static esp_err_t static_art_put_handler(httpd_req_t *req)
+{
+    if (require_auth(req) != ESP_OK) {
+        return ESP_OK;
+    }
+    if (req->content_len <= 0) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        return send_json(req, "{\"error\":\"static art body is required\"}");
+    }
+    if (req->content_len > 65536) {
+        drain_body(req);
+        httpd_resp_set_status(req, "413 Payload Too Large");
+        return send_json(req, "{\"error\":\"static art body exceeds 65536 bytes\"}");
+    }
+
+    char *body = malloc((size_t)req->content_len + 1u);
+    if (body == NULL) {
+        drain_body(req);
+        httpd_resp_set_status(req, "503 Service Unavailable");
+        return send_json(req, "{\"error\":\"static art parse out of memory\"}");
+    }
+    if (!read_body(req, body, (size_t)req->content_len + 1u)) {
+        free(body);
+        httpd_resp_set_status(req, "400 Bad Request");
+        return send_json(req, "{\"error\":\"incomplete static art body\"}");
+    }
+    cJSON *json = cJSON_Parse(body);
+    free(body);
+    if (!cJSON_IsObject(json)) {
+        cJSON_Delete(json);
+        httpd_resp_set_status(req, "400 Bad Request");
+        return send_json(req, "{\"error\":\"static art body must be a JSON object\"}");
+    }
+
+    cJSON *width = cJSON_GetObjectItemCaseSensitive(json, "width");
+    cJSON *height = cJSON_GetObjectItemCaseSensitive(json, "height");
+    cJSON *encoding = cJSON_GetObjectItemCaseSensitive(json, "encoding");
+    cJSON *rows_json = cJSON_GetObjectItemCaseSensitive(json, "rows");
+    const char **rows = calloc(PJ_STATIC_ART_HEIGHT, sizeof(*rows));
+    pj_static_art_t *art = malloc(sizeof(*art));
+    if (rows == NULL || art == NULL) {
+        free(rows);
+        free(art);
+        cJSON_Delete(json);
+        httpd_resp_set_status(req, "503 Service Unavailable");
+        return send_json(req, "{\"error\":\"static art validation out of memory\"}");
+    }
+    size_t row_count = cJSON_IsArray(rows_json) ? (size_t)cJSON_GetArraySize(rows_json) : 0;
+    int rows_are_strings = row_count == PJ_STATIC_ART_HEIGHT;
+    for (int i = 0; rows_are_strings && i < PJ_STATIC_ART_HEIGHT; i++) {
+        cJSON *row = cJSON_GetArrayItem(rows_json, i);
+        rows_are_strings = cJSON_IsString(row) && row->valuestring != NULL;
+        rows[i] = rows_are_strings ? row->valuestring : NULL;
+    }
+
+    char validation_error[96];
+    int width_value = cJSON_IsNumber(width) && width->valuedouble == PJ_STATIC_ART_WIDTH ?
+        PJ_STATIC_ART_WIDTH : 0;
+    int height_value = cJSON_IsNumber(height) && height->valuedouble == PJ_STATIC_ART_HEIGHT ?
+        PJ_STATIC_ART_HEIGHT : 0;
+    int parsed = rows_are_strings &&
+        pj_static_art_from_rows(width_value,
+                                height_value,
+                                cJSON_IsString(encoding) ? encoding->valuestring : NULL,
+                                rows, row_count, art, validation_error, sizeof(validation_error));
+    if (!rows_are_strings) {
+        (void)snprintf(validation_error, sizeof(validation_error),
+                       row_count == PJ_STATIC_ART_HEIGHT ?
+                       "each row must be a string" : "rows must contain exactly 200 strings");
+    }
+    free(rows);
+    cJSON_Delete(json);
+    if (!parsed) {
+        char encoded_error[128];
+        (void)snprintf(encoded_error, sizeof(encoded_error), "{\"error\":\"%s\"}", validation_error);
+        free(art);
+        httpd_resp_set_status(req, "400 Bad Request");
+        return send_json(req, encoded_error);
+    }
+
+    if (!static_art_take(portMAX_DELAY)) {
+        free(art);
+        httpd_resp_set_status(req, "503 Service Unavailable");
+        return send_json(req, "{\"error\":\"static art store busy\"}");
+    }
+    int saved_slot = -1;
+    esp_err_t err = static_art_save(art, &saved_slot);
+    if (err == ESP_OK) {
+        g_static_art = *art;
+        g_static_art_valid = 1;
+        g_static_art_slot = saved_slot;
+        g_static_art_update_pending = 1;
+    }
+    static_art_give();
+    free(art);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Static art save failed: %s", esp_err_to_name(err));
+        httpd_resp_set_status(req, "500 Internal Server Error");
+        return send_json(req, "{\"error\":\"static art store failed\"}");
+    }
+    return send_json(req, "{\"updated\":true}");
 }
 
 static esp_err_t audio_list_handler(httpd_req_t *req)
@@ -4801,7 +5126,7 @@ int pj_board_http_start(void)
     REGISTER_URI_OR_FAIL("/v1/home", HTTP_GET, home_get_handler);
     REGISTER_URI_OR_FAIL("/v1/home", HTTP_PUT, update_ok_handler);
     REGISTER_URI_OR_FAIL("/v1/static-art", HTTP_GET, static_art_get_handler);
-    REGISTER_URI_OR_FAIL("/v1/static-art", HTTP_PUT, update_ok_handler);
+    REGISTER_URI_OR_FAIL("/v1/static-art", HTTP_PUT, static_art_put_handler);
     REGISTER_URI_OR_FAIL("/v1/audio", HTTP_GET, audio_list_handler);
     REGISTER_URI_OR_FAIL("/v1/audio", HTTP_DELETE, audio_delete_handler);
     REGISTER_URI_OR_FAIL("/v1/audio/*", HTTP_GET, audio_download_handler);

@@ -343,6 +343,39 @@ static void test_no_back_button_pixels(void)
     }
 }
 
+static void test_static_art_render_and_fallback(void)
+{
+    pj_ui_context_t ui;
+    pj_framebuffer_t fallback;
+    pj_framebuffer_t custom;
+    uint8_t pixels[PJ_FRAMEBUFFER_BYTES] = {0};
+    pj_ui_init(&ui);
+
+    pj_ui_render(&ui, &fallback);
+    assert(count_black_pixels(&fallback) > 10);
+
+    size_t first = (size_t)4 * PJ_DISPLAY_WIDTH + 3;
+    size_t second = (size_t)199 * PJ_DISPLAY_WIDTH + 199;
+    pixels[first >> 3u] |= (uint8_t)(1u << (first & 7u));
+    pixels[second >> 3u] |= (uint8_t)(1u << (second & 7u));
+    pj_ui_mark_displayed(&ui);
+    pj_ui_set_static_art(&ui, pixels, sizeof(pixels));
+    assert(ui.static_art_valid == 1);
+    assert(pj_ui_is_dirty(&ui) == 1);
+    assert(ui.dirty.partial == 0);
+
+    pj_ui_render(&ui, &custom);
+    assert(count_black_pixels(&custom) == 2);
+    assert(pj_framebuffer_get(&custom, 3, 4) == 1);
+    assert(pj_framebuffer_get(&custom, 199, 199) == 1);
+    assert(pj_framebuffer_get(&custom, 100, 100) == 0);
+
+    ui.dark_mode = 1;
+    pj_ui_request_full_refresh(&ui);
+    pj_ui_render(&ui, &custom);
+    assert(count_black_pixels(&custom) == 2);
+}
+
 static void test_render_all_states(void)
 {
     pj_ui_context_t ui;
@@ -374,6 +407,7 @@ int main(void)
     test_dirty_lifecycle();
     test_partial_render_preserves_outside_region();
     test_no_back_button_pixels();
+    test_static_art_render_and_fallback();
     test_render_all_states();
     puts("ui tests passed");
     return 0;

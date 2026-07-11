@@ -95,6 +95,8 @@ typedef struct {
     int note_page;
     int selected_note;
     char note_labels[PJ_UI_MAX_NOTES][PJ_UI_NOTE_LABEL_LEN];
+    uint8_t static_art[PJ_FRAMEBUFFER_BYTES];
+    int static_art_valid;
     pj_record_state_t record_state;
     pj_playback_state_t playback_state;
     int playback_exit_pending;
@@ -117,6 +119,7 @@ void pj_ui_set_time(pj_ui_context_t *ctx, int hour, int minute, int year, int mo
 void pj_ui_set_notes(pj_ui_context_t *ctx, int count, const char labels[][PJ_UI_NOTE_LABEL_LEN]);
 void pj_ui_set_audio_state(pj_ui_context_t *ctx, int recording, int playback_active);
 void pj_ui_set_sync_state(pj_ui_context_t *ctx, int pending, int transferred, int online);
+void pj_ui_set_static_art(pj_ui_context_t *ctx, const uint8_t *pixels, size_t pixel_bytes);
 int pj_ui_tick(pj_ui_context_t *ctx);
 int pj_ui_is_dirty(const pj_ui_context_t *ctx);
 void pj_ui_mark_displayed(pj_ui_context_t *ctx);

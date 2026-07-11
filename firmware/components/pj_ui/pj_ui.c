@@ -803,6 +803,21 @@ void pj_ui_set_sync_state(pj_ui_context_t *ctx, int pending, int transferred, in
     }
 }
 
+void pj_ui_set_static_art(pj_ui_context_t *ctx, const uint8_t *pixels, size_t pixel_bytes)
+{
+    if (ctx == NULL || pixels == NULL || pixel_bytes != sizeof(ctx->static_art)) {
+        return;
+    }
+    if (ctx->static_art_valid && memcmp(ctx->static_art, pixels, sizeof(ctx->static_art)) == 0) {
+        return;
+    }
+    memcpy(ctx->static_art, pixels, sizeof(ctx->static_art));
+    ctx->static_art_valid = 1;
+    if (ctx->state == PJ_UI_STATE_STATIC) {
+        mark_full(ctx);
+    }
+}
+
 void pj_ui_set_time(pj_ui_context_t *ctx, int hour, int minute, int year, int month, int day)
 {
     if (ctx->hour == hour && ctx->minute == minute && ctx->year == year && ctx->month == month && ctx->day == day) {
@@ -1166,7 +1181,17 @@ int pj_ui_handle_touch(pj_ui_context_t *ctx, int x, int y, pj_touch_kind_t kind)
 
 static void draw_home_static(const pj_ui_context_t *ctx, pj_framebuffer_t *fb)
 {
-    (void)ctx;
+    if (ctx->static_art_valid) {
+        for (int y = 0; y < PJ_DISPLAY_HEIGHT; y++) {
+            for (int x = 0; x < PJ_DISPLAY_WIDTH; x++) {
+                size_t index = (size_t)y * PJ_DISPLAY_WIDTH + (size_t)x;
+                if ((ctx->static_art[index >> 3u] >> (index & 7u)) & 1u) {
+                    fb_set(fb, x, y, 1);
+                }
+            }
+        }
+        return;
+    }
     draw_circle(fb, 100, 98, 66);
     draw_circle(fb, 100, 98, 58);
     fill_rect(fb, 74, 78, 12, 12);
@@ -1432,7 +1457,7 @@ static void render_scene(const pj_ui_context_t *ctx, pj_framebuffer_t *fb)
         break;
     }
 
-    if (ctx->dark_mode) {
+    if (ctx->dark_mode && !(ctx->state == PJ_UI_STATE_STATIC && ctx->static_art_valid)) {
         invert_framebuffer(fb);
     }
 }
