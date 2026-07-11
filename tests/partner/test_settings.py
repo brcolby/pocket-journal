@@ -13,7 +13,18 @@ class SettingsCliTests(unittest.TestCase):
         )
 
     def test_rejects_unsupported_and_malformed_assignments(self) -> None:
-        for assignments in (["volume"], ["unknown=1"], ["volume=loud"], ["theme=blue"], ["alarm_enabled=yes"]):
+        for assignments in (
+            ["volume"],
+            ["unknown=1"],
+            ["volume=loud"],
+            ["volume=11"],
+            ["alarm_hour=24"],
+            ["alarm_minute=-1"],
+            ["timer_seconds=29"],
+            ["interval_seconds=86401"],
+            ["theme=blue"],
+            ["alarm_enabled=yes"],
+        ):
             with self.subTest(assignments=assignments), self.assertRaises(SystemExit):
                 _parse_settings_assignments(assignments)
 
