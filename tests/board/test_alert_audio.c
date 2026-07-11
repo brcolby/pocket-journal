@@ -297,7 +297,9 @@ static void test_volume_applies_on_next_start_and_zero_is_visual_only(void)
     assert(mock.prepare_calls == prepares && mock.write_calls == writes);
     pj_alert_audio_set_volume(&audio, 255);
     assert(audio.configured_volume == 100);
-    assert(audio.state == PJ_ALERT_AUDIO_SILENT);
+    assert(audio.state == PJ_ALERT_AUDIO_PLAYING && audio.start_volume == 100);
+    assert(pj_alert_audio_pump(&audio, scratch) == PJ_ALERT_AUDIO_BLOCK_WRITTEN);
+    assert(mock.volume == 100);
 }
 
 static void test_pattern_silence_finishes_stream(void)

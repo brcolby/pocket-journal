@@ -154,6 +154,11 @@ void pj_alert_audio_set_volume(pj_alert_audio_t *audio, uint8_t volume)
 {
     if (audio != NULL) {
         audio->configured_volume = clamp_volume(volume);
+        if (audio->alert_id != 0 && audio->state == PJ_ALERT_AUDIO_SILENT &&
+            audio->configured_volume != 0 && !audio->recording) {
+            audio->cancellation_generation++;
+            select_start_state(audio, 0);
+        }
     }
 }
 

@@ -1,4 +1,5 @@
 #include "pj_board.h"
+#include "pj_alert_audio.h"
 #include "pj_audio_level.h"
 #include "pj_aux_input.h"
 #include "pj_auth.h"
@@ -151,6 +152,7 @@
 #define PJ_AUDIO_RECORD_TASK_STACK 6144
 #define PJ_AUDIO_PROCESS_TASK_STACK 6144
 #define PJ_AUDIO_PLAYBACK_TASK_STACK 6144
+#define PJ_ALERT_AUDIO_TASK_STACK 4096
 #define PJ_AUDIO_IO_BUFFER_BYTES 1024
 #define PJ_AUDIO_MAX_CONSECUTIVE_READ_ERRORS 10
 #define AUDIO_PA_ACTIVE_LEVEL 1
@@ -272,6 +274,9 @@ static volatile int g_notes_update_pending;
 static TaskHandle_t g_record_task;
 static TaskHandle_t g_audio_process_task;
 static TaskHandle_t g_playback_task;
+static TaskHandle_t g_alert_audio_task;
+static int g_record_audio_owned;
+static int g_alert_audio_output_owned;
 static char g_active_recording_path[128];
 static char g_active_playback_path[128];
 static int g_ui_note_audio_indices[PJ_UI_MAX_NOTES];
@@ -297,6 +302,17 @@ static int g_rtc_ext1_enabled;
 static int g_rtc_wake_hardware_verified;
 static int g_timer_wakeup_enabled;
 
+typedef struct {
+    uint64_t alert_id;
+    pj_alert_audio_kind_t kind;
+    uint8_t volume;
+    uint8_t recording;
+    uint8_t deferred;
+} alert_audio_intent_t;
+
+static portMUX_TYPE g_alert_audio_intent_lock = portMUX_INITIALIZER_UNLOCKED;
+static alert_audio_intent_t g_alert_audio_intent;
+
 static esp_err_t rtc_write_status_time(void);
 static uint64_t board_monotonic_ms(void);
 static int board_time_model_clock(pj_time_clock_t *clock);
@@ -305,6 +321,13 @@ static int time_state_persist(int force);
 static int time_state_reconcile_alarm(const pj_time_clock_t *clock);
 static int time_state_project(pj_ui_context_t *ui);
 static int rtc_wake_sync(void);
+static int settings_codec_volume_snapshot(void);
+static void alert_audio_project(const pj_time_alert_t *alert,
+                                pj_time_conflict_action_t action);
+static void alert_audio_set_recording(int recording);
+static void alert_audio_set_volume(int codec_volume);
+
+static pj_alert_audio_t g_alert_audio;
 
 static void board_audio_state_set(int recording, int playback_active)
 {
@@ -501,7 +524,17 @@ static esp_err_t audio_write_silence_ms(uint32_t duration_ms)
     return ESP_OK;
 }
 
-static esp_err_t audio_prepare_output(const char *reason, int pa_level_override)
+static void audio_abort_output(const char *reason)
+{
+    if (g_audio_playback_codec != NULL) {
+        (void)esp_codec_dev_set_out_mute(g_audio_playback_codec, true);
+    }
+    audio_pa_set(0);
+    audio_log_output_regs(reason);
+}
+
+static esp_err_t audio_prepare_output(const char *reason, int pa_level_override,
+                                      int codec_volume)
 {
     if (g_audio_playback_codec == NULL || g_es8311_codec_if == NULL) {
         return ESP_ERR_INVALID_STATE;
@@ -514,13 +547,14 @@ static esp_err_t audio_prepare_output(const char *reason, int pa_level_override)
         }
     }
 
-    int codec_volume = pj_settings_codec_volume(g_settings.volume);
     int vol_ret = esp_codec_dev_set_out_vol(g_audio_playback_codec, codec_volume);
     if (vol_ret != ESP_CODEC_DEV_OK) {
+        audio_abort_output("output-volume-failed");
         return (esp_err_t)vol_ret;
     }
     int mute_ret = esp_codec_dev_set_out_mute(g_audio_playback_codec, true);
     if (mute_ret != ESP_CODEC_DEV_OK) {
+        audio_abort_output("output-mute-failed");
         return (esp_err_t)mute_ret;
     }
 
@@ -532,20 +566,18 @@ static esp_err_t audio_prepare_output(const char *reason, int pa_level_override)
 
     esp_err_t silence_err = audio_write_silence_ms(PJ_AUDIO_OUTPUT_SILENCE_MS);
     if (silence_err != ESP_OK) {
-        ESP_ERROR_CHECK_WITHOUT_ABORT((esp_err_t)esp_codec_dev_set_out_mute(g_audio_playback_codec, true));
-        audio_pa_set(0);
+        audio_abort_output("output-preroll-failed");
         return silence_err;
     }
     vTaskDelay(pdMS_TO_TICKS(10));
     mute_ret = esp_codec_dev_set_out_mute(g_audio_playback_codec, false);
     if (mute_ret != ESP_CODEC_DEV_OK) {
-        audio_pa_set(0);
+        audio_abort_output("output-unmute-failed");
         return (esp_err_t)mute_ret;
     }
     silence_err = audio_write_silence_ms(PJ_AUDIO_OUTPUT_SILENCE_MS);
     if (silence_err != ESP_OK) {
-        ESP_ERROR_CHECK_WITHOUT_ABORT((esp_err_t)esp_codec_dev_set_out_mute(g_audio_playback_codec, true));
-        audio_pa_set(0);
+        audio_abort_output("output-post-unmute-failed");
         return silence_err;
     }
 
@@ -555,16 +587,211 @@ static esp_err_t audio_prepare_output(const char *reason, int pa_level_override)
     return ESP_OK;
 }
 
-static void audio_finish_output(const char *reason)
+static esp_err_t audio_finish_output(const char *reason)
 {
+    esp_err_t result = ESP_OK;
     if (g_audio_playback_codec != NULL) {
-        ESP_ERROR_CHECK_WITHOUT_ABORT(audio_write_silence_ms(PJ_AUDIO_OUTPUT_SILENCE_MS));
+        result = audio_write_silence_ms(PJ_AUDIO_OUTPUT_SILENCE_MS);
         vTaskDelay(pdMS_TO_TICKS(PJ_AUDIO_OUTPUT_SILENCE_MS));
-        ESP_ERROR_CHECK_WITHOUT_ABORT((esp_err_t)esp_codec_dev_set_out_mute(g_audio_playback_codec, true));
+        int mute = esp_codec_dev_set_out_mute(g_audio_playback_codec, true);
+        if (result == ESP_OK && mute != ESP_CODEC_DEV_OK) {
+            result = (esp_err_t)mute;
+        }
         vTaskDelay(pdMS_TO_TICKS(10));
     }
     audio_pa_set(0);
     audio_log_output_regs(reason);
+    return result;
+}
+
+static int alert_audio_prepare(void *context, uint32_t sample_rate, uint8_t channels,
+                               uint8_t codec_volume)
+{
+    (void)context;
+    if (sample_rate != PJ_AUDIO_SAMPLE_RATE || channels != 2 ||
+        g_audio_lock == NULL || board_time_activity() != PJ_TIME_ACTIVITY_IDLE ||
+        xSemaphoreTake(g_audio_lock, pdMS_TO_TICKS(20)) != pdTRUE) {
+        return 0;
+    }
+    if (board_time_activity() != PJ_TIME_ACTIVITY_IDLE) {
+        xSemaphoreGive(g_audio_lock);
+        return 0;
+    }
+    g_alert_audio_output_owned = 1;
+    esp_err_t err = audio_prepare_output("time-alert", -1, codec_volume);
+    if (err != ESP_OK) {
+        audio_abort_output("time-alert-prepare-failed");
+        g_alert_audio_output_owned = 0;
+        xSemaphoreGive(g_audio_lock);
+        (void)snprintf(g_status.last_error, sizeof(g_status.last_error),
+                       "time alert audio prepare failed: %s", esp_err_to_name(err));
+        ESP_LOGW(TAG, "%s", g_status.last_error);
+        return 0;
+    }
+    return 1;
+}
+
+static int alert_audio_write(void *context, const int16_t *samples, size_t frames)
+{
+    (void)context;
+    if (!g_alert_audio_output_owned || samples == NULL || frames == 0 ||
+        frames > PJ_ALERT_AUDIO_BLOCK_FRAMES) {
+        return 0;
+    }
+    int result = esp_codec_dev_write(g_audio_playback_codec, (void *)samples,
+                                     (int)(frames * PJ_AUDIO_FRAME_BYTES));
+    if (result != ESP_CODEC_DEV_OK) {
+        (void)snprintf(g_status.last_error, sizeof(g_status.last_error),
+                       "time alert audio write failed: %s", esp_err_to_name((esp_err_t)result));
+        ESP_LOGW(TAG, "%s", g_status.last_error);
+        return 0;
+    }
+    return 1;
+}
+
+static int alert_audio_finish(void *context)
+{
+    (void)context;
+    if (!g_alert_audio_output_owned) {
+        return 1;
+    }
+    esp_err_t result = audio_finish_output("time-alert-finish");
+    g_alert_audio_output_owned = 0;
+    xSemaphoreGive(g_audio_lock);
+    if (result != ESP_OK) {
+        (void)snprintf(g_status.last_error, sizeof(g_status.last_error),
+                       "time alert audio cleanup failed: %s", esp_err_to_name(result));
+        ESP_LOGW(TAG, "%s", g_status.last_error);
+        return 0;
+    }
+    return 1;
+}
+
+static void alert_audio_notify(void)
+{
+    if (g_alert_audio_task != NULL) {
+        xTaskNotifyGive(g_alert_audio_task);
+    }
+}
+
+static alert_audio_intent_t alert_audio_intent_snapshot(void)
+{
+    alert_audio_intent_t intent;
+    portENTER_CRITICAL(&g_alert_audio_intent_lock);
+    intent = g_alert_audio_intent;
+    portEXIT_CRITICAL(&g_alert_audio_intent_lock);
+    return intent;
+}
+
+static void alert_audio_apply_intent(const alert_audio_intent_t *intent)
+{
+    pj_alert_audio_set_volume(&g_alert_audio, intent->volume);
+    (void)pj_alert_audio_set_recording(&g_alert_audio, intent->recording);
+
+    uint64_t current_id = g_alert_audio.alert_id;
+    if (intent->alert_id == 0) {
+        if (current_id != 0) {
+            (void)pj_alert_audio_stop(&g_alert_audio, current_id);
+        }
+        return;
+    }
+    if (current_id != intent->alert_id) {
+        (void)pj_alert_audio_transition(&g_alert_audio, current_id,
+                                        intent->alert_id, intent->kind,
+                                        intent->deferred);
+    } else if (intent->deferred || intent->recording) {
+        (void)pj_alert_audio_defer(&g_alert_audio, intent->alert_id);
+    } else {
+        (void)pj_alert_audio_resume(&g_alert_audio, intent->alert_id);
+    }
+}
+
+static void alert_audio_task(void *arg)
+{
+    (void)arg;
+    int16_t scratch[PJ_ALERT_AUDIO_BLOCK_SAMPLES];
+    while (1) {
+        alert_audio_intent_t intent = alert_audio_intent_snapshot();
+        alert_audio_apply_intent(&intent);
+        pj_alert_audio_result_t result = pj_alert_audio_pump(&g_alert_audio, scratch);
+        int active = g_alert_audio.state == PJ_ALERT_AUDIO_PLAYING ||
+                     g_alert_audio.cleanup_pending;
+        if (result < 0) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+        } else if (result == PJ_ALERT_AUDIO_BLOCK_WRITTEN) {
+            /* The blocking I2S write provides the producer pacing. */
+        } else if (result == PJ_ALERT_AUDIO_SILENT_BLOCK) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+        } else if (!active) {
+            (void)ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(500));
+        } else {
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+    }
+}
+
+static esp_err_t alert_audio_start(void)
+{
+    pj_alert_audio_io_t io = {
+        .prepare = alert_audio_prepare,
+        .write = alert_audio_write,
+        .finish = alert_audio_finish,
+    };
+    uint8_t volume = (uint8_t)settings_codec_volume_snapshot();
+    portENTER_CRITICAL(&g_alert_audio_intent_lock);
+    g_alert_audio_intent.volume = volume;
+    portEXIT_CRITICAL(&g_alert_audio_intent_lock);
+    pj_alert_audio_init(&g_alert_audio, &io, volume);
+    if (xTaskCreate(alert_audio_task, "pj-time-alert", PJ_ALERT_AUDIO_TASK_STACK,
+                    NULL, 5, &g_alert_audio_task) != pdPASS) {
+        g_alert_audio_task = NULL;
+        return ESP_ERR_NO_MEM;
+    }
+    return ESP_OK;
+}
+
+static int alert_audio_desired(void)
+{
+    return alert_audio_intent_snapshot().alert_id != 0;
+}
+
+static void alert_audio_set_volume(int codec_volume)
+{
+    portENTER_CRITICAL(&g_alert_audio_intent_lock);
+    g_alert_audio_intent.volume = (uint8_t)codec_volume;
+    portEXIT_CRITICAL(&g_alert_audio_intent_lock);
+    alert_audio_notify();
+}
+
+static void alert_audio_set_recording(int recording)
+{
+    portENTER_CRITICAL(&g_alert_audio_intent_lock);
+    g_alert_audio_intent.recording = recording != 0;
+    if (!recording) {
+        g_alert_audio_intent.deferred = 0;
+    }
+    portEXIT_CRITICAL(&g_alert_audio_intent_lock);
+    alert_audio_notify();
+}
+
+static void alert_audio_project(const pj_time_alert_t *alert,
+                                pj_time_conflict_action_t action)
+{
+    uint64_t alert_id = alert != NULL ? alert->id : 0;
+    pj_alert_audio_kind_t kind = 0;
+    if (alert != NULL) {
+        kind = alert->source == PJ_TIME_ALERT_TIMER ?
+            PJ_ALERT_AUDIO_TIMER : alert->source == PJ_TIME_ALERT_INTERVAL ?
+            PJ_ALERT_AUDIO_INTERVAL : PJ_ALERT_AUDIO_ALARM;
+    }
+    portENTER_CRITICAL(&g_alert_audio_intent_lock);
+    g_alert_audio_intent.alert_id = alert_id;
+    g_alert_audio_intent.kind = kind;
+    g_alert_audio_intent.deferred = alert_id != 0 &&
+        action == PJ_TIME_VISUAL_DEFER_AUDIO &&
+        g_alert_audio_intent.recording;
+    portEXIT_CRITICAL(&g_alert_audio_intent_lock);
+    alert_audio_notify();
 }
 
 static i2s_std_gpio_config_t audio_i2s_gpio_config(gpio_num_t dout_pin)
@@ -802,6 +1029,16 @@ static void settings_give(void)
     if (g_settings_lock != NULL) {
         xSemaphoreGive(g_settings_lock);
     }
+}
+
+static int settings_codec_volume_snapshot(void)
+{
+    int volume = 0;
+    if (settings_take(portMAX_DELAY)) {
+        volume = pj_settings_codec_volume(g_settings.volume);
+        settings_give();
+    }
+    return volume;
 }
 
 static int static_art_take(TickType_t timeout)
@@ -1223,13 +1460,21 @@ static rtc_wake_load_result_t rtc_wake_plan_load(pj_rtc_wake_plan_t *plan)
         RTC_WAKE_LOAD_VALID : RTC_WAKE_LOAD_INVALID;
 }
 
-static void settings_apply_codec_volume(void)
+static void settings_apply_codec_volume(int codec_volume)
 {
     if (g_audio_playback_codec == NULL) {
         return;
     }
-    int codec_volume = pj_settings_codec_volume(g_settings.volume);
+    int locked = g_audio_lock != NULL &&
+                 xSemaphoreTake(g_audio_lock, pdMS_TO_TICKS(100)) == pdTRUE;
+    if (g_audio_lock != NULL && !locked) {
+        ESP_LOGI(TAG, "Codec volume update deferred until the next audio start");
+        return;
+    }
     int result = esp_codec_dev_set_out_vol(g_audio_playback_codec, codec_volume);
+    if (locked) {
+        xSemaphoreGive(g_audio_lock);
+    }
     if (result != ESP_CODEC_DEV_OK) {
         ESP_LOGW(TAG, "Codec volume update failed: %s", esp_err_to_name((esp_err_t)result));
     }
@@ -3349,11 +3594,12 @@ static int time_state_project(pj_ui_context_t *ui)
         .recovery_time_uncertain = g_time_state.recovery_time_uncertain,
     };
     const pj_time_alert_t *alert = pj_time_active_alert(&g_time_state);
+    pj_time_conflict_action_t action = PJ_TIME_PRESENT;
     if (alert != NULL) {
         projection.active_alert = *alert;
         pj_time_activity_t activity = board_time_activity();
-        pj_time_conflict_action_t action = pj_time_alert_conflict_action(
-            (pj_time_alert_source_t)alert->source, activity);
+        action = pj_time_alert_conflict_action((pj_time_alert_source_t)alert->source,
+                                               activity);
         projection.alert_audio_deferred = action == PJ_TIME_VISUAL_DEFER_AUDIO;
         if (action == PJ_TIME_PREEMPT_PLAYBACK &&
             g_time_last_preempt_alert_id != alert->id) {
@@ -3363,6 +3609,7 @@ static int time_state_project(pj_ui_context_t *ui)
     } else {
         g_time_last_preempt_alert_id = 0;
     }
+    alert_audio_project(alert, action);
     pj_ui_set_time_projection(ui, &projection);
     return 1;
 }
@@ -3693,11 +3940,16 @@ static esp_err_t audio_init(void)
 
 static void record_task_exit(int note_ready)
 {
+    if (g_record_audio_owned) {
+        g_record_audio_owned = 0;
+        xSemaphoreGive(g_audio_lock);
+    }
     if (note_ready) {
         g_notes_update_pending = 1;
     }
     g_record_task = NULL;
     board_audio_state_set(0, -1);
+    alert_audio_set_recording(0);
     g_audio_state_update_pending = 1;
     vTaskDelete(NULL);
 }
@@ -3706,6 +3958,7 @@ static void playback_task_exit(void)
 {
     g_playback_task = NULL;
     board_audio_state_set(-1, 0);
+    alert_audio_notify();
     g_audio_state_update_pending = 1;
     vTaskDelete(NULL);
 }
@@ -3713,6 +3966,12 @@ static void playback_task_exit(void)
 static void record_task(void *arg)
 {
     (void)arg;
+    if (g_audio_lock == NULL || xSemaphoreTake(g_audio_lock, portMAX_DELAY) != pdTRUE) {
+        ESP_LOGE(TAG, "Recording could not acquire audio ownership");
+        record_task_exit(0);
+        return;
+    }
+    g_record_audio_owned = 1;
     int16_t *stereo = malloc(PJ_AUDIO_IO_BUFFER_BYTES);
     int16_t *mono = malloc((PJ_AUDIO_IO_BUFFER_BYTES / PJ_AUDIO_FRAME_BYTES) * sizeof(int16_t));
     uint32_t data_bytes = 0;
@@ -3816,6 +4075,8 @@ static void record_task(void *arg)
             break;
         }
     }
+    g_record_audio_owned = 0;
+    xSemaphoreGive(g_audio_lock);
     uint32_t raw_avg = sample_count > 0 ? (uint32_t)(abs_sum / sample_count) : 0;
     int header_ok = wav_write_header(file, data_bytes, PJ_AUDIO_CHANNELS, PJ_AUDIO_SAMPLE_RATE);
     int flush_ok = fflush(file) == 0 && fsync(fileno(file)) == 0;
@@ -3926,12 +4187,30 @@ static void playback_task(void *arg)
     }
     ESP_LOGI(TAG, "Playback WAV header: %s channels=%u sample_rate=%u bits=%u data_bytes=%u",
              g_active_playback_path, channels, (unsigned)sample_rate, bits, (unsigned)data_bytes);
-    esp_err_t output_err = audio_prepare_output("playback", -1);
+    if (g_audio_lock == NULL || xSemaphoreTake(g_audio_lock, portMAX_DELAY) != pdTRUE) {
+        ESP_LOGE(TAG, "Playback could not acquire audio ownership");
+        fclose(file);
+        free(mono);
+        free(stereo);
+        playback_task_exit();
+        return;
+    }
+    if (g_playback_stop_requested) {
+        xSemaphoreGive(g_audio_lock);
+        fclose(file);
+        free(mono);
+        free(stereo);
+        playback_task_exit();
+        return;
+    }
+    esp_err_t output_err = audio_prepare_output("playback", -1,
+                                                settings_codec_volume_snapshot());
     if (output_err != ESP_OK) {
         ESP_LOGE(TAG, "Playback output prepare failed: %s", esp_err_to_name(output_err));
         fclose(file);
         free(mono);
         free(stereo);
+        xSemaphoreGive(g_audio_lock);
         playback_task_exit();
         return;
     }
@@ -3967,6 +4246,7 @@ static void playback_task(void *arg)
         }
     }
     audio_finish_output("playback-finish");
+    xSemaphoreGive(g_audio_lock);
     fclose(file);
     free(mono);
     free(stereo);
@@ -3981,13 +4261,19 @@ static esp_err_t audio_play_tone_ms(uint32_t duration_ms, const audio_tone_diag_
     if (!g_audio_ready || g_audio_playback_codec == NULL) {
         return ESP_ERR_INVALID_STATE;
     }
-    if (g_status.recording || g_record_task != NULL || g_status.playback_active || g_playback_task != NULL) {
+    if (g_status.recording || g_record_task != NULL || g_status.playback_active ||
+        g_playback_task != NULL || alert_audio_desired()) {
         return ESP_ERR_INVALID_STATE;
+    }
+    if (g_audio_lock == NULL ||
+        xSemaphoreTake(g_audio_lock, pdMS_TO_TICKS(100)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
     }
 
     size_t frames_per_block = PJ_AUDIO_IO_BUFFER_BYTES / PJ_AUDIO_FRAME_BYTES;
     int16_t *stereo = malloc(frames_per_block * PJ_AUDIO_FRAME_BYTES);
     if (stereo == NULL) {
+        xSemaphoreGive(g_audio_lock);
         return ESP_ERR_NO_MEM;
     }
 
@@ -4004,6 +4290,7 @@ static esp_err_t audio_play_tone_ms(uint32_t duration_ms, const audio_tone_diag_
     esp_err_t route_err = audio_reconfigure_tx_dout(dout_gpio_override);
     if (route_err != ESP_OK) {
         free(stereo);
+        xSemaphoreGive(g_audio_lock);
         return route_err;
     }
     gpio_num_t tone_dout_pin = g_i2s_dout_pin;
@@ -4013,7 +4300,8 @@ static esp_err_t audio_play_tone_ms(uint32_t duration_ms, const audio_tone_diag_
         vTaskDelay(pdMS_TO_TICKS(20));
     }
 
-    esp_err_t output_err = audio_prepare_output("tone", pa_level_override);
+    int codec_volume = settings_codec_volume_snapshot();
+    esp_err_t output_err = audio_prepare_output("tone", pa_level_override, codec_volume);
     if (output_err != ESP_OK) {
         if (gp45_override >= 0) {
             ESP_ERROR_CHECK_WITHOUT_ABORT(audio_codec_reg_set(PJ_ES8311_GP_REG45, original_gp45));
@@ -4028,6 +4316,7 @@ static esp_err_t audio_play_tone_ms(uint32_t duration_ms, const audio_tone_diag_
             ESP_ERROR_CHECK_WITHOUT_ABORT(audio_reconfigure_tx_dout((int)original_dout_pin));
         }
         free(stereo);
+        xSemaphoreGive(g_audio_lock);
         return output_err;
     }
     if (gpio44_override >= 0) {
@@ -4041,6 +4330,7 @@ static esp_err_t audio_play_tone_ms(uint32_t duration_ms, const audio_tone_diag_
                 ESP_ERROR_CHECK_WITHOUT_ABORT(audio_reconfigure_tx_dout((int)original_dout_pin));
             }
             free(stereo);
+            xSemaphoreGive(g_audio_lock);
             return reg_err;
         }
     }
@@ -4058,6 +4348,7 @@ static esp_err_t audio_play_tone_ms(uint32_t duration_ms, const audio_tone_diag_
                 ESP_ERROR_CHECK_WITHOUT_ABORT(audio_reconfigure_tx_dout((int)original_dout_pin));
             }
             free(stereo);
+            xSemaphoreGive(g_audio_lock);
             return reg_err;
         }
     }
@@ -4109,10 +4400,11 @@ static esp_err_t audio_play_tone_ms(uint32_t duration_ms, const audio_tone_diag_
         }
     }
     free(stereo);
+    xSemaphoreGive(g_audio_lock);
     ESP_LOGI(TAG, "Audio tone complete: frames=%u pa_level=%d volume=%d dout=%d pwr=%d gpio44=%02x gp45=%02x result=%s",
              (unsigned)generated,
              pa_level_override == 0 || pa_level_override == 1 ? pa_level_override : AUDIO_PA_ACTIVE_LEVEL,
-             pj_settings_codec_volume(g_settings.volume),
+             codec_volume,
              (int)tone_dout_pin,
              audio_power_override == 0 || audio_power_override == 1 ? audio_power_override : original_audio_power_level,
              gpio44_override >= 0 ? gpio44_override & 0xFF : original_gpio44 & 0xFF,
@@ -4126,8 +4418,13 @@ static esp_err_t audio_mic_check_ms(uint32_t duration_ms, int gain_db, audio_mic
     if (!g_audio_ready || g_audio_record_codec == NULL || result == NULL) {
         return ESP_ERR_INVALID_STATE;
     }
-    if (g_status.recording || g_record_task != NULL || g_status.playback_active || g_playback_task != NULL) {
+    if (g_status.recording || g_record_task != NULL || g_status.playback_active ||
+        g_playback_task != NULL || alert_audio_desired()) {
         return ESP_ERR_INVALID_STATE;
+    }
+    if (g_audio_lock == NULL ||
+        xSemaphoreTake(g_audio_lock, pdMS_TO_TICKS(100)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
     }
 
     if (duration_ms == 0) {
@@ -4138,6 +4435,7 @@ static esp_err_t audio_mic_check_ms(uint32_t duration_ms, int gain_db, audio_mic
 
     int16_t *stereo = malloc(PJ_AUDIO_IO_BUFFER_BYTES);
     if (stereo == NULL) {
+        xSemaphoreGive(g_audio_lock);
         return ESP_ERR_NO_MEM;
     }
 
@@ -4145,6 +4443,7 @@ static esp_err_t audio_mic_check_ms(uint32_t duration_ms, int gain_db, audio_mic
         int gain_ret = esp_codec_dev_set_in_gain(g_audio_record_codec, (float)gain_db);
         if (gain_ret != ESP_CODEC_DEV_OK) {
             free(stereo);
+            xSemaphoreGive(g_audio_lock);
             return (esp_err_t)gain_ret;
         }
     } else {
@@ -4203,6 +4502,7 @@ static esp_err_t audio_mic_check_ms(uint32_t duration_ms, int gain_db, audio_mic
         result->avg_abs = (uint32_t)(abs_sum / result->frames);
     }
     free(stereo);
+    xSemaphoreGive(g_audio_lock);
     ESP_LOGI(TAG,
              "Mic check complete: ms=%u gain=%d channel=%d bytes=%u frames=%u peak=%u avg_abs=%u clipped=%u near_zero=%u read_errors=%u",
              (unsigned)result->duration_ms,
@@ -4497,21 +4797,26 @@ void pj_board_init(const pj_board_profile_t *profile)
         g_status.storage = PJ_BOARD_SERVICE_READY;
         ESP_LOGI(TAG, "microSD mounted at %s", g_status.storage_path);
         static_art_load();
-        esp_err_t audio_err = audio_init();
-        if (audio_err == ESP_OK) {
-            g_status.audio = PJ_BOARD_SERVICE_READY;
-        } else {
-            g_status.audio = PJ_BOARD_SERVICE_ERROR;
-            (void)snprintf(g_status.last_error, sizeof(g_status.last_error),
-                           "audio init failed: %s", esp_err_to_name(audio_err));
-            ESP_LOGW(TAG, "%s", g_status.last_error);
-        }
     } else {
         g_status.storage = PJ_BOARD_SERVICE_ERROR;
-        g_status.audio = PJ_BOARD_SERVICE_UNAVAILABLE;
         (void)snprintf(g_status.last_error, sizeof(g_status.last_error),
                        "microSD mount failed: %s; check card inserted and FAT32/exFAT formatting",
                        esp_err_to_name(storage_err));
+        ESP_LOGW(TAG, "%s", g_status.last_error);
+    }
+    esp_err_t audio_err = audio_init();
+    if (audio_err == ESP_OK) {
+        g_status.audio = PJ_BOARD_SERVICE_READY;
+        esp_err_t alert_err = alert_audio_start();
+        if (alert_err != ESP_OK) {
+            (void)snprintf(g_status.last_error, sizeof(g_status.last_error),
+                           "time alert audio task failed: %s", esp_err_to_name(alert_err));
+            ESP_LOGW(TAG, "%s", g_status.last_error);
+        }
+    } else {
+        g_status.audio = PJ_BOARD_SERVICE_ERROR;
+        (void)snprintf(g_status.last_error, sizeof(g_status.last_error),
+                       "audio init failed: %s", esp_err_to_name(audio_err));
         ESP_LOGW(TAG, "%s", g_status.last_error);
     }
 
@@ -4641,9 +4946,10 @@ int pj_board_store_settings_from_ui(const pj_ui_context_t *ui)
         return 0;
     }
     esp_err_t err = settings_save(&updated);
+    int codec_volume = -1;
     if (err == ESP_OK) {
         g_settings = updated;
-        settings_apply_codec_volume();
+        codec_volume = pj_settings_codec_volume(updated.volume);
     } else {
         g_settings_update_pending = 1;
     }
@@ -4654,6 +4960,8 @@ int pj_board_store_settings_from_ui(const pj_ui_context_t *ui)
         ESP_LOGW(TAG, "%s", g_status.last_error);
         return -1;
     }
+    settings_apply_codec_volume(codec_volume);
+    alert_audio_set_volume(codec_volume);
     ESP_LOGI(TAG, "Settings saved from UI: volume=%d theme=%s", updated.volume,
              updated.dark_mode ? "dark" : "light");
 #else
@@ -5201,10 +5509,12 @@ int pj_board_record_set_active(int active)
     }
     next_recording_path(g_active_recording_path, sizeof(g_active_recording_path));
     g_record_stop_requested = 0;
+    alert_audio_set_recording(1);
     board_audio_state_set(1, -1);
     BaseType_t created = xTaskCreate(record_task, "pj-record", PJ_AUDIO_RECORD_TASK_STACK, NULL, 5, &g_record_task);
     if (created != pdPASS) {
         board_audio_state_set(0, -1);
+        alert_audio_set_recording(0);
         g_record_task = NULL;
         ESP_LOGE(TAG, "Record start failed: task create failed");
         return 0;
@@ -5251,7 +5561,8 @@ int pj_board_playback_set_active(int active, int note_index)
     if (g_status.playback_active) {
         return 1;
     }
-    if (g_status.recording || g_record_task != NULL || g_audio_process_task != NULL) {
+    if (g_status.recording || g_record_task != NULL || g_audio_process_task != NULL ||
+        alert_audio_desired()) {
         ESP_LOGW(TAG, "Playback start ignored: recording or audio processing active");
         return 0;
     }
@@ -6087,9 +6398,10 @@ static esp_err_t settings_put_handler(httpd_req_t *req)
     cJSON_Delete(json);
 
     esp_err_t err = settings_save(&updated);
+    int codec_volume = -1;
     if (err == ESP_OK) {
         g_settings = updated;
-        settings_apply_codec_volume();
+        codec_volume = pj_settings_codec_volume(updated.volume);
         g_settings_update_pending = 1;
     }
     settings_give();
@@ -6098,6 +6410,8 @@ static esp_err_t settings_put_handler(httpd_req_t *req)
         httpd_resp_set_status(req, "500 Internal Server Error");
         return send_json(req, "{\"error\":\"settings store failed\"}");
     }
+    settings_apply_codec_volume(codec_volume);
+    alert_audio_set_volume(codec_volume);
     return settings_get_handler(req);
 }
 
