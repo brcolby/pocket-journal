@@ -15,6 +15,41 @@ static int count_black_pixels(const pj_framebuffer_t *fb)
     return count;
 }
 
+static void assert_region_clear(const pj_framebuffer_t *fb, int x, int y, int width, int height)
+{
+    for (int row = y; row < y + height; row++) {
+        for (int column = x; column < x + width; column++) {
+            assert(pj_framebuffer_get(fb, column, row) == 0);
+        }
+    }
+}
+
+static int count_black_pixels_in_region(const pj_framebuffer_t *fb,
+                                        int x, int y, int width, int height)
+{
+    int count = 0;
+    for (int row = y; row < y + height; row++) {
+        for (int column = x; column < x + width; column++) {
+            count += pj_framebuffer_get(fb, column, row);
+        }
+    }
+    return count;
+}
+
+static int count_pixel_differences_in_region(const pj_framebuffer_t *left,
+                                             const pj_framebuffer_t *right,
+                                             int x, int y, int width, int height)
+{
+    int count = 0;
+    for (int row = y; row < y + height; row++) {
+        for (int column = x; column < x + width; column++) {
+            count += pj_framebuffer_get(left, column, row) !=
+                pj_framebuffer_get(right, column, row);
+        }
+    }
+    return count;
+}
+
 static void seed_notes(pj_ui_context_t *ui)
 {
     const char labels[][PJ_UI_NOTE_LABEL_LEN] = {
@@ -324,6 +359,44 @@ static void test_settings_dark_mode_toggle(void)
     assert(pj_ui_current_state(&ui) == PJ_UI_STATE_SETTINGS);
     assert(ui.dark_mode != initial_dark_mode);
     assert(ui.dirty.partial == 0);
+}
+
+static void test_settings_volume_opens_dedicated_screen(void)
+{
+    pj_ui_context_t ui;
+    pj_ui_init(&ui);
+    ui.state = PJ_UI_STATE_SETTINGS;
+    ui.volume = 4;
+
+    assert(pj_ui_handle_touch(&ui, 150, 40, PJ_TOUCH_TAP) == 1);
+    assert(pj_ui_current_state(&ui) == PJ_UI_STATE_VOLUME);
+    assert(ui.volume == 4);
+}
+
+static void test_volume_only_bottom_controls_adjust_and_clamp(void)
+{
+    pj_ui_context_t ui;
+    pj_ui_init(&ui);
+    ui.state = PJ_UI_STATE_VOLUME;
+    ui.volume = 5;
+
+    assert(pj_ui_handle_touch(&ui, 100, 24, PJ_TOUCH_TAP) == 0);
+    assert(pj_ui_handle_touch(&ui, 100, 76, PJ_TOUCH_TAP) == 0);
+    assert(pj_ui_handle_touch(&ui, 100, 116, PJ_TOUCH_TAP) == 0);
+    assert(pj_ui_handle_touch(&ui, 100, 166, PJ_TOUCH_TAP) == 0);
+    assert(ui.volume == 5);
+
+    assert(pj_ui_handle_touch(&ui, 52, 166, PJ_TOUCH_TAP) == 1);
+    assert(ui.volume == 4);
+    assert(pj_ui_handle_touch(&ui, 148, 166, PJ_TOUCH_TAP) == 1);
+    assert(ui.volume == 5);
+
+    ui.volume = 0;
+    assert(pj_ui_handle_touch(&ui, 52, 166, PJ_TOUCH_TAP) == 1);
+    assert(ui.volume == 0);
+    ui.volume = 10;
+    assert(pj_ui_handle_touch(&ui, 148, 166, PJ_TOUCH_TAP) == 1);
+    assert(ui.volume == 10);
 }
 
 static void test_timer_presets_are_not_runtime_counters(void)
@@ -646,6 +719,37 @@ static void test_partial_render_preserves_outside_region(void)
     }
 }
 
+static void test_record_partial_render_replaces_status_through_bottom_edge(void)
+{
+    pj_ui_context_t ui;
+    pj_ui_context_t expected_ui;
+    pj_framebuffer_t before;
+    pj_framebuffer_t partial;
+    pj_framebuffer_t expected;
+    pj_ui_init(&ui);
+    ui.state = PJ_UI_STATE_RECORD;
+    ui.record_state = PJ_RECORD_IDLE;
+    pj_ui_render(&ui, &partial);
+    before = partial;
+    pj_ui_mark_displayed(&ui);
+
+    pj_ui_set_audio_state(&ui, 1, 0);
+    assert(ui.state == PJ_UI_STATE_RECORD);
+    assert(ui.record_state == PJ_RECORD_ACTIVE);
+    assert(ui.dirty.partial == 1);
+    assert(ui.dirty.x == 0 && ui.dirty.y == 32);
+    assert(ui.dirty.width == PJ_DISPLAY_WIDTH);
+    assert(ui.dirty.y + ui.dirty.height == PJ_DISPLAY_HEIGHT);
+    pj_ui_render(&ui, &partial);
+
+    expected_ui = ui;
+    pj_ui_request_full_refresh(&expected_ui);
+    pj_ui_render(&expected_ui, &expected);
+    assert(memcmp(&partial, &expected, sizeof(expected)) == 0);
+    assert(count_pixel_differences_in_region(
+               &before, &partial, 0, 150, PJ_DISPLAY_WIDTH, 50) > 0);
+}
+
 static void test_no_back_button_pixels(void)
 {
     pj_ui_context_t ui;
@@ -692,6 +796,90 @@ static void test_static_art_render_and_fallback(void)
     assert(count_black_pixels(&custom) == 2);
 }
 
+static void test_long_note_label_stays_clear_of_pagination_rail(void)
+{
+    pj_ui_context_t ui;
+    pj_framebuffer_t fb;
+    const char labels[][PJ_UI_NOTE_LABEL_LEN] = {
+        "MAXIMUM-LABEL-TXT",
+    };
+    pj_ui_init(&ui);
+    pj_ui_set_notes(&ui, 1, labels);
+    ui.state = PJ_UI_STATE_LISTEN;
+
+    pj_ui_render(&ui, &fb);
+    assert(count_black_pixels(&fb) > 0);
+    assert_region_clear(&fb, 145, 8, 7, 46);
+}
+
+static void test_note_detail_title_respects_side_margins(void)
+{
+    pj_ui_context_t ui;
+    pj_framebuffer_t fb;
+    const char labels[][PJ_UI_NOTE_LABEL_LEN] = {
+        "WWWWWWWWWWWWWWWWW",
+    };
+    pj_ui_init(&ui);
+    pj_ui_set_notes(&ui, 1, labels);
+    ui.state = PJ_UI_STATE_NOTE_DETAIL;
+    ui.selected_note = 0;
+
+    pj_ui_render(&ui, &fb);
+    assert(count_black_pixels_in_region(&fb, 8, 12, 184, 36) > 0);
+    assert_region_clear(&fb, 0, 12, 8, 36);
+    assert_region_clear(&fb, 192, 12, 8, 36);
+}
+
+static void test_calendar_divider_stays_above_empty_state(void)
+{
+    pj_ui_context_t ui;
+    pj_framebuffer_t fb;
+    pj_ui_init(&ui);
+    ui.state = PJ_UI_STATE_CALENDAR;
+    pj_ui_render(&ui, &fb);
+
+    for (int x = 36; x <= 164; x++) {
+        assert(pj_framebuffer_get(&fb, x, 76) == 1);
+    }
+    assert_region_clear(&fb, 36, 77, 129, 20);
+}
+
+static void test_polished_scenes_render_stably(void)
+{
+    static const pj_ui_state_t stable_states[] = {
+        PJ_UI_STATE_STATIC,
+        PJ_UI_STATE_CALENDAR,
+        PJ_UI_STATE_NOTE_DETAIL,
+    };
+    pj_ui_context_t ui;
+    pj_framebuffer_t first;
+    pj_framebuffer_t second;
+    pj_framebuffer_t record_frames[3];
+    pj_ui_init(&ui);
+    pj_ui_set_time(&ui, 9, 41, 2026, 7, 11);
+
+    for (size_t i = 0; i < sizeof(stable_states) / sizeof(stable_states[0]); i++) {
+        ui.state = stable_states[i];
+        pj_ui_render(&ui, &first);
+        pj_ui_render(&ui, &second);
+        assert(count_black_pixels(&first) > 0);
+        assert(memcmp(&first, &second, sizeof(first)) == 0);
+    }
+
+    ui.state = PJ_UI_STATE_RECORD;
+    for (int state = PJ_RECORD_IDLE; state <= PJ_RECORD_STOPPING; state++) {
+        ui.record_state = (pj_record_state_t)state;
+        pj_ui_render(&ui, &record_frames[state]);
+        pj_ui_render(&ui, &second);
+        assert(count_black_pixels(&record_frames[state]) > 0);
+        assert(memcmp(&record_frames[state], &second, sizeof(second)) == 0);
+    }
+    assert(memcmp(&record_frames[PJ_RECORD_IDLE],
+                  &record_frames[PJ_RECORD_ACTIVE], sizeof(first)) != 0);
+    assert(memcmp(&record_frames[PJ_RECORD_ACTIVE],
+                  &record_frames[PJ_RECORD_STOPPING], sizeof(first)) != 0);
+}
+
 static void test_render_all_states(void)
 {
     pj_ui_context_t ui;
@@ -722,6 +910,8 @@ int main(void)
     test_aux_double_click_routing();
     test_audio_lifecycle_reconciliation();
     test_settings_dark_mode_toggle();
+    test_settings_volume_opens_dedicated_screen();
+    test_volume_only_bottom_controls_adjust_and_clamp();
     test_timer_presets_are_not_runtime_counters();
     test_time_projection_and_alert_repaint();
     test_active_alert_gates_background_actions();
@@ -732,8 +922,13 @@ int main(void)
     test_sync_state_is_board_driven();
     test_dirty_lifecycle();
     test_partial_render_preserves_outside_region();
+    test_record_partial_render_replaces_status_through_bottom_edge();
     test_no_back_button_pixels();
     test_static_art_render_and_fallback();
+    test_long_note_label_stays_clear_of_pagination_rail();
+    test_note_detail_title_respects_side_margins();
+    test_calendar_divider_stays_above_empty_state();
+    test_polished_scenes_render_stably();
     test_render_all_states();
     puts("ui tests passed");
     return 0;
