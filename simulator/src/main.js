@@ -172,9 +172,9 @@ function logAction(message) {
 }
 
 function updateDisplayScale() {
-  const device = canvas.parentElement;
-  const availableWidth = device?.clientWidth ?? window.innerWidth;
-  const availableHeight = Math.max(DISPLAY_HEIGHT, window.innerHeight - 64);
+  const device = canvas.closest(".device-stage");
+  const availableWidth = Math.max(DISPLAY_WIDTH, (device?.clientWidth ?? window.innerWidth) - 48);
+  const availableHeight = Math.max(DISPLAY_HEIGHT, window.innerHeight - 220);
   const scale = Math.max(1, Math.min(4, Math.floor(Math.min(availableWidth, availableHeight) / DISPLAY_WIDTH)));
   canvas.style.width = `${DISPLAY_WIDTH * scale}px`;
   canvas.style.height = `${DISPLAY_HEIGHT * scale}px`;
@@ -261,7 +261,8 @@ function paintFirmwareFramebuffer(action = "render") {
   copyFirmwareFramebuffer(region);
   ctx.putImageData(framebufferImage, 0, 0, region.x, region.y, region.width, region.height);
   stateName.textContent = state;
-  powerButton.textContent = state === "static" ? "On (D)" : "Off (D)";
+  powerButton.setAttribute("aria-pressed", state === "static" ? "false" : "true");
+  powerButton.title = state === "static" ? "Power on" : "Power off";
   history.dataset.dirtyRegion = JSON.stringify(dirty);
   updateHistory(state);
   traceDebug("firmware.render", { action, state, dirty, painted: region });

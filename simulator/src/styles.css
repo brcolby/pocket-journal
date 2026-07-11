@@ -1,10 +1,13 @@
 :root {
   color-scheme: light;
-  --ink: #000;
+  --ink: #171817;
   --paper: #fff;
-  --line: #d3d0c3;
+  --line: #c9cec9;
   --panel: #ffffff;
-  --accent: #1f6f5b;
+  --accent: #176b55;
+  --accent-soft: #dcebe5;
+  --hardware: #252827;
+  --signal: #ba3d32;
 }
 
 * {
@@ -16,59 +19,155 @@ body {
   min-height: 100vh;
   font-family: "Space Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
   font-weight: 700;
-  background: #eeeeea;
+  background: #eef0ed;
   color: var(--ink);
+}
+
+.topbar {
+  min-height: 72px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 24px;
+  padding: 14px 28px;
+  background: var(--paper);
+  border-bottom: 1px solid var(--line);
+}
+
+.topbar h1,
+.topbar p,
+.history-panel h2 {
+  margin: 0;
+}
+
+.topbar h1 {
+  font-size: 22px;
+  line-height: 1.1;
+}
+
+.topbar p {
+  margin-top: 3px;
+  color: #606560;
+  font-size: 12px;
+  font-weight: 400;
+}
+
+.runtime-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: #4c514d;
+  font-size: 12px;
+}
+
+.runtime-status i {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--accent);
 }
 
 .app {
   display: grid;
-  grid-template-columns: minmax(320px, 1fr) 320px;
-  gap: 24px;
-  min-height: 100vh;
-  padding: 32px;
-  align-items: center;
+  grid-template-columns: minmax(420px, 1fr) 336px;
+  min-height: calc(100vh - 72px);
+  align-items: stretch;
 }
 
 .device {
   display: grid;
   place-items: center;
-  gap: 14px;
+  align-content: center;
+  gap: 28px;
+  min-width: 0;
+  padding: 48px 32px 40px;
+}
+
+.device-stage {
+  display: grid;
+  place-items: center;
+  width: 100%;
+  min-height: 200px;
+}
+
+.device-frame {
+  position: relative;
+  padding: 20px 20px 34px;
+  background: var(--hardware);
+  border: 1px solid #0d0e0e;
+  box-shadow: 0 18px 40px rgb(30 34 31 / 18%);
+}
+
+.device-mark {
+  position: absolute;
+  right: 18px;
+  bottom: 10px;
+  color: #aeb4b0;
+  font-size: 10px;
+  font-weight: 400;
 }
 
 #display {
   image-rendering: pixelated;
   image-rendering: crisp-edges;
   background: #fff;
-  border: 1px solid #111;
+  border: 1px solid #090a09;
   display: block;
   cursor: crosshair;
+  touch-action: none;
 }
 
 .device-buttons {
   display: grid;
-  grid-template-columns: repeat(2, minmax(96px, 1fr));
-  gap: 12px;
-  width: min(420px, 100%);
+  grid-template-columns: repeat(2, 112px);
+  gap: 16px;
+}
+
+.device-buttons button {
+  display: grid;
+  grid-template-columns: 30px 1fr;
+  align-items: center;
+  min-height: 48px;
+  padding: 7px 12px 7px 8px;
+  border-color: #aeb4af;
+  background: #f9faf8;
+}
+
+.device-buttons b {
+  display: grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  background: var(--hardware);
+  color: #fff;
+  border-radius: 50%;
+}
+
+.device-buttons span {
+  color: #545954;
+  font-size: 10px;
 }
 
 .panel {
-  align-self: stretch;
   display: flex;
   flex-direction: column;
-  gap: 18px;
-  padding: 18px;
+  gap: 22px;
+  padding: 24px;
   background: var(--panel);
   border-left: 1px solid var(--line);
+  min-width: 0;
+}
+
+.panel-heading {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: start;
+  gap: 16px;
 }
 
 .status,
 .action-status {
-  display: flex;
-  justify-content: space-between;
-  align-items: baseline;
-  gap: 12px;
-  padding-bottom: 14px;
-  border-bottom: 1px solid var(--line);
+  min-width: 0;
 }
 
 .status span,
@@ -79,11 +178,16 @@ body {
 
 .status strong,
 .action-status strong {
-  font-size: 20px;
+  display: block;
+  margin-top: 5px;
+  font-size: 21px;
+  overflow-wrap: anywhere;
 }
 
 .action-status {
-  display: block;
+  padding: 16px 0 18px;
+  border-top: 1px solid var(--line);
+  border-bottom: 1px solid var(--line);
 }
 
 .action-status strong {
@@ -96,8 +200,8 @@ body {
 
 .controls {
   display: grid;
-  grid-template-columns: 1fr;
-  gap: 10px;
+  grid-template-columns: repeat(2, 40px);
+  gap: 8px;
 }
 
 button {
@@ -112,24 +216,93 @@ button {
 
 button:hover {
   border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+button:focus-visible {
+  outline: 3px solid var(--accent-soft);
+  outline-offset: 2px;
+  border-color: var(--accent);
+}
+
+button:active {
+  transform: translateY(1px);
+}
+
+#powerButton[aria-pressed="true"] {
+  border-color: var(--signal);
+  color: var(--signal);
+}
+
+.history-panel {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  flex-direction: column;
+}
+
+.history-panel h2 {
+  font-size: 13px;
+  color: #606560;
 }
 
 #history {
-  margin: 0;
+  margin: 10px 0 0;
   padding-left: 24px;
   overflow: auto;
-  font-size: 14px;
-  line-height: 1.6;
+  font-size: 13px;
+  line-height: 1.75;
+}
+
+#history li::marker {
+  color: var(--accent);
 }
 
 @media (max-width: 820px) {
+  .topbar {
+    padding: 12px 18px;
+  }
+
   .app {
     grid-template-columns: 1fr;
-    padding: 18px;
+  }
+
+  .device {
+    min-height: calc(100vh - 72px);
+    padding: 36px 18px 30px;
   }
 
   .panel {
     border-left: 0;
     border-top: 1px solid var(--line);
+    min-height: 320px;
+  }
+}
+
+@media (max-width: 460px) {
+  .runtime-status {
+    font-size: 0;
+  }
+
+  .device {
+    gap: 24px;
+    min-height: auto;
+  }
+
+  .device-frame {
+    padding: 12px 12px 26px;
+  }
+
+  .device-buttons {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    width: 100%;
+  }
+
+  .panel-heading {
+    grid-template-columns: 1fr;
+  }
+
+  .controls {
+    grid-template-columns: repeat(4, 40px);
   }
 }

@@ -7,30 +7,47 @@
     <link rel="stylesheet" href="src/styles.css?v=firmware-wasm-1">
   </head>
   <body>
+    <header class="topbar">
+      <div>
+        <h1>Pocket Journal</h1>
+        <p>Firmware simulator</p>
+      </div>
+      <span class="runtime-status"><i aria-hidden="true"></i>Local runtime</span>
+    </header>
     <main class="app">
-      <section class="device">
-        <canvas id="display" width="200" height="200" aria-label="Pocket Journal 200 by 200 e-paper display"></canvas>
+      <section class="device" aria-label="Simulated Pocket Journal device">
+        <div class="device-stage">
+          <div class="device-frame">
+            <canvas id="display" width="200" height="200" aria-label="Pocket Journal 200 by 200 e-paper display"></canvas>
+            <span class="device-mark">PJ</span>
+          </div>
+        </div>
         <div class="device-buttons" aria-label="Simulated hardware buttons">
-          <button id="simAuxButton" type="button">A / AUX</button>
-          <button id="simPowerButton" type="button">D / POWER</button>
+          <button id="simAuxButton" type="button" title="Auxiliary button"><b>A</b><span>AUX</span></button>
+          <button id="simPowerButton" type="button" title="Power button"><b>D</b><span>POWER</span></button>
         </div>
       </section>
       <aside class="panel">
-        <div class="status">
-          <span>State</span>
-          <strong id="stateName">static</strong>
+        <div class="panel-heading">
+          <div class="status">
+            <span>State</span>
+            <strong id="stateName">static</strong>
+          </div>
+          <div class="controls" aria-label="Simulator controls">
+            <button id="powerButton" type="button" title="Toggle power" aria-label="Toggle power">&#9211;</button>
+            <button id="resetButton" type="button" title="Reset simulator" aria-label="Reset simulator">&#8635;</button>
+            <button id="bootButton" type="button" title="Press auxiliary button" aria-label="Press auxiliary button">A</button>
+            <button id="debugDumpButton" type="button" title="Flush debug log" aria-label="Flush debug log">LOG</button>
+          </div>
         </div>
         <div class="action-status">
-          <span>Action</span>
+          <span>Last input</span>
           <strong id="actionLine">ready</strong>
         </div>
-        <div class="controls">
-          <button id="powerButton" type="button">On (D)</button>
-          <button id="resetButton" type="button">Reset</button>
-          <button id="bootButton" type="button">BOOT / AUX (A)</button>
-          <button id="debugDumpButton" type="button">Flush debug log</button>
-        </div>
-        <ol id="history"></ol>
+        <section class="history-panel">
+          <h2>Activity</h2>
+          <ol id="history"></ol>
+        </section>
       </aside>
     </main>
     <script>

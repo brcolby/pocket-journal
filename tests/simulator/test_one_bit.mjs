@@ -44,7 +44,7 @@ const makefile = await readFile("Makefile", "utf8");
 const wasmBridge = await readFile("simulator/wasm/pj_ui_wasm_bridge.c", "utf8");
 
 assert.match(simulatorHtml, /id="powerButton"/);
-assert.match(simulatorHtml, /On \(D\)/);
+assert.match(simulatorHtml, /aria-label="Toggle power"/);
 assert.match(simulatorHtml, /id="simAuxButton"/);
 assert.match(simulatorHtml, /id="simPowerButton"/);
 assert.match(simulatorHtml, /id="debugDumpButton"/);
@@ -65,6 +65,7 @@ assert.match(simulatorJs, /pocketJournalSimulatorDebugLog/);
 assert.match(simulatorJs, /flushDebugLog/);
 assert.match(simulatorJs, /postDebugEntries/);
 assert.match(simulatorJs, /handlePowerToggle/);
+assert.match(simulatorJs, /setAttribute\("aria-pressed"/);
 assert.match(simulatorJs, /key === "a"/);
 assert.match(simulatorJs, /key === "d"/);
 assert.match(simulatorJs, /LONG_PRESS_MS = AUX_LONG_PRESS_MS/);
