@@ -4,6 +4,7 @@
 #include <stdint.h>
 
 #include "pj_home_layout.h"
+#include "pj_time_model.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -59,6 +60,33 @@ typedef enum {
     PJ_PLAYBACK_STOPPING
 } pj_playback_state_t;
 
+typedef enum {
+    PJ_UI_TIME_COMMAND_NONE = 0,
+    PJ_UI_TIME_COMMAND_ALERT_DISMISS,
+    PJ_UI_TIME_COMMAND_ALARM_SNOOZE
+} pj_ui_time_command_type_t;
+
+typedef struct {
+    pj_ui_time_command_type_t type;
+    uint64_t alert_id;
+} pj_ui_time_command_t;
+
+typedef struct {
+    int alarm_enabled;
+    int alarm_hour;
+    int alarm_minute;
+    int stopwatch_running;
+    uint64_t stopwatch_elapsed_ms;
+    int timer_running;
+    uint64_t timer_remaining_ms;
+    int interval_running;
+    uint64_t interval_remaining_ms;
+    uint64_t interval_phase;
+    pj_time_alert_t active_alert;
+    int alert_audio_deferred;
+    int recovery_time_uncertain;
+} pj_ui_time_projection_t;
+
 typedef struct {
     int x;
     int y;
@@ -103,6 +131,10 @@ typedef struct {
     pj_record_state_t record_state;
     pj_playback_state_t playback_state;
     int playback_exit_pending;
+    pj_time_alert_t active_alert;
+    int alert_audio_deferred;
+    int recovery_time_uncertain;
+    pj_ui_time_command_t time_command;
     int note_count;
     pj_ui_dirty_region_t dirty;
 } pj_ui_context_t;
@@ -121,6 +153,8 @@ void pj_ui_set_status(pj_ui_context_t *ctx, int battery_percent, int temperature
 void pj_ui_set_time(pj_ui_context_t *ctx, int hour, int minute, int year, int month, int day);
 void pj_ui_set_notes(pj_ui_context_t *ctx, int count, const char labels[][PJ_UI_NOTE_LABEL_LEN]);
 void pj_ui_set_audio_state(pj_ui_context_t *ctx, int recording, int playback_active);
+void pj_ui_set_time_projection(pj_ui_context_t *ctx, const pj_ui_time_projection_t *projection);
+int pj_ui_consume_time_command(pj_ui_context_t *ctx, pj_ui_time_command_t *command);
 void pj_ui_set_sync_state(pj_ui_context_t *ctx, int pending, int transferred, int online);
 void pj_ui_set_static_art(pj_ui_context_t *ctx, const uint8_t *pixels, size_t pixel_bytes);
 int pj_ui_set_home_layout(pj_ui_context_t *ctx, const pj_home_layout_t *layout);
