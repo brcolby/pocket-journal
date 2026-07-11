@@ -10,9 +10,10 @@ requires-python = ">=3.11"
 dependencies = []
 
 [project.optional-dependencies]
-ble = ["bleak>=0.22"]
+ble = ["bleak>=0.22", "zeroconf>=0.132"]
 calendar = ["google-api-python-client>=2.130", "google-auth-oauthlib>=1.2"]
 transcription = ["transformers>=4.41", "torch>=2.3", "accelerate>=0.30"]
+usb = ["pyserial>=3.5"]
 dev = []
 
 [project.scripts]
@@ -20,4 +21,3 @@ pj = "pocket_journal_partner.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
-

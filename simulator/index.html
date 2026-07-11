@@ -4,25 +4,117 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Pocket Journal Simulator</title>
-    <link rel="stylesheet" href="src/styles.css?v=punctuation-1">
+    <link rel="stylesheet" href="src/styles.css?v=firmware-wasm-1">
   </head>
   <body>
     <main class="app">
       <section class="device">
         <canvas id="display" width="200" height="200" aria-label="Pocket Journal 200 by 200 e-paper display"></canvas>
+        <div class="device-buttons" aria-label="Simulated hardware buttons">
+          <button id="simAuxButton" type="button">A / AUX</button>
+          <button id="simPowerButton" type="button">D / POWER</button>
+        </div>
       </section>
       <aside class="panel">
         <div class="status">
           <span>State</span>
           <strong id="stateName">static</strong>
         </div>
+        <div class="action-status">
+          <span>Action</span>
+          <strong id="actionLine">ready</strong>
+        </div>
         <div class="controls">
+          <button id="powerButton" type="button">On (D)</button>
           <button id="resetButton" type="button">Reset</button>
-          <button id="backButton" type="button">Back</button>
+          <button id="bootButton" type="button">BOOT / AUX (A)</button>
+          <button id="debugDumpButton" type="button">Flush debug log</button>
         </div>
         <ol id="history"></ol>
       </aside>
     </main>
-    <script type="module" src="src/main.js?v=punctuation-1"></script>
+    <script>
+      window.__pocketJournalSimulatorModuleLoaded = false;
+      window.__pocketJournalSimulatorDebugLogKey = "pocketJournalSimulatorDebugLog";
+      window.__pocketJournalSimulatorPersistEntries = (entries, reason = "bootstrap") => {
+        const body = JSON.stringify({
+          reason,
+          generatedAt: new Date().toISOString(),
+          href: window.location.href,
+          userAgent: navigator.userAgent,
+          entries
+        });
+        if (navigator.sendBeacon) {
+          const blob = new Blob([body], { type: "application/json" });
+          if (navigator.sendBeacon("/__simulator_logs", blob)) {
+            return;
+          }
+        }
+        fetch("/__simulator_logs", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body,
+          keepalive: true
+        }).catch((error) => {
+          console.warn("Unable to persist simulator debug log to .logs/", error);
+        });
+      };
+      window.__pocketJournalSimulatorLog = (event, details = {}) => {
+        const key = window.__pocketJournalSimulatorDebugLogKey;
+        const entry = {
+          sequence: 1,
+          time: new Date().toISOString(),
+          event,
+          details: {
+            location: window.location.href,
+            userAgent: navigator.userAgent,
+            ...details
+          }
+        };
+        try {
+          const entries = JSON.parse(localStorage.getItem(key) || "[]");
+          entry.sequence = entries.length + 1;
+          entries.push(entry);
+          localStorage.setItem(key, JSON.stringify(entries.slice(-500)));
+        } catch (error) {
+          console.warn("Unable to persist simulator bootstrap log locally", error);
+        }
+        window.__pocketJournalSimulatorPersistEntries([entry], "bootstrap");
+        return entry;
+      };
+      window.addEventListener("error", (event) => {
+        window.__pocketJournalSimulatorLog("bootstrap.window.error", {
+          message: event.message,
+          filename: event.filename,
+          lineno: event.lineno,
+          colno: event.colno,
+          error: event.error ? {
+            name: event.error.name,
+            message: event.error.message,
+            stack: event.error.stack
+          } : null
+        });
+      });
+      window.addEventListener("unhandledrejection", (event) => {
+        window.__pocketJournalSimulatorLog("bootstrap.window.unhandledrejection", {
+          reason: String(event.reason)
+        });
+      });
+      window.__pocketJournalSimulatorLog("bootstrap.inline.ready");
+      document.querySelector("#debugDumpButton").addEventListener("click", () => {
+        window.__pocketJournalSimulatorLog("bootstrap.flush.click", {
+          moduleLoaded: window.__pocketJournalSimulatorModuleLoaded
+        });
+      });
+      window.setTimeout(() => {
+        if (window.__pocketJournalSimulatorModuleLoaded) {
+          return;
+        }
+        const message = "simulator module did not start; check .logs/simulator-debug-latest.json";
+        document.querySelector("#actionLine").textContent = message;
+        window.__pocketJournalSimulatorLog("module.watchdog.timeout", { message });
+      }, 1500);
+    </script>
+    <script id="simulatorModuleScript" type="module" src="src/main.js?v=firmware-wasm-1"></script>
   </body>
 </html>

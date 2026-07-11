@@ -19,6 +19,7 @@ build/
 dist/
 coverage/
 firmware/build/
+firmware/managed_components/
 simulator/generated/
 
 # Local firmware/tooling config
@@ -29,3 +30,17 @@ firmware/sdkconfig.old
 # Runtime data/logs
 .logs/
 partner/data/
+
+# Beads / Dolt files (added by bd init)
+.beads/
+.dolt/
+*.db
+.beads-credential-key
+.beads/proxieddb/
+
+# Local agent workspace files
+.agents/
+.claude/
+.codex/
+AGENTS.md
+CLAUDE.md

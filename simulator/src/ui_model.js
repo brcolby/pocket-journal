@@ -15,7 +15,6 @@ export const states = {
   SYNC: "sync",
   VOLUME: "volume",
   CALENDAR: "calendar",
-  TBD: "tbd",
   NOTE_DETAIL: "note_detail",
 };
 
@@ -36,44 +35,40 @@ export const meta = {
   sync: { title: "SYNC", parent: "settings" },
   volume: { title: "VOLUME", parent: "settings" },
   calendar: { title: "CALENDAR", parent: "home" },
-  tbd: { title: "TBD", parent: "home" },
   note_detail: { title: "NOTE", parent: "read" },
 };
 
 export const defaultHomeDesign = {
   title: "Pocket Journal",
   slots: [
-    { label: "Notes", icon: "stylus_note", state: "notes" },
-    { label: "Time", icon: "schedule", state: "time" },
-    { label: "Calendar", icon: "calendar_month", state: "calendar" },
-    { label: "TBD", icon: "star", state: "tbd" },
-    { label: "Settings", icon: "settings", state: "settings" },
+    { label: "", icon: "notebook", state: "notes" },
+    { label: "", icon: "time", state: "time" },
+    { label: "", icon: "settings", state: "settings" },
   ],
 };
 
 const menus = {
   home: [
-    { label: "Notes", icon: "stylus_note", state: "notes" },
-    { label: "Time", icon: "schedule", state: "time" },
-    { label: "Calendar", icon: "calendar_month", state: "calendar" },
-    { label: "TBD", icon: "star", state: "tbd" },
-    { label: "Settings", icon: "settings", state: "settings" },
+    { label: "", icon: "notebook", state: "notes" },
+    { label: "", icon: "time", state: "time" },
+    { label: "", icon: "settings", state: "settings" },
   ],
   notes: [
-    { label: "Record", icon: "radio_button_checked", state: "record" },
-    { label: "Listen", icon: "headphones", state: "listen" },
-    { label: "Read", icon: "article", state: "read" },
+    { label: "", icon: "microphone", state: "record" },
+    { label: "", icon: "document_audio", state: "listen" },
+    { label: "", icon: "read_me", state: "read" },
   ],
   time: [
-    { label: "Alarm", icon: "alarm", state: "alarm" },
-    { label: "Stopwatch", icon: "timer", state: "stopwatch" },
-    { label: "Timer", icon: "hourglass_top", state: "timer" },
-    { label: "Interval", icon: "repeat", state: "interval" },
+    { label: "", icon: "alarm", state: "alarm" },
+    { label: "", icon: "timer", state: "stopwatch" },
+    { label: "", icon: "timer", state: "timer" },
+    { label: "", icon: "repeat", state: "interval" },
   ],
   settings: [
-    { label: "Sync", icon: "sync", state: "sync" },
-    { label: "Volume", icon: "volume_up", state: "settings_volume" },
-    { label: "Dark", icon: "dark_mode", state: "toggle_theme" },
+    { label: "", icon: "wifi", state: "sync" },
+    { label: "", icon: "volume_up", state: "settings" },
+    { label: "", icon: "settings_adjust", state: "toggle_theme" },
+    { label: "", icon: "power", state: "static" },
   ],
 };
 
@@ -110,10 +105,10 @@ export function loadHomeDesign() {
     }
     return {
       title: parsed.title || defaultHomeDesign.title,
-      slots: parsed.slots.slice(0, 5).map((slot, index) => ({
+      slots: parsed.slots.slice(0, 3).map((slot, index) => ({
         label: slot.label || defaultHomeDesign.slots[index]?.label || "Slot",
         icon: slot.icon || defaultHomeDesign.slots[index]?.icon || "circle",
-        state: slot.state || defaultHomeDesign.slots[index]?.state || "tbd",
+        state: slot.state || defaultHomeDesign.slots[index]?.state || "settings",
       })),
     };
   } catch {
@@ -133,25 +128,71 @@ export function menuFor(state) {
 }
 
 export function backHit(state, x, y) {
-  if (state !== "static" && x >= 0 && x < 42 && y >= 0 && y < 32) {
-    return true;
-  }
+  void state;
+  void x;
+  void y;
   return false;
 }
 
-export function menuHit(state, y) {
+export function tilesFor(state) {
   const menu = menuFor(state);
   if (!menu) {
+    return [];
+  }
+  if (state === "notes" && menu.length === 3) {
+    return [
+      { ...menu[0], x: 8, y: 8, width: 184, height: 84 },
+      { ...menu[1], x: 8, y: 104, width: 88, height: 88 },
+      { ...menu[2], x: 104, y: 104, width: 88, height: 88 },
+    ];
+  }
+  if (state === "home" && menu.length >= 3) {
+    return [
+      { ...menu[0], x: 8, y: 8, width: 118, height: 184 },
+      { ...menu[1], x: 134, y: 8, width: 58, height: 86 },
+      { ...menu[2], x: 134, y: 106, width: 58, height: 86 },
+    ];
+  }
+  return menu.slice(0, 4).map((item, index) => ({
+    ...item,
+    x: index % 2 === 0 ? 8 : 104,
+    y: index < 2 ? 8 : 104,
+    width: 88,
+    height: 88,
+  }));
+}
+
+export function menuHit(state, x, y) {
+  const tiles = tilesFor(state);
+  if (!tiles.length) {
     return null;
   }
-  const top = 42;
-  const bottom = 192;
-  if (y < top || y >= bottom) {
-    return null;
+  for (const tile of tiles) {
+    if (x >= tile.x && x < tile.x + tile.width && y >= tile.y && y < tile.y + tile.height) {
+      return tile;
+    }
   }
-  const rowHeight = Math.floor((200 - top - 8) / menu.length);
-  const index = Math.floor((y - top) / rowHeight);
-  return menu[index] ?? null;
+  return null;
+}
+
+export function handleAuxLong(state) {
+  return state === "static" ? "static" : parentOf(state);
+}
+
+export function handleAuxShort(state) {
+  if (state === "static") {
+    return "time_temp";
+  }
+  if (state === "time_temp") {
+    return "home";
+  }
+  if (state === "notes") {
+    return "record";
+  }
+  if (state === "time") {
+    return "stopwatch";
+  }
+  return state;
 }
 
 export function handleTap(state, x, y) {
@@ -166,7 +207,7 @@ export function handleTap(state, x, y) {
     return "home";
   }
 
-  const item = menuHit(state, y);
+  const item = menuHit(state, x, y);
   if (item?.state === "toggle_theme") {
     return state;
   }

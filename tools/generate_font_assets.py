@@ -10,7 +10,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_FONT = REPO_ROOT / "assets/fonts/SpaceMono-Bold.ttf"
+DEFAULT_FONT = REPO_ROOT / "assets/fonts/IBMPlexMono-Bold.ttf"
 SIM_OUTPUT = REPO_ROOT / "simulator/assets/fonts/space-mono-bold-1bit.json"
 FW_OUTPUT = REPO_ROOT / "firmware/components/pj_ui/include/pj_font_space_mono.h"
 ASCII_CHARS = "".join(chr(code) for code in range(32, 127))
@@ -89,7 +89,7 @@ def generate(font_path: Path) -> dict:
             "glyphs": glyphs,
         }
     return {
-        "family": "Space Mono Bold",
+        "family": "IBM Plex Mono Bold",
         "source": str(font_path.relative_to(REPO_ROOT)),
         "encoding": "1bit-rows",
         "sizes": sizes,

@@ -23,6 +23,16 @@ Waveshare notes that V1 and V2 example programs are not interchangeable. Keep al
 10. Start LAN API and verify `/v1/status`.
 11. Run full sync: audio download, partner transcription, transcript upload.
 
+## Audio Leveling
+
+The ES8311 microphone PGA uses `42 dB`, selected from on-device speech measurements that showed no sustained clipping. Recording captures the stronger slot from the mono codec rather than averaging it with an empty I2S slot.
+
+After capture stops, the UI returns home immediately while a lower-priority task processes a temporary WAV before publishing it to the note list. Processing uses one fixed I2S input slot for the entire recording, a three-sample median de-click filter, an approximately 80 Hz high-pass and 4.8 kHz low-pass voice band, and 10 ms edge fades. It then normalizes from average level and the 99.9th-percentile peak, targets peak `28000` and average absolute level `2500`, and caps digital gain at `8x`. Silence below peak `128` or average absolute level `16` is not amplified.
+
+Playback writes silent preroll and postroll around codec mute and PA transitions so amplifier switching occurs outside the note content.
+
+The processor logs raw, filtered, robust-peak, clipping, gain, and normalized statistics. The final `.wav` is renamed into place only after processing succeeds; `.tmp` capture files are not indexed or played.
+
 ## Known Risks
 
 - V1/V2 pin and peripheral differences.
@@ -30,4 +40,3 @@ Waveshare notes that V1 and V2 example programs are not interchangeable. Keep al
 - BLE provisioning and Wi-Fi coexistence memory pressure.
 - Audio codec clocking and sample format.
 - TF card availability and write latency.
-

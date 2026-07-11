@@ -1,56 +1,175 @@
 import {
-  backHit,
-  dummyNotes,
-  handleTap,
-  menuFor,
-  menuHit,
-  meta,
-  parentOf,
-} from "./ui_model.js";
-import {
-  DISPLAY_HEIGHT,
-  DISPLAY_WIDTH,
-  INK,
-  ONE_BIT_THRESHOLD,
-  PAPER,
-  quantizeRgbaBuffer,
-} from "./display.js";
+  AUX_DOUBLE_CLICK_MS,
+  AUX_LONG_PRESS_MS,
+  createAuxClickDetector,
+} from "./aux_input.js";
 
 const canvas = document.querySelector("#display");
 const ctx = canvas.getContext("2d", { alpha: false });
 const stateName = document.querySelector("#stateName");
+const actionLine = document.querySelector("#actionLine");
 const history = document.querySelector("#history");
+const powerButton = document.querySelector("#powerButton");
 const resetButton = document.querySelector("#resetButton");
-const backButton = document.querySelector("#backButton");
+const bootButton = document.querySelector("#bootButton");
+const simAuxButton = document.querySelector("#simAuxButton");
+const simPowerButton = document.querySelector("#simPowerButton");
+const debugDumpButton = document.querySelector("#debugDumpButton");
 
-const ICON_FONT = "'Material Symbols Rounded'";
-const FONT_ASSET_URL = "assets/fonts/space-mono-bold-1bit.json?v=punctuation-1";
-const BOX_LABEL_SIZE = 15;
-const NOTE_LIST_SIZE = 14;
-const CLOCK_BUTTON_SIZE = 15;
+const WASM_MODULE_URL = "../generated/pj_ui_wasm.js?v=firmware-wasm-1";
+const DEBUG_LOG_KEY = "pocketJournalSimulatorDebugLog";
+const DEBUG_LOG_LIMIT = 500;
+const DISPLAY_WIDTH = 200;
+const DISPLAY_HEIGHT = 200;
+const LONG_PRESS_MS = AUX_LONG_PRESS_MS;
+const DOUBLE_CLICK_MS = AUX_DOUBLE_CLICK_MS;
 
-let state = "static";
-let darkMode = false;
-let volume = 5;
-let syncPending = 3;
-let syncTransferred = 0;
-let batteryPercent = 84;
-let recording = "idle";
-let selectedNote = dummyNotes[0];
-let listening = false;
-let listenProgress = 0;
-let alarmOn = false;
-let alarmMinutes = 450;
-let stopwatchRunning = false;
-let stopwatchSeconds = 0;
-let timerRunning = false;
-let timerSeconds = 300;
-let intervalRunning = false;
-let intervalSeconds = 1500;
-let intervalRound = 1;
-let dirtyRegion = "full refresh";
-const visited = ["static"];
-let fontAsset = null;
+let wasmModule = null;
+let api = null;
+let framebufferImage = ctx.createImageData(DISPLAY_WIDTH, DISPLAY_HEIGHT);
+let auxPressStartedAt = 0;
+let auxPressPointerId = null;
+const visited = [];
+const debugLog = loadDebugLog();
+
+window.__pocketJournalSimulatorModuleLoaded = true;
+
+function safeError(error) {
+  if (!error) {
+    return null;
+  }
+  return {
+    name: error.name ?? "Error",
+    message: error.message ?? String(error),
+    stack: error.stack ?? null,
+  };
+}
+
+function stateLabel() {
+  if (!api) {
+    return "loading";
+  }
+  return wasmModule.UTF8ToString(api.stateName());
+}
+
+function dirtyRegion() {
+  if (!api) {
+    return { x: 0, y: 0, width: DISPLAY_WIDTH, height: DISPLAY_HEIGHT, partial: 0 };
+  }
+  return {
+    x: api.dirtyX(),
+    y: api.dirtyY(),
+    width: api.dirtyWidth(),
+    height: api.dirtyHeight(),
+    partial: api.dirtyPartial(),
+  };
+}
+
+function simulatorSnapshot(extra = {}) {
+  return {
+    state: stateLabel(),
+    dirty: dirtyRegion(),
+    wasmLoaded: Boolean(wasmModule),
+    canvas: canvas
+      ? {
+          width: canvas.width,
+          height: canvas.height,
+          clientWidth: canvas.clientWidth,
+          clientHeight: canvas.clientHeight,
+        }
+      : null,
+    location: window.location.href,
+    userAgent: navigator.userAgent,
+    ...extra,
+  };
+}
+
+function loadDebugLog() {
+  try {
+    const raw = localStorage.getItem(DEBUG_LOG_KEY);
+    if (!raw) {
+      return [];
+    }
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed.slice(-DEBUG_LOG_LIMIT) : [];
+  } catch (error) {
+    console.warn("Unable to load simulator debug log", error);
+    return [];
+  }
+}
+
+function persistDebugLog() {
+  try {
+    localStorage.setItem(DEBUG_LOG_KEY, JSON.stringify(debugLog.slice(-DEBUG_LOG_LIMIT)));
+  } catch (error) {
+    console.warn("Unable to persist simulator debug log", error);
+  }
+}
+
+function postDebugEntries(entries, reason = "module") {
+  if (typeof window.__pocketJournalSimulatorPersistEntries === "function") {
+    window.__pocketJournalSimulatorPersistEntries(entries, reason);
+    return;
+  }
+  const body = JSON.stringify({
+    reason,
+    generatedAt: new Date().toISOString(),
+    href: window.location.href,
+    userAgent: navigator.userAgent,
+    entries,
+  });
+  fetch("/__simulator_logs", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body,
+    keepalive: true,
+  }).catch((error) => {
+    console.warn("Unable to persist simulator debug log to .logs/", error);
+  });
+}
+
+function traceDebug(event, details = {}) {
+  const entry = {
+    sequence: debugLog.length + 1,
+    time: new Date().toISOString(),
+    event,
+    details,
+    snapshot: simulatorSnapshot(),
+  };
+  debugLog.push(entry);
+  if (debugLog.length > DEBUG_LOG_LIMIT) {
+    debugLog.splice(0, debugLog.length - DEBUG_LOG_LIMIT);
+  }
+  persistDebugLog();
+  postDebugEntries([entry], "module");
+  console.debug("[Pocket Journal Simulator]", event, details, entry.snapshot);
+  return entry;
+}
+
+function debugDump() {
+  return {
+    generatedAt: new Date().toISOString(),
+    key: DEBUG_LOG_KEY,
+    entries: debugLog.slice(),
+    snapshot: simulatorSnapshot(),
+  };
+}
+
+function flushDebugLog() {
+  postDebugEntries(debugLog.slice(), "manual_flush");
+  traceDebug("debug.flush", { entries: debugLog.length });
+}
+
+function clearDebugLog() {
+  debugLog.splice(0, debugLog.length);
+  persistDebugLog();
+  traceDebug("debug.clear");
+}
+
+function logAction(message) {
+  actionLine.textContent = message;
+  traceDebug("action", { message });
+}
 
 function updateDisplayScale() {
   const device = canvas.parentElement;
@@ -59,692 +178,342 @@ function updateDisplayScale() {
   const scale = Math.max(1, Math.min(4, Math.floor(Math.min(availableWidth, availableHeight) / DISPLAY_WIDTH)));
   canvas.style.width = `${DISPLAY_WIDTH * scale}px`;
   canvas.style.height = `${DISPLAY_HEIGHT * scale}px`;
+  traceDebug("display.scale", {
+    availableWidth,
+    availableHeight,
+    scale,
+    styleWidth: canvas.style.width,
+    styleHeight: canvas.style.height,
+  });
 }
 
-function colors() {
-  return darkMode
-    ? { paper: INK, ink: PAPER, muted: PAPER }
-    : { paper: PAPER, ink: INK, muted: INK };
-}
-
-function setInk() {
-  const palette = colors();
-  ctx.fillStyle = palette.ink;
-  ctx.strokeStyle = palette.ink;
-}
-
-function clear() {
-  const palette = colors();
-  ctx.imageSmoothingEnabled = false;
-  ctx.fillStyle = palette.paper;
-  ctx.fillRect(0, 0, DISPLAY_WIDTH, DISPLAY_HEIGHT);
-  setInk();
-  ctx.lineWidth = 2;
-  ctx.textBaseline = "top";
-}
-
-function quantizeToOneBit() {
-  const frame = ctx.getImageData(0, 0, DISPLAY_WIDTH, DISPLAY_HEIGHT);
-  quantizeRgbaBuffer(frame.data, ONE_BIT_THRESHOLD);
-  ctx.putImageData(frame, 0, 0);
-}
-
-function iconFont(size) {
-  ctx.font = `${size}px ${ICON_FONT}`;
-}
-
-function textCenter(text, y, size = 16) {
-  const rendered = displayText(text);
-  const width = bitmapTextWidth(rendered, size);
-  drawBitmapText(rendered, Math.max(0, Math.round((DISPLAY_WIDTH - width) / 2)), y, size);
-}
-
-function textCenterAt(text, x, y, size = 12) {
-  const rendered = displayText(text);
-  const bounds = bitmapTextBounds(rendered, size);
-  const width = bitmapTextWidth(rendered, size);
-  drawBitmapText(rendered, Math.round(x - width / 2), Math.round(y - (bounds.minY + bounds.maxY) / 2), size);
-}
-
-function textLeftCenter(text, x, y, size = 14) {
-  const rendered = displayText(text);
-  const bounds = bitmapTextBounds(rendered, size);
-  drawBitmapText(rendered, x, Math.round(y - (bounds.minY + bounds.maxY) / 2), size);
-}
-
-function icon(name, x, y, size = 22) {
-  iconFont(size);
-  ctx.textBaseline = "alphabetic";
-  ctx.textAlign = "center";
-  const metrics = ctx.measureText(name);
-  const ascent = metrics.actualBoundingBoxAscent || size * 0.75;
-  const descent = metrics.actualBoundingBoxDescent || size * 0.25;
-  ctx.fillText(name, x, y + (ascent - descent) / 2);
-}
-
-function backTriangle() {
-  ctx.beginPath();
-  ctx.moveTo(8, 16);
-  ctx.lineTo(27, 5);
-  ctx.lineTo(27, 27);
-  ctx.closePath();
-  ctx.fill();
-}
-
-function roundedRect(x, y, w, h, r = 8, fill = false) {
-  ctx.beginPath();
-  ctx.roundRect(x, y, w, h, r);
-  fill ? ctx.fill() : ctx.stroke();
-}
-
-function fillCircle(x, y, r) {
-  ctx.beginPath();
-  ctx.arc(x, y, r, 0, Math.PI * 2);
-  ctx.fill();
-}
-
-function line(x1, y1, x2, y2) {
-  ctx.beginPath();
-  ctx.moveTo(x1, y1);
-  ctx.lineTo(x2, y2);
-  ctx.stroke();
-}
-
-function logicalFontSize(size) {
-  if (size <= 8) {
-    return "1";
-  }
-  if (size <= 14) {
-    return "2";
-  }
-  if (size <= 22) {
-    return "3";
-  }
-  return "4";
-}
-
-function displayText(text) {
-  return String(text).toUpperCase();
-}
-
-function bitmapMetrics(size) {
-  const key = logicalFontSize(size);
-  const metrics = fontAsset?.sizes?.[key];
-  if (!metrics) {
-    return { lineHeight: size, glyphs: {} };
-  }
+function bindApi(module) {
   return {
-    ...metrics,
-    lineHeight: metrics.lineHeight ?? metrics.line_height ?? size,
-    glyphs: metrics.glyphs ?? {},
+    init: module.cwrap("pj_sim_init", null, []),
+    reset: module.cwrap("pj_sim_reset", null, []),
+    wake: module.cwrap("pj_sim_wake", null, []),
+    sleep: module.cwrap("pj_sim_sleep", null, []),
+    auxShort: module.cwrap("pj_sim_aux_short", "number", []),
+    auxLong: module.cwrap("pj_sim_aux_long", "number", []),
+    auxDouble: module.cwrap("pj_sim_aux_double", "number", []),
+    touchTap: module.cwrap("pj_sim_touch_tap", "number", ["number", "number"]),
+    tick: module.cwrap("pj_sim_tick", "number", []),
+    setStatus: module.cwrap("pj_sim_set_status", null, ["number", "number"]),
+    setTime: module.cwrap("pj_sim_set_time", null, ["number", "number", "number", "number", "number"]),
+    setNoteCount: module.cwrap("pj_sim_set_note_count", null, ["number"]),
+    setNoteLabel: module.cwrap("pj_sim_set_note_label", null, ["number", "string"]),
+    render: module.cwrap("pj_sim_render", null, []),
+    framebuffer: module.cwrap("pj_sim_framebuffer", "number", []),
+    framebufferBytes: module.cwrap("pj_sim_framebuffer_bytes", "number", []),
+    displayWidth: module.cwrap("pj_sim_display_width", "number", []),
+    displayHeight: module.cwrap("pj_sim_display_height", "number", []),
+    state: module.cwrap("pj_sim_state", "number", []),
+    stateName: module.cwrap("pj_sim_state_name", "number", []),
+    dirtyX: module.cwrap("pj_sim_dirty_x", "number", []),
+    dirtyY: module.cwrap("pj_sim_dirty_y", "number", []),
+    dirtyWidth: module.cwrap("pj_sim_dirty_width", "number", []),
+    dirtyHeight: module.cwrap("pj_sim_dirty_height", "number", []),
+    dirtyPartial: module.cwrap("pj_sim_dirty_partial", "number", []),
   };
 }
 
-function bitmapGlyph(char, size) {
-  const metrics = bitmapMetrics(size);
-  return metrics.glyphs[char] ?? metrics.glyphs["?"] ?? null;
-}
-
-function bitmapTextWidth(text, size) {
-  let width = 0;
-  for (const char of text) {
-    width += bitmapGlyph(char, size)?.advance ?? Math.ceil(size / 2);
+function updateHistory(nextState) {
+  if (visited[visited.length - 1] !== nextState) {
+    visited.push(nextState);
   }
-  return width;
-}
-
-function bitmapTextBounds(text, size) {
-  const metrics = bitmapMetrics(size);
-  let minY = Infinity;
-  let maxY = -Infinity;
-  for (const char of text) {
-    const glyph = bitmapGlyph(char, size);
-    if (!glyph || !glyph.rows.some((row) => row.includes("1"))) {
-      continue;
-    }
-    minY = Math.min(minY, glyph.y_offset);
-    maxY = Math.max(maxY, glyph.y_offset + glyph.height);
-  }
-  if (!Number.isFinite(minY) || !Number.isFinite(maxY)) {
-    return { minY: 0, maxY: metrics.lineHeight };
-  }
-  return { minY, maxY };
-}
-
-function drawBitmapText(text, x, y, size) {
-  const palette = colors();
-  ctx.fillStyle = palette.ink;
-  let cursor = x;
-  for (const char of text) {
-    const glyph = bitmapGlyph(char, size);
-    if (!glyph) {
-      cursor += Math.ceil(size / 2);
-      continue;
-    }
-    glyph.rows.forEach((row, rowIndex) => {
-      for (let col = 0; col < row.length; col += 1) {
-        if (row[col] === "1") {
-          ctx.fillRect(cursor + glyph.x_offset + col, y + glyph.y_offset + rowIndex, 1, 1);
-        }
-      }
-    });
-    cursor += glyph.advance;
-  }
-}
-
-function drawDefaultStaticArt() {
-  const palette = colors();
-  ctx.fillStyle = palette.paper;
-  ctx.fillRect(0, 0, DISPLAY_WIDTH, DISPLAY_HEIGHT);
-  ctx.strokeStyle = palette.ink;
-  ctx.fillStyle = palette.ink;
-  ctx.lineWidth = 7;
-  ctx.beginPath();
-  ctx.arc(100, 100, 68, 0, Math.PI * 2);
-  ctx.stroke();
-  fillCircle(74, 82, 8);
-  fillCircle(126, 82, 8);
-  ctx.beginPath();
-  ctx.arc(100, 110, 35, 0.18 * Math.PI, 0.82 * Math.PI);
-  ctx.stroke();
-}
-
-function drawStaticArtRows(rows) {
-  const palette = colors();
-  ctx.fillStyle = palette.paper;
-  ctx.fillRect(0, 0, DISPLAY_WIDTH, DISPLAY_HEIGHT);
-  ctx.fillStyle = palette.ink;
-  rows.forEach((row, y) => {
-    for (let x = 0; x < row.length; x += 1) {
-      if (row[x] === "1" || row[x] === "#") {
-        ctx.fillRect(x, y, 1, 1);
-      }
-    }
-  });
-}
-
-function loadStaticArtRows() {
-  try {
-    const raw = localStorage.getItem("pocketJournalStaticArt");
-    if (!raw) {
-      return null;
-    }
-    const parsed = JSON.parse(raw);
-    if (parsed.width !== 200 || parsed.height !== 200 || parsed.encoding !== "rows") {
-      return null;
-    }
-    if (!Array.isArray(parsed.rows) || parsed.rows.length !== 200) {
-      return null;
-    }
-    if (!parsed.rows.every((row) => typeof row === "string" && row.length === 200)) {
-      return null;
-    }
-    return parsed.rows;
-  } catch {
-    return null;
-  }
-}
-
-function drawMenu(items) {
-  const top = 42;
-  const rowHeight = Math.floor((200 - top - 8) / items.length);
-  items.forEach((item, index) => {
-    const y = top + index * rowHeight;
-    const height = rowHeight - 4;
-    roundedRect(12, y, 176, height, 8);
-    icon(item.icon, 38, y + height / 2, 22);
-    textLeftCenter(item.label, 64, y + height / 2, BOX_LABEL_SIZE);
-  });
-}
-
-function drawSettings() {
-  const rows = [
-    { y: 42, h: 38, label: "SYNC", icon: "sync" },
-    { y: 86, h: 48, label: "VOLUME", icon: "volume_up" },
-    { y: 140, h: 38, label: "DARK", icon: "dark_mode" },
-  ];
-  rows.forEach((row) => roundedRect(12, row.y, 176, row.h, 8));
-  icon(rows[0].icon, 38, 61, 22);
-  textLeftCenter(rows[0].label, 64, 61, BOX_LABEL_SIZE);
-
-  icon("volume_down", 38, 110, 22);
-  icon("volume_up", 162, 110, 22);
-  roundedRect(62, 103, 76, 16, 6);
-  const width = Math.floor((volume / 10) * 68);
-  if (width > 0) {
-    roundedRect(66, 107, width, 8, 4, true);
-  }
-
-  icon(rows[2].icon, 38, 159, 22);
-  textLeftCenter(rows[2].label, 64, 159, BOX_LABEL_SIZE);
-}
-
-function drawTimeTemp() {
-  backTriangle();
-  textCenter("SAT 06/06", 46, 18);
-  textCenter("09:41", 76, 18);
-  textCenter("22C / 72F", 106, 18);
-  textCenter(`${batteryPercent}% BAT`, 136, 18);
-}
-
-function drawSync() {
-  backTriangle();
-  icon("sync", 100, 55, 32);
-  textCenter("SYNC", 75, 17);
-  roundedRect(22, 105, 156, 22, 7);
-  const total = Math.max(syncPending + syncTransferred, 1);
-  const width = Math.floor((syncTransferred / total) * 148);
-  if (width > 0) {
-    roundedRect(26, 109, width, 14, 5, true);
-  }
-  textCenter(`${syncPending} PENDING`, 137, 13);
-  textCenter(`${syncTransferred} TRANSFERRED`, 157, 13);
-}
-
-function drawRecording() {
-  backTriangle();
-  textCenter("SAT 06/06 09:41", 8, 10);
-  icon(recording === "paused" ? "pause_circle" : "radio_button_checked", 100, 66, 42);
-  textCenter(recording === "paused" ? "PAUSED" : "REC", 92, 18);
-  [
-    { label: "PAUSE", icon: "pause_circle", x: 14 },
-    { label: "RESUME", icon: "play_circle", x: 74 },
-    { label: "FINISH", icon: "check", x: 134 },
-  ].forEach((control) => {
-    roundedRect(control.x, 142, 52, 40, 8);
-    icon(control.icon, control.x + 26, 162, 28);
-  });
-}
-
-function drawNoteList(kind) {
-  backTriangle();
-  dummyNotes.forEach((note, index) => {
-    const y = 44 + index * 48;
-    roundedRect(12, y, 176, 38, 8);
-    icon(kind === "listen" ? "headphones" : "article", 36, y + 19, 22);
-    textLeftCenter(noteDisplayTime(note.time), 62, y + 19, NOTE_LIST_SIZE);
-  });
-}
-
-function drawListenDetail() {
-  backTriangle();
-  textCenter(noteDisplayTime(selectedNote.time), 34, 10);
-  icon(listening ? "pause_circle" : "play_circle", 100, 76, 38);
-  roundedRect(30, 114, 140, 18, 7);
-  const width = Math.floor(listenProgress * 132);
-  if (width > 0) {
-    roundedRect(34, 118, width, 10, 4, true);
-  }
-  const total = durationToSeconds(selectedNote.duration);
-  textCenterAt(`${formatDuration(Math.round(total * listenProgress))} / ${selectedNote.duration}`, 100, 146, 10);
-  roundedRect(30, 160, 62, 28, 8);
-  roundedRect(108, 160, 62, 28, 8);
-  icon("pause_circle", 61, 174, 24);
-  icon("play_circle", 139, 174, 24);
-}
-
-function drawReadDetail() {
-  backTriangle();
-  textCenter(noteDisplayTime(selectedNote.time), 34, 10);
-  textCenter("TRANSCRIPT", 62, 12);
-  const words = selectedNote.transcript.toUpperCase().split(" ");
-  const lines = [
-    words.slice(0, 5).join(" "),
-    words.slice(5, 10).join(" "),
-    words.slice(10, 15).join(" "),
-    words.slice(15, 20).join(" "),
-  ].filter(Boolean);
-  lines.forEach((lineText, index) => textCenter(lineText, 90 + index * 20, 8));
-}
-
-function drawCalendar() {
-  backTriangle();
-  textCenter("SAT 06/06", 34, 15);
-  [
-    ["09:00", "DESIGN"],
-    ["11:30", "SYNC"],
-    ["15:00", "WALK"],
-  ].forEach((event, index) => {
-    const y = 62 + index * 40;
-    roundedRect(16, y, 168, 30, 8);
-    textLeftCenter(event[0], 28, y + 15, 9);
-    textLeftCenter(event[1], 86, y + 15, 11);
-  });
-}
-
-function formatDuration(seconds) {
-  const minutes = Math.floor(seconds / 60);
-  const rest = seconds % 60;
-  return `${String(minutes).padStart(2, "0")}:${String(rest).padStart(2, "0")}`;
-}
-
-function durationToSeconds(duration) {
-  const [minutes, seconds] = duration.split(":").map((part) => Number.parseInt(part, 10));
-  return minutes * 60 + seconds;
-}
-
-function noteDisplayTime(time) {
-  return time.replace(/^[A-Za-z]{3}\s+/, "");
-}
-
-function formatClockMinutes(minutes) {
-  const hour = Math.floor(minutes / 60) % 24;
-  const minute = minutes % 60;
-  return `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}`;
-}
-
-function drawAlarm() {
-  backTriangle();
-  icon("alarm", 100, 54, 34);
-  textCenter(formatClockMinutes(alarmMinutes), 84, 26);
-  textCenter(alarmOn ? "ON" : "OFF", 116, 16);
-  drawTripleTimeControls(alarmOn ? "OFF" : "ON", "-30", "+30");
-}
-
-function drawStopwatch() {
-  backTriangle();
-  icon("timer", 100, 50, 32);
-  textCenter(formatDuration(stopwatchSeconds), 84, 26);
-  roundedRect(22, 146, 70, 34, 8);
-  roundedRect(108, 146, 70, 34, 8);
-  textCenterAt(stopwatchRunning ? "PAUSE" : "START", 57, 164, 9);
-  textCenterAt("RESET", 143, 164, 9);
-}
-
-function drawTimer() {
-  backTriangle();
-  icon("hourglass_top", 100, 48, 32);
-  textCenter(formatDuration(timerSeconds), 82, 26);
-  drawTripleTimeControls(timerRunning ? "PAUSE" : "GO", "-1", "+1");
-}
-
-function drawInterval() {
-  backTriangle();
-  icon("repeat", 100, 45, 32);
-  textCenter(`ROUND ${intervalRound}`, 78, 14);
-  textCenter(formatDuration(intervalSeconds), 104, 22);
-  drawTripleTimeControls(intervalRunning ? "PAUSE" : "GO", "-1", "+1");
-}
-
-function drawTripleTimeControls(centerLabel, leftLabel, rightLabel) {
-  roundedRect(18, 142, 48, 36, 8);
-  roundedRect(76, 142, 48, 36, 8);
-  roundedRect(134, 142, 48, 36, 8);
-  textCenterAt(leftLabel, 42, 160, CLOCK_BUTTON_SIZE);
-  textCenterAt(centerLabel, 100, 160, centerLabel.length > 4 ? 14 : CLOCK_BUTTON_SIZE);
-  textCenterAt(rightLabel, 158, 160, CLOCK_BUTTON_SIZE);
-}
-
-function drawLeaf() {
-  backTriangle();
-  icon(meta[state]?.title === "TBD" ? "star" : "category", 100, 66, 34);
-  textCenter(meta[state]?.title ?? "V1", 108, 16);
-}
-
-function drawState() {
-  clear();
-  if (state === "static") {
-    const rows = loadStaticArtRows();
-    rows ? drawStaticArtRows(rows) : drawDefaultStaticArt();
-  } else if (state === "time_temp") {
-    drawTimeTemp();
-  } else if (state === "sync") {
-    drawSync();
-  } else if (state === "record") {
-    drawRecording();
-  } else if (state === "listen" || state === "read") {
-    drawNoteList(state);
-  } else if (state === "note_detail") {
-    selectedNote.mode === "listen" ? drawListenDetail() : drawReadDetail();
-  } else if (state === "calendar") {
-    drawCalendar();
-  } else if (state === "alarm") {
-    drawAlarm();
-  } else if (state === "stopwatch") {
-    drawStopwatch();
-  } else if (state === "timer") {
-    drawTimer();
-  } else if (state === "interval") {
-    drawInterval();
-  } else if (state === "settings") {
-    backTriangle();
-    drawSettings();
-  } else if (menuFor(state)) {
-    backTriangle();
-    drawMenu(menuFor(state));
-  } else {
-    drawLeaf();
-  }
-  quantizeToOneBit();
-  stateName.textContent = `${state}${darkMode ? " / dark" : " / light"}`;
   history.innerHTML = visited.slice(-20).map((item) => `<li>${item}</li>`).join("");
-  history.dataset.dirtyRegion = dirtyRegion;
 }
 
-function setState(next, dirty = "full refresh") {
-  dirtyRegion = dirty;
-  if (next === "record" && state !== "record") {
-    recording = "active";
-  }
-  if (next !== state) {
-    state = next;
-    visited.push(next);
-  }
-  drawState();
+function framebufferBit(bytes, x, y) {
+  const index = y * DISPLAY_WIDTH + x;
+  return (bytes[index >> 3] >> (index & 7)) & 1;
 }
 
-function handleSettingsClick(x, y) {
-  if (y >= 42 && y < 80) {
-    setState("sync");
-    return true;
+function copyFirmwareFramebuffer(region) {
+  const pointer = api.framebuffer();
+  const byteCount = api.framebufferBytes();
+  const bytes = wasmModule.HEAPU8.subarray(pointer, pointer + byteCount);
+  const x0 = Math.max(0, region.x);
+  const y0 = Math.max(0, region.y);
+  const x1 = Math.min(DISPLAY_WIDTH, x0 + region.width);
+  const y1 = Math.min(DISPLAY_HEIGHT, y0 + region.height);
+
+  for (let y = y0; y < y1; y += 1) {
+    for (let x = x0; x < x1; x += 1) {
+      const offset = (y * DISPLAY_WIDTH + x) * 4;
+      const value = framebufferBit(bytes, x, y) ? 0 : 255;
+      framebufferImage.data[offset] = value;
+      framebufferImage.data[offset + 1] = value;
+      framebufferImage.data[offset + 2] = value;
+      framebufferImage.data[offset + 3] = 255;
+    }
   }
-  if (y >= 86 && y < 134) {
-    volume += x < 100 ? -1 : 1;
-    volume = Math.max(0, Math.min(10, volume));
-    setState("settings", "partial: volume row");
-    return true;
-  }
-  if (y >= 140 && y < 178) {
-    darkMode = !darkMode;
-    setState("settings", "partial: theme");
-    return true;
-  }
-  return false;
 }
 
-function handleTimeToolClick(x, y) {
-  if (state === "alarm" && y >= 134) {
-    if (x < 72) {
-      alarmMinutes = (alarmMinutes + 1410) % 1440;
-    } else if (x < 130) {
-      alarmOn = !alarmOn;
-    } else {
-      alarmMinutes = (alarmMinutes + 30) % 1440;
-    }
-    setState(state, "partial: alarm controls");
-    return true;
+function paintFirmwareFramebuffer(action = "render") {
+  api.render();
+  const state = stateLabel();
+  const dirty = dirtyRegion();
+  const region = dirty.partial && dirty.width > 0 && dirty.height > 0
+    ? dirty
+    : { x: 0, y: 0, width: DISPLAY_WIDTH, height: DISPLAY_HEIGHT, partial: 0 };
+
+  copyFirmwareFramebuffer(region);
+  ctx.putImageData(framebufferImage, 0, 0, region.x, region.y, region.width, region.height);
+  stateName.textContent = state;
+  powerButton.textContent = state === "static" ? "On (D)" : "Off (D)";
+  history.dataset.dirtyRegion = JSON.stringify(dirty);
+  updateHistory(state);
+  traceDebug("firmware.render", { action, state, dirty, painted: region });
+}
+
+function dispatchFirmware(action, callback) {
+  if (!api) {
+    logAction(`${action}: firmware runtime not ready`);
+    return;
   }
-  if (state === "stopwatch" && y >= 138) {
-    if (x < 100) {
-      stopwatchRunning = !stopwatchRunning;
+  const previous = stateLabel();
+  const changed = callback();
+  paintFirmwareFramebuffer(action);
+  const current = stateLabel();
+  logAction(`${action}: ${previous} -> ${current}${changed === 0 ? " (no change)" : ""}`);
+  traceDebug("firmware.event", {
+    action,
+    previous,
+    current,
+    changed,
+    dirty: dirtyRegion(),
+  });
+}
+
+function handlePowerToggle(action = "power") {
+  dispatchFirmware(action, () => {
+    if (stateLabel() === "static") {
+      api.wake();
     } else {
-      stopwatchRunning = false;
-      stopwatchSeconds = 0;
+      api.sleep();
     }
-    setState(state, "partial: stopwatch controls");
-    return true;
-  }
-  if (state === "timer" && y >= 134) {
-    if (x < 72) {
-      timerSeconds = Math.max(60, timerSeconds - 60);
-    } else if (x < 130) {
-      timerRunning = !timerRunning;
-    } else {
-      timerSeconds = Math.min(5940, timerSeconds + 60);
-    }
-    setState(state, "partial: timer controls");
-    return true;
-  }
-  if (state === "interval" && y >= 140) {
-    if (x < 72) {
-      intervalSeconds = Math.max(60, intervalSeconds - 60);
-    } else if (x < 130) {
-      intervalRunning = !intervalRunning;
-    } else {
-      intervalSeconds = Math.min(5940, intervalSeconds + 60);
-    }
-    setState(state, "partial: interval controls");
-    return true;
-  }
-  return false;
+    return 1;
+  });
+}
+
+function handleAuxShort(action = "A aux") {
+  dispatchFirmware(action, () => api.auxShort());
+}
+
+function handleAuxLong(action = "A aux long") {
+  dispatchFirmware(action, () => api.auxLong());
+}
+
+function handleAuxDouble(action = "A aux double") {
+  dispatchFirmware(action, () => api.auxDouble());
+}
+
+const auxClickDetector = createAuxClickDetector({
+  onShort: handleAuxShort,
+  onDouble: handleAuxDouble,
+  now: () => performance.now(),
+  setTimer: (callback, delay) => setTimeout(callback, delay),
+  clearTimer: (timer) => clearTimeout(timer),
+});
+
+function cancelPendingAuxShort() {
+  auxClickDetector.cancel();
+}
+
+function scheduleAuxShort(label) {
+  auxClickDetector.click(label);
+}
+
+function resetSimulator() {
+  cancelPendingAuxShort();
+  dispatchFirmware("reset", () => {
+    api.reset();
+    seedDynamicContent();
+    return 1;
+  });
+}
+
+function seedDynamicContent() {
+  api.setStatus(84, 22);
+  api.setTime(9, 41, 2026, 6, 6);
+  api.setNoteCount(3);
+  ["SAT 09:41", "FRI 18:12", "THU 07:30"].forEach((label, index) => {
+    api.setNoteLabel(index, label);
+  });
 }
 
 function handleCanvasClick(x, y) {
-  if (backHit(state, x, y)) {
-    setState(parentOf(state));
-    return;
-  }
+  dispatchFirmware("display tap", () => api.touchTap(x, y));
+}
 
-  if (state === "settings" && handleSettingsClick(x, y)) {
-    return;
-  }
-
-  if (["alarm", "stopwatch", "timer", "interval"].includes(state) && handleTimeToolClick(x, y)) {
-    return;
-  }
-
-  if (state === "sync") {
-    if (syncPending > 0) {
-      syncPending -= 1;
-      syncTransferred += 1;
-    }
-    setState(state, "partial: sync counters");
-    return;
-  }
-
-  if (state === "record") {
-    if (y >= 142 && y <= 190) {
-      if (x < 70) {
-        recording = "paused";
-        setState(state, "partial: recording controls");
-      } else if (x < 130) {
-        recording = "active";
-        setState(state, "partial: recording controls");
-      } else {
-        recording = "idle";
-        setState("notes");
-      }
-    } else {
-      recording = recording === "paused" ? "active" : "paused";
-      setState(state, "partial: recording status");
-    }
-    return;
-  }
-
-  if (state === "listen" || state === "read") {
-    const index = Math.floor((y - 44) / 48);
-    if (index >= 0 && index < dummyNotes.length) {
-      selectedNote = { ...dummyNotes[index], mode: state };
-      setState("note_detail");
+function attachAuxButton(button, label) {
+  button.addEventListener("pointerdown", (event) => {
+    if (auxPressPointerId !== null) {
       return;
     }
-  }
+    auxPressStartedAt = performance.now();
+    auxPressPointerId = event.pointerId;
+    button.setPointerCapture?.(event.pointerId);
+    traceDebug("event.aux.pointerdown", {
+      source: label,
+      pointerId: event.pointerId,
+      pointerType: event.pointerType,
+      startedAt: auxPressStartedAt,
+    });
+  });
 
-  if (state === "note_detail" && selectedNote.mode === "listen" && y >= 150) {
-    listening = x >= 100;
-    setState(state, "partial: listen controls");
-    return;
-  }
+  button.addEventListener("pointerup", (event) => {
+    if (auxPressPointerId === null || event.pointerId !== auxPressPointerId) {
+      return;
+    }
+    const heldMs = performance.now() - auxPressStartedAt;
+    auxPressStartedAt = 0;
+    auxPressPointerId = null;
+    traceDebug("event.aux.pointerup", { source: label, heldMs });
+    if (heldMs >= LONG_PRESS_MS) {
+      cancelPendingAuxShort();
+      handleAuxLong(`${label} long`);
+    } else {
+      scheduleAuxShort(label);
+    }
+  });
 
-  const item = menuHit(state, y);
-  if (state === "settings" && item?.state === "toggle_theme") {
-    darkMode = !darkMode;
-    setState(state, "partial: theme");
-    return;
-  }
+  button.addEventListener("pointercancel", (event) => {
+    traceDebug("event.aux.pointercancel", { source: label, pointerId: event.pointerId });
+    auxPressStartedAt = 0;
+    auxPressPointerId = null;
+  });
 
-  setState(handleTap(state, x, y));
+  button.addEventListener("keydown", (event) => {
+    if (!event.repeat && (event.key === "Enter" || event.key === " ")) {
+      event.preventDefault();
+      traceDebug("event.aux.keydown", { source: label, key: event.key });
+      scheduleAuxShort(`${label} key`);
+    }
+  });
 }
 
 canvas.addEventListener("click", (event) => {
   const rect = canvas.getBoundingClientRect();
-  const x = Math.floor(((event.clientX - rect.left) / rect.width) * 200);
-  const y = Math.floor(((event.clientY - rect.top) / rect.height) * 200);
+  const x = Math.floor(((event.clientX - rect.left) / rect.width) * DISPLAY_WIDTH);
+  const y = Math.floor(((event.clientY - rect.top) / rect.height) * DISPLAY_HEIGHT);
+  traceDebug("event.canvas.click", {
+    clientX: event.clientX,
+    clientY: event.clientY,
+    rect: { left: rect.left, top: rect.top, width: rect.width, height: rect.height },
+    x,
+    y,
+  });
   handleCanvasClick(x, y);
 });
 
 window.addEventListener("resize", updateDisplayScale);
 
 resetButton.addEventListener("click", () => {
-  state = "static";
-  darkMode = false;
-  volume = 5;
-  syncPending = 3;
-  syncTransferred = 0;
-  batteryPercent = 84;
-  recording = "idle";
-  listening = false;
-  listenProgress = 0;
-  alarmOn = false;
-  alarmMinutes = 450;
-  stopwatchRunning = false;
-  stopwatchSeconds = 0;
-  timerRunning = false;
-  timerSeconds = 300;
-  intervalRunning = false;
-  intervalSeconds = 1500;
-  intervalRound = 1;
-  visited.splice(0, visited.length, "static");
-  setState("static");
+  traceDebug("event.reset.click");
+  resetSimulator();
 });
 
-backButton.addEventListener("click", () => {
-  setState(parentOf(state));
+powerButton.addEventListener("click", () => {
+  traceDebug("event.power.click", { source: "panel" });
+  handlePowerToggle("side power");
 });
+
+simPowerButton.addEventListener("click", () => {
+  traceDebug("event.power.click", { source: "device" });
+  handlePowerToggle("D power");
+});
+
+attachAuxButton(bootButton, "side aux");
+attachAuxButton(simAuxButton, "A aux");
+
+window.addEventListener("keydown", (event) => {
+  if (event.target instanceof HTMLInputElement || event.target instanceof HTMLTextAreaElement) {
+    return;
+  }
+  const key = event.key.toLowerCase();
+  if (key === "a" && !event.repeat) {
+    event.preventDefault();
+    traceDebug("event.keydown", { key, mappedTo: "aux" });
+    scheduleAuxShort("A key");
+  } else if (key === "d" && !event.repeat) {
+    event.preventDefault();
+    traceDebug("event.keydown", { key, mappedTo: "power" });
+    handlePowerToggle("D key");
+  }
+});
+
+debugDumpButton?.addEventListener("click", () => {
+  traceDebug("event.debug_flush.click");
+  flushDebugLog();
+  logAction("debug log flushed to .logs/");
+});
+
+window.pocketJournalSimulator = {
+  power: () => handlePowerToggle("debug power"),
+  bootShort: () => handleAuxShort("debug aux"),
+  bootLong: () => handleAuxLong("debug aux long"),
+  bootDouble: () => handleAuxDouble("debug aux double"),
+  reset: resetSimulator,
+  state: () => stateLabel(),
+  action: () => actionLine.textContent,
+  debugLog: () => debugDump(),
+  flushDebugLog,
+  clearDebugLog,
+};
 
 setInterval(() => {
-  let needsDraw = false;
-  if (stopwatchRunning) {
-    stopwatchSeconds += 1;
-    needsDraw = state === "stopwatch";
+  if (!api) {
+    return;
   }
-  if (timerRunning && timerSeconds > 0) {
-    timerSeconds -= 1;
-    needsDraw = state === "timer";
-  }
-  if (intervalRunning && intervalSeconds > 0) {
-    intervalSeconds -= 1;
-    if (intervalSeconds === 0) {
-      intervalRound += 1;
-      intervalSeconds = intervalRound % 2 === 0 ? 300 : 1500;
-    }
-    needsDraw = state === "interval";
-  }
-  if (listening) {
-    listenProgress = Math.min(1, listenProgress + 0.02);
-    if (listenProgress >= 1) {
-      listening = false;
-    }
-    needsDraw = state === "note_detail" && selectedNote.mode === "listen";
-  }
-  if (needsDraw) {
-    dirtyRegion = "partial: ticking state";
-    drawState();
+  const changed = api.tick();
+  if (changed) {
+    paintFirmwareFramebuffer("tick");
   }
 }, 1000);
 
-async function boot() {
-  updateDisplayScale();
-  if (document.fonts) {
-    await Promise.all([
-      document.fonts.load(`24px ${ICON_FONT}`, "settings"),
-      document.fonts.load(`24px ${ICON_FONT}`, "timer"),
-      document.fonts.load(`24px ${ICON_FONT}`, "calendar_month"),
-      document.fonts.ready,
-    ]);
-  }
-  fontAsset = await fetch(FONT_ASSET_URL).then((response) => response.json());
-  drawState();
+async function loadFirmwareRuntime() {
+  traceDebug("wasm.fetch.start", { url: WASM_MODULE_URL });
+  const factory = (await import(WASM_MODULE_URL)).default;
+  wasmModule = await factory({
+    locateFile(path) {
+      return `generated/${path}`;
+    },
+  });
+  api = bindApi(wasmModule);
+  api.init();
+  seedDynamicContent();
+  traceDebug("wasm.loaded", {
+    width: api.displayWidth(),
+    height: api.displayHeight(),
+    framebufferBytes: api.framebufferBytes(),
+  });
 }
 
-boot();
+async function boot() {
+  updateDisplayScale();
+  await loadFirmwareRuntime();
+  paintFirmwareFramebuffer("boot");
+  logAction("firmware simulator ready");
+}
+
+traceDebug("module.ready", {
+  elements: {
+    canvas: Boolean(canvas),
+    ctx: Boolean(ctx),
+    stateName: Boolean(stateName),
+    actionLine: Boolean(actionLine),
+    powerButton: Boolean(powerButton),
+    bootButton: Boolean(bootButton),
+    simAuxButton: Boolean(simAuxButton),
+    simPowerButton: Boolean(simPowerButton),
+    debugDumpButton: Boolean(debugDumpButton),
+  },
+});
+
+boot().catch((error) => {
+  traceDebug("boot.failed", { error: safeError(error) });
+  logAction("boot failed; check .logs/simulator-debug-latest.json");
+  console.error("Simulator boot failed", error);
+});

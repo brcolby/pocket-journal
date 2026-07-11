@@ -21,6 +21,23 @@ Returns device id, firmware version, board profile, Wi-Fi state, storage state, 
 The time/temp screen can display battery percentage when firmware can read it from the board power-management path. Until hardware bring-up confirms that path, simulator and native tests use a dummy percentage.
 
 ```http
+GET /v1/time
+PUT /v1/time
+```
+
+Reads or updates the local time/date shown on the time/temp screen. The v0 firmware accepts integer `hour`, `minute`, `month`, and `day` fields, plus optional `year` for weekday calculation.
+
+```json
+{
+  "hour": 14,
+  "minute": 5,
+  "year": 2026,
+  "month": 6,
+  "day": 19
+}
+```
+
+```http
 GET /v1/settings
 PUT /v1/settings
 ```
@@ -34,7 +51,7 @@ GET /v1/home
 PUT /v1/home
 ```
 
-Reads or updates the custom home screen design supplied by the partner app. The device should retain up to five slots.
+Reads or updates the custom home screen design supplied by the partner app. The device should retain up to four slots.
 
 ```json
 {
@@ -71,9 +88,10 @@ The partner CLI can build this payload from `.pbm` raster files directly, or fro
 ```http
 GET /v1/audio
 GET /v1/audio/{audio_id}
+DELETE /v1/audio
 ```
 
-Lists and downloads unsynced or retained WAV recordings from the TF card.
+Lists, downloads, or wipes retained WAV recordings from the TF card. `DELETE /v1/audio` also removes transcript JSON sidecars and returns the number of audio files deleted. It returns `409 Conflict` while recording or playback is active.
 
 ```http
 PUT /v1/transcripts/{audio_id}
@@ -92,6 +110,25 @@ POST /v1/ota
 ```
 
 Reserved for partner-driven firmware updates after rollback and version checks are implemented.
+
+## USB-C Partner Commands
+
+The firmware also accepts a small line protocol on the USB Serial/JTAG console for maintenance when Wi-Fi is unavailable. The firmware console must be configured with USB Serial/JTAG as the primary console input; a secondary USB log console is output-only for `stdin` consumers.
+
+```text
+PJ_STATUS
+PJ_WIFI_HEX 4c61622057694669 70617373776f7264 746f6b656e
+PJ_TIME 2026 06 20 14 05
+PJ_WIPE_RECORDINGS
+PJ_AUDIO_TONE [0|1|-] [dout_gpio] [pa=0|1|-] [dout=gpio] [pwr=0|1|-] [gpio44=0x00..0xff] [gp45=0x00..0xff]
+PJ_MIC_CHECK [duration_ms] [ms=1..10000] [gain_db=0..42]
+```
+
+`PJ_WIFI_HEX` stores hex-encoded UTF-8 `ssid`, `password`, and bearer-token strings in NVS. It intentionally does not echo credentials back over serial.
+`PJ_AUDIO_TONE` plays a generated diagnostic tone. Its optional first argument forces the speaker PA GPIO level; `-` keeps the firmware default. Its optional second argument temporarily routes I2S TX data to a DOUT GPIO for board pin-map diagnosis. The named arguments expose the same probes plus temporary audio power GPIO and ES8311 register overrides; the firmware restores the normal route, power level, and register values after the tone.
+`PJ_MIC_CHECK` samples the ES8311 microphone path without creating a note file and returns input statistics: `peak`, `avg_abs`, `clipped`, `near_zero`, `read_errors`, and `silent`. The production recording gain is `42 dB`; use lower diagnostic overrides only when measuring input headroom.
+
+Responses start with `PJ_OK` or `PJ_ERR` followed by a compact JSON object. Normal ESP-IDF logs may appear on the same serial stream, so clients should scan for those prefixes.
 
 ## Calendar Event Shape
 

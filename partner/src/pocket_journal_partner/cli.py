@@ -1,16 +1,17 @@
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 import argparse
 import asyncio
 import json
+import secrets
 import sys
 
 from .ble import provision_wifi
 from .calendar import calendar_payload_for_day
 from .config import DeviceProfile, load_config, save_config
-from .device import DeviceClient, discover_mdns
+from .device import DeviceClient, DeviceError, SerialDeviceClient, discover_mdns, resolve_serial_port
 from .storage import PartnerStore
 from .sync import sync_device_audio
 from .transcription import backend_from_name
@@ -29,18 +30,33 @@ def _device_profile(device_id: str, data_dir: str | None = None) -> DeviceProfil
 
 
 def cmd_provision(args: argparse.Namespace) -> int:
-    provisioned = asyncio.run(provision_wifi(args.ble_name, args.ssid, args.password, mock=args.mock))
     data_dir = Path(args.data_dir) if args.data_dir else None
-    config = load_config(data_dir)
     base_url = args.base_url or ""
-    config.devices[provisioned.device_id] = DeviceProfile(
-        device_id=provisioned.device_id,
-        ble_name=provisioned.ble_name,
-        token=provisioned.token,
-        base_url=base_url,
-    )
+    if args.serial_port:
+        token = secrets.token_urlsafe(24)
+        client = SerialDeviceClient(resolve_serial_port(args.serial_port), baudrate=args.serial_baud, timeout=args.timeout)
+        response = client.provision_wifi(args.ssid, args.password, token)
+        device_id = str(response.get("device_id") or "pj-usb")
+        ble_name = args.ble_name or ""
+        profile = DeviceProfile(
+            device_id=device_id,
+            ble_name=ble_name,
+            token=token,
+            base_url=base_url,
+        )
+    else:
+        provisioned = asyncio.run(provision_wifi(args.ble_name, args.ssid, args.password, mock=args.mock))
+        profile = DeviceProfile(
+            device_id=provisioned.device_id,
+            ble_name=provisioned.ble_name,
+            token=provisioned.token,
+            base_url=base_url,
+        )
+
+    config = load_config(data_dir)
+    config.devices[profile.device_id] = profile
     save_config(config, data_dir)
-    _print_json(config.devices[provisioned.device_id].__dict__)
+    _print_json(config.devices[profile.device_id].__dict__)
     return 0
 
 
@@ -56,6 +72,18 @@ def _client_from_args(args: argparse.Namespace) -> tuple[str, DeviceClient]:
     if not base_url:
         raise SystemExit("device base URL is required; pass --base-url or store it in config")
     return profile.device_id, DeviceClient(base_url, profile.token)
+
+
+def _control_client_from_args(args: argparse.Namespace):
+    serial_port = getattr(args, "serial_port", None)
+    if serial_port or not getattr(args, "device", None):
+        resolved_port = resolve_serial_port(serial_port)
+        return getattr(args, "device", None) or "usb", SerialDeviceClient(
+            resolved_port,
+            baudrate=getattr(args, "serial_baud", 115200),
+            timeout=getattr(args, "timeout", 6.0),
+        )
+    return _client_from_args(args)
 
 
 def cmd_sync(args: argparse.Namespace) -> int:
@@ -97,6 +125,69 @@ def cmd_settings_set(args: argparse.Namespace) -> int:
         settings[key] = value
     response = client.put_settings(settings)
     _print_json(response or {"updated": settings})
+    return 0
+
+
+def cmd_device_sync_time(args: argparse.Namespace) -> int:
+    device_id, client = _control_client_from_args(args)
+    now = datetime.now().astimezone()
+    response = client.put_time(now.hour, now.minute, now.month, now.day, now.year)
+    transport = "usb" if isinstance(client, SerialDeviceClient) else "http"
+    _print_json({
+        "device_id": device_id,
+        "transport": transport,
+        "time": response or {
+            "hour": now.hour,
+            "minute": now.minute,
+            "year": now.year,
+            "month": now.month,
+            "day": now.day,
+        },
+    })
+    return 0
+
+
+def cmd_recordings_wipe(args: argparse.Namespace) -> int:
+    if not args.yes:
+        raise SystemExit("refusing to wipe recordings without --yes")
+    device_id, client = _control_client_from_args(args)
+    response = client.wipe_recordings()
+    transport = "usb" if isinstance(client, SerialDeviceClient) else "http"
+    _print_json({
+        "device_id": device_id,
+        "transport": transport,
+        "result": response or {"deleted": None},
+    })
+    return 0
+
+
+def cmd_device_tone(args: argparse.Namespace) -> int:
+    resolved_port = resolve_serial_port(args.serial_port)
+    client = SerialDeviceClient(resolved_port, baudrate=args.serial_baud, timeout=args.timeout)
+    response = client.audio_tone(
+        args.pa_level,
+        args.dout_gpio,
+        args.audio_power_level,
+        args.codec_gpio44,
+        args.codec_gp45,
+    )
+    _print_json({
+        "device_id": args.device or "usb",
+        "transport": "usb",
+        "result": response,
+    })
+    return 0
+
+
+def cmd_device_mic_check(args: argparse.Namespace) -> int:
+    resolved_port = resolve_serial_port(args.serial_port)
+    client = SerialDeviceClient(resolved_port, baudrate=args.serial_baud, timeout=args.timeout)
+    response = client.mic_check(args.duration_ms, args.gain_db)
+    _print_json({
+        "device_id": args.device or "usb",
+        "transport": "usb",
+        "result": response,
+    })
     return 0
 
 
@@ -233,11 +324,44 @@ def build_parser() -> argparse.ArgumentParser:
     provision.add_argument("--ble-name")
     provision.add_argument("--base-url")
     provision.add_argument("--data-dir")
+    provision.add_argument("--serial-port", help="provision over USB-C serial instead of BLE")
+    provision.add_argument("--serial-baud", type=int, default=115200)
+    provision.add_argument("--timeout", type=float, default=6.0)
     provision.add_argument("--mock", action="store_true", help="store a mock provisioned profile before hardware is available")
     provision.set_defaults(func=cmd_provision)
 
     discover = sub.add_parser("discover", help="discover Pocket Journal devices on LAN")
     discover.set_defaults(func=cmd_discover)
+
+    device = sub.add_parser("device", help="device maintenance commands")
+    device_sub = device.add_subparsers(dest="device_command", required=True)
+    device_sync_time = device_sub.add_parser("sync-time", help="set device time from this computer")
+    device_sync_time.add_argument("--device", help="paired device id for Wi-Fi HTTP; optional for USB-C")
+    device_sync_time.add_argument("--base-url")
+    device_sync_time.add_argument("--data-dir")
+    device_sync_time.add_argument("--serial-port", help="USB-C serial port, such as /dev/cu.usbmodem1101; auto-detected when omitted")
+    device_sync_time.add_argument("--serial-baud", type=int, default=115200)
+    device_sync_time.add_argument("--timeout", type=float, default=6.0)
+    device_sync_time.set_defaults(func=cmd_device_sync_time)
+    device_tone = device_sub.add_parser("tone", help="play a USB-C audio diagnostic tone")
+    device_tone.add_argument("--device", help="optional label for output")
+    device_tone.add_argument("--serial-port", help="USB-C serial port, such as /dev/cu.usbmodem1101; auto-detected when omitted")
+    device_tone.add_argument("--serial-baud", type=int, default=115200)
+    device_tone.add_argument("--timeout", type=float, default=6.0)
+    device_tone.add_argument("--pa-level", type=int, choices=[0, 1], help="force speaker PA GPIO level for diagnosis")
+    device_tone.add_argument("--dout-gpio", type=int, help="temporarily route I2S TX data to this GPIO for diagnosis")
+    device_tone.add_argument("--audio-power-level", type=int, choices=[0, 1], help="force audio power GPIO level for diagnosis")
+    device_tone.add_argument("--codec-gpio44", type=lambda value: int(value, 0), help="temporarily write ES8311 register 0x44 before the tone")
+    device_tone.add_argument("--codec-gp45", type=lambda value: int(value, 0), help="temporarily write ES8311 register 0x45 before the tone")
+    device_tone.set_defaults(func=cmd_device_tone)
+    device_mic_check = device_sub.add_parser("mic-check", help="sample the ES8311 microphone path and report levels")
+    device_mic_check.add_argument("--device", help="optional label for output")
+    device_mic_check.add_argument("--serial-port", help="USB-C serial port, such as /dev/cu.usbmodem1101; auto-detected when omitted")
+    device_mic_check.add_argument("--serial-baud", type=int, default=115200)
+    device_mic_check.add_argument("--timeout", type=float, default=8.0)
+    device_mic_check.add_argument("--duration-ms", type=int, default=1500)
+    device_mic_check.add_argument("--gain-db", type=int, help="temporarily set ES8311 input gain for this check, 0..42 dB")
+    device_mic_check.set_defaults(func=cmd_device_mic_check)
 
     sync = sub.add_parser("sync", help="download audio, transcribe, and upload transcripts")
     sync.add_argument("--device", required=True)
@@ -268,6 +392,18 @@ def build_parser() -> argparse.ArgumentParser:
     settings_set.add_argument("--data-dir")
     settings_set.add_argument("assignments", nargs="+")
     settings_set.set_defaults(func=cmd_settings_set)
+
+    recordings = sub.add_parser("recordings", help="recording maintenance commands")
+    recordings_sub = recordings.add_subparsers(dest="recordings_command", required=True)
+    recordings_wipe = recordings_sub.add_parser("wipe", help="delete all recordings from the device")
+    recordings_wipe.add_argument("--device", help="paired device id for Wi-Fi HTTP; optional for USB-C")
+    recordings_wipe.add_argument("--base-url")
+    recordings_wipe.add_argument("--data-dir")
+    recordings_wipe.add_argument("--serial-port", help="USB-C serial port, such as /dev/cu.usbmodem1101; auto-detected when omitted")
+    recordings_wipe.add_argument("--serial-baud", type=int, default=115200)
+    recordings_wipe.add_argument("--timeout", type=float, default=6.0)
+    recordings_wipe.add_argument("--yes", action="store_true", help="confirm deletion of all device recordings")
+    recordings_wipe.set_defaults(func=cmd_recordings_wipe)
 
     home = sub.add_parser("home", help="custom home screen design")
     home_sub = home.add_subparsers(dest="home_command", required=True)
@@ -305,6 +441,9 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         return args.func(args)
+    except DeviceError as exc:
+        print(f"pj: error: {exc}", file=sys.stderr)
+        return 1
     except KeyboardInterrupt:
         return 130
     except BrokenPipeError:

@@ -6,16 +6,39 @@ The partner CLI is the source of truth for laptop-side sync state.
 
 ```sh
 pj provision --ssid <ssid> --password <password>
+pj provision --ssid <ssid> --password <password> --serial-port /dev/cu.usbmodem1101
 pj discover
 pj sync --device <device-id>
 pj calendar sync --device <device-id>
 pj settings get --device <device-id>
 pj settings set --device <device-id> volume=5
+pj device sync-time --device <device-id>
+pj device tone
+pj device tone --pa-level 1
+pj device tone --pa-level 0 --dout-gpio 45
+pj device tone --audio-power-level 0
+pj device tone --codec-gp45 0xff
+pj device mic-check --duration-ms 2000
+pj device mic-check --duration-ms 2000 --gain-db 30
+pj recordings wipe --device <device-id> --yes
 pj home get --device <device-id>
 pj home set --device <device-id> --file home.json
 pj static-art get --device <device-id>
 pj static-art set --device <device-id> --file static-art.pbm
 ```
+
+Wi-Fi commands use the paired device config created by provisioning. For USB-C maintenance when Wi-Fi is unavailable, install the USB extra. The CLI auto-detects `/dev/cu.usbmodem1101` or the single attached USB serial port; pass `--serial-port` only to override detection.
+
+```sh
+cd partner
+pip install -e '.[usb]'
+pj device sync-time
+pj recordings wipe --yes
+```
+
+`pj provision --serial-port ...` stores Wi-Fi credentials and a generated API bearer token on the device, then writes the paired device profile into the local partner config. Actual Wi-Fi connection/reconnect is still firmware work tracked separately.
+
+Only one process can own the USB serial port. Quit `idf.py monitor` with `Ctrl+]` before running the partner utility over USB-C.
 
 ## Data Stored Locally
 
