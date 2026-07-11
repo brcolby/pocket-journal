@@ -1,6 +1,7 @@
 #include "pj_board.h"
 #include "pj_audio_level.h"
 #include "pj_aux_input.h"
+#include "pj_auth.h"
 #include "pj_note_model.h"
 
 #include <stdio.h>
@@ -3623,12 +3624,10 @@ int pj_board_wipe_recordings(pj_ui_context_t *ui)
 static int auth_ok(httpd_req_t *req)
 {
     char header[96];
-    char expected[96];
-    (void)snprintf(expected, sizeof(expected), "Bearer %s", g_status.token);
     if (httpd_req_get_hdr_value_str(req, "Authorization", header, sizeof(header)) != ESP_OK) {
         return 0;
     }
-    return strcmp(header, expected) == 0;
+    return pj_auth_header_valid(header, g_status.token);
 }
 
 static esp_err_t send_json(httpd_req_t *req, const char *json)
@@ -3643,6 +3642,7 @@ static esp_err_t require_auth(httpd_req_t *req)
         return ESP_OK;
     }
     httpd_resp_set_status(req, "401 Unauthorized");
+    httpd_resp_set_hdr(req, "WWW-Authenticate", "Bearer realm=\"pocket-journal\"");
     return send_json(req, "{\"error\":\"unauthorized\"}");
 }
 
@@ -4477,7 +4477,7 @@ int pj_board_http_start(void)
 #undef REGISTER_URI_OR_FAIL
 
     g_status.http = PJ_BOARD_SERVICE_READY;
-    ESP_LOGI(TAG, "HTTP API started; bearer token for bring-up is '%s'", g_status.token);
+    ESP_LOGI(TAG, "HTTP API started with bearer authentication enabled");
     return 1;
 #else
     g_status.http = PJ_BOARD_SERVICE_UNAVAILABLE;

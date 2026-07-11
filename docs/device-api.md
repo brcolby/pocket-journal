@@ -10,6 +10,8 @@ Authorization: Bearer <pairing-token>
 
 TLS is intentionally deferred for v1 LAN derisking.
 
+Every `/v1` route is protected. Missing, malformed, or invalid credentials receive `401 Unauthorized`, a `WWW-Authenticate: Bearer realm="pocket-journal"` header, and the same non-secret JSON error. Provisioning is performed outside the LAN API over the dedicated USB-C or BLE transports; there is no unauthenticated LAN health endpoint.
+
 ## Endpoints
 
 ```http

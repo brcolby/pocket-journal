@@ -39,6 +39,31 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(calls[0], ("GET", "/v1/time", None))
         self.assertEqual(calls[1], ("PUT", "/v1/time", {"hour": 14, "minute": 5, "month": 6, "day": 19}))
 
+    def test_http_client_sends_bearer_authorization(self) -> None:
+        captured = []
+
+        class Response:
+            headers = {"Content-Type": "application/json"}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb) -> None:
+                _ = (exc_type, exc, tb)
+
+            def read(self) -> bytes:
+                return b"{}"
+
+        def fake_urlopen(req, timeout):
+            captured.append((req.get_header("Authorization"), timeout))
+            return Response()
+
+        client = DeviceClient("http://127.0.0.1", "pairing-token", timeout=3.0)
+        with patch("pocket_journal_partner.device.request.urlopen", fake_urlopen):
+            client.status()
+
+        self.assertEqual(captured, [("Bearer pairing-token", 3.0)])
+
     def test_audio_payloads_and_wipe_endpoint(self) -> None:
         calls = []
         client = DeviceClient("http://127.0.0.1", "token")
