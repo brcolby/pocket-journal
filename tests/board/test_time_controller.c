@@ -8,6 +8,9 @@
 #define ARRAY_LEN(values) (sizeof(values) / sizeof((values)[0]))
 
 typedef struct {
+    char events[128];
+    size_t event_count;
+
     pj_time_controller_load_result_t load_result;
     uint8_t load_record[PJ_TIME_STATE_RECORD_BYTES];
     unsigned load_calls;
@@ -25,6 +28,7 @@ typedef struct {
 
     pj_time_clock_t clock;
     int clock_ok;
+    int clock_preserve_boot_id;
     unsigned clock_calls;
     uint32_t clock_boot_id;
 
@@ -48,6 +52,19 @@ typedef struct {
     unsigned publish_calls;
     pj_time_controller_result_t published;
 } fixture_t;
+
+static void record_event(fixture_t *fixture, char event)
+{
+    assert(fixture->event_count < sizeof(fixture->events));
+    fixture->events[fixture->event_count++] = event;
+}
+
+static void assert_events(const fixture_t *fixture, const char *expected)
+{
+    size_t length = strlen(expected);
+    assert(fixture->event_count == length);
+    assert(memcmp(fixture->events, expected, length) == 0);
+}
 
 static pj_time_clock_t clock_at(uint32_t boot_id, uint64_t monotonic_ms,
                                 int64_t wall_ms, int32_t day,
@@ -83,6 +100,7 @@ static pj_time_controller_load_result_t load_callback(
     void *context, uint8_t record[PJ_TIME_STATE_RECORD_BYTES])
 {
     fixture_t *fixture = context;
+    record_event(fixture, 'L');
     fixture->load_calls++;
     memcpy(record, fixture->load_record, sizeof(fixture->load_record));
     return fixture->load_result;
@@ -92,6 +110,7 @@ static pj_time_controller_save_result_t save_callback(
     void *context, const uint8_t record[PJ_TIME_STATE_RECORD_BYTES])
 {
     fixture_t *fixture = context;
+    record_event(fixture, 'V');
     size_t index = fixture->save_calls++;
     memcpy(fixture->saved_record, record, sizeof(fixture->saved_record));
     assert(pj_time_state_decode(record, PJ_TIME_STATE_RECORD_BYTES,
@@ -105,6 +124,7 @@ static pj_time_controller_save_result_t save_callback(
 static uint32_t next_boot_id_callback(void *context)
 {
     fixture_t *fixture = context;
+    record_event(fixture, 'B');
     size_t index = fixture->boot_calls++;
     if (index < fixture->boot_plan_count) {
         return fixture->boot_plan[index];
@@ -116,10 +136,13 @@ static int clock_callback(void *context, uint32_t boot_id,
                           pj_time_clock_t *clock)
 {
     fixture_t *fixture = context;
+    record_event(fixture, 'C');
     fixture->clock_calls++;
     fixture->clock_boot_id = boot_id;
     *clock = fixture->clock;
-    clock->boot_id = boot_id;
+    if (!fixture->clock_preserve_boot_id) {
+        clock->boot_id = boot_id;
+    }
     return fixture->clock_ok;
 }
 
@@ -127,6 +150,7 @@ static int alarm_settings_callback(
     void *context, pj_time_controller_alarm_settings_t *settings)
 {
     fixture_t *fixture = context;
+    record_event(fixture, 'S');
     fixture->alarm_calls++;
     *settings = fixture->alarm;
     return fixture->alarm_ok;
@@ -135,12 +159,14 @@ static int alarm_settings_callback(
 static int wall_time_trusted_callback(void *context)
 {
     fixture_t *fixture = context;
+    record_event(fixture, 'T');
     return fixture->trusted;
 }
 
 static pj_time_activity_t activity_callback(void *context)
 {
     fixture_t *fixture = context;
+    record_event(fixture, 'A');
     return fixture->activity;
 }
 
@@ -148,6 +174,7 @@ static pj_time_controller_wake_result_t schedule_wake_callback(
     void *context, const pj_time_wake_deadline_t *deadline)
 {
     fixture_t *fixture = context;
+    record_event(fixture, 'W');
     size_t index = fixture->wake_calls++;
     fixture->wake_armed = deadline != NULL;
     fixture->wake_deadline = deadline == NULL
@@ -164,6 +191,7 @@ static void project_media_callback(void *context,
                                    pj_time_conflict_action_t action)
 {
     fixture_t *fixture = context;
+    record_event(fixture, 'M');
     fixture->media_calls++;
     fixture->media_has_alert = alert != NULL;
     fixture->media_alert = alert == NULL ? (pj_time_alert_t) {0} : *alert;
@@ -174,6 +202,7 @@ static void publish_status_callback(
     void *context, const pj_time_controller_result_t *result)
 {
     fixture_t *fixture = context;
+    record_event(fixture, 'P');
     fixture->publish_calls++;
     fixture->published = *result;
 }
@@ -206,6 +235,7 @@ static void fixture_load_state(fixture_t *fixture,
 
 static void clear_observations(fixture_t *fixture)
 {
+    fixture->event_count = 0;
     fixture->save_calls = 0;
     fixture->save_plan_count = 0;
     fixture->wake_calls = 0;
@@ -742,6 +772,347 @@ static void test_media_playback_recording_and_queued_transitions(void)
     assert(result.media_action == PJ_TIME_PRESENT);
 }
 
+static void test_monotonic_rollback_resets_cadence_baselines(void)
+{
+    fixture_t fixture;
+    fixture_defaults(&fixture);
+    pj_time_controller_t controller = init_default(&fixture);
+    assert(apply(&controller, &fixture,
+                 PJ_TIME_CONTROLLER_COMMAND_STOPWATCH_START, 0, 0)
+               .command_applied);
+
+    clear_observations(&fixture);
+    fixture.clock.monotonic_ms = 500;
+    pj_time_controller_result_t result;
+    assert(pj_time_controller_update(&controller, &result));
+    assert(result.state_changed);
+    assert(!result.persistence_attempted);
+    assert(controller.last_persist_ms == 500);
+    assert(controller.state.recovery_time_uncertain);
+
+    fixture.clock.monotonic_ms =
+        500 + PJ_TIME_CONTROLLER_CHECKPOINT_MS - 1;
+    assert(pj_time_controller_update(&controller, &result));
+    assert(!result.persistence_attempted);
+    fixture.clock.monotonic_ms++;
+    assert(pj_time_controller_update(&controller, &result));
+    assert(result.persistence_attempted);
+    assert(fixture.saved_state.stopwatch_elapsed_ms ==
+           PJ_TIME_CONTROLLER_CHECKPOINT_MS);
+
+    clear_observations(&fixture);
+    fixture.save_plan[0] = PJ_TIME_CONTROLLER_SAVE_TRANSIENT_ERROR;
+    fixture.save_plan[1] = PJ_TIME_CONTROLLER_SAVE_OK;
+    fixture.save_plan_count = 2;
+    result = apply(&controller, &fixture,
+                   PJ_TIME_CONTROLLER_COMMAND_STOPWATCH_PAUSE, 0, 0);
+    assert(result.persistence_attempted && result.dirty);
+    uint64_t failed_at = fixture.clock.monotonic_ms;
+    assert(controller.last_retry_ms == failed_at);
+
+    fixture.clock.monotonic_ms = 100;
+    assert(pj_time_controller_update(&controller, &result));
+    assert(!result.persistence_attempted);
+    assert(controller.last_retry_ms == 100);
+    fixture.clock.monotonic_ms = 100 + PJ_TIME_CONTROLLER_RETRY_MS - 1;
+    assert(pj_time_controller_update(&controller, &result));
+    assert(!result.persistence_attempted);
+    fixture.clock.monotonic_ms++;
+    assert(pj_time_controller_update(&controller, &result));
+    assert(result.persistence_attempted && !result.dirty);
+    assert(fixture.save_calls == 2);
+}
+
+static void test_settings_failure_is_conservative_and_recovers(void)
+{
+    fixture_t fixture;
+    fixture_defaults(&fixture);
+    fixture.alarm_ok = 0;
+    pj_time_controller_io_t io = fixture_io(&fixture);
+    pj_time_controller_t controller;
+    pj_time_controller_result_t result;
+    assert(!pj_time_controller_init(&controller, &io, &result));
+    assert(!result.ready);
+    assert(result.diagnostic == PJ_TIME_CONTROLLER_DIAGNOSTIC_SETTINGS_ERROR);
+    assert(fixture.save_calls == 0 && fixture.wake_calls == 0);
+    assert(fixture.media_calls == 0);
+    assert_events(&fixture, "LBCTSP");
+
+    fixture_defaults(&fixture);
+    controller = init_default(&fixture);
+    assert(apply(&controller, &fixture,
+                 PJ_TIME_CONTROLLER_COMMAND_TIMER_START, 120000, 0)
+               .command_applied);
+    clear_observations(&fixture);
+    fixture.alarm = (pj_time_controller_alarm_settings_t) {
+        .enabled = 1,
+        .hour = 9,
+        .minute = 15,
+    };
+    fixture.alarm_ok = 0;
+    fixture.clock.monotonic_ms = 2000;
+    assert(!pj_time_controller_update(&controller, &result));
+    assert(result.ready && result.dirty);
+    assert(result.state_changed);
+    assert(result.diagnostic == PJ_TIME_CONTROLLER_DIAGNOSTIC_SETTINGS_ERROR);
+    assert(controller.state.timer.remaining_ms == 119000);
+    assert(!controller.state.alarm_enabled);
+    assert(fixture.save_calls == 0 && fixture.wake_calls == 0);
+    assert(fixture.media_calls == 0);
+    assert_events(&fixture, "CSP");
+
+    clear_observations(&fixture);
+    fixture.alarm_ok = 1;
+    fixture.clock.monotonic_ms = PJ_TIME_CONTROLLER_RETRY_MS;
+    assert(pj_time_controller_update(&controller, &result));
+    assert(result.state_changed && result.transition);
+    assert(result.persistence_attempted && !result.dirty);
+    assert(result.wake_requested);
+    assert(controller.state.alarm_enabled);
+    assert(controller.state.alarm_hour == 9);
+    assert(controller.state.alarm_minute == 15);
+    assert(fixture.saved_state.timer.remaining_ms == 61000);
+    assert(result.diagnostic == PJ_TIME_CONTROLLER_DIAGNOSTIC_NONE);
+}
+
+static void test_operational_diagnostic_precedence(void)
+{
+    pj_time_clock_t old_clock = clock_at(1, 0, 100000, 20, 100);
+    pj_time_state_t state;
+    pj_time_state_defaults(&state, &old_clock);
+    assert(pj_time_timer_start(&state, 120000, &old_clock));
+
+    fixture_t fixture;
+    fixture_defaults(&fixture);
+    fixture_load_state(&fixture, &state);
+    fixture.trusted = 0;
+    fixture.save_plan[0] = PJ_TIME_CONTROLLER_SAVE_TRANSIENT_ERROR;
+    fixture.save_plan_count = 1;
+    fixture.wake_plan[0] = PJ_TIME_CONTROLLER_WAKE_ERROR;
+    fixture.wake_plan_count = 1;
+    pj_time_controller_t controller;
+    pj_time_controller_result_t result;
+    pj_time_controller_io_t io = fixture_io(&fixture);
+    assert(pj_time_controller_init(&controller, &io, &result));
+    assert(controller.state.recovery_time_uncertain);
+    assert(result.diagnostic == PJ_TIME_CONTROLLER_DIAGNOSTIC_SAVE_TRANSIENT);
+
+    clear_observations(&fixture);
+    fixture.alarm_ok = 0;
+    assert(!pj_time_controller_update(&controller, &result));
+    assert(result.diagnostic == PJ_TIME_CONTROLLER_DIAGNOSTIC_SETTINGS_ERROR);
+
+    clear_observations(&fixture);
+    fixture.alarm_ok = 1;
+    fixture.wake_plan[0] = PJ_TIME_CONTROLLER_WAKE_ERROR;
+    fixture.wake_plan_count = 1;
+    result = apply(&controller, &fixture,
+                   PJ_TIME_CONTROLLER_COMMAND_TIMER_START, 60000, 0);
+    assert(result.save_result == PJ_TIME_CONTROLLER_SAVE_OK);
+    assert(result.wake_result == PJ_TIME_CONTROLLER_WAKE_ERROR);
+    assert(result.diagnostic == PJ_TIME_CONTROLLER_DIAGNOSTIC_WAKE_ERROR);
+
+    clear_observations(&fixture);
+    result = apply(&controller, &fixture,
+                   PJ_TIME_CONTROLLER_COMMAND_TIMER_RESET, 0, 0);
+    assert(result.wake_result == PJ_TIME_CONTROLLER_WAKE_OK);
+    assert(result.diagnostic == PJ_TIME_CONTROLLER_DIAGNOSTIC_TIME_UNCERTAIN);
+
+    fixture_defaults(&fixture);
+    fixture.load_result = PJ_TIME_CONTROLLER_LOAD_CORRUPT;
+    fixture.wake_plan[0] = PJ_TIME_CONTROLLER_WAKE_ERROR;
+    fixture.wake_plan_count = 1;
+    io = fixture_io(&fixture);
+    assert(pj_time_controller_init(&controller, &io, &result));
+    assert(result.diagnostic == PJ_TIME_CONTROLLER_DIAGNOSTIC_WAKE_ERROR);
+    clear_observations(&fixture);
+    assert(pj_time_controller_time_changed(&controller, 1, &result));
+    assert(result.diagnostic == PJ_TIME_CONTROLLER_DIAGNOSTIC_LOAD_CORRUPT);
+}
+
+static void test_clock_boot_id_must_match_controller(void)
+{
+    fixture_t fixture;
+    fixture_defaults(&fixture);
+    fixture.clock_preserve_boot_id = 1;
+    fixture.clock.boot_id = 999;
+    pj_time_controller_t controller;
+    pj_time_controller_result_t result;
+    pj_time_controller_io_t io = fixture_io(&fixture);
+    assert(!pj_time_controller_init(&controller, &io, &result));
+    assert(result.diagnostic == PJ_TIME_CONTROLLER_DIAGNOSTIC_CLOCK_ERROR);
+    assert(!result.ready);
+    assert(fixture.alarm_calls == 0 && fixture.save_calls == 0);
+    assert_events(&fixture, "LBCP");
+
+    fixture_defaults(&fixture);
+    controller = init_default(&fixture);
+    pj_time_state_t before = controller.state;
+    clear_observations(&fixture);
+    fixture.clock_preserve_boot_id = 1;
+    fixture.clock.boot_id = controller.boot_id + 1;
+    assert(!pj_time_controller_update(&controller, &result));
+    assert(result.ready);
+    assert(result.diagnostic == PJ_TIME_CONTROLLER_DIAGNOSTIC_CLOCK_ERROR);
+    assert(memcmp(&before, &controller.state, sizeof(before)) == 0);
+    assert_events(&fixture, "CP");
+
+    clear_observations(&fixture);
+    fixture.clock_preserve_boot_id = 0;
+    assert(pj_time_controller_update(&controller, &result));
+    assert(result.diagnostic == PJ_TIME_CONTROLLER_DIAGNOSTIC_NONE);
+}
+
+static void test_forward_and_backward_civil_changes(void)
+{
+    fixture_t fixture;
+    fixture_defaults(&fixture);
+    fixture.clock.local_day = 20;
+    fixture.clock.local_second = 6 * 3600 + 59 * 60;
+    fixture.alarm = (pj_time_controller_alarm_settings_t) {
+        .enabled = 1,
+        .hour = 7,
+        .minute = 0,
+    };
+    pj_time_controller_t controller = init_default(&fixture);
+    clear_observations(&fixture);
+
+    fixture.clock.monotonic_ms += 120000;
+    fixture.clock.wall_utc_ms += 2 * 86400000ll + 120000;
+    fixture.clock.local_day = 22;
+    fixture.clock.local_second = 9 * 3600;
+    pj_time_controller_result_t result;
+    assert(pj_time_controller_time_changed(&controller, 1, &result));
+    assert(result.transition && result.persistence_attempted);
+    assert(controller.state.active_alert.source == PJ_TIME_ALERT_ALARM);
+    assert(controller.state.active_alert.recovered);
+    uint64_t handled_occurrence = controller.state.active_alert.occurrence;
+    uint64_t alert_id = controller.state.active_alert.id;
+    assert_events(&fixture, "CSVWAMP");
+    assert(apply(&controller, &fixture,
+                 PJ_TIME_CONTROLLER_COMMAND_ALERT_DISMISS, alert_id, 0)
+               .command_applied);
+
+    clear_observations(&fixture);
+    fixture.clock.monotonic_ms += 1000;
+    fixture.clock.wall_utc_ms -= 3 * 86400000ll;
+    fixture.clock.local_day = 19;
+    fixture.clock.local_second = 6 * 3600;
+    assert(pj_time_controller_time_changed(&controller, 1, &result));
+    assert(controller.state.active_alert.source == PJ_TIME_ALERT_NONE);
+
+    fixture.clock.monotonic_ms += 1000;
+    fixture.clock.wall_utc_ms += 3 * 86400000ll;
+    fixture.clock.local_day = 22;
+    fixture.clock.local_second = 7 * 3600;
+    assert(pj_time_controller_time_changed(&controller, 1, &result));
+    assert(controller.state.active_alert.source == PJ_TIME_ALERT_NONE);
+    assert(controller.state.alarm_last_occurrence == handled_occurrence);
+
+    fixture.clock.monotonic_ms += 86400000;
+    fixture.clock.wall_utc_ms += 86400000;
+    fixture.clock.local_day = 23;
+    assert(pj_time_controller_time_changed(&controller, 1, &result));
+    assert(controller.state.active_alert.source == PJ_TIME_ALERT_ALARM);
+    assert(controller.state.active_alert.occurrence > handled_occurrence);
+}
+
+static void test_callback_operation_ordering(void)
+{
+    fixture_t fixture;
+    fixture_defaults(&fixture);
+    pj_time_controller_t controller = init_default(&fixture);
+    assert_events(&fixture, "LBCTSVWAMP");
+
+    clear_observations(&fixture);
+    pj_time_controller_result_t result = apply(
+        &controller, &fixture, PJ_TIME_CONTROLLER_COMMAND_TIMER_START, 1000, 0);
+    assert(result.command_applied);
+    assert_events(&fixture, "CSVWAP");
+
+    clear_observations(&fixture);
+    fixture.clock.monotonic_ms += 1000;
+    fixture.clock.wall_utc_ms += 1000;
+    assert(pj_time_controller_update(&controller, &result));
+    assert(result.transition);
+    assert_events(&fixture, "CSVWAMP");
+
+    clear_observations(&fixture);
+    fixture.alarm_ok = 0;
+    assert(!pj_time_controller_update(&controller, &result));
+    assert_events(&fixture, "CSP");
+}
+
+static void test_staged_save_failures_preserve_latest_state(void)
+{
+    fixture_t fixture;
+    fixture_defaults(&fixture);
+    fixture.save_plan[0] = PJ_TIME_CONTROLLER_SAVE_TRANSIENT_ERROR;
+    fixture.save_plan_count = 1;
+    pj_time_controller_t controller;
+    pj_time_controller_result_t result;
+    pj_time_controller_io_t io = fixture_io(&fixture);
+    assert(pj_time_controller_init(&controller, &io, &result));
+    assert(result.dirty);
+    assert(result.diagnostic == PJ_TIME_CONTROLLER_DIAGNOSTIC_SAVE_TRANSIENT);
+
+    clear_observations(&fixture);
+    fixture.save_plan[0] = PJ_TIME_CONTROLLER_SAVE_PERMANENT_ERROR;
+    fixture.save_plan_count = 1;
+    result = apply(&controller, &fixture,
+                   PJ_TIME_CONTROLLER_COMMAND_STOPWATCH_START, 0, 0);
+    assert(result.command_applied && result.dirty);
+    assert(result.diagnostic == PJ_TIME_CONTROLLER_DIAGNOSTIC_SAVE_PERMANENT);
+    assert(fixture.saved_state.stopwatch_running);
+
+    clear_observations(&fixture);
+    fixture.save_plan[0] = PJ_TIME_CONTROLLER_SAVE_TRANSIENT_ERROR;
+    fixture.save_plan_count = 1;
+    result = apply(&controller, &fixture,
+                   PJ_TIME_CONTROLLER_COMMAND_TIMER_START, 120000, 0);
+    assert(result.command_applied && result.dirty);
+    assert(result.diagnostic == PJ_TIME_CONTROLLER_DIAGNOSTIC_SAVE_TRANSIENT);
+    assert(fixture.saved_state.stopwatch_running);
+    assert(fixture.saved_state.timer.running);
+
+    clear_observations(&fixture);
+    fixture.clock.monotonic_ms += PJ_TIME_CONTROLLER_RETRY_MS;
+    fixture.clock.wall_utc_ms += PJ_TIME_CONTROLLER_RETRY_MS;
+    assert(pj_time_controller_update(&controller, &result));
+    assert(result.persistence_attempted && !result.dirty);
+    assert(result.save_result == PJ_TIME_CONTROLLER_SAVE_OK);
+    assert(fixture.saved_state.stopwatch_running);
+    assert(fixture.saved_state.stopwatch_elapsed_ms ==
+           PJ_TIME_CONTROLLER_RETRY_MS);
+    assert(fixture.saved_state.timer.remaining_ms ==
+           120000 - PJ_TIME_CONTROLLER_RETRY_MS);
+    assert(result.diagnostic == PJ_TIME_CONTROLLER_DIAGNOSTIC_NONE);
+}
+
+static void test_untrusted_time_disarms_and_retrusted_time_rearms(void)
+{
+    fixture_t fixture;
+    fixture_defaults(&fixture);
+    pj_time_controller_t controller = init_default(&fixture);
+    pj_time_controller_result_t result = apply(
+        &controller, &fixture, PJ_TIME_CONTROLLER_COMMAND_TIMER_START, 60000, 0);
+    assert(result.wake_requested && fixture.wake_armed);
+
+    clear_observations(&fixture);
+    assert(pj_time_controller_time_changed(&controller, 0, &result));
+    assert(result.wake_requested && result.wake_changed);
+    assert(!fixture.wake_armed && !controller.wake_armed);
+    assert(controller.state.timer.running);
+
+    clear_observations(&fixture);
+    fixture.clock.monotonic_ms += 1000;
+    fixture.clock.wall_utc_ms += 1000;
+    assert(pj_time_controller_time_changed(&controller, 1, &result));
+    assert(result.wake_requested && result.wake_changed);
+    assert(fixture.wake_armed && controller.wake_armed);
+    assert(fixture.wake_deadline.delay_ms == 59000);
+}
+
 int main(void)
 {
     test_argument_validation_and_load_classes();
@@ -755,6 +1126,14 @@ int main(void)
     test_time_changes_and_recovery_acknowledge();
     test_wake_arm_disarm_and_error_retry();
     test_media_playback_recording_and_queued_transitions();
+    test_monotonic_rollback_resets_cadence_baselines();
+    test_settings_failure_is_conservative_and_recovers();
+    test_operational_diagnostic_precedence();
+    test_clock_boot_id_must_match_controller();
+    test_forward_and_backward_civil_changes();
+    test_callback_operation_ordering();
+    test_staged_save_failures_preserve_latest_state();
+    test_untrusted_time_disarms_and_retrusted_time_rearms();
     puts("time controller tests passed");
     return 0;
 }
