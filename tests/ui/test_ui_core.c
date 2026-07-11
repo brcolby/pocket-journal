@@ -361,6 +361,118 @@ static void test_timer_presets_are_not_runtime_counters(void)
     assert(ui.interval_seconds == 1560);
 }
 
+static pj_ui_time_projection_t time_projection_with_alert(uint64_t id,
+                                                          pj_time_alert_source_t source)
+{
+    pj_ui_time_projection_t projection = {0};
+    projection.alarm_enabled = 1;
+    projection.alarm_hour = 6;
+    projection.alarm_minute = 45;
+    projection.stopwatch_running = 1;
+    projection.stopwatch_elapsed_ms = 1250;
+    projection.timer_running = 1;
+    projection.timer_remaining_ms = 2501;
+    projection.interval_running = 1;
+    projection.interval_remaining_ms = 60000;
+    projection.interval_phase = 3;
+    projection.active_alert = (pj_time_alert_t) {
+        .id = id,
+        .occurrence = 7,
+        .source = (uint8_t)source,
+        .reason = source == PJ_TIME_ALERT_ALARM ? PJ_TIME_ALERT_SCHEDULED : PJ_TIME_ALERT_EXPIRED,
+    };
+    return projection;
+}
+
+static void test_time_projection_and_alert_repaint(void)
+{
+    pj_ui_context_t ui;
+    pj_ui_init(&ui);
+    ui.state = PJ_UI_STATE_TIMER;
+    pj_ui_mark_displayed(&ui);
+
+    pj_ui_time_projection_t projection = time_projection_with_alert(41, PJ_TIME_ALERT_TIMER);
+    pj_ui_set_time_projection(&ui, &projection);
+    assert(ui.alarm_on == 1 && ui.alarm_hour == 6 && ui.alarm_minute == 45);
+    assert(ui.stopwatch_running == 1 && ui.stopwatch_seconds == 1);
+    assert(ui.timer_running == 1 && ui.timer_seconds == 3);
+    assert(ui.interval_running == 1 && ui.interval_seconds == 60 && ui.interval_round == 3);
+    assert(ui.active_alert.id == 41);
+    assert(pj_ui_is_dirty(&ui) == 1 && ui.dirty.partial == 0);
+
+    pj_ui_mark_displayed(&ui);
+    pj_ui_set_time_projection(&ui, &projection);
+    assert(pj_ui_is_dirty(&ui) == 0);
+
+    projection.active_alert.skipped_occurrences = 2;
+    pj_ui_set_time_projection(&ui, &projection);
+    assert(pj_ui_is_dirty(&ui) == 1 && ui.dirty.partial == 0);
+
+    pj_ui_mark_displayed(&ui);
+    projection.alert_audio_deferred = 1;
+    pj_ui_set_time_projection(&ui, &projection);
+    assert(ui.alert_audio_deferred == 1);
+    assert(pj_ui_is_dirty(&ui) == 1 && ui.dirty.partial == 0);
+}
+
+static void test_active_alert_gates_background_actions(void)
+{
+    pj_ui_context_t ui;
+    pj_ui_init(&ui);
+    ui.state = PJ_UI_STATE_HOME;
+    ui.stopwatch_running = 1;
+    ui.timer_running = 1;
+    ui.interval_running = 1;
+    pj_ui_time_projection_t projection = time_projection_with_alert(51, PJ_TIME_ALERT_TIMER);
+    pj_ui_set_time_projection(&ui, &projection);
+
+    pj_ui_sleep(&ui);
+    assert(pj_ui_current_state(&ui) == PJ_UI_STATE_HOME);
+    assert(ui.stopwatch_running == 1 && ui.timer_running == 1 && ui.interval_running == 1);
+    assert(pj_ui_handle_aux_long(&ui) == 0);
+    assert(pj_ui_current_state(&ui) == PJ_UI_STATE_HOME);
+    assert(pj_ui_handle_aux_double(&ui) == 0);
+    assert(pj_ui_current_state(&ui) == PJ_UI_STATE_HOME);
+    assert(ui.record_state == PJ_RECORD_IDLE);
+    assert(pj_ui_handle_aux_short(&ui) == 0);
+    assert(pj_ui_handle_touch(&ui, 20, 40, PJ_TOUCH_TAP) == 0);
+    assert(pj_ui_current_state(&ui) == PJ_UI_STATE_HOME);
+}
+
+static void test_alert_overlay_commands_keep_model_authoritative(void)
+{
+    pj_ui_context_t ui;
+    pj_ui_time_command_t command;
+    pj_framebuffer_t fb;
+    pj_ui_init(&ui);
+    ui.state = PJ_UI_STATE_SETTINGS;
+
+    pj_ui_time_projection_t projection = time_projection_with_alert(61, PJ_TIME_ALERT_ALARM);
+    pj_ui_set_time_projection(&ui, &projection);
+    pj_ui_render(&ui, &fb);
+    assert(count_black_pixels(&fb) > 0);
+
+    assert(pj_ui_handle_touch(&ui, 40, 166, PJ_TOUCH_TAP) == 1);
+    assert(ui.active_alert.id == 61);
+    assert(pj_ui_consume_time_command(&ui, &command) == 1);
+    assert(command.type == PJ_UI_TIME_COMMAND_ALERT_DISMISS && command.alert_id == 61);
+    assert(pj_ui_consume_time_command(&ui, &command) == 0);
+
+    assert(pj_ui_handle_touch(&ui, 150, 166, PJ_TOUCH_TAP) == 1);
+    assert(ui.active_alert.id == 61);
+    assert(pj_ui_consume_time_command(&ui, &command) == 1);
+    assert(command.type == PJ_UI_TIME_COMMAND_ALARM_SNOOZE && command.alert_id == 61);
+
+    projection = time_projection_with_alert(62, PJ_TIME_ALERT_INTERVAL);
+    pj_ui_set_time_projection(&ui, &projection);
+    assert(pj_ui_handle_touch(&ui, 150, 166, PJ_TOUCH_TAP) == 0);
+    assert(pj_ui_consume_time_command(&ui, &command) == 0);
+    assert(pj_ui_handle_touch(&ui, 40, 166, PJ_TOUCH_TAP) == 1);
+    assert(pj_ui_consume_time_command(&ui, &command) == 1);
+    assert(command.type == PJ_UI_TIME_COMMAND_ALERT_DISMISS && command.alert_id == 62);
+    assert(pj_ui_current_state(&ui) == PJ_UI_STATE_SETTINGS);
+}
+
 static void test_sync_state_is_board_driven(void)
 {
     pj_ui_context_t ui;
@@ -522,6 +634,9 @@ int main(void)
     test_audio_lifecycle_reconciliation();
     test_settings_dark_mode_toggle();
     test_timer_presets_are_not_runtime_counters();
+    test_time_projection_and_alert_repaint();
+    test_active_alert_gates_background_actions();
+    test_alert_overlay_commands_keep_model_authoritative();
     test_sync_state_is_board_driven();
     test_dirty_lifecycle();
     test_partial_render_preserves_outside_region();

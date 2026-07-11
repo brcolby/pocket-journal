@@ -19,6 +19,7 @@
 #endif
 
 #include <ctype.h>
+#include <limits.h>
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
@@ -199,6 +200,11 @@ static void set_state(pj_ui_context_t *ctx, pj_ui_state_t state)
         ctx->state = state;
         mark_full(ctx);
     }
+}
+
+static int active_alert_present(const pj_ui_context_t *ctx)
+{
+    return ctx != NULL && ctx->active_alert.id != 0;
 }
 
 static void fb_clear(pj_framebuffer_t *fb)
@@ -828,6 +834,9 @@ void pj_ui_wake(pj_ui_context_t *ctx)
 
 void pj_ui_sleep(pj_ui_context_t *ctx)
 {
+    if (active_alert_present(ctx)) {
+        return;
+    }
     ctx->record_state = PJ_RECORD_IDLE;
     ctx->playback_state = PJ_PLAYBACK_IDLE;
     ctx->stopwatch_running = 0;
@@ -940,8 +949,93 @@ void pj_ui_set_audio_state(pj_ui_context_t *ctx, int recording, int playback_act
     }
 }
 
+static int elapsed_seconds_from_ms(uint64_t milliseconds)
+{
+    uint64_t seconds = milliseconds / 1000u;
+    return seconds > INT_MAX ? INT_MAX : (int)seconds;
+}
+
+static int countdown_seconds_from_ms(uint64_t milliseconds)
+{
+    uint64_t seconds = milliseconds / 1000u + (milliseconds % 1000u != 0);
+    return seconds > INT_MAX ? INT_MAX : (int)seconds;
+}
+
+static int alerts_equal(const pj_time_alert_t *left, const pj_time_alert_t *right)
+{
+    return left->id == right->id && left->occurrence == right->occurrence &&
+        left->skipped_occurrences == right->skipped_occurrences &&
+        left->source == right->source && left->reason == right->reason &&
+        left->recovered == right->recovered;
+}
+
+void pj_ui_set_time_projection(pj_ui_context_t *ctx, const pj_ui_time_projection_t *projection)
+{
+    if (ctx == NULL || projection == NULL) {
+        return;
+    }
+
+    int next_stopwatch_seconds = elapsed_seconds_from_ms(projection->stopwatch_elapsed_ms);
+    int next_timer_seconds = countdown_seconds_from_ms(projection->timer_remaining_ms);
+    int next_interval_seconds = countdown_seconds_from_ms(projection->interval_remaining_ms);
+    int next_interval_round = projection->interval_phase > INT_MAX ?
+        INT_MAX : (int)projection->interval_phase;
+    int alert_changed = !alerts_equal(&ctx->active_alert, &projection->active_alert) ||
+        ctx->alert_audio_deferred != (projection->alert_audio_deferred != 0) ||
+        ctx->recovery_time_uncertain != (projection->recovery_time_uncertain != 0);
+    int alarm_changed = ctx->alarm_on != (projection->alarm_enabled != 0) ||
+        ctx->alarm_hour != projection->alarm_hour ||
+        ctx->alarm_minute != projection->alarm_minute;
+    int stopwatch_changed = ctx->stopwatch_running != (projection->stopwatch_running != 0) ||
+        ctx->stopwatch_seconds != next_stopwatch_seconds;
+    int timer_changed = ctx->timer_running != (projection->timer_running != 0) ||
+        ctx->timer_seconds != next_timer_seconds;
+    int interval_changed = ctx->interval_running != (projection->interval_running != 0) ||
+        ctx->interval_seconds != next_interval_seconds ||
+        ctx->interval_round != next_interval_round;
+
+    ctx->alarm_on = projection->alarm_enabled != 0;
+    ctx->alarm_hour = projection->alarm_hour;
+    ctx->alarm_minute = projection->alarm_minute;
+    ctx->stopwatch_running = projection->stopwatch_running != 0;
+    ctx->stopwatch_seconds = next_stopwatch_seconds;
+    ctx->timer_running = projection->timer_running != 0;
+    ctx->timer_seconds = next_timer_seconds;
+    ctx->interval_running = projection->interval_running != 0;
+    ctx->interval_seconds = next_interval_seconds;
+    ctx->interval_round = next_interval_round;
+    ctx->active_alert = projection->active_alert;
+    ctx->alert_audio_deferred = projection->alert_audio_deferred != 0;
+    ctx->recovery_time_uncertain = projection->recovery_time_uncertain != 0;
+
+    if (alert_changed) {
+        mark_full(ctx);
+    } else if (ctx->state == PJ_UI_STATE_ALARM && alarm_changed) {
+        mark_partial(ctx, 0, 28, PJ_DISPLAY_WIDTH, 100);
+    } else if (ctx->state == PJ_UI_STATE_STOPWATCH && stopwatch_changed) {
+        mark_partial(ctx, 0, 40, PJ_DISPLAY_WIDTH, 96);
+    } else if (ctx->state == PJ_UI_STATE_TIMER && timer_changed) {
+        mark_partial(ctx, 0, 40, PJ_DISPLAY_WIDTH, 96);
+    } else if (ctx->state == PJ_UI_STATE_INTERVAL && interval_changed) {
+        mark_partial(ctx, 0, 24, PJ_DISPLAY_WIDTH, 120);
+    }
+}
+
+int pj_ui_consume_time_command(pj_ui_context_t *ctx, pj_ui_time_command_t *command)
+{
+    if (ctx == NULL || command == NULL || ctx->time_command.type == PJ_UI_TIME_COMMAND_NONE) {
+        return 0;
+    }
+    *command = ctx->time_command;
+    memset(&ctx->time_command, 0, sizeof(ctx->time_command));
+    return 1;
+}
+
 int pj_ui_handle_aux_long(pj_ui_context_t *ctx)
 {
+    if (active_alert_present(ctx)) {
+        return 0;
+    }
     if (ctx->state == PJ_UI_STATE_STATIC) {
         return 0;
     }
@@ -969,6 +1063,9 @@ int pj_ui_handle_aux_long(pj_ui_context_t *ctx)
 
 int pj_ui_handle_aux_short(pj_ui_context_t *ctx)
 {
+    if (active_alert_present(ctx)) {
+        return 0;
+    }
     switch (ctx->state) {
     case PJ_UI_STATE_STATIC:
         pj_ui_wake(ctx);
@@ -1032,7 +1129,7 @@ int pj_ui_handle_aux_short(pj_ui_context_t *ctx)
 
 int pj_ui_handle_aux_double(pj_ui_context_t *ctx)
 {
-    if (ctx->state == PJ_UI_STATE_RECORD ||
+    if (active_alert_present(ctx) || ctx->state == PJ_UI_STATE_RECORD ||
         ctx->record_state != PJ_RECORD_IDLE || ctx->playback_state != PJ_PLAYBACK_IDLE ||
         ctx->stopwatch_running || ctx->timer_running || ctx->interval_running) {
         return 0;
@@ -1084,6 +1181,21 @@ int pj_ui_tick(pj_ui_context_t *ctx)
 int pj_ui_handle_touch(pj_ui_context_t *ctx, int x, int y, pj_touch_kind_t kind)
 {
     pj_ui_state_t next = ctx->state;
+
+    if (active_alert_present(ctx)) {
+        if (kind != PJ_TOUCH_TAP || y < 140 || ctx->time_command.type != PJ_UI_TIME_COMMAND_NONE) {
+            return 0;
+        }
+        if (x < 100) {
+            ctx->time_command.type = PJ_UI_TIME_COMMAND_ALERT_DISMISS;
+        } else if (ctx->active_alert.source == PJ_TIME_ALERT_ALARM) {
+            ctx->time_command.type = PJ_UI_TIME_COMMAND_ALARM_SNOOZE;
+        } else {
+            return 0;
+        }
+        ctx->time_command.alert_id = ctx->active_alert.id;
+        return 1;
+    }
 
     if (kind == PJ_TOUCH_LONG_PRESS || kind == PJ_TOUCH_SWIPE_RIGHT) {
         return pj_ui_handle_aux_long(ctx);
@@ -1425,6 +1537,45 @@ static void draw_alarm_buttons(pj_framebuffer_t *fb)
     draw_text_center_at(fb, 174, 166, "M+", 2);
 }
 
+static const char *alert_title(const pj_time_alert_t *alert)
+{
+    switch ((pj_time_alert_source_t)alert->source) {
+    case PJ_TIME_ALERT_ALARM:
+        return "ALARM";
+    case PJ_TIME_ALERT_TIMER:
+        return "TIMER DONE";
+    case PJ_TIME_ALERT_INTERVAL:
+        return "INTERVAL";
+    default:
+        return "TIME ALERT";
+    }
+}
+
+static void draw_alert_overlay(const pj_ui_context_t *ctx, pj_framebuffer_t *fb)
+{
+    draw_text_center_at(fb, 100, 35, alert_title(&ctx->active_alert), 3);
+    if (ctx->active_alert.recovered || ctx->recovery_time_uncertain) {
+        draw_text_center_at(fb, 100, 80, "RECOVERED", 1);
+    } else if (ctx->active_alert.reason == PJ_TIME_ALERT_SNOOZE) {
+        draw_text_center_at(fb, 100, 80, "SNOOZED", 1);
+    } else {
+        draw_text_center_at(fb, 100, 80, "NOW", 2);
+    }
+    if (ctx->alert_audio_deferred) {
+        draw_text_center_at(fb, 100, 110, "AUDIO DEFERRED", 1);
+    }
+    if (!lvgl_widgets_active()) {
+        draw_round_rect_width(fb, 8, 140, 88, 52, 12, 3);
+    }
+    draw_text_center_at(fb, 52, 166, "DISMISS", 1);
+    if (ctx->active_alert.source == PJ_TIME_ALERT_ALARM) {
+        if (!lvgl_widgets_active()) {
+            draw_round_rect_width(fb, 104, 140, 88, 52, 12, 3);
+        }
+        draw_text_center_at(fb, 148, 166, "SNOOZE", 1);
+    }
+}
+
 static void format_hms(char *out, size_t out_size, int seconds)
 {
     int hours = seconds / 3600;
@@ -1438,7 +1589,10 @@ static void render_scene(const pj_ui_context_t *ctx, pj_framebuffer_t *fb)
     char text[24];
     fb_clear(fb);
 
-    switch (ctx->state) {
+    if (active_alert_present(ctx)) {
+        draw_alert_overlay(ctx, fb);
+    } else {
+        switch (ctx->state) {
     case PJ_UI_STATE_STATIC:
         draw_home_static(ctx, fb);
         break;
@@ -1524,9 +1678,10 @@ static void render_scene(const pj_ui_context_t *ctx, pj_framebuffer_t *fb)
     case PJ_UI_STATE_VOLUME:
         draw_settings(ctx, fb);
         break;
-    default:
-        draw_centered_text(fb, 90, "UNKNOWN", 2);
-        break;
+        default:
+            draw_centered_text(fb, 90, "UNKNOWN", 2);
+            break;
+        }
     }
 
     if (ctx->dark_mode && !(ctx->state == PJ_UI_STATE_STATIC && ctx->static_art_valid)) {
@@ -1826,9 +1981,22 @@ static void lvgl_alarm_buttons(int color_index)
     lvgl_outline_button(152, 140, 44, 52, 10, 3, color_index);
 }
 
+static void lvgl_alert_buttons(const pj_ui_context_t *ctx, int color_index)
+{
+    lvgl_outline_button(8, 140, 88, 52, 12, 3, color_index);
+    if (ctx->active_alert.source == PJ_TIME_ALERT_ALARM) {
+        lvgl_outline_button(104, 140, 88, 52, 12, 3, color_index);
+    }
+}
+
 static void lvgl_add_widgets(const pj_ui_context_t *ctx)
 {
     int color_index = ctx->dark_mode ? 0 : 1;
+
+    if (active_alert_present(ctx)) {
+        lvgl_alert_buttons(ctx, color_index);
+        return;
+    }
 
     switch (ctx->state) {
     case PJ_UI_STATE_HOME: {
