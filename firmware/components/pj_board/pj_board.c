@@ -4,6 +4,7 @@
 #include "pj_auth.h"
 #include "pj_home_layout.h"
 #include "pj_note_model.h"
+#include "pj_rtc_wake.h"
 #include "pj_settings.h"
 #include "pj_static_art.h"
 #include "pj_storage.h"
@@ -44,6 +45,7 @@
 #include "driver/gpio.h"
 #include "driver/i2c_master.h"
 #include "driver/i2s_std.h"
+#include "driver/rtc_io.h"
 #include "driver/sdmmc_host.h"
 #include "driver/spi_master.h"
 #include "freertos/FreeRTOS.h"
@@ -83,6 +85,7 @@
 #define PJ_NVS_STATIC_ART_SLOT "art_slot"
 #define PJ_NVS_HOME_LAYOUT "home_layout"
 #define PJ_NVS_TIME_STATE "time_state"
+#define PJ_NVS_WAKE_PLAN "wake_plan"
 #define PJ_TIME_CHECKPOINT_MS (15ull * 60ull * 1000ull)
 #define PJ_TIME_PERSIST_RETRY_MS (60ull * 1000ull)
 #define PJ_TIME_SNOOZE_MS (10ull * 60ull * 1000ull)
@@ -106,6 +109,7 @@
 #define VBAT_PWR_PIN GPIO_NUM_17
 #define VBAT_ADC_CHANNEL ADC_CHANNEL_3
 #define BOOT_BUTTON_PIN GPIO_NUM_0
+#define RTC_INT_PIN GPIO_NUM_5
 #define PWR_BUTTON_PIN GPIO_NUM_18
 #define LED_PIN GPIO_NUM_3
 #define ESP32_I2C_SDA_PIN GPIO_NUM_47
@@ -222,6 +226,7 @@ static adc_oneshot_unit_handle_t g_adc1_handle;
 static adc_cali_handle_t g_adc_cali_handle;
 static QueueHandle_t g_board_event_queue;
 static SemaphoreHandle_t g_i2c_lock;
+static SemaphoreHandle_t g_rtc_sequence_lock;
 static SemaphoreHandle_t g_audio_lock;
 static SemaphoreHandle_t g_settings_lock;
 static SemaphoreHandle_t g_static_art_lock;
@@ -287,6 +292,10 @@ static uint64_t g_time_last_preempt_alert_id;
 static int g_time_state_ready;
 static int g_time_persist_dirty;
 static int g_time_wall_trusted;
+static pj_rtc_wake_plan_t g_rtc_wake_plan;
+static int g_rtc_ext1_enabled;
+static int g_rtc_wake_hardware_verified;
+static int g_timer_wakeup_enabled;
 
 static esp_err_t rtc_write_status_time(void);
 static uint64_t board_monotonic_ms(void);
@@ -295,6 +304,7 @@ static int time_state_initialize(void);
 static int time_state_persist(int force);
 static int time_state_reconcile_alarm(const pj_time_clock_t *clock);
 static int time_state_project(pj_ui_context_t *ui);
+static int rtc_wake_sync(void);
 
 static void board_audio_state_set(int recording, int playback_active)
 {
@@ -1149,6 +1159,68 @@ static esp_err_t time_state_save_record(const pj_time_state_t *state)
         nvs_close(nvs);
     }
     return err;
+}
+
+static int rtc_wake_plan_save(void *context, const pj_rtc_wake_plan_t *plan)
+{
+    (void)context;
+    if (!pj_rtc_wake_plan_valid(plan)) {
+        return 0;
+    }
+    nvs_handle_t nvs;
+    esp_err_t err = nvs_open(PJ_NVS_NAMESPACE, NVS_READWRITE, &nvs);
+    if (err == ESP_OK) {
+        err = nvs_set_blob(nvs, PJ_NVS_WAKE_PLAN, plan, sizeof(*plan));
+        if (err == ESP_OK) {
+            err = nvs_commit(nvs);
+        }
+        nvs_close(nvs);
+    }
+    if (err == ESP_OK) {
+        g_rtc_wake_plan = *plan;
+        return 1;
+    }
+    return 0;
+}
+
+static int rtc_wake_plan_preserve(void *context, const pj_rtc_wake_plan_t *plan)
+{
+    (void)context;
+    return pj_rtc_wake_plan_valid(plan);
+}
+
+typedef enum {
+    RTC_WAKE_LOAD_IO_ERROR = -2,
+    RTC_WAKE_LOAD_INVALID = -1,
+    RTC_WAKE_LOAD_NOT_FOUND = 0,
+    RTC_WAKE_LOAD_VALID = 1,
+} rtc_wake_load_result_t;
+
+static rtc_wake_load_result_t rtc_wake_plan_load(pj_rtc_wake_plan_t *plan)
+{
+    memset(plan, 0, sizeof(*plan));
+    plan->version = PJ_RTC_WAKE_PLAN_VERSION;
+    nvs_handle_t nvs;
+    esp_err_t err = nvs_open(PJ_NVS_NAMESPACE, NVS_READONLY, &nvs);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        return RTC_WAKE_LOAD_NOT_FOUND;
+    }
+    if (err != ESP_OK) {
+        return RTC_WAKE_LOAD_IO_ERROR;
+    }
+    size_t size = sizeof(*plan);
+    err = nvs_get_blob(nvs, PJ_NVS_WAKE_PLAN, plan, &size);
+    nvs_close(nvs);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        memset(plan, 0, sizeof(*plan));
+        plan->version = PJ_RTC_WAKE_PLAN_VERSION;
+        return RTC_WAKE_LOAD_NOT_FOUND;
+    }
+    if (err != ESP_OK) {
+        return RTC_WAKE_LOAD_IO_ERROR;
+    }
+    return size == sizeof(*plan) && pj_rtc_wake_plan_valid(plan) ?
+        RTC_WAKE_LOAD_VALID : RTC_WAKE_LOAD_INVALID;
 }
 
 static void settings_apply_codec_volume(void)
@@ -2738,9 +2810,71 @@ static esp_err_t rtc_init(void)
     if (g_rtc_ready) {
         return ESP_OK;
     }
+    if (g_rtc_sequence_lock == NULL) {
+        g_rtc_sequence_lock = xSemaphoreCreateMutex();
+        if (g_rtc_sequence_lock == NULL) {
+            return ESP_ERR_NO_MEM;
+        }
+    }
     ESP_RETURN_ON_ERROR(i2c_add_device(I2C_PCF85063_DEV_ADDRESS, &g_rtc_dev), TAG, "rtc i2c add failed");
+    gpio_config_t interrupt = {
+        .pin_bit_mask = 1ull << RTC_INT_PIN,
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    ESP_RETURN_ON_ERROR(gpio_config(&interrupt), TAG, "rtc interrupt gpio failed");
     g_rtc_ready = 1;
     return ESP_OK;
+}
+
+static int rtc_sequence_take(TickType_t timeout)
+{
+    return g_rtc_sequence_lock != NULL &&
+           xSemaphoreTake(g_rtc_sequence_lock, timeout) == pdTRUE;
+}
+
+static void rtc_sequence_give(void)
+{
+    if (g_rtc_sequence_lock != NULL) {
+        xSemaphoreGive(g_rtc_sequence_lock);
+    }
+}
+
+static int rtc_wake_read(void *context, uint8_t reg, uint8_t *data, size_t size)
+{
+    (void)context;
+    if (!g_rtc_ready || g_rtc_dev == NULL || data == NULL || size == 0 ||
+        !i2c_take(pdMS_TO_TICKS(50))) {
+        return 0;
+    }
+    esp_err_t err = i2c_master_transmit_receive(g_rtc_dev, &reg, 1, data, size, 100);
+    i2c_give();
+    return err == ESP_OK;
+}
+
+static int rtc_wake_write(void *context, uint8_t reg, const uint8_t *data, size_t size)
+{
+    (void)context;
+    if (!g_rtc_ready || g_rtc_dev == NULL || data == NULL || size == 0 || size > 7 ||
+        !i2c_take(pdMS_TO_TICKS(50))) {
+        return 0;
+    }
+    uint8_t message[8] = {reg};
+    memcpy(message + 1, data, size);
+    esp_err_t err = i2c_master_transmit(g_rtc_dev, message, size + 1, 100);
+    i2c_give();
+    return err == ESP_OK;
+}
+
+static pj_rtc_wake_io_t rtc_wake_io(void)
+{
+    return (pj_rtc_wake_io_t) {
+        .read = rtc_wake_read,
+        .write = rtc_wake_write,
+        .persist = rtc_wake_plan_save,
+    };
 }
 
 static uint64_t board_monotonic_ms(void)
@@ -2829,13 +2963,18 @@ static int rtc_read_status_time(void)
     if (!g_rtc_ready || g_rtc_dev == NULL) {
         return 0;
     }
+    if (!rtc_sequence_take(pdMS_TO_TICKS(100))) {
+        return 0;
+    }
     if (!i2c_take(pdMS_TO_TICKS(20))) {
+        rtc_sequence_give();
         return 0;
     }
     uint8_t reg = 0x04;
     uint8_t data[7] = {0};
     esp_err_t err = i2c_master_transmit_receive(g_rtc_dev, &reg, 1, data, sizeof(data), 100);
     i2c_give();
+    rtc_sequence_give();
     if (err != ESP_OK || (data[0] & 0x80) != 0) {
         return 0;
     }
@@ -2869,7 +3008,11 @@ static esp_err_t rtc_write_status_time(void)
         u8_to_bcd((uint8_t)time.month),
         u8_to_bcd((uint8_t)(time.year - 2000)),
     };
+    if (!rtc_sequence_take(pdMS_TO_TICKS(200))) {
+        return ESP_ERR_TIMEOUT;
+    }
     if (!i2c_take(pdMS_TO_TICKS(50))) {
+        rtc_sequence_give();
         return ESP_ERR_TIMEOUT;
     }
     esp_err_t err = i2c_master_transmit(g_rtc_dev, data, sizeof(data), 100);
@@ -2878,6 +3021,7 @@ static esp_err_t rtc_write_status_time(void)
         err = i2c_master_transmit(g_rtc_dev, ctrl, sizeof(ctrl), 100);
     }
     i2c_give();
+    rtc_sequence_give();
     return err;
 }
 
@@ -3015,6 +3159,167 @@ static int time_state_initialize(void)
     ESP_LOGI(TAG, "Time state %s with boot id %u",
              restored ? "restored" : "initialized", (unsigned)g_time_boot_id);
     return 1;
+}
+
+static const char *rtc_wake_result_name(pj_rtc_wake_result_t result)
+{
+    switch (result) {
+    case PJ_RTC_WAKE_OK: return "ok";
+    case PJ_RTC_WAKE_ERR_READ_CONTROL1: return "control1 read";
+    case PJ_RTC_WAKE_ERR_SANITIZE_CONTROL1: return "control1 sanitize";
+    case PJ_RTC_WAKE_ERR_READ_CONTROL: return "control read";
+    case PJ_RTC_WAKE_ERR_DISABLE_CONTROL: return "interrupt disable";
+    case PJ_RTC_WAKE_ERR_CLEAR_TIMER: return "timer clear";
+    case PJ_RTC_WAKE_ERR_DISABLE_TIMER: return "timer disable";
+    case PJ_RTC_WAKE_ERR_DISABLE_ALARM: return "alarm disable";
+    case PJ_RTC_WAKE_ERR_WRITE_ALARM: return "alarm write";
+    case PJ_RTC_WAKE_ERR_READBACK_ALARM: return "alarm readback";
+    case PJ_RTC_WAKE_ERR_PERSIST: return "metadata persist";
+    case PJ_RTC_WAKE_ERR_ENABLE_CONTROL: return "interrupt enable";
+    case PJ_RTC_WAKE_ERR_VERIFY_CONTROL: return "control verify";
+    case PJ_RTC_WAKE_ERR_INVALID:
+    default: return "invalid plan";
+    }
+}
+
+static pj_rtc_wake_result_t rtc_wake_disarm_board(uint8_t *flags, int force)
+{
+    g_rtc_wake_hardware_verified = 0;
+    if (!g_rtc_ready || (!force && g_rtc_wake_plan.state != PJ_RTC_WAKE_ARMED)) {
+        return PJ_RTC_WAKE_OK;
+    }
+    if (!rtc_sequence_take(pdMS_TO_TICKS(500))) {
+        return PJ_RTC_WAKE_ERR_DISABLE_CONTROL;
+    }
+    pj_rtc_wake_io_t io = rtc_wake_io();
+    pj_rtc_wake_result_t result = pj_rtc_wake_disarm(&io, flags);
+    rtc_sequence_give();
+    if (g_rtc_ext1_enabled) {
+        (void)esp_sleep_disable_ext1_wakeup_io(1ull << RTC_INT_PIN);
+        g_rtc_ext1_enabled = 0;
+    }
+    return result;
+}
+
+static int rtc_wake_sync(void)
+{
+    if (!g_rtc_ready || !g_time_state_ready) {
+        return -1;
+    }
+    int trusted = 0;
+    portENTER_CRITICAL(&g_time_lock);
+    trusted = g_time_wall_trusted;
+    portEXIT_CRITICAL(&g_time_lock);
+    if (!trusted) {
+        (void)rtc_wake_disarm_board(NULL, 0);
+        return -1;
+    }
+    pj_time_clock_t clock;
+    if (!board_time_model_clock(&clock)) {
+        return -1;
+    }
+    int changed = pj_time_advance(&g_time_state, &clock);
+    changed |= time_state_reconcile_alarm(&clock);
+    if (changed) {
+        (void)time_state_persist(1);
+    }
+    pj_rtc_wake_plan_t plan;
+    if (!pj_rtc_wake_plan(&g_time_state, &clock, &plan)) {
+        return -1;
+    }
+    if (plan.state != PJ_RTC_WAKE_ARMED) {
+        pj_rtc_wake_result_t result = rtc_wake_disarm_board(NULL, 0);
+        if (result != PJ_RTC_WAKE_OK) {
+            ESP_LOGW(TAG, "RTC wake disarm failed at %s", rtc_wake_result_name(result));
+        }
+        return plan.state == PJ_RTC_WAKE_DUE ? 0 : 1;
+    }
+    if (g_rtc_wake_plan.state == PJ_RTC_WAKE_ARMED &&
+        g_rtc_wake_plan.token == plan.token && g_rtc_wake_hardware_verified &&
+        g_rtc_ext1_enabled) {
+        return gpio_get_level(RTC_INT_PIN) == 0 ? 0 : 1;
+    }
+    if (!rtc_sequence_take(pdMS_TO_TICKS(500))) {
+        return -1;
+    }
+    pj_rtc_wake_io_t io = rtc_wake_io();
+    g_rtc_wake_hardware_verified = 0;
+    pj_rtc_wake_result_t result = pj_rtc_wake_program(&plan, &io);
+    rtc_sequence_give();
+    if (result != PJ_RTC_WAKE_OK) {
+        (void)rtc_wake_disarm_board(NULL, 1);
+        (void)snprintf(g_status.last_error, sizeof(g_status.last_error),
+                       "RTC wake setup failed at %s", rtc_wake_result_name(result));
+        ESP_LOGW(TAG, "%s", g_status.last_error);
+        return -1;
+    }
+    pj_time_clock_t verify_clock;
+    pj_rtc_wake_plan_t verify_plan;
+    if (!board_time_model_clock(&verify_clock) ||
+        !pj_rtc_wake_plan(&g_time_state, &verify_clock, &verify_plan) ||
+        verify_plan.state != PJ_RTC_WAKE_ARMED || verify_plan.token != plan.token) {
+        (void)rtc_wake_disarm_board(NULL, 1);
+        ESP_LOGW(TAG, "RTC wake target changed during setup; sleep deferred");
+        return 0;
+    }
+    if (gpio_get_level(RTC_INT_PIN) == 0) {
+        (void)rtc_wake_disarm_board(NULL, 1);
+        ESP_LOGW(TAG, "RTC wake setup raced a due alarm; sleep deferred");
+        return 0;
+    }
+    esp_err_t err = esp_sleep_enable_ext1_wakeup_io(1ull << RTC_INT_PIN,
+                                                    ESP_EXT1_WAKEUP_ANY_LOW);
+    if (err != ESP_OK) {
+        (void)rtc_wake_disarm_board(NULL, 1);
+        (void)snprintf(g_status.last_error, sizeof(g_status.last_error),
+                       "RTC GPIO5 wake setup failed: %s", esp_err_to_name(err));
+        ESP_LOGW(TAG, "%s", g_status.last_error);
+        return -1;
+    }
+    g_rtc_ext1_enabled = 1;
+    g_rtc_wake_hardware_verified = 1;
+    ESP_LOGI(TAG, "RTC wake armed token=%08x target_day=%ld second=%lu%s",
+             (unsigned)plan.token, (long)plan.target_local_day,
+             (unsigned long)plan.target_local_second,
+             plan.checkpoint ? " checkpoint" : "");
+    return 1;
+}
+
+static void rtc_wake_restore(void)
+{
+    pj_rtc_wake_plan_t persisted;
+    rtc_wake_load_result_t load_result = rtc_wake_plan_load(&persisted);
+    if (load_result == RTC_WAKE_LOAD_IO_ERROR) {
+        (void)snprintf(g_status.last_error, sizeof(g_status.last_error),
+                       "RTC wake metadata read failed; persistence left untouched");
+        ESP_LOGW(TAG, "%s", g_status.last_error);
+        if (rtc_sequence_take(pdMS_TO_TICKS(500))) {
+            pj_rtc_wake_io_t io = rtc_wake_io();
+            io.persist = rtc_wake_plan_preserve;
+            (void)pj_rtc_wake_disarm(&io, NULL);
+            rtc_sequence_give();
+        }
+        g_rtc_wake_hardware_verified = 0;
+        return;
+    }
+    if (load_result == RTC_WAKE_LOAD_INVALID) {
+        (void)snprintf(g_status.last_error, sizeof(g_status.last_error),
+                       "RTC wake metadata was invalid; clearing hardware alarm");
+        ESP_LOGW(TAG, "%s", g_status.last_error);
+        memset(&persisted, 0, sizeof(persisted));
+        persisted.version = PJ_RTC_WAKE_PLAN_VERSION;
+    }
+    g_rtc_wake_plan = persisted;
+    g_rtc_wake_hardware_verified = 0;
+    uint8_t flags = 0;
+    pj_rtc_wake_result_t result = rtc_wake_disarm_board(&flags, 1);
+    if (result != PJ_RTC_WAKE_OK) {
+        ESP_LOGW(TAG, "RTC wake restore clear failed at %s", rtc_wake_result_name(result));
+    } else if (flags != 0) {
+        ESP_LOGI(TAG, "Recovered RTC wake flags=0x%02x token=%08x; model remains authoritative",
+                 flags, (unsigned)persisted.token);
+    }
+    (void)rtc_wake_sync();
 }
 
 static int time_state_project(pj_ui_context_t *ui)
@@ -4173,6 +4478,8 @@ void pj_board_init(const pj_board_profile_t *profile)
     }
     if (!time_state_initialize()) {
         ESP_LOGE(TAG, "Durable time state is unavailable");
+    } else {
+        rtc_wake_restore();
     }
 
     esp_err_t display_err = display_init();
@@ -4507,6 +4814,7 @@ int pj_board_consume_time_update(pj_ui_context_t *ui)
             (void)pj_time_advance(&g_time_state, &clock);
             (void)time_state_reconcile_alarm(&clock);
             (void)time_state_persist(1);
+            (void)rtc_wake_sync();
             (void)time_state_project(ui);
         }
     }
@@ -4528,6 +4836,7 @@ void pj_board_refresh_time_state(pj_ui_context_t *ui)
     changed |= time_state_reconcile_alarm(&clock);
     if (changed) {
         (void)time_state_persist(1);
+        (void)rtc_wake_sync();
     }
     (void)time_state_project(ui);
 #else
@@ -4590,6 +4899,7 @@ int pj_board_apply_time_actions(pj_ui_context_t *ui)
     int changed = memcmp(&before, &g_time_state, sizeof(before)) != 0;
     if (changed) {
         (void)time_state_persist(1);
+        (void)rtc_wake_sync();
     }
     (void)time_state_project(ui);
     return changed;
@@ -4624,6 +4934,9 @@ int pj_board_update_time_state(pj_ui_context_t *ui)
         (void)time_state_persist(1);
     } else if (changed || g_time_persist_dirty) {
         (void)time_state_persist(0);
+    }
+    if (transition) {
+        (void)rtc_wake_sync();
     }
     (void)time_state_project(ui);
     return pj_ui_is_dirty(ui);
@@ -4741,16 +5054,94 @@ int pj_board_poll_event(pj_board_event_t *event)
 void pj_board_enter_sleep(void)
 {
 #ifdef ESP_PLATFORM
+    int rtc_schedule = rtc_wake_sync();
+    uint64_t wake_delay_ms = UINT64_MAX;
+    if (g_time_state_ready) {
+        pj_time_clock_t clock;
+        if (board_time_model_clock(&clock)) {
+            wake_delay_ms = pj_time_next_wake_delay_ms(&g_time_state, &clock);
+        }
+    }
+    if (wake_delay_ms == 0) {
+        ESP_LOGI(TAG, "Sleep deferred because a time alert is due");
+        return;
+    }
+    if (wake_delay_ms != UINT64_MAX) {
+        esp_err_t err = esp_sleep_enable_timer_wakeup(wake_delay_ms * 1000u);
+        if (err == ESP_OK) {
+            g_timer_wakeup_enabled = 1;
+            ESP_LOGI(TAG, "Internal fallback wake armed in %llu ms",
+                     (unsigned long long)wake_delay_ms);
+        } else if (rtc_schedule <= 0) {
+            ESP_LOGW(TAG, "Sleep deferred; no scheduled wake source: %s",
+                     esp_err_to_name(err));
+            return;
+        } else {
+            ESP_LOGW(TAG, "Internal fallback wake unavailable: %s", esp_err_to_name(err));
+        }
+    } else if (g_timer_wakeup_enabled) {
+        (void)esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_TIMER);
+        g_timer_wakeup_enabled = 0;
+    }
+    if (g_rtc_wake_plan.state == PJ_RTC_WAKE_ARMED &&
+        gpio_get_level(RTC_INT_PIN) == 0) {
+        ESP_LOGI(TAG, "Sleep deferred because RTC_INT is already active");
+        return;
+    }
     if (g_display_ready) {
         gpio_set_level(EPD_PWR_PIN, 1);
         g_epd_shadow_valid = 0;
         g_epd_partial_ready = 0;
     }
-    ESP_LOGI(TAG, "Entering light sleep; BOOT wakes the device");
-    ESP_ERROR_CHECK_WITHOUT_ABORT(gpio_wakeup_enable(BOOT_BUTTON_PIN, GPIO_INTR_LOW_LEVEL));
-    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_sleep_enable_gpio_wakeup());
-    esp_light_sleep_start();
+    ESP_LOGI(TAG, "Entering light sleep; BOOT, RTC_INT, or timer wake the device");
+    esp_err_t sleep_err = gpio_wakeup_enable(BOOT_BUTTON_PIN, GPIO_INTR_LOW_LEVEL);
+    if (sleep_err == ESP_OK) {
+        sleep_err = esp_sleep_enable_gpio_wakeup();
+    }
+    if (sleep_err == ESP_OK) {
+        sleep_err = esp_light_sleep_start();
+    }
+    if (sleep_err != ESP_OK) {
+        gpio_set_level(EPD_PWR_PIN, 0);
+        ESP_LOGW(TAG, "Light sleep rejected: %s", esp_err_to_name(sleep_err));
+        return;
+    }
+    uint32_t wake_causes = esp_sleep_get_wakeup_causes();
+    int timer_wake = (wake_causes & (1u << ESP_SLEEP_WAKEUP_TIMER)) != 0;
+    int rtc_wake = (wake_causes & (1u << ESP_SLEEP_WAKEUP_EXT1)) != 0;
+    esp_err_t timer_disable = esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_TIMER);
+    if (timer_disable != ESP_OK && timer_disable != ESP_ERR_INVALID_STATE) {
+        ESP_LOGW(TAG, "Timer wake disable failed: %s", esp_err_to_name(timer_disable));
+    }
+    g_timer_wakeup_enabled = 0;
+    esp_err_t gpio_restore = rtc_gpio_hold_dis(RTC_INT_PIN);
+    if (gpio_restore == ESP_OK) {
+        gpio_restore = rtc_gpio_deinit(RTC_INT_PIN);
+    }
+    if (gpio_restore == ESP_OK) {
+        gpio_restore = gpio_set_pull_mode(RTC_INT_PIN, GPIO_PULLUP_ONLY);
+    }
+    if (gpio_restore != ESP_OK) {
+        ESP_LOGW(TAG, "RTC GPIO5 restore failed: %s", esp_err_to_name(gpio_restore));
+    }
+    uint8_t rtc_flags = 0;
+    pj_rtc_wake_result_t clear_result = rtc_wake_disarm_board(&rtc_flags, 1);
+    if (clear_result != PJ_RTC_WAKE_OK) {
+        ESP_LOGW(TAG, "RTC wake clear failed at %s", rtc_wake_result_name(clear_result));
+    }
     (void)rtc_read_status_time();
+    if (g_time_state_ready) {
+        pj_time_clock_t clock;
+        if (board_time_model_clock(&clock)) {
+            pj_time_state_t before = g_time_state;
+            (void)pj_time_advance(&g_time_state, &clock);
+            (void)time_state_reconcile_alarm(&clock);
+            if (memcmp(&before, &g_time_state, sizeof(before)) != 0) {
+                (void)time_state_persist(1);
+            }
+        }
+        (void)rtc_wake_sync();
+    }
     uint32_t wake_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
     if (gpio_get_level(BOOT_BUTTON_PIN) == 0) {
         pj_aux_input_resume_pressed(&g_aux_input, wake_ms);
@@ -4758,7 +5149,11 @@ void pj_board_enter_sleep(void)
         pj_aux_input_init(&g_aux_input, 1, wake_ms);
     }
     gpio_set_level(EPD_PWR_PIN, 0);
-    ESP_LOGI(TAG, "Woke from light sleep");
+    const char *source = rtc_wake ? "RTC_INT" : timer_wake ? "timer" : "GPIO";
+    ESP_LOGI(TAG, "Woke from light sleep via %s (RTC flags=0x%02x)%s",
+             source, rtc_flags,
+             rtc_wake &&
+             (rtc_flags & PJ_RTC_WAKE_CONTROL2_AF) == 0 ? " spurious" : "");
 #endif
 }
 

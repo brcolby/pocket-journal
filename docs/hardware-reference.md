@@ -45,6 +45,7 @@ hardware.
 | 0 | `BOOT0` / BOOT key | Active-low AUX input and ROM download strap. Do not hold low through reset unless entering download mode. |
 | 3 | LED | Onboard LED; also an ESP32-S3 JTAG-selection strapping pin, so avoid external drive during reset. |
 | 4 | `BAT_ADC` | ADC1 channel 3, through the board's 200 kOhm / 200 kOhm divider; battery voltage is approximately 2x ADC input voltage. |
+| 5 | `RTC_INT` | PCF85063ATL open-drain, active-low alarm interrupt and RTC-capable external wake input. |
 | 6 | `EPD3V3_EN` | Active-low e-paper supply enable through the onboard P-channel switch. |
 | 7 | `EPD_TP_RST` | Touch reset. |
 | 8 | `EPD_BUSY` | E-paper busy input; high means the controller must not receive commands. |
@@ -146,6 +147,14 @@ reset. Wi-Fi/BLE connections are not preserved by manually entering light or
 deep sleep unless the documented modem-sleep/automatic-light-sleep integration
 is used. Reinitialize or validate display, touch, audio, SD, and network state
 after any deeper sleep mode that powers down their domains.
+
+The PCF85063ATL `INT` output is routed as `RTC_INT` to ESP32-S3 GPIO5. Durable
+alarms, timers, snoozes, and intervals use that active-low signal as an
+external light-sleep wake source. The ESP32-S3 internal RTC timer remains a
+short-deadline fallback and independent cross-check while the device stays in
+the same boot. Because the PCF alarm has no month or year comparator, firmware
+only arms a day-of-month match when it is the next future match; otherwise it
+arms the next first-of-month checkpoint and recalculates the durable deadline.
 
 ## Change Checklist
 

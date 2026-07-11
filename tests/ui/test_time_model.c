@@ -341,6 +341,58 @@ static void test_local_minute_and_occurrence_boundaries(void)
     assert(!pj_time_state_valid(&invalid));
 }
 
+static void test_next_wake_delay(void)
+{
+    pj_time_clock_t clock = clock_at(50, 1000, 100500, 50,
+                                     6 * 3600 + 59 * 60 + 59);
+    pj_time_state_t state;
+    pj_time_state_defaults(&state, &clock);
+    assert(pj_time_next_wake_delay_ms(&state, &clock) == UINT64_MAX);
+
+    assert(pj_time_alarm_configure(&state, 1, 7, 0, &clock));
+    assert(pj_time_next_wake_delay_ms(&state, &clock) == 500);
+
+    pj_time_clock_t crossed_alarm = clock;
+    crossed_alarm.monotonic_ms += 500;
+    crossed_alarm.wall_utc_ms += 500;
+    crossed_alarm.local_second += 1;
+    assert(pj_time_next_wake_delay_ms(&state, &crossed_alarm) == 0);
+    assert(pj_time_alarm_configure(&state, 0, 7, 0, &clock));
+
+    assert(pj_time_timer_start(&state, 30000, &clock));
+    pj_time_clock_t later = clock;
+    later.monotonic_ms += 5000;
+    later.wall_utc_ms += 5000;
+    later.local_second += 5;
+    assert(pj_time_next_wake_delay_ms(&state, &later) == 25000);
+
+    assert(pj_time_interval_start(&state, 10000, 5000, &later));
+    assert(pj_time_next_wake_delay_ms(&state, &later) == 10000);
+
+    pj_time_clock_t due = later;
+    due.monotonic_ms += 10000;
+    due.wall_utc_ms += 10000;
+    due.local_second += 10;
+    assert(pj_time_next_wake_delay_ms(&state, &due) == 0);
+
+    (void)pj_time_advance(&state, &due);
+    assert(pj_time_active_alert(&state) != NULL);
+    assert(pj_time_next_wake_delay_ms(&state, &due) == 0);
+}
+
+static void test_next_wake_delay_after_trusted_reboot(void)
+{
+    pj_time_clock_t start = clock_at(60, 0, 100000, 60, 100);
+    pj_time_state_t state;
+    pj_time_state_defaults(&state, &start);
+    assert(pj_time_timer_start(&state, 60000, &start));
+
+    pj_time_clock_t reboot = clock_at(61, 0, 125000, 60, 125);
+    reboot.reboot_elapsed_valid = 1;
+    reboot.reboot_elapsed_ms = 25000;
+    assert(pj_time_next_wake_delay_ms(&state, &reboot) == 35000);
+}
+
 int main(void)
 {
     test_record_round_trip_and_corruption();
@@ -354,6 +406,8 @@ int main(void)
     test_simultaneous_priority_and_conflicts();
     test_pause_at_expiry_and_canonical_validation();
     test_local_minute_and_occurrence_boundaries();
+    test_next_wake_delay();
+    test_next_wake_delay_after_trusted_reboot();
     puts("time model tests passed");
     return 0;
 }

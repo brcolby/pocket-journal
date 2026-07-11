@@ -53,6 +53,39 @@ int pj_time_clock_civil_valid(int year, int month, int day,
            second >= 0 && second <= 59;
 }
 
+int pj_time_clock_civil_from_day(int32_t local_day,
+                                 int *year, int *month, int *day)
+{
+    if (local_day < 0 || local_day > civil_day(9999, 12, 31) ||
+        year == NULL || month == NULL || day == NULL) {
+        return 0;
+    }
+
+    int first = 1970;
+    int last = 9999;
+    while (first < last) {
+        int candidate = first + (last - first + 1) / 2;
+        if (civil_day(candidate, 1, 1) <= local_day) {
+            first = candidate;
+        } else {
+            last = candidate - 1;
+        }
+    }
+
+    int result_year = first;
+    int day_of_year = local_day - civil_day(result_year, 1, 1);
+    int result_month = 1;
+    while (day_of_year >= days_in_month(result_year, result_month)) {
+        day_of_year -= days_in_month(result_year, result_month);
+        result_month++;
+    }
+
+    *year = result_year;
+    *month = result_month;
+    *day = day_of_year + 1;
+    return 1;
+}
+
 int pj_time_clock_anchor_set(pj_time_clock_anchor_t *anchor,
                              int year, int month, int day,
                              int hour, int minute, int second,
