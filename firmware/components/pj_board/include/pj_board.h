@@ -80,6 +80,8 @@ void pj_board_refresh_status(pj_ui_context_t *ui);
 void pj_board_refresh_settings(pj_ui_context_t *ui);
 int pj_board_store_settings_from_ui(const pj_ui_context_t *ui);
 int pj_board_consume_settings_update(pj_ui_context_t *ui);
+void pj_board_refresh_static_art(pj_ui_context_t *ui);
+int pj_board_consume_static_art_update(pj_ui_context_t *ui);
 void pj_board_refresh_notes(pj_ui_context_t *ui);
 int pj_board_consume_audio_update(pj_ui_context_t *ui);
 int pj_board_consume_notes_update(pj_ui_context_t *ui);
