@@ -5,6 +5,7 @@ CFLAGS ?= -std=c11 -Wall -Wextra -Werror -pedantic
 EMCC ?= emcc
 
 UI_TEST_BIN := build/test_ui_core
+TIME_MODEL_TEST_BIN := build/test_time_model
 AUX_INPUT_TEST_BIN := build/test_aux_input
 AUDIO_LEVEL_TEST_BIN := build/test_audio_level
 NOTE_MODEL_TEST_BIN := build/test_note_model
@@ -49,6 +50,12 @@ test-ui: check-lvgl-managed
 		tests/ui/test_ui_core.c \
 		-o $(UI_TEST_BIN)
 	$(UI_TEST_BIN)
+	$(CC) $(CFLAGS) \
+		-Ifirmware/components/pj_ui/include \
+		firmware/components/pj_ui/pj_time_model.c \
+		tests/ui/test_time_model.c \
+		-o $(TIME_MODEL_TEST_BIN)
+	$(TIME_MODEL_TEST_BIN)
 
 test-input:
 	mkdir -p build
