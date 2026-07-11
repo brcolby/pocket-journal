@@ -44,9 +44,21 @@ GET /v1/settings
 PUT /v1/settings
 ```
 
-Reads or updates the larger partner-managed settings surface.
+Reads or atomically updates the persisted settings surface. A PUT may contain any non-empty subset of these fields; an unknown, incorrectly typed, or out-of-range field rejects the entire update without replacing the last valid settings:
 
-Expected v1 keys include `theme` with `light` or `dark`, `volume` from `0` to `10`, and sync status fields returned by `/v1/status`.
+```json
+{
+  "theme": "dark",
+  "volume": 8,
+  "alarm_enabled": true,
+  "alarm_hour": 7,
+  "alarm_minute": 30,
+  "timer_seconds": 300,
+  "interval_seconds": 1500
+}
+```
+
+`theme` is `light` or `dark`; `volume` is `0` through `10`; alarm time uses a 24-hour clock; `timer_seconds` is `30` through `86400`; and `interval_seconds` is `60` through `86400`. GET also returns the derived `sync_pending` and `sync_transferred` counters. When NVS has no valid stored value, defaults preserve full codec volume (`10`), light mode, a disabled `07:30` alarm, a five-minute timer, and a 25-minute interval.
 
 ```http
 GET /v1/home

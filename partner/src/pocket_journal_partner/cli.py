@@ -115,14 +115,41 @@ def cmd_settings_get(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_settings_set(args: argparse.Namespace) -> int:
-    _, client = _client_from_args(args)
-    settings = {}
-    for assignment in args.assignments:
+def _parse_settings_assignments(assignments: list[str]) -> dict[str, object]:
+    integer_keys = {
+        "volume",
+        "alarm_hour",
+        "alarm_minute",
+        "timer_seconds",
+        "interval_seconds",
+    }
+    supported_keys = integer_keys | {"theme", "alarm_enabled"}
+    settings: dict[str, object] = {}
+    for assignment in assignments:
         if "=" not in assignment:
             raise SystemExit(f"expected key=value assignment, got {assignment}")
         key, value = assignment.split("=", 1)
-        settings[key] = value
+        if key not in supported_keys:
+            raise SystemExit(f"unsupported setting: {key}")
+        if key in integer_keys:
+            try:
+                settings[key] = int(value)
+            except ValueError as exc:
+                raise SystemExit(f"expected integer for {key}, got {value}") from exc
+        elif key == "alarm_enabled":
+            if value.lower() not in {"true", "false"}:
+                raise SystemExit(f"expected true or false for {key}, got {value}")
+            settings[key] = value.lower() == "true"
+        else:
+            if value not in {"light", "dark"}:
+                raise SystemExit(f"expected light or dark for theme, got {value}")
+            settings[key] = value
+    return settings
+
+
+def cmd_settings_set(args: argparse.Namespace) -> int:
+    _, client = _client_from_args(args)
+    settings = _parse_settings_assignments(args.assignments)
     response = client.put_settings(settings)
     _print_json(response or {"updated": settings})
     return 0

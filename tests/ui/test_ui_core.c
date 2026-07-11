@@ -211,6 +211,41 @@ static void test_settings_dark_mode_toggle(void)
     assert(ui.dirty.partial == 0);
 }
 
+static void test_timer_presets_are_not_runtime_counters(void)
+{
+    pj_ui_context_t ui;
+    pj_ui_init(&ui);
+    ui.state = PJ_UI_STATE_TIMER;
+
+    assert(pj_ui_handle_touch(&ui, 100, 160, PJ_TOUCH_TAP) == 1);
+    assert(ui.timer_seconds == 330);
+    assert(ui.timer_preset_seconds == 330);
+    ui.timer_running = 1;
+    assert(pj_ui_tick(&ui) == 1);
+    assert(ui.timer_seconds == 329);
+    assert(ui.timer_preset_seconds == 330);
+
+    ui.timer_running = 0;
+    ui.timer_seconds = 0;
+    assert(pj_ui_handle_aux_short(&ui) == 1);
+    assert(ui.timer_running == 1);
+    assert(ui.timer_seconds == 330);
+
+    pj_ui_init(&ui);
+    ui.state = PJ_UI_STATE_INTERVAL;
+    assert(pj_ui_handle_touch(&ui, 100, 160, PJ_TOUCH_TAP) == 1);
+    assert(ui.interval_seconds == 1560);
+    assert(ui.interval_preset_seconds == 1560);
+    ui.interval_running = 1;
+    ui.interval_seconds = 1;
+    assert(pj_ui_tick(&ui) == 1);
+    assert(ui.interval_seconds == 300);
+    assert(ui.interval_preset_seconds == 1560);
+    ui.interval_seconds = 1;
+    assert(pj_ui_tick(&ui) == 1);
+    assert(ui.interval_seconds == 1560);
+}
+
 static void test_sync_state_is_board_driven(void)
 {
     pj_ui_context_t ui;
@@ -334,6 +369,7 @@ int main(void)
     test_aux_double_click_routing();
     test_audio_lifecycle_reconciliation();
     test_settings_dark_mode_toggle();
+    test_timer_presets_are_not_runtime_counters();
     test_sync_state_is_board_driven();
     test_dirty_lifecycle();
     test_partial_render_preserves_outside_region();

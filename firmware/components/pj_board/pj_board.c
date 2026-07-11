@@ -3,6 +3,7 @@
 #include "pj_aux_input.h"
 #include "pj_auth.h"
 #include "pj_note_model.h"
+#include "pj_settings.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -64,6 +65,13 @@
 #define PJ_NVS_WIFI_SSID "wifi_ssid"
 #define PJ_NVS_WIFI_PASSWORD "wifi_pass"
 #define PJ_NVS_TOKEN "token"
+#define PJ_NVS_VOLUME "volume"
+#define PJ_NVS_DARK_MODE "dark_mode"
+#define PJ_NVS_ALARM_ENABLED "alarm_on"
+#define PJ_NVS_ALARM_HOUR "alarm_hr"
+#define PJ_NVS_ALARM_MINUTE "alarm_min"
+#define PJ_NVS_TIMER_SECONDS "timer_sec"
+#define PJ_NVS_INTERVAL_SECONDS "intvl_sec"
 #define PJ_WIFI_SSID_MAX_LEN 32
 #define PJ_WIFI_PASSWORD_MAX_LEN 64
 #define EPD_SPI_NUM SPI2_HOST
@@ -119,7 +127,6 @@
 #define PJ_AUDIO_BITS_PER_SAMPLE 16
 #define PJ_AUDIO_FRAME_BYTES 4
 #define PJ_AUDIO_MCLK_MULTIPLE I2S_MCLK_MULTIPLE_384
-#define PJ_AUDIO_CODEC_VOLUME 100
 #define PJ_AUDIO_MIC_GAIN_DB 42.0f
 #define PJ_AUDIO_RECORD_TASK_STACK 6144
 #define PJ_AUDIO_PROCESS_TASK_STACK 6144
@@ -149,8 +156,10 @@
 #endif
 
 static pj_board_status_t g_status;
+static pj_settings_t g_settings;
 static int g_display_warning_logged;
 static int g_time_update_pending;
+static volatile int g_settings_update_pending;
 
 #ifdef ESP_PLATFORM
 static httpd_handle_t g_http_server;
@@ -172,6 +181,7 @@ static adc_cali_handle_t g_adc_cali_handle;
 static QueueHandle_t g_board_event_queue;
 static SemaphoreHandle_t g_i2c_lock;
 static SemaphoreHandle_t g_audio_lock;
+static SemaphoreHandle_t g_settings_lock;
 static sdmmc_card_t *g_sd_card;
 static uint8_t g_epd_buffer[PJ_FRAMEBUFFER_BYTES];
 static pj_framebuffer_t g_epd_shadow_fb;
@@ -407,7 +417,8 @@ static esp_err_t audio_prepare_output(const char *reason, int pa_level_override)
         }
     }
 
-    int vol_ret = esp_codec_dev_set_out_vol(g_audio_playback_codec, PJ_AUDIO_CODEC_VOLUME);
+    int codec_volume = pj_settings_codec_volume(g_settings.volume);
+    int vol_ret = esp_codec_dev_set_out_vol(g_audio_playback_codec, codec_volume);
     if (vol_ret != ESP_CODEC_DEV_OK) {
         return (esp_err_t)vol_ret;
     }
@@ -443,7 +454,7 @@ static esp_err_t audio_prepare_output(const char *reason, int pa_level_override)
 
     audio_log_output_regs(reason);
     ESP_LOGI(TAG, "Playback output enabled: pa_level=%d volume=%d",
-             gpio_get_level(AUDIO_PA_PIN), PJ_AUDIO_CODEC_VOLUME);
+             gpio_get_level(AUDIO_PA_PIN), codec_volume);
     return ESP_OK;
 }
 
@@ -681,6 +692,105 @@ static void wifi_apply_provisioning_status(void)
     if (g_status.wifi != PJ_BOARD_SERVICE_READY) {
         g_status.wifi = PJ_BOARD_SERVICE_UNAVAILABLE;
         (void)snprintf(g_status.last_error, sizeof(g_status.last_error), "Wi-Fi credentials stored");
+    }
+}
+
+static int settings_take(TickType_t timeout)
+{
+    return g_settings_lock == NULL || xSemaphoreTake(g_settings_lock, timeout) == pdTRUE;
+}
+
+static void settings_give(void)
+{
+    if (g_settings_lock != NULL) {
+        xSemaphoreGive(g_settings_lock);
+    }
+}
+
+static int nvs_read_i32(nvs_handle_t nvs, const char *key, int *value)
+{
+    int32_t stored = 0;
+    if (nvs_get_i32(nvs, key, &stored) != ESP_OK) {
+        return 0;
+    }
+    *value = (int)stored;
+    return 1;
+}
+
+static void settings_load(void)
+{
+    pj_settings_t loaded;
+    pj_settings_defaults(&loaded);
+    nvs_handle_t nvs;
+    if (nvs_open(PJ_NVS_NAMESPACE, NVS_READONLY, &nvs) != ESP_OK) {
+        g_settings = loaded;
+        return;
+    }
+
+    int value = 0;
+    if (nvs_read_i32(nvs, PJ_NVS_VOLUME, &value) && value >= 0 && value <= 10) {
+        loaded.volume = value;
+    }
+    if (nvs_read_i32(nvs, PJ_NVS_DARK_MODE, &value) && (value == 0 || value == 1)) {
+        loaded.dark_mode = value;
+    }
+    if (nvs_read_i32(nvs, PJ_NVS_ALARM_ENABLED, &value) && (value == 0 || value == 1)) {
+        loaded.alarm_enabled = value;
+    }
+    if (nvs_read_i32(nvs, PJ_NVS_ALARM_HOUR, &value) && value >= 0 && value <= 23) {
+        loaded.alarm_hour = value;
+    }
+    if (nvs_read_i32(nvs, PJ_NVS_ALARM_MINUTE, &value) && value >= 0 && value <= 59) {
+        loaded.alarm_minute = value;
+    }
+    if (nvs_read_i32(nvs, PJ_NVS_TIMER_SECONDS, &value) && value >= 30 && value <= 86400) {
+        loaded.timer_seconds = value;
+    }
+    if (nvs_read_i32(nvs, PJ_NVS_INTERVAL_SECONDS, &value) && value >= 60 && value <= 86400) {
+        loaded.interval_seconds = value;
+    }
+    nvs_close(nvs);
+    g_settings = loaded;
+    ESP_LOGI(TAG, "Settings loaded: volume=%d theme=%s", loaded.volume,
+             loaded.dark_mode ? "dark" : "light");
+}
+
+static esp_err_t settings_save(const pj_settings_t *settings)
+{
+    nvs_handle_t nvs;
+    esp_err_t err = nvs_open(PJ_NVS_NAMESPACE, NVS_READWRITE, &nvs);
+    if (err != ESP_OK) {
+        return err;
+    }
+#define SET_SETTING(key, value) do { \
+        if (err == ESP_OK) { \
+            err = nvs_set_i32(nvs, (key), (int32_t)(value)); \
+        } \
+    } while (0)
+    SET_SETTING(PJ_NVS_VOLUME, settings->volume);
+    SET_SETTING(PJ_NVS_DARK_MODE, settings->dark_mode);
+    SET_SETTING(PJ_NVS_ALARM_ENABLED, settings->alarm_enabled);
+    SET_SETTING(PJ_NVS_ALARM_HOUR, settings->alarm_hour);
+    SET_SETTING(PJ_NVS_ALARM_MINUTE, settings->alarm_minute);
+    SET_SETTING(PJ_NVS_TIMER_SECONDS, settings->timer_seconds);
+    SET_SETTING(PJ_NVS_INTERVAL_SECONDS, settings->interval_seconds);
+#undef SET_SETTING
+    if (err == ESP_OK) {
+        err = nvs_commit(nvs);
+    }
+    nvs_close(nvs);
+    return err;
+}
+
+static void settings_apply_codec_volume(void)
+{
+    if (g_audio_playback_codec == NULL) {
+        return;
+    }
+    int codec_volume = pj_settings_codec_volume(g_settings.volume);
+    int result = esp_codec_dev_set_out_vol(g_audio_playback_codec, codec_volume);
+    if (result != ESP_CODEC_DEV_OK) {
+        ESP_LOGW(TAG, "Codec volume update failed: %s", esp_err_to_name((esp_err_t)result));
     }
 }
 
@@ -2463,7 +2573,8 @@ static esp_err_t audio_codec_init(void)
                         ESP_FAIL, TAG, "audio playback codec open failed");
     ESP_RETURN_ON_FALSE(esp_codec_dev_open(g_audio_record_codec, &sample_cfg) == ESP_CODEC_DEV_OK,
                         ESP_FAIL, TAG, "audio record codec open failed");
-    ESP_RETURN_ON_FALSE(esp_codec_dev_set_out_vol(g_audio_playback_codec, PJ_AUDIO_CODEC_VOLUME) == ESP_CODEC_DEV_OK,
+    ESP_RETURN_ON_FALSE(esp_codec_dev_set_out_vol(g_audio_playback_codec,
+                                                  pj_settings_codec_volume(g_settings.volume)) == ESP_CODEC_DEV_OK,
                         ESP_FAIL, TAG, "audio codec volume set failed");
     ESP_RETURN_ON_FALSE(esp_codec_dev_set_in_gain(g_audio_record_codec, PJ_AUDIO_MIC_GAIN_DB) == ESP_CODEC_DEV_OK,
                         ESP_FAIL, TAG, "audio codec input gain set failed");
@@ -2910,7 +3021,7 @@ static esp_err_t audio_play_tone_ms(uint32_t duration_ms, const audio_tone_diag_
     ESP_LOGI(TAG, "Audio tone complete: frames=%u pa_level=%d volume=%d dout=%d pwr=%d gpio44=%02x gp45=%02x result=%s",
              (unsigned)generated,
              pa_level_override == 0 || pa_level_override == 1 ? pa_level_override : AUDIO_PA_ACTIVE_LEVEL,
-             PJ_AUDIO_CODEC_VOLUME,
+             pj_settings_codec_volume(g_settings.volume),
              (int)tone_dout_pin,
              audio_power_override == 0 || audio_power_override == 1 ? audio_power_override : original_audio_power_level,
              gpio44_override >= 0 ? gpio44_override & 0xFF : original_gpio44 & 0xFF,
@@ -3145,6 +3256,7 @@ static void advance_status_one_minute(void)
 void pj_board_init(const pj_board_profile_t *profile)
 {
     init_default_status(profile);
+    pj_settings_defaults(&g_settings);
 
 #ifdef ESP_PLATFORM
     esp_err_t err = nvs_flash_init();
@@ -3158,6 +3270,12 @@ void pj_board_init(const pj_board_profile_t *profile)
         ESP_LOGE(TAG, "%s", g_status.last_error);
         return;
     }
+
+    g_settings_lock = xSemaphoreCreateMutex();
+    if (g_settings_lock == NULL) {
+        ESP_LOGW(TAG, "Settings mutex allocation failed");
+    }
+    settings_load();
 
     uint8_t mac[6] = {0};
     if (esp_read_mac(mac, ESP_MAC_WIFI_STA) == ESP_OK) {
@@ -3279,6 +3397,113 @@ void pj_board_start_services(const pj_board_profile_t *profile)
 pj_board_status_t pj_board_status(void)
 {
     return g_status;
+}
+
+static int settings_apply_to_ui(pj_ui_context_t *ui, const pj_settings_t *settings)
+{
+    if (ui == NULL || settings == NULL) {
+        return 0;
+    }
+    int changed = ui->volume != settings->volume ||
+                  ui->dark_mode != settings->dark_mode ||
+                  ui->alarm_on != settings->alarm_enabled ||
+                  ui->alarm_hour != settings->alarm_hour ||
+                  ui->alarm_minute != settings->alarm_minute ||
+                  ui->timer_preset_seconds != settings->timer_seconds ||
+                  ui->interval_preset_seconds != settings->interval_seconds;
+    ui->volume = settings->volume;
+    ui->dark_mode = settings->dark_mode;
+    ui->alarm_on = settings->alarm_enabled;
+    ui->alarm_hour = settings->alarm_hour;
+    ui->alarm_minute = settings->alarm_minute;
+    ui->timer_preset_seconds = settings->timer_seconds;
+    ui->interval_preset_seconds = settings->interval_seconds;
+    if (!ui->timer_running) {
+        ui->timer_seconds = settings->timer_seconds;
+    }
+    if (!ui->interval_running) {
+        ui->interval_seconds = settings->interval_seconds;
+    }
+    if (changed) {
+        pj_ui_request_full_refresh(ui);
+    }
+    return changed;
+}
+
+void pj_board_refresh_settings(pj_ui_context_t *ui)
+{
+    pj_settings_t settings = g_settings;
+#ifdef ESP_PLATFORM
+    if (settings_take(portMAX_DELAY)) {
+        settings = g_settings;
+        settings_give();
+    }
+#endif
+    (void)settings_apply_to_ui(ui, &settings);
+}
+
+int pj_board_store_settings_from_ui(const pj_ui_context_t *ui)
+{
+    if (ui == NULL) {
+        return 0;
+    }
+    pj_settings_t updated = {
+        .volume = ui->volume,
+        .dark_mode = ui->dark_mode,
+        .alarm_enabled = ui->alarm_on,
+        .alarm_hour = ui->alarm_hour,
+        .alarm_minute = ui->alarm_minute,
+        .timer_seconds = ui->timer_preset_seconds,
+        .interval_seconds = ui->interval_preset_seconds,
+    };
+    if (!pj_settings_valid(&updated)) {
+        return -1;
+    }
+#ifdef ESP_PLATFORM
+    if (!settings_take(portMAX_DELAY)) {
+        return -1;
+    }
+    if (g_settings_update_pending) {
+        settings_give();
+        return 0;
+    }
+    if (memcmp(&updated, &g_settings, sizeof(updated)) == 0) {
+        settings_give();
+        return 0;
+    }
+    esp_err_t err = settings_save(&updated);
+    if (err == ESP_OK) {
+        g_settings = updated;
+        settings_apply_codec_volume();
+    } else {
+        g_settings_update_pending = 1;
+    }
+    settings_give();
+    if (err != ESP_OK) {
+        (void)snprintf(g_status.last_error, sizeof(g_status.last_error),
+                       "settings save failed: %s", esp_err_to_name(err));
+        ESP_LOGW(TAG, "%s", g_status.last_error);
+        return -1;
+    }
+    ESP_LOGI(TAG, "Settings saved from UI: volume=%d theme=%s", updated.volume,
+             updated.dark_mode ? "dark" : "light");
+#else
+    if (memcmp(&updated, &g_settings, sizeof(updated)) == 0) {
+        return 0;
+    }
+    g_settings = updated;
+#endif
+    return 1;
+}
+
+int pj_board_consume_settings_update(pj_ui_context_t *ui)
+{
+    if (!g_settings_update_pending) {
+        return 0;
+    }
+    g_settings_update_pending = 0;
+    pj_board_refresh_settings(ui);
+    return 1;
 }
 
 void pj_board_refresh_status(pj_ui_context_t *ui)
@@ -3936,7 +4161,7 @@ static void serial_command_task(void *arg)
                 printf("PJ_OK {\"tone_ms\":%d,\"pa_level\":%d,\"volume\":%d,\"dout_gpio\":%d,\"audio_power_level\":%d,\"gpio44\":%d,\"gp45\":%d}\n",
                        PJ_AUDIO_DIAG_TONE_MS,
                        tone_opts.pa_level == 0 || tone_opts.pa_level == 1 ? tone_opts.pa_level : AUDIO_PA_ACTIVE_LEVEL,
-                       PJ_AUDIO_CODEC_VOLUME,
+                       pj_settings_codec_volume(g_settings.volume),
                        tone_opts.dout_gpio >= 0 ? tone_opts.dout_gpio : (int)g_i2s_dout_pin,
                        tone_opts.audio_power_level == 0 || tone_opts.audio_power_level == 1 ? tone_opts.audio_power_level : gpio_get_level(AUDIO_PWR_PIN),
                        tone_opts.codec_gpio44 >= 0 ? tone_opts.codec_gpio44 : audio_codec_reg_get(PJ_ES8311_GPIO_REG44),
@@ -4202,14 +4427,91 @@ static esp_err_t settings_get_handler(httpd_req_t *req)
     if (require_auth(req) != ESP_OK) {
         return ESP_OK;
     }
+    pj_settings_t settings = g_settings;
+    if (settings_take(portMAX_DELAY)) {
+        settings = g_settings;
+        settings_give();
+    }
     int pending_sync = 0;
     int transferred_sync = 0;
     collect_sync_counts(&pending_sync, &transferred_sync);
-    char json[128];
+    char json[320];
     (void)snprintf(json, sizeof(json),
-                   "{\"theme\":\"light\",\"volume\":5,\"sync_pending\":%d,\"sync_transferred\":%d}",
-                   pending_sync, transferred_sync);
+                   "{\"theme\":\"%s\",\"volume\":%d,\"alarm_enabled\":%s,"
+                   "\"alarm_hour\":%d,\"alarm_minute\":%d,\"timer_seconds\":%d,"
+                   "\"interval_seconds\":%d,\"sync_pending\":%d,\"sync_transferred\":%d}",
+                   settings.dark_mode ? "dark" : "light",
+                   settings.volume,
+                   settings.alarm_enabled ? "true" : "false",
+                   settings.alarm_hour,
+                   settings.alarm_minute,
+                   settings.timer_seconds,
+                   settings.interval_seconds,
+                   pending_sync,
+                   transferred_sync);
     return send_json(req, json);
+}
+
+static int json_exact_int(const cJSON *item, int *value)
+{
+    if (!cJSON_IsNumber(item) || item->valuedouble != (double)item->valueint) {
+        return 0;
+    }
+    *value = item->valueint;
+    return 1;
+}
+
+static int settings_parse_update(const cJSON *json, pj_settings_t *settings)
+{
+    if (!cJSON_IsObject(json) || json->child == NULL) {
+        return 0;
+    }
+    for (const cJSON *item = json->child; item != NULL; item = item->next) {
+        const char *key = item->string;
+        if (key == NULL) {
+            return 0;
+        }
+        if (strcmp(key, "theme") == 0) {
+            if (!cJSON_IsString(item) || item->valuestring == NULL) {
+                return 0;
+            }
+            if (strcmp(item->valuestring, "light") == 0) {
+                settings->dark_mode = 0;
+            } else if (strcmp(item->valuestring, "dark") == 0) {
+                settings->dark_mode = 1;
+            } else {
+                return 0;
+            }
+        } else if (strcmp(key, "alarm_enabled") == 0) {
+            if (!cJSON_IsBool(item)) {
+                return 0;
+            }
+            settings->alarm_enabled = cJSON_IsTrue(item) ? 1 : 0;
+        } else if (strcmp(key, "volume") == 0) {
+            if (!json_exact_int(item, &settings->volume)) {
+                return 0;
+            }
+        } else if (strcmp(key, "alarm_hour") == 0) {
+            if (!json_exact_int(item, &settings->alarm_hour)) {
+                return 0;
+            }
+        } else if (strcmp(key, "alarm_minute") == 0) {
+            if (!json_exact_int(item, &settings->alarm_minute)) {
+                return 0;
+            }
+        } else if (strcmp(key, "timer_seconds") == 0) {
+            if (!json_exact_int(item, &settings->timer_seconds)) {
+                return 0;
+            }
+        } else if (strcmp(key, "interval_seconds") == 0) {
+            if (!json_exact_int(item, &settings->interval_seconds)) {
+                return 0;
+            }
+        } else {
+            return 0;
+        }
+    }
+    return pj_settings_valid(settings);
 }
 
 static esp_err_t settings_put_handler(httpd_req_t *req)
@@ -4217,8 +4519,39 @@ static esp_err_t settings_put_handler(httpd_req_t *req)
     if (require_auth(req) != ESP_OK) {
         return ESP_OK;
     }
-    drain_body(req);
-    return send_json(req, "{\"updated\":true}");
+    char body[512];
+    if (!read_body(req, body, sizeof(body))) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        return send_json(req, "{\"error\":\"invalid settings body\"}");
+    }
+    cJSON *json = cJSON_Parse(body);
+    if (!settings_take(portMAX_DELAY)) {
+        cJSON_Delete(json);
+        httpd_resp_set_status(req, "503 Service Unavailable");
+        return send_json(req, "{\"error\":\"settings busy\"}");
+    }
+    pj_settings_t updated = g_settings;
+    if (!settings_parse_update(json, &updated)) {
+        cJSON_Delete(json);
+        settings_give();
+        httpd_resp_set_status(req, "400 Bad Request");
+        return send_json(req, "{\"error\":\"unsupported or invalid settings\"}");
+    }
+    cJSON_Delete(json);
+
+    esp_err_t err = settings_save(&updated);
+    if (err == ESP_OK) {
+        g_settings = updated;
+        settings_apply_codec_volume();
+        g_settings_update_pending = 1;
+    }
+    settings_give();
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "HTTP settings save failed: %s", esp_err_to_name(err));
+        httpd_resp_set_status(req, "500 Internal Server Error");
+        return send_json(req, "{\"error\":\"settings store failed\"}");
+    }
+    return settings_get_handler(req);
 }
 
 static esp_err_t home_get_handler(httpd_req_t *req)

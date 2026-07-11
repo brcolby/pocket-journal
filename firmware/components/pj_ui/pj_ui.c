@@ -632,7 +632,9 @@ void pj_ui_init(pj_ui_context_t *ctx)
     ctx->alarm_hour = 7;
     ctx->alarm_minute = 30;
     ctx->timer_seconds = 300;
+    ctx->timer_preset_seconds = 300;
     ctx->interval_seconds = 1500;
+    ctx->interval_preset_seconds = 1500;
     ctx->record_state = PJ_RECORD_IDLE;
     ctx->playback_state = PJ_PLAYBACK_IDLE;
     ctx->note_count = 0;
@@ -928,6 +930,9 @@ int pj_ui_handle_aux_short(pj_ui_context_t *ctx)
         mark_partial(ctx, 0, 40, PJ_DISPLAY_WIDTH, 96);
         return 1;
     case PJ_UI_STATE_TIMER:
+        if (!ctx->timer_running && ctx->timer_seconds <= 0) {
+            ctx->timer_seconds = ctx->timer_preset_seconds;
+        }
         ctx->timer_running = !ctx->timer_running;
         mark_partial(ctx, 0, 40, PJ_DISPLAY_WIDTH, 96);
         return 1;
@@ -983,7 +988,8 @@ int pj_ui_tick(pj_ui_context_t *ctx)
             ctx->interval_seconds--;
             if (ctx->interval_seconds == 0) {
                 ctx->interval_round++;
-                ctx->interval_seconds = (ctx->interval_round % 2) == 0 ? 300 : 1500;
+                ctx->interval_seconds = (ctx->interval_round % 2) == 0 ?
+                    ctx->interval_preset_seconds : 300;
             }
             mark_partial(ctx, 0, 24, PJ_DISPLAY_WIDTH, 120);
             return 1;
@@ -1120,8 +1126,11 @@ int pj_ui_handle_touch(pj_ui_context_t *ctx, int x, int y, pj_touch_kind_t kind)
             } else if (x < 132) {
                 ctx->timer_seconds += 30;
             } else {
-                ctx->timer_seconds = 300;
+                ctx->timer_seconds = ctx->timer_preset_seconds;
                 ctx->timer_running = 0;
+            }
+            if (x < 132) {
+                ctx->timer_preset_seconds = ctx->timer_seconds;
             }
             mark_partial(ctx, 0, 40, PJ_DISPLAY_WIDTH, 96);
             return 1;
@@ -1137,9 +1146,12 @@ int pj_ui_handle_touch(pj_ui_context_t *ctx, int x, int y, pj_touch_kind_t kind)
             } else if (x < 132) {
                 ctx->interval_seconds += 60;
             } else {
-                ctx->interval_seconds = 1500;
+                ctx->interval_seconds = ctx->interval_preset_seconds;
                 ctx->interval_round = 0;
                 ctx->interval_running = 0;
+            }
+            if (x < 132) {
+                ctx->interval_preset_seconds = ctx->interval_seconds;
             }
             mark_partial(ctx, 0, 24, PJ_DISPLAY_WIDTH, 120);
             return 1;

@@ -84,8 +84,10 @@ typedef struct {
     int stopwatch_seconds;
     int timer_running;
     int timer_seconds;
+    int timer_preset_seconds;
     int interval_running;
     int interval_seconds;
+    int interval_preset_seconds;
     int interval_round;
     int alarm_on;
     int alarm_hour;

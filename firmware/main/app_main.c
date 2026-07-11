@@ -111,6 +111,7 @@ static void handle_board_event(pj_ui_context_t *ui, const pj_board_event_t *even
                  pj_ui_state_name(previous), event->x, event->y);
     }
     apply_board_state_effects(previous, pj_ui_current_state(ui), event);
+    (void)pj_board_store_settings_from_ui(ui);
 }
 
 void app_main(void)
@@ -122,6 +123,7 @@ void app_main(void)
     pj_board_start_services(&profile);
 
     pj_ui_init(&g_ui);
+    pj_board_refresh_settings(&g_ui);
     pj_ui_wake(&g_ui);
     pj_board_refresh_status(&g_ui);
     pj_ui_request_full_refresh(&g_ui);
@@ -182,6 +184,10 @@ void app_main(void)
 
         if (pj_board_consume_notes_update(&g_ui)) {
             sync_ui_audio_from_board(&g_ui);
+            render_and_flush_if_dirty(&g_ui);
+        }
+
+        if (pj_board_consume_settings_update(&g_ui)) {
             render_and_flush_if_dirty(&g_ui);
         }
 
