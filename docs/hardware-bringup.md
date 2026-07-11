@@ -1,13 +1,22 @@
 # Hardware Bring-Up
 
-The target product is Waveshare SKU `34211`, ESP32-S3-Touch-ePaper-1.54.
+The target product is Waveshare SKU `34211`, ESP32-S3-Touch-ePaper-1.54. Use
+[the hardware reference](hardware-reference.md) for authoritative source links,
+the pin contract, display constraints, and the known vendor naming ambiguity.
 
 Before touching low-level drivers, identify the hardware revision:
 
-- V2: board has `V2` on the back or top-left PCB silkscreen.
-- V1: no V2 marking.
+- Expected project target: PICO-1-N8R8, 8 MB flash, 8 MB PSRAM, touch controller,
+  and the V2 example family.
+- V2-marked board: `V2` appears on the back or top-left PCB silkscreen.
+- Unmarked board: do not infer V1 compatibility from the absence of the mark;
+  verify the SoC, memory, touch controller, and schematic first.
 
-Waveshare notes that V1 and V2 example programs are not interchangeable. Keep all pin maps and driver init values behind the board profile layer in `firmware/components/pj_board`.
+Waveshare notes that V1 and V2 example programs are not interchangeable, while
+its example repository separately describes the touch SKU as having one
+version. Keep all pin maps and driver init values behind the board profile layer
+in `firmware/components/pj_board` and follow the PICO-1-N8R8 schematic for this
+project.
 
 ## Bring-Up Checklist
 
