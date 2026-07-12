@@ -1,4 +1,4 @@
-.PHONY: test test-ui test-input test-partner test-simulator test-simulator-runtime check-lvgl-managed generate-font-assets generate-icon-assets generate-simulator-wasm simulator clean
+.PHONY: test test-ui test-input test-partner test-simulator test-simulator-runtime test-ui-images ui-gallery check-lvgl-managed generate-font-assets generate-icon-assets generate-simulator-wasm simulator clean
 
 CC ?= cc
 CFLAGS ?= -std=c11 -Wall -Wextra -Werror -pedantic
@@ -162,6 +162,12 @@ test-simulator:
 
 test-simulator-runtime: generate-simulator-wasm
 	node tests/simulator/test_wasm_runtime.mjs
+
+test-ui-images:
+	node tests/simulator/test_ui_image_checks.mjs
+
+ui-gallery: generate-simulator-wasm test-ui-images
+	node tools/generate_ui_gallery.mjs
 
 generate-font-assets:
 	python3 tools/generate_font_assets.py
