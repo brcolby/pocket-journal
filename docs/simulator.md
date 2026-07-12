@@ -76,5 +76,6 @@ The inline bootstrap logger writes to the same endpoint before `src/main.js` loa
 - `record`: entering starts recording; pause/resume/finish update only the control/status region.
 - `listen` and `read`: show dummy recordings ordered newest first; tap a note to enter detail.
 - AUX double-click jumps from any idle screen, including the resting screen, directly into recording. It is ignored while recording, playback, stopwatch, timer, or interval activity is in progress.
-- AUX single-click actions wait 350 ms so a second click can be recognized; hold for one second to trigger a long press.
+- AUX single-click actions wait 350 ms so a second click can be recognized; release after holding for at least 650 ms to trigger a long press.
 - AUX long press backs out through the firmware parent state graph.
+- AUX short press follows the primary action on each screen: Home opens its configured first tile, Settings opens Volume, Volume raises one step, and active media/time screens start, pause, or stop their current action.

@@ -151,6 +151,14 @@ static size_t home_tiles(const pj_ui_context_t *ctx, tile_t tiles[PJ_HOME_MAX_SL
     return count;
 }
 
+static pj_ui_state_t home_primary_state(const pj_ui_context_t *ctx)
+{
+    if (ctx->home_layout.slot_count == 0) {
+        return PJ_UI_STATE_HOME;
+    }
+    return state_from_destination(ctx->home_layout.slots[0].destination);
+}
+
 static const char *weekday_name(int weekday)
 {
     static const char *names[] = {"SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"};
@@ -1104,6 +1112,16 @@ int pj_ui_handle_aux_short(pj_ui_context_t *ctx)
     case PJ_UI_STATE_TIME_TEMP:
         set_state(ctx, PJ_UI_STATE_HOME);
         return 1;
+    case PJ_UI_STATE_HOME:
+        if (ctx->record_state != PJ_RECORD_IDLE || ctx->playback_state != PJ_PLAYBACK_IDLE) {
+            return 0;
+        }
+        pj_ui_state_t primary = home_primary_state(ctx);
+        if (primary == PJ_UI_STATE_HOME) {
+            return 0;
+        }
+        set_state(ctx, primary);
+        return 1;
     case PJ_UI_STATE_NOTES:
         ctx->record_state = PJ_RECORD_ACTIVE;
         set_state(ctx, PJ_UI_STATE_RECORD);
@@ -1158,8 +1176,14 @@ int pj_ui_handle_aux_short(pj_ui_context_t *ctx)
         return 1;
     case PJ_UI_STATE_SYNC:
         return 0;
+    case PJ_UI_STATE_SETTINGS:
+        set_state(ctx, PJ_UI_STATE_VOLUME);
+        return 1;
     case PJ_UI_STATE_VOLUME:
-        set_state(ctx, PJ_UI_STATE_SETTINGS);
+        if (ctx->volume < 10) {
+            ctx->volume++;
+            mark_partial(ctx, 0, 48, PJ_DISPLAY_WIDTH, 144);
+        }
         return 1;
     default:
         return 0;
@@ -1711,8 +1735,8 @@ static void render_scene(const pj_ui_context_t *ctx, pj_framebuffer_t *fb)
         break;
     case PJ_UI_STATE_STOPWATCH:
         format_hms(text, sizeof(text), ctx->stopwatch_seconds);
-        draw_text_center_at(fb, 100, 62, text, 3);
-        draw_text_center_at(fb, 100, 116, ctx->stopwatch_running ? "RUN" : "STOP", 3);
+        draw_text_center_at(fb, 100, 62, text, 4);
+        draw_text_center_at(fb, 100, 116, ctx->stopwatch_running ? "RUN" : "STOP", 2);
         if (!lvgl_widgets_active()) {
             draw_round_rect_width(fb, 136, 140, 56, 52, 12, 3);
         }
@@ -1720,16 +1744,16 @@ static void render_scene(const pj_ui_context_t *ctx, pj_framebuffer_t *fb)
         break;
     case PJ_UI_STATE_TIMER:
         format_hms(text, sizeof(text), ctx->timer_seconds);
-        draw_text_center_at(fb, 100, 62, text, 3);
-        draw_text_center_at(fb, 100, 116, ctx->timer_running ? "RUN" : "STOP", 3);
+        draw_text_center_at(fb, 100, 62, text, 4);
+        draw_text_center_at(fb, 100, 116, ctx->timer_running ? "RUN" : "STOP", 2);
         draw_change_buttons(fb);
         break;
     case PJ_UI_STATE_INTERVAL:
         (void)snprintf(text, sizeof(text), "%d", ctx->interval_round);
         draw_text_center_at(fb, 100, 34, text, 4);
         format_hms(text, sizeof(text), ctx->interval_seconds);
-        draw_text_center_at(fb, 100, 90, text, 3);
-        draw_text_center_at(fb, 100, 130, ctx->interval_running ? "RUN" : "STOP", 2);
+        draw_text_center_at(fb, 100, 90, text, 4);
+        draw_text_center_at(fb, 100, 130, ctx->interval_running ? "RUN" : "STOP", 1);
         draw_change_buttons(fb);
         break;
     case PJ_UI_STATE_CALENDAR:

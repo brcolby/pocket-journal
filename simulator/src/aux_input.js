@@ -1,4 +1,4 @@
-export const AUX_LONG_PRESS_MS = 1000;
+export const AUX_LONG_PRESS_MS = 650;
 export const AUX_DOUBLE_CLICK_MS = 350;
 
 export function createAuxClickDetector({ onShort, onDouble, now, setTimer, clearTimer }) {
