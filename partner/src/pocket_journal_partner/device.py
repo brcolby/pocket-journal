@@ -13,6 +13,13 @@ class DeviceError(RuntimeError):
     pass
 
 
+class DeviceHTTPError(DeviceError):
+    def __init__(self, message: str, status_code: int, retryable: bool) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.retryable = retryable
+
+
 DEFAULT_SERIAL_PORT = "/dev/cu.usbmodem1101"
 SERIAL_PORT_PATTERNS = (
     "/dev/cu.usbmodem*",
@@ -107,7 +114,10 @@ class DeviceClient:
                 detail = "device is busy; stop recording or playback and retry"
             else:
                 detail = f"HTTP {exc.code}"
-            raise DeviceError(f"{method} {path} failed: {detail}") from exc
+            retryable = exc.code in {408, 409, 425, 429} or 500 <= exc.code < 600
+            raise DeviceHTTPError(
+                f"{method} {path} failed: {detail}", exc.code, retryable
+            ) from exc
         except error.URLError as exc:
             raise DeviceError(f"{method} {path} failed: {exc.reason}") from exc
 

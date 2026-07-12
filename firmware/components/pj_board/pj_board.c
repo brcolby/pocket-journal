@@ -11,6 +11,7 @@
 #include "pj_storage.h"
 #include "pj_time_clock.h"
 #include "pj_time_controller.h"
+#include "pj_transcript_upload.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -177,7 +178,6 @@
 #define PJ_STORAGE_RESERVE_BYTES (256ULL * 1024ULL)
 #define PJ_STORAGE_RECORD_START_BYTES (64ULL * 1024ULL)
 #define PJ_STORAGE_CAPACITY_CHECK_BYTES (64U * 1024U)
-#define PJ_TRANSCRIPT_MAX_BODY_BYTES (64U * 1024U)
 #endif
 
 static pj_board_status_t g_status;
@@ -6938,26 +6938,16 @@ static esp_err_t transcript_put_handler(httpd_req_t *req)
         httpd_resp_set_status(req, "400 Bad Request");
         return send_json(req, "{\"error\":\"incomplete transcript body\"}");
     }
-    if (memchr(body, '\0', (size_t)req->content_len) != NULL) {
+    pj_transcript_body_result_t validation = pj_transcript_body_validate(
+        body, (size_t)req->content_len, (size_t)req->content_len);
+    if (validation != PJ_TRANSCRIPT_BODY_VALID) {
         free(body);
         httpd_resp_set_status(req, "400 Bad Request");
-        return send_json(req, "{\"error\":\"malformed transcript JSON\"}");
-    }
-    cJSON *json = cJSON_ParseWithLengthOpts(body, (size_t)req->content_len + 1u, NULL, true);
-    if (json == NULL) {
-        free(body);
-        httpd_resp_set_status(req, "400 Bad Request");
-        return send_json(req, "{\"error\":\"malformed transcript JSON\"}");
-    }
-    cJSON *text = json == NULL ? NULL : cJSON_GetObjectItemCaseSensitive(json, "text");
-    if (!cJSON_IsObject(json) || !cJSON_IsString(text) || text->valuestring == NULL ||
-        text->valuestring[0] == '\0') {
-        cJSON_Delete(json);
-        free(body);
-        httpd_resp_set_status(req, "400 Bad Request");
+        if (validation == PJ_TRANSCRIPT_BODY_MALFORMED) {
+            return send_json(req, "{\"error\":\"malformed transcript JSON\"}");
+        }
         return send_json(req, "{\"error\":\"transcript must be a JSON object with non-empty text\"}");
     }
-    cJSON_Delete(json);
     char path[PJ_NOTE_TRANSCRIPT_PATH_LEN];
     transcript_path_for_audio(path, sizeof(path), id + 1);
     esp_err_t write_err = json_write_file_atomic(path, body, (size_t)req->content_len);

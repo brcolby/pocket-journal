@@ -13,7 +13,7 @@ import unittest
 
 from pocket_journal_partner import cli
 from pocket_journal_partner.config import DeviceProfile, PartnerConfig
-from pocket_journal_partner.device import AudioItem, DeviceClient, DeviceError, SerialDeviceClient, resolve_serial_port
+from pocket_journal_partner.device import AudioItem, DeviceClient, DeviceError, DeviceHTTPError, SerialDeviceClient, resolve_serial_port
 
 
 class ConfigTests(unittest.TestCase):
@@ -122,6 +122,18 @@ class ConfigTests(unittest.TestCase):
                 failure.close()
                 self.assertIn(expected, str(raised.exception))
                 self.assertNotIn("super-secret-token", str(raised.exception))
+
+    def test_http_errors_expose_retry_classification(self) -> None:
+        client = DeviceClient("http://device.local", "token")
+        for code, retryable in ((401, False), (404, False), (409, True), (429, True), (500, True)):
+            with self.subTest(code=code):
+                failure = error.HTTPError(client._url("/v1/status"), code, "error", {}, None)
+                with patch("pocket_journal_partner.device.request.urlopen", side_effect=failure):
+                    with self.assertRaises(DeviceHTTPError) as raised:
+                        client.status()
+                failure.close()
+                self.assertEqual(raised.exception.status_code, code)
+                self.assertEqual(raised.exception.retryable, retryable)
 
     def test_provision_output_does_not_expose_generated_token_or_password(self) -> None:
         with TemporaryDirectory() as tmp:

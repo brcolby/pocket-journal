@@ -13,7 +13,7 @@ import threading
 import unittest
 
 from pocket_journal_partner import cli
-from pocket_journal_partner.device import AudioItem
+from pocket_journal_partner.device import AudioItem, DeviceHTTPError
 from pocket_journal_partner.storage import PartnerStore
 from pocket_journal_partner.sync import DEVICE_TRANSCRIPT_MAX_BYTES, sync_device_audio
 from pocket_journal_partner.transcription import FakeTranscriptionBackend
@@ -143,6 +143,39 @@ class SyncTests(unittest.TestCase):
         self.assertEqual(client.downloaded, ["new.wav"])
         self.assertEqual(client.uploaded, ["new.wav"])
         self.assertEqual(backend.calls, 1)
+
+    def test_permanent_upload_http_error_is_cached(self) -> None:
+        class UnauthorizedClient(FakeClient):
+            def upload_transcript(self, audio_id: str, transcript: dict[str, object]) -> None:
+                self.uploaded.append(audio_id)
+                raise DeviceHTTPError("authentication failed", 401, False)
+
+        with TemporaryDirectory() as tmp:
+            client = UnauthorizedClient()
+            store = PartnerStore(Path(tmp))
+            first = sync_device_audio("pj-test", client, store, FakeBackend())  # type: ignore[arg-type]
+            second = sync_device_audio("pj-test", client, store, FakeBackend())  # type: ignore[arg-type]
+
+        self.assertFalse(first[0]["retryable"])
+        self.assertTrue(second[0]["cached"])
+        self.assertEqual(client.uploaded, ["new.wav"])
+
+    def test_retryable_upload_http_error_is_retried(self) -> None:
+        class BusyClient(FakeClient):
+            def upload_transcript(self, audio_id: str, transcript: dict[str, object]) -> None:
+                self.uploaded.append(audio_id)
+                if len(self.uploaded) == 1:
+                    raise DeviceHTTPError("device busy", 409, True)
+
+        with TemporaryDirectory() as tmp:
+            client = BusyClient()
+            store = PartnerStore(Path(tmp))
+            first = sync_device_audio("pj-test", client, store, FakeBackend())  # type: ignore[arg-type]
+            second = sync_device_audio("pj-test", client, store, FakeBackend())  # type: ignore[arg-type]
+
+        self.assertTrue(first[0]["retryable"])
+        self.assertEqual(second[0]["status"], "uploaded")
+        self.assertEqual(client.uploaded, ["new.wav", "new.wav"])
 
     def test_fingerprint_change_invalidates_cached_transcript(self) -> None:
         with TemporaryDirectory() as tmp:

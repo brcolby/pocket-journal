@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+import errno
 import hashlib
 import json
 import os
@@ -8,6 +9,7 @@ from pathlib import Path
 import re
 import tempfile
 import threading
+import time
 from typing import Any
 from urllib.parse import quote
 
@@ -63,6 +65,17 @@ def _thread_lock(path: Path) -> threading.Lock:
         return _thread_locks.setdefault(key, threading.Lock())
 
 
+def _acquire_windows_lock(handle) -> None:
+    while True:
+        try:
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            return
+        except OSError as error:
+            if error.errno not in {errno.EACCES, errno.EAGAIN, errno.EDEADLK}:
+                raise
+            time.sleep(0.05)
+
+
 @contextmanager
 def _file_lock(lock_path: Path):
     lock_path.parent.mkdir(parents=True, exist_ok=True)
@@ -74,7 +87,7 @@ def _file_lock(lock_path: Path):
                 handle.write(b"\0")
                 handle.flush()
             handle.seek(0)
-            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+            _acquire_windows_lock(handle)
         else:
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
         try:
@@ -96,12 +109,22 @@ def _item_lock(path: Path):
 
 
 def _migrate_legacy_file(legacy_path: Path, path: Path) -> None:
-    if path.exists() or not legacy_path.exists():
+    try:
+        legacy_exists = legacy_path.exists()
+    except OSError as error:
+        if error.errno in {errno.ENAMETOOLONG, errno.EINVAL}:
+            return
+        raise
+    if path.exists() or not legacy_exists:
         return
     path.parent.mkdir(parents=True, exist_ok=True)
     with _item_lock(path):
-        if not path.exists() and legacy_path.exists():
-            legacy_path.replace(path)
+        try:
+            if not path.exists() and legacy_path.exists():
+                legacy_path.replace(path)
+        except OSError as error:
+            if error.errno not in {errno.ENAMETOOLONG, errno.EINVAL}:
+                raise
 
 
 class PartnerStore:

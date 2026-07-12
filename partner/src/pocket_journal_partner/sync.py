@@ -7,7 +7,7 @@ import hashlib
 import json
 import tempfile
 
-from .device import DeviceClient
+from .device import DeviceClient, DeviceHTTPError
 from .storage import PartnerStore
 from .transcript_payload import DEVICE_TRANSCRIPT_MAX_BYTES, build_device_transcript_payload
 from .transcription import FakeTranscriptionBackend, TranscriptionBackend, inspect_wav
@@ -223,6 +223,8 @@ def _failure_result(
     retryable = operation != "prepare_upload"
     if isinstance(error, PermanentAudioError):
         retryable = False
+    if isinstance(error, DeviceHTTPError):
+        retryable = error.retryable
     if operation == "transcribe" and isinstance(error, ValueError):
         retryable = False
     job["last_error"] = {

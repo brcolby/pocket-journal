@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+import errno
 import hashlib
 import multiprocessing
 from pathlib import Path
@@ -10,6 +11,7 @@ import unittest
 from unittest.mock import patch
 from urllib.parse import quote
 
+import pocket_journal_partner.storage as storage_module
 from pocket_journal_partner.storage import PartnerStore
 
 
@@ -28,6 +30,32 @@ def _legacy_component(value: str) -> str:
 
 
 class StoragePathTests(unittest.TestCase):
+    def test_windows_lock_waits_until_competing_process_releases(self) -> None:
+        attempts = 0
+
+        class FakeMsvcrt:
+            LK_NBLCK = 1
+
+            @staticmethod
+            def locking(_fd: int, _mode: int, _length: int) -> None:
+                nonlocal attempts
+                attempts += 1
+                if attempts < 3:
+                    raise OSError(errno.EACCES, "locked")
+
+        class FakeHandle:
+            @staticmethod
+            def fileno() -> int:
+                return 7
+
+        with patch.object(storage_module, "msvcrt", FakeMsvcrt, create=True), patch.object(
+            storage_module.time, "sleep"
+        ) as sleep:
+            storage_module._acquire_windows_lock(FakeHandle())
+
+        self.assertEqual(attempts, 3)
+        self.assertEqual(sleep.call_count, 2)
+
     def test_audio_path_is_contained_collision_safe_and_preserves_safe_suffix(self) -> None:
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
