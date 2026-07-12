@@ -115,6 +115,32 @@ static void test_empty_notes_do_not_open_detail(void)
     assert(pj_ui_current_state(&ui) == PJ_UI_STATE_READ);
 }
 
+static void test_note_paging_tracks_hardware_focus_and_swipes(void)
+{
+    pj_ui_context_t ui;
+    const char labels[6][PJ_UI_NOTE_LABEL_LEN] = {
+        "One", "Two", "Three", "Four", "Five", "Six",
+    };
+    pj_ui_init(&ui);
+    pj_ui_set_notes(&ui, 6, labels);
+    ui.state = PJ_UI_STATE_LISTEN;
+
+    for (int i = 0; i < 4; i++) assert(pj_ui_handle_aux_double(&ui) == 1);
+    assert(ui.focus_index == 4);
+    assert(ui.note_page == 1);
+    assert(pj_ui_handle_aux_short(&ui) == 1);
+    assert(ui.state == PJ_UI_STATE_NOTE_DETAIL);
+    assert(ui.selected_note == 4);
+
+    ui.state = PJ_UI_STATE_READ;
+    ui.note_page = 0;
+    ui.focus_index = 0;
+    assert(pj_ui_handle_touch(&ui, 100, 100, PJ_TOUCH_SWIPE_LEFT) == 1);
+    assert(ui.note_page == 1 && ui.focus_index == 4);
+    assert(pj_ui_handle_touch(&ui, 100, 100, PJ_TOUCH_SWIPE_RIGHT) == 1);
+    assert(ui.note_page == 0 && ui.focus_index == 0);
+}
+
 static void test_read_opens_transcript_detail_without_playback(void)
 {
     pj_ui_context_t ui;
@@ -254,7 +280,10 @@ static void test_aux_focus_and_activation(void)
     ui.state = PJ_UI_STATE_HOME;
 
     assert(pj_ui_handle_aux_short(&ui) == 1);
-    assert(pj_ui_current_state(&ui) == PJ_UI_STATE_NOTES);
+    assert(pj_ui_current_state(&ui) == PJ_UI_STATE_HOME);
+    assert(ui.focus_index == 1);
+    assert(pj_ui_handle_aux_double(&ui) == 1);
+    assert(pj_ui_current_state(&ui) == PJ_UI_STATE_TIME);
 
     assert(pj_ui_handle_aux_long(&ui) == 1);
     assert(pj_ui_current_state(&ui) == PJ_UI_STATE_HOME);
@@ -995,6 +1024,21 @@ static void test_note_detail_title_respects_side_margins(void)
     assert_region_clear(&fb, 192, 12, 8, 36);
 }
 
+static void test_long_home_title_is_ellipsized_inside_header(void)
+{
+    pj_ui_context_t ui;
+    pj_framebuffer_t fb;
+    pj_ui_init(&ui);
+    strcpy(ui.home_layout.title, "My long personal journal");
+    ui.state = PJ_UI_STATE_HOME;
+    pj_ui_render(&ui, &fb);
+    assert(count_black_pixels_in_region(&fb, 10, 6, 180, 24) > 0);
+    for (int y = 6; y < 30; y++) {
+        assert(pj_framebuffer_get(&fb, 0, y) == 0);
+        assert(pj_framebuffer_get(&fb, 199, y) == 0);
+    }
+}
+
 static void test_calendar_divider_stays_above_empty_state(void)
 {
     pj_ui_context_t ui;
@@ -1067,6 +1111,7 @@ int main(void)
 {
     test_state_graph();
     test_empty_notes_do_not_open_detail();
+    test_note_paging_tracks_hardware_focus_and_swipes();
     test_read_opens_transcript_detail_without_playback();
     test_note_detail_play_control_has_touch_parity();
     test_custom_home_slots_render_and_route_in_order();
@@ -1095,6 +1140,7 @@ int main(void)
     test_static_art_render_and_fallback();
     test_long_note_label_stays_inside_editorial_row();
     test_note_detail_title_respects_side_margins();
+    test_long_home_title_is_ellipsized_inside_header();
     test_calendar_divider_stays_above_empty_state();
     test_polished_scenes_render_stably();
     test_render_all_states();

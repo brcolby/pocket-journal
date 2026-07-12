@@ -149,14 +149,6 @@ static size_t home_tiles(const pj_ui_context_t *ctx, tile_t tiles[PJ_HOME_MAX_SL
     return count;
 }
 
-static pj_ui_state_t home_primary_state(const pj_ui_context_t *ctx)
-{
-    if (ctx->home_layout.slot_count == 0) {
-        return PJ_UI_STATE_HOME;
-    }
-    return state_from_destination(ctx->home_layout.slots[0].destination);
-}
-
 static const char *weekday_name(int weekday)
 {
     static const char *names[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
@@ -594,10 +586,11 @@ static void invert_region(pj_framebuffer_t *fb, int x, int y, int w, int h)
 
 static void draw_screen_header(pj_framebuffer_t *fb, const char *title, int show_back)
 {
+    int title_x = show_back ? 34 : 10;
     if (show_back) {
         draw_text(fb, 10, 8, "<", 2);
     }
-    draw_text(fb, show_back ? 34 : 10, 8, title, 2);
+    draw_text_ellipsized(fb, title_x, 8, title, 2, 190 - title_x);
     draw_hline(fb, 10, 189, 31);
 }
 
@@ -1038,6 +1031,7 @@ static void queue_time_command(pj_ui_context_t *ctx, pj_ui_time_command_type_t t
 static int focus_count(const pj_ui_context_t *ctx)
 {
     switch (ctx->state) {
+    case PJ_UI_STATE_HOME: return (int)ctx->home_layout.slot_count;
     case PJ_UI_STATE_NOTES: return 3;
     case PJ_UI_STATE_TIME: return 4;
     case PJ_UI_STATE_SETTINGS: return 4;
@@ -1059,6 +1053,9 @@ static int cycle_focus(pj_ui_context_t *ctx)
         return 0;
     }
     ctx->focus_index = (ctx->focus_index + 1) % count;
+    if (ctx->state == PJ_UI_STATE_LISTEN || ctx->state == PJ_UI_STATE_READ) {
+        ctx->note_page = ctx->focus_index / notes_per_page();
+    }
     mark_full(ctx);
     return 1;
 }
@@ -1123,12 +1120,13 @@ int pj_ui_handle_aux_short(pj_ui_context_t *ctx)
         if (ctx->record_state != PJ_RECORD_IDLE || ctx->playback_state != PJ_PLAYBACK_IDLE) {
             return 0;
         }
-        pj_ui_state_t primary = home_primary_state(ctx);
-        if (primary == PJ_UI_STATE_HOME) {
-            return 0;
+        if (ctx->home_layout.slot_count == 1) {
+            pj_ui_state_t only = state_from_destination(ctx->home_layout.slots[0].destination);
+            if (only == PJ_UI_STATE_HOME) return 0;
+            set_state(ctx, only);
+            return 1;
         }
-        set_state(ctx, primary);
-        return 1;
+        return cycle_focus(ctx);
     case PJ_UI_STATE_NOTES:
         if (ctx->focus_index == 0) {
             ctx->record_state = PJ_RECORD_ACTIVE;
@@ -1264,6 +1262,24 @@ int pj_ui_handle_aux_double(pj_ui_context_t *ctx)
         ctx->time_command.alert_id = ctx->active_alert.id;
         return 1;
     }
+    if (ctx->state == PJ_UI_STATE_HOME) {
+        if (ctx->record_state != PJ_RECORD_IDLE || ctx->playback_state != PJ_PLAYBACK_IDLE) {
+            return 0;
+        }
+        if (ctx->focus_index == 0) {
+            ctx->record_state = PJ_RECORD_ACTIVE;
+            ctx->recording_seconds = 0;
+            set_state(ctx, PJ_UI_STATE_RECORD);
+            return 1;
+        }
+        tile_t tiles[PJ_HOME_MAX_SLOTS];
+        size_t count = home_tiles(ctx, tiles);
+        if ((size_t)ctx->focus_index < count) {
+            set_state(ctx, tiles[ctx->focus_index].next);
+            return 1;
+        }
+        return 0;
+    }
     if (focus_count(ctx) > 1) {
         return cycle_focus(ctx);
     }
@@ -1353,6 +1369,22 @@ int pj_ui_handle_touch(pj_ui_context_t *ctx, int x, int y, pj_touch_kind_t kind)
         return 1;
     }
 
+    if (kind == PJ_TOUCH_SWIPE_LEFT &&
+        (ctx->state == PJ_UI_STATE_LISTEN || ctx->state == PJ_UI_STATE_READ)) {
+        if (ctx->note_page + 1 >= note_page_count(ctx)) return 0;
+        ctx->note_page++;
+        ctx->focus_index = ctx->note_page * notes_per_page();
+        mark_full(ctx);
+        return 1;
+    }
+    if (kind == PJ_TOUCH_SWIPE_RIGHT &&
+        (ctx->state == PJ_UI_STATE_LISTEN || ctx->state == PJ_UI_STATE_READ) &&
+        ctx->note_page > 0) {
+        ctx->note_page--;
+        ctx->focus_index = ctx->note_page * notes_per_page();
+        mark_full(ctx);
+        return 1;
+    }
     if (kind == PJ_TOUCH_LONG_PRESS || kind == PJ_TOUCH_SWIPE_RIGHT) {
         return pj_ui_handle_aux_long(ctx);
     }
@@ -1435,7 +1467,7 @@ int pj_ui_handle_touch(pj_ui_context_t *ctx, int x, int y, pj_touch_kind_t kind)
             int index = ctx->note_page * notes_per_page() + row;
             if (row >= 0 && row < notes_per_page() && index < ctx->note_count) {
                 ctx->selected_note = index;
-                ctx->focus_index = row;
+                ctx->focus_index = index;
                 ctx->note_detail_transcript = ctx->state == PJ_UI_STATE_READ;
                 set_state(ctx, PJ_UI_STATE_NOTE_DETAIL);
             }
@@ -1679,7 +1711,7 @@ static void render_scene(const pj_ui_context_t *ctx, pj_framebuffer_t *fb)
         tile_t tiles[PJ_HOME_MAX_SLOTS];
         size_t tile_count = home_tiles(ctx, tiles);
         draw_screen_header(fb, ctx->home_layout.title, 0);
-        draw_menu_rows(fb, tiles, tile_count, 0);
+        draw_menu_rows(fb, tiles, tile_count, ctx->focus_index);
         break;
     }
     case PJ_UI_STATE_NOTES:
