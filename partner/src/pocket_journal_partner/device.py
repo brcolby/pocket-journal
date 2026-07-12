@@ -68,7 +68,9 @@ class DeviceClient:
         data = None
         headers = {"Authorization": f"Bearer {self.token}"}
         if body is not None:
-            data = json.dumps(body).encode("utf-8")
+            data = json.dumps(
+                body, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+            ).encode("utf-8")
             headers["Content-Type"] = "application/json"
         req = request.Request(self._url(path), data=data, method=method, headers=headers)
         try:

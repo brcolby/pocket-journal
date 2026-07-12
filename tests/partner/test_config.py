@@ -69,6 +69,33 @@ class ConfigTests(unittest.TestCase):
 
         self.assertEqual(captured, [("Bearer pairing-token", 3.0)])
 
+    def test_http_client_serializes_compact_utf8_json(self) -> None:
+        captured: list[bytes] = []
+
+        class Response:
+            headers = {"Content-Type": "application/json"}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb) -> None:
+                _ = (exc_type, exc, tb)
+
+            def read(self) -> bytes:
+                return b"{}"
+
+        def fake_urlopen(req, timeout):
+            _ = timeout
+            captured.append(req.data)
+            return Response()
+
+        client = DeviceClient("http://127.0.0.1", "token")
+        with patch("pocket_journal_partner.device.request.urlopen", fake_urlopen):
+            client.upload_transcript("note.wav", {"text": "caf\u00e9"})
+
+        self.assertEqual(captured, ['{"text":"caf\u00e9"}'.encode("utf-8")])
+        self.assertNotIn(b"\\u00e9", captured[0])
+
     def test_http_client_rejects_unsafe_connection_configuration(self) -> None:
         for base_url, token in (
             ("device.local", "token"),

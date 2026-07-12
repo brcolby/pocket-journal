@@ -16,7 +16,7 @@ from .home_design import normalize_home_design
 from .operations import DeviceSession
 from .storage import PartnerStore
 from .sync import sync_device_audio
-from .transcription import backend_from_name
+from .transcription import FakeTranscriptionBackend, backend_from_name
 
 
 def _print_json(payload) -> None:
@@ -107,9 +107,30 @@ def cmd_sync(args: argparse.Namespace) -> int:
     backend = backend_from_name(args.backend)
     session = _lan_session_from_args(args)
     session.require("audio.sync")
-    results = sync_device_audio(session.device_id, session.client, store, backend)  # type: ignore[arg-type]
-    _print_json(session.envelope({"synced": results, "count": len(results)}))
-    return 0
+    upload_transcripts = not isinstance(backend, FakeTranscriptionBackend) or bool(
+        getattr(args, "allow_fake_upload", False)
+    )
+    results = sync_device_audio(
+        session.device_id,
+        session.client,
+        store,
+        backend,  # type: ignore[arg-type]
+        upload_transcripts=upload_transcripts,
+        reprocess_synced=getattr(args, "reprocess", False),
+    )
+    uploaded_count = sum(result.get("status") == "uploaded" for result in results)
+    failed_count = sum(result.get("status") == "failed" for result in results)
+    transcribed_count = sum(result.get("status") == "transcribed" for result in results)
+    _print_json(session.envelope({
+        "results": results,
+        "count": len(results),
+        "synced": results,
+        "uploaded_count": uploaded_count,
+        "failed_count": failed_count,
+        "transcribed_count": transcribed_count,
+        "dry_run": not upload_transcripts,
+    }))
+    return 1 if failed_count else 0
 
 
 def cmd_calendar_sync(args: argparse.Namespace) -> int:
@@ -456,6 +477,8 @@ def build_parser() -> argparse.ArgumentParser:
     sync.add_argument("--base-url")
     sync.add_argument("--token", help="override the stored LAN bearer token")
     sync.add_argument("--backend", choices=["fake", "hf"], default="hf")
+    sync.add_argument("--allow-fake-upload", action="store_true", help=argparse.SUPPRESS)
+    sync.add_argument("--reprocess", action="store_true", help="reprocess notes already marked synced")
     sync.add_argument("--data-dir")
     sync.set_defaults(func=cmd_sync)
 
