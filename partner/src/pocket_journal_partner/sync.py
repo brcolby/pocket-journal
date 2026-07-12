@@ -12,8 +12,8 @@ from .storage import PartnerStore
 from .transcription import TranscriptionBackend, inspect_wav
 
 
-JOB_SCHEMA_VERSION = 1
-TRANSCRIPT_SCHEMA_VERSION = 1
+JOB_SCHEMA_VERSION = 2
+TRANSCRIPT_SCHEMA_VERSION = 2
 DEVICE_TRANSCRIPT_SCHEMA_VERSION = 1
 DEVICE_TRANSCRIPT_MAX_BYTES = 60 * 1024
 
@@ -33,6 +33,7 @@ def _new_job(device_id: str, audio_id: str, filename: str) -> dict[str, Any]:
         "item_identity": None,
         "source": None,
         "transcription_fingerprint": None,
+        "cache_key": None,
         "last_error": None,
         "updated_at": _now(),
     }
@@ -77,11 +78,13 @@ def _transcript_matches(
     if not isinstance(transcript.get("text"), str) or not transcript["text"].strip():
         return False
     sync_metadata = transcript.get("sync")
+    cache_key = _cache_key(source, fingerprint)
     return (
         isinstance(sync_metadata, dict)
         and sync_metadata.get("schema_version") == TRANSCRIPT_SCHEMA_VERSION
         and sync_metadata.get("source") == source
         and sync_metadata.get("transcription_fingerprint") == fingerprint
+        and sync_metadata.get("cache_key") == cache_key
     )
 
 
@@ -101,6 +104,7 @@ def _prepare_transcript(
         "schema_version": TRANSCRIPT_SCHEMA_VERSION,
         "source": source,
         "transcription_fingerprint": fingerprint,
+        "cache_key": _cache_key(source, fingerprint),
     }
     return prepared
 
@@ -113,6 +117,34 @@ def _json_bytes(payload: dict[str, Any]) -> bytes:
 
 def _fingerprint_digest(fingerprint: dict[str, Any]) -> str:
     return hashlib.sha256(_json_bytes(fingerprint)).hexdigest()
+
+
+def _cache_key(source: dict[str, Any], fingerprint: dict[str, Any]) -> str:
+    identity = {
+        "source": {
+            "sha256": source["sha256"],
+            "bytes": source["bytes"],
+        },
+        "transcription_fingerprint": fingerprint,
+    }
+    return hashlib.sha256(_json_bytes(identity)).hexdigest()
+
+
+def _verified_cached_source(
+    store: PartnerStore, device_id: str, item: Any
+) -> dict[str, Any] | None:
+    path = store.audio_path(device_id, item.audio_id, item.filename)
+    if not path.exists():
+        return None
+    try:
+        metadata = inspect_wav(path)
+    except (OSError, ValueError):
+        return None
+    if item.size is not None and metadata["bytes"] != item.size:
+        return None
+    if item.data_bytes is not None and metadata["data_bytes"] != item.data_bytes:
+        return None
+    return _source_identity(metadata)
 
 
 def _device_transcript_payload(
@@ -267,17 +299,19 @@ def sync_device_audio(
                 completed_source = (
                     completed_job.get("source") if isinstance(completed_job, dict) else None
                 )
+                cached_source = _verified_cached_source(store, device_id, item)
                 if not reprocess_synced and (
                     isinstance(completed_job, dict)
                     and completed_job.get("audio_id") == item.audio_id
                     and completed_job.get("stage") == "uploaded"
                     and isinstance(completed_source, dict)
-                    and _transcript_matches(completed_transcript, completed_source, fingerprint)
+                    and cached_source == completed_source
+                    and _transcript_matches(completed_transcript, cached_source, fingerprint)
                 ):
                     completed_job["last_error"] = None
                     _save_job(store, device_id, item.audio_id, completed_job)
                     continue
-                if not reprocess_synced:
+                if not reprocess_synced and not isinstance(completed_job, dict):
                     continue
 
             job = _load_job(store, device_id, item.audio_id, item.filename)
@@ -290,6 +324,7 @@ def sync_device_audio(
             job["stage"] = "discovered"
             job["source"] = None
             job["transcription_fingerprint"] = None
+            job["cache_key"] = None
             job["last_error"] = None
             operation = "save_job"
             _save_job(store, device_id, item.audio_id, job)
@@ -305,6 +340,7 @@ def sync_device_audio(
             source = _source_identity(audio_metadata)
             job["stage"] = "audio_verified"
             job["source"] = source
+            job["cache_key"] = _cache_key(source, fingerprint)
             _save_job(store, device_id, item.audio_id, job)
 
             operation = "transcribe"
