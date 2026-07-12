@@ -22,7 +22,10 @@ Last synchronized with `bd human list`: 2026-07-12.
   - Exercise primary screens, touch targets, rapid navigation, wake, and repeated partial refreshes.
   - Record stale pixels, clipping, missed touches, ghosting, and approximate refresh latency.
 - [ ] **Editorial UI redesign** (`pocket-journal-nz5`)
-  - Inspect mixed-case headers, restrained rules, inverted focus rows, large time values, and compact action strips for physical legibility.
+  - Confirm Static shows only the placeholder notebook splash art, with no clock or status text.
+  - Confirm Time/Temp uses the full display for the enlarged clock, date, temperature, and battery without clipping or stale pixels.
+  - Confirm every child screen has a reliable on-screen back chevron as an alternative to AUX long/back, and no title text beside it.
+  - Inspect the icon-only Notes, Time, and Settings grids plus icon-only play/pause/reset/volume controls for physical legibility and unambiguous meaning.
   - On Home, short-press cycles destinations and double-press activates the focused secondary destination; focus-zero double-press remains quick record.
   - In Notes, Time, and Settings, double-press cycles visible focus, short-press activates, and long-press returns to the immediate parent.
   - Verify record elapsed time, wrapped transcript preview, tappable Play, alert dismiss/snooze, long Home-title ellipsis, and note paging beyond four items.

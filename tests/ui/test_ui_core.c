@@ -82,7 +82,7 @@ static void test_state_graph(void)
     assert(pj_ui_handle_touch(&ui, 20, 50, PJ_TOUCH_TAP) == 1);
     assert(pj_ui_current_state(&ui) == PJ_UI_STATE_NOTES);
 
-    assert(pj_ui_handle_touch(&ui, 20, 120, PJ_TOUCH_TAP) == 1);
+    assert(pj_ui_handle_touch(&ui, 40, 150, PJ_TOUCH_TAP) == 1);
     assert(pj_ui_current_state(&ui) == PJ_UI_STATE_LISTEN);
 
     assert(pj_ui_handle_touch(&ui, 20, 50, PJ_TOUCH_TAP) == 1);
@@ -554,7 +554,7 @@ static void test_settings_volume_opens_dedicated_screen(void)
     ui.state = PJ_UI_STATE_SETTINGS;
     ui.volume = 4;
 
-    assert(pj_ui_handle_touch(&ui, 100, 90, PJ_TOUCH_TAP) == 1);
+    assert(pj_ui_handle_touch(&ui, 150, 70, PJ_TOUCH_TAP) == 1);
     assert(pj_ui_current_state(&ui) == PJ_UI_STATE_VOLUME);
     assert(ui.volume == 4);
 }
@@ -962,6 +962,7 @@ static void test_back_affordance_is_visible_on_child_screens(void)
     ui.state = PJ_UI_STATE_TIMER;
     pj_ui_render(&ui, &fb);
     assert(count_black_pixels_in_region(&fb, 8, 6, 24, 24) > 0);
+    assert(count_black_pixels_in_region(&fb, 44, 0, 146, 30) == 0);
     assert(pj_ui_handle_touch(&ui, 16, 16, PJ_TOUCH_TAP) == 1);
     assert(ui.state == PJ_UI_STATE_TIME);
 }
@@ -970,12 +971,17 @@ static void test_static_art_render_and_fallback(void)
 {
     pj_ui_context_t ui;
     pj_framebuffer_t fallback;
+    pj_framebuffer_t fallback_after_clock_change;
     pj_framebuffer_t custom;
     uint8_t pixels[PJ_FRAMEBUFFER_BYTES] = {0};
     pj_ui_init(&ui);
 
     pj_ui_render(&ui, &fallback);
     assert(count_black_pixels(&fallback) > 10);
+    pj_ui_set_time(&ui, 23, 59, 2030, 12, 31);
+    pj_ui_set_status(&ui, 7, -4);
+    pj_ui_render(&ui, &fallback_after_clock_change);
+    assert(memcmp(&fallback, &fallback_after_clock_change, sizeof(fallback)) == 0);
 
     size_t first = (size_t)4 * PJ_DISPLAY_WIDTH + 3;
     size_t second = (size_t)199 * PJ_DISPLAY_WIDTH + 199;
