@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+import hashlib
 import multiprocessing
 from pathlib import Path
 from tempfile import TemporaryDirectory
+import threading
 import unittest
 from unittest.mock import patch
+from urllib.parse import quote
 
 from pocket_journal_partner.storage import PartnerStore
 
@@ -16,6 +19,12 @@ def _save_job_in_process(root: str, value: int) -> None:
 
 def _visible_items(path: Path) -> list[Path]:
     return [item for item in path.iterdir() if item.name != ".locks"]
+
+
+def _legacy_component(value: str) -> str:
+    encoded = quote(value, safe="")
+    digest = hashlib.sha256(value.encode("utf-8", "surrogatepass")).hexdigest()[:16]
+    return f"{digest}-{encoded or '%EMPTY'}"
 
 
 class StoragePathTests(unittest.TestCase):
@@ -109,6 +118,40 @@ class StoragePathTests(unittest.TestCase):
                 store.job_path("device", common + "x"),
                 store.job_path("device", common + "y"),
             )
+
+    def test_prior_cache_paths_are_migrated_and_remain_visible(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = PartnerStore(root)
+            device_component = _legacy_component("device")
+            audio_component = _legacy_component("audio")
+            legacy_audio = (
+                root
+                / "audio"
+                / device_component
+                / f"{len(audio_component)}-{audio_component}.wav"
+            )
+            legacy_job = root / "jobs" / device_component / f"{audio_component}.json"
+            legacy_transcript = (
+                root / "transcripts" / device_component / f"{audio_component}.json"
+            )
+            legacy_audio.parent.mkdir(parents=True)
+            legacy_job.parent.mkdir(parents=True)
+            legacy_transcript.parent.mkdir(parents=True)
+            legacy_audio.write_bytes(b"old audio")
+            legacy_job.write_text('{"state": "downloaded"}', encoding="utf-8")
+            legacy_transcript.write_text('{"text": "cached"}', encoding="utf-8")
+
+            audio_path = store.audio_path("device", "audio", "recording.wav")
+
+            self.assertEqual(audio_path.read_bytes(), b"old audio")
+            self.assertEqual(store.load_job("device", "audio"), {"state": "downloaded"})
+            self.assertEqual(store.load_transcript("device", "audio"), {"text": "cached"})
+            self.assertFalse(legacy_audio.exists())
+            self.assertFalse(legacy_job.exists())
+            self.assertFalse(legacy_transcript.exists())
+            self.assertTrue(store.job_path("device", "audio").exists())
+            self.assertTrue(store.transcript_path("device", "audio").exists())
 
 
 class JsonStorageTests(unittest.TestCase):
@@ -229,6 +272,40 @@ class JsonStorageTests(unittest.TestCase):
                     store.save_job("device", "audio", {"state": "new"})
 
             self.assertEqual(store.load_job("device", "audio"), {"state": "old"})
+
+    def test_workflow_lock_serializes_holders_and_allows_json_saves(self) -> None:
+        with TemporaryDirectory() as tmp:
+            store = PartnerStore(Path(tmp))
+            first_acquired = threading.Event()
+            release_first = threading.Event()
+            second_acquired = threading.Event()
+
+            def first_holder() -> None:
+                with store.workflow_lock("device", "audio"):
+                    store.save_job("device", "audio", {"holder": "first"})
+                    first_acquired.set()
+                    self.assertTrue(release_first.wait(5))
+
+            def second_holder() -> None:
+                self.assertTrue(first_acquired.wait(5))
+                with store.workflow_lock("device", "audio"):
+                    second_acquired.set()
+                    store.save_job("device", "audio", {"holder": "second"})
+
+            first = threading.Thread(target=first_holder)
+            second = threading.Thread(target=second_holder)
+            first.start()
+            second.start()
+            self.assertTrue(first_acquired.wait(5))
+            self.assertFalse(second_acquired.wait(0.1))
+            release_first.set()
+            first.join(5)
+            second.join(5)
+
+            self.assertFalse(first.is_alive())
+            self.assertFalse(second.is_alive())
+            self.assertTrue(second_acquired.is_set())
+            self.assertEqual(store.load_job("device", "audio"), {"holder": "second"})
 
 
 if __name__ == "__main__":

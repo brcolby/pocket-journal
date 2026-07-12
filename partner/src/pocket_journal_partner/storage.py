@@ -44,6 +44,19 @@ def _audio_filename(audio_id: str, filename: str) -> str:
     return f"{encoded_id[:stem_length]}{safe_suffix}"
 
 
+def _legacy_path_component(value: str) -> str:
+    encoded = quote(value, safe="")
+    digest = hashlib.sha256(value.encode("utf-8", "surrogatepass")).hexdigest()[:16]
+    return f"{digest}-{encoded or '%EMPTY'}"
+
+
+def _legacy_audio_filename(audio_id: str, filename: str) -> str:
+    encoded_id = _legacy_path_component(audio_id)
+    suffix = Path(filename).suffix
+    safe_suffix = suffix if _SAFE_SUFFIX.fullmatch(suffix) else ""
+    return f"{len(encoded_id)}-{encoded_id}{safe_suffix}"
+
+
 def _thread_lock(path: Path) -> threading.Lock:
     key = os.path.abspath(os.fspath(path))
     with _thread_locks_guard:
@@ -51,12 +64,8 @@ def _thread_lock(path: Path) -> threading.Lock:
 
 
 @contextmanager
-def _item_lock(path: Path):
-    """Serialize a persisted item across threads and local processes."""
-    lock_dir = path.parent / ".locks"
-    lock_dir.mkdir(parents=True, exist_ok=True)
-    lock_name = hashlib.sha256(path.name.encode("utf-8")).hexdigest() + ".lock"
-    lock_path = lock_dir / lock_name
+def _file_lock(lock_path: Path):
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
     local_lock = _thread_lock(lock_path)
     with local_lock, lock_path.open("a+b") as handle:
         if os.name == "nt":
@@ -78,6 +87,23 @@ def _item_lock(path: Path):
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
+@contextmanager
+def _item_lock(path: Path):
+    """Serialize a persisted item across threads and local processes."""
+    lock_name = hashlib.sha256(path.name.encode("utf-8")).hexdigest() + ".lock"
+    with _file_lock(path.parent / ".locks" / lock_name):
+        yield
+
+
+def _migrate_legacy_file(legacy_path: Path, path: Path) -> None:
+    if path.exists() or not legacy_path.exists():
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with _item_lock(path):
+        if not path.exists() and legacy_path.exists():
+            legacy_path.replace(path)
+
+
 class PartnerStore:
     def __init__(self, root: Path | None = None) -> None:
         self.root = root or default_data_dir()
@@ -86,21 +112,53 @@ class PartnerStore:
         return self.root / "audio" / _path_component(device_id)
 
     def audio_path(self, device_id: str, audio_id: str, filename: str) -> Path:
-        return self.audio_dir(device_id) / _audio_filename(audio_id, filename)
+        path = self.audio_dir(device_id) / _audio_filename(audio_id, filename)
+        legacy_path = (
+            self.root
+            / "audio"
+            / _legacy_path_component(device_id)
+            / _legacy_audio_filename(audio_id, filename)
+        )
+        _migrate_legacy_file(legacy_path, path)
+        return path
 
     def transcript_dir(self, device_id: str) -> Path:
         return self.root / "transcripts" / _path_component(device_id)
 
     def transcript_path(self, device_id: str, audio_id: str) -> Path:
         component = _path_component(audio_id)
-        return self.transcript_dir(device_id) / f"{component[:_MAX_COMPONENT_LENGTH - 5]}.json"
+        path = self.transcript_dir(device_id) / f"{component[:_MAX_COMPONENT_LENGTH - 5]}.json"
+        legacy_path = (
+            self.root
+            / "transcripts"
+            / _legacy_path_component(device_id)
+            / f"{_legacy_path_component(audio_id)}.json"
+        )
+        _migrate_legacy_file(legacy_path, path)
+        return path
 
     def job_dir(self, device_id: str) -> Path:
         return self.root / "jobs" / _path_component(device_id)
 
     def job_path(self, device_id: str, audio_id: str) -> Path:
         component = _path_component(audio_id)
-        return self.job_dir(device_id) / f"{component[:_MAX_COMPONENT_LENGTH - 5]}.json"
+        path = self.job_dir(device_id) / f"{component[:_MAX_COMPONENT_LENGTH - 5]}.json"
+        legacy_path = (
+            self.root
+            / "jobs"
+            / _legacy_path_component(device_id)
+            / f"{_legacy_path_component(audio_id)}.json"
+        )
+        _migrate_legacy_file(legacy_path, path)
+        return path
+
+    @contextmanager
+    def workflow_lock(self, device_id: str, audio_id: str):
+        """Serialize one audio item's complete sync workflow."""
+        identity = json.dumps([device_id, audio_id], ensure_ascii=True, separators=(",", ":"))
+        lock_name = hashlib.sha256(identity.encode("ascii")).hexdigest() + ".lock"
+        with _file_lock(self.root / ".workflow-locks" / lock_name):
+            yield
 
     def save_transcript(self, device_id: str, audio_id: str, transcript: dict[str, Any]) -> Path:
         path = self.transcript_path(device_id, audio_id)
