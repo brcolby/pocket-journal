@@ -4,7 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Pocket Journal Simulator</title>
-    <link rel="stylesheet" href="src/styles.css?v=firmware-wasm-1">
+    <link rel="stylesheet" href="src/styles.css?v=review-shell-1">
   </head>
   <body>
     <header class="topbar">
@@ -12,7 +12,7 @@
         <h1>Pocket Journal</h1>
         <p>Firmware simulator</p>
       </div>
-      <span class="runtime-status"><i aria-hidden="true"></i>Local runtime</span>
+      <span class="runtime-status"><i aria-hidden="true"></i>Firmware WASM</span>
     </header>
     <main class="app">
       <section class="device" aria-label="Simulated Pocket Journal device">
@@ -27,23 +27,59 @@
           <button id="simPowerButton" type="button" title="Power button"><b>D</b><span>POWER</span></button>
         </div>
       </section>
-      <aside class="panel">
+      <aside class="panel" aria-label="Review controls">
         <div class="panel-heading">
           <div class="status">
             <span>State</span>
             <strong id="stateName">static</strong>
           </div>
-          <div class="controls" aria-label="Simulator controls">
+          <div class="controls" aria-label="Runtime controls">
             <button id="powerButton" type="button" title="Toggle power" aria-label="Toggle power">&#9211;</button>
             <button id="resetButton" type="button" title="Reset simulator" aria-label="Reset simulator">&#8635;</button>
-            <button id="bootButton" type="button" title="Press auxiliary button" aria-label="Press auxiliary button">A</button>
+            <button id="bootButton" type="button" title="Press AUX" aria-label="Press AUX">A</button>
             <button id="debugDumpButton" type="button" title="Flush debug log" aria-label="Flush debug log">LOG</button>
           </div>
         </div>
+        <section class="review-panel" aria-labelledby="reviewHeading">
+          <div class="section-heading">
+            <h2 id="reviewHeading">Review view</h2>
+            <button id="captureButton" class="compact-button" type="button" title="Save display PNG">PNG</button>
+          </div>
+          <label for="viewPicker">Screen</label>
+          <div class="view-picker-row">
+            <select id="viewPicker">
+              <option value="static">Resting</option>
+              <option value="time_temp">Clock</option>
+              <option value="home">Home</option>
+              <option value="notes">Notes</option>
+              <option value="record">Record</option>
+              <option value="listen">Listen</option>
+              <option value="read">Read</option>
+              <option value="time">Time tools</option>
+              <option value="alarm">Alarm</option>
+              <option value="stopwatch">Stopwatch</option>
+              <option value="timer">Timer</option>
+              <option value="interval">Interval</option>
+              <option value="settings">Settings</option>
+              <option value="sync">Sync</option>
+              <option value="volume">Volume</option>
+            </select>
+            <button id="openViewButton" type="button">Open</button>
+          </div>
+        </section>
         <div class="action-status">
           <span>Last input</span>
           <strong id="actionLine">ready</strong>
         </div>
+        <section class="key-panel" aria-labelledby="keyHeading">
+          <h2 id="keyHeading">Hardware keys</h2>
+          <dl>
+            <div><dt><kbd>A</kbd></dt><dd>AUX short; press twice for double</dd></div>
+            <div><dt><kbd>Shift</kbd> + <kbd>A</kbd></dt><dd>AUX long</dd></div>
+            <div><dt><kbd>D</kbd></dt><dd>Power / wake</dd></div>
+            <div><dt><kbd>R</kbd></dt><dd>Reset</dd></div>
+          </dl>
+        </section>
         <section class="history-panel">
           <h2>Activity</h2>
           <ol id="history"></ol>

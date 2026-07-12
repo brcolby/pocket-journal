@@ -15,6 +15,9 @@ const bootButton = document.querySelector("#bootButton");
 const simAuxButton = document.querySelector("#simAuxButton");
 const simPowerButton = document.querySelector("#simPowerButton");
 const debugDumpButton = document.querySelector("#debugDumpButton");
+const viewPicker = document.querySelector("#viewPicker");
+const openViewButton = document.querySelector("#openViewButton");
+const captureButton = document.querySelector("#captureButton");
 
 const WASM_MODULE_URL = "../generated/pj_ui_wasm.js?v=firmware-wasm-1";
 const DEBUG_LOG_KEY = "pocketJournalSimulatorDebugLog";
@@ -31,6 +34,24 @@ let auxPressStartedAt = 0;
 let auxPressPointerId = null;
 const visited = [];
 const debugLog = loadDebugLog();
+
+const REVIEW_ROUTES = {
+  static: [],
+  time_temp: ["wake"],
+  home: ["wake", "aux"],
+  notes: ["wake", "aux", [20, 30]],
+  record: ["wake", "aux", [20, 30], [20, 30]],
+  listen: ["wake", "aux", [20, 30], [20, 130]],
+  read: ["wake", "aux", [20, 30], [130, 130]],
+  time: ["wake", "aux", [150, 30]],
+  alarm: ["wake", "aux", [150, 30], [30, 30]],
+  stopwatch: ["wake", "aux", [150, 30], [150, 30]],
+  timer: ["wake", "aux", [150, 30], [30, 130]],
+  interval: ["wake", "aux", [150, 30], [150, 130]],
+  settings: ["wake", "aux", [30, 150]],
+  sync: ["wake", "aux", [30, 150], [30, 30]],
+  volume: ["wake", "aux", [30, 150], [150, 30]],
+};
 
 window.__pocketJournalSimulatorModuleLoaded = true;
 
@@ -264,6 +285,9 @@ function paintFirmwareFramebuffer(action = "render") {
   copyFirmwareFramebuffer(region);
   ctx.putImageData(framebufferImage, 0, 0, region.x, region.y, region.width, region.height);
   stateName.textContent = state;
+  if (viewPicker && Object.hasOwn(REVIEW_ROUTES, state)) {
+    viewPicker.value = state;
+  }
   powerButton.setAttribute("aria-pressed", state === "static" ? "false" : "true");
   powerButton.title = state === "static" ? "Power on" : "Power off";
   history.dataset.dirtyRegion = JSON.stringify(dirty);
@@ -336,6 +360,36 @@ function resetSimulator() {
     seedDynamicContent();
     return 1;
   });
+}
+
+function openReviewView(name) {
+  const route = REVIEW_ROUTES[name];
+  if (!api || !route) {
+    logAction(`view ${name}: unavailable`);
+    return;
+  }
+  cancelPendingAuxShort();
+  api.reset();
+  seedDynamicContent();
+  for (const step of route) {
+    if (step === "wake") {
+      api.wake();
+    } else if (step === "aux") {
+      api.auxShort();
+    } else {
+      api.touchTap(step[0], step[1]);
+    }
+  }
+  paintFirmwareFramebuffer(`review ${name}`);
+  logAction(`opened ${stateLabel()} through firmware inputs`);
+}
+
+function captureDisplay() {
+  const link = document.createElement("a");
+  link.download = `pocket-journal-${stateLabel()}.png`;
+  link.href = canvas.toDataURL("image/png");
+  link.click();
+  logAction(`captured ${stateLabel()} display`);
 }
 
 function seedDynamicContent() {
@@ -437,7 +491,12 @@ window.addEventListener("keydown", (event) => {
     return;
   }
   const key = event.key.toLowerCase();
-  if (key === "a" && !event.repeat) {
+  if (key === "a" && event.shiftKey && !event.repeat) {
+    event.preventDefault();
+    traceDebug("event.keydown", { key, mappedTo: "aux-long" });
+    cancelPendingAuxShort();
+    handleAuxLong("Shift+A key");
+  } else if (key === "a" && !event.repeat) {
     event.preventDefault();
     traceDebug("event.keydown", { key, mappedTo: "aux" });
     scheduleAuxShort("A key");
@@ -445,8 +504,16 @@ window.addEventListener("keydown", (event) => {
     event.preventDefault();
     traceDebug("event.keydown", { key, mappedTo: "power" });
     handlePowerToggle("D key");
+  } else if (key === "r" && !event.repeat) {
+    event.preventDefault();
+    traceDebug("event.keydown", { key, mappedTo: "reset" });
+    resetSimulator();
   }
 });
+
+openViewButton?.addEventListener("click", () => openReviewView(viewPicker.value));
+viewPicker?.addEventListener("change", () => openReviewView(viewPicker.value));
+captureButton?.addEventListener("click", captureDisplay);
 
 debugDumpButton?.addEventListener("click", () => {
   traceDebug("event.debug_flush.click");
