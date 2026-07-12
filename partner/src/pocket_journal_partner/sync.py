@@ -9,13 +9,17 @@ import tempfile
 
 from .device import DeviceClient
 from .storage import PartnerStore
-from .transcription import TranscriptionBackend, inspect_wav
+from .transcription import FakeTranscriptionBackend, TranscriptionBackend, inspect_wav
 
 
 JOB_SCHEMA_VERSION = 2
 TRANSCRIPT_SCHEMA_VERSION = 2
 DEVICE_TRANSCRIPT_SCHEMA_VERSION = 1
 DEVICE_TRANSCRIPT_MAX_BYTES = 60 * 1024
+
+
+class PermanentAudioError(ValueError):
+    pass
 
 
 def _now() -> str:
@@ -144,6 +148,9 @@ def _verified_cached_source(
         return None
     if item.data_bytes is not None and metadata["data_bytes"] != item.data_bytes:
         return None
+    expected_sha256 = getattr(item, "source_sha256", None)
+    if expected_sha256 is not None and metadata["sha256"] != expected_sha256:
+        return None
     return _source_identity(metadata)
 
 
@@ -186,12 +193,23 @@ def _download_and_inspect(
             metadata = None
         if metadata is not None and item.size is not None and metadata["bytes"] != item.size:
             metadata = None
+        expected_sha256 = getattr(item, "source_sha256", None)
+        if metadata is not None and expected_sha256 is not None:
+            if metadata["sha256"] != expected_sha256:
+                metadata = None
 
     if metadata is None:
         audio_path.parent.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(prefix=".download-", dir=audio_path.parent) as tmp:
             downloaded = client.download_audio(item, Path(tmp))
-            metadata = inspect_wav(downloaded)
+            downloaded_sha256 = hashlib.sha256(downloaded.read_bytes()).hexdigest()
+            try:
+                metadata = inspect_wav(downloaded)
+            except ValueError as error:
+                expected_sha256 = getattr(item, "source_sha256", None)
+                if expected_sha256 is not None and downloaded_sha256 == expected_sha256:
+                    raise PermanentAudioError(str(error)) from error
+                raise
             if item.size is not None and metadata["bytes"] != item.size:
                 raise ValueError(
                     f"downloaded WAV size mismatch: expected {item.size} bytes, "
@@ -201,6 +219,12 @@ def _download_and_inspect(
                 raise ValueError(
                     "downloaded WAV data length mismatch: "
                     f"expected {item.data_bytes} bytes, got {metadata['data_bytes']}"
+                )
+            expected_sha256 = getattr(item, "source_sha256", None)
+            if expected_sha256 is not None and metadata["sha256"] != expected_sha256:
+                raise ValueError(
+                    "downloaded WAV digest mismatch: "
+                    f"expected {expected_sha256}, got {metadata['sha256']}"
                 )
             downloaded.replace(audio_path)
 
@@ -226,6 +250,8 @@ def _failure_result(
 ) -> dict[str, Any]:
     message = str(error).strip() or error.__class__.__name__
     retryable = operation != "prepare_upload"
+    if isinstance(error, PermanentAudioError):
+        retryable = False
     if operation == "transcribe" and isinstance(error, ValueError):
         retryable = False
     job["last_error"] = {
@@ -255,6 +281,7 @@ def _item_identity(item: Any) -> dict[str, Any]:
         "filename": item.filename,
         "size": item.size,
         "data_bytes": item.data_bytes,
+        "source_sha256": getattr(item, "source_sha256", None),
     }
 
 
@@ -288,6 +315,8 @@ def sync_device_audio(
     reprocess_synced: bool = False,
 ) -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
+    if isinstance(backend, FakeTranscriptionBackend):
+        upload_transcripts = False
     fingerprint = backend.fingerprint()
     for item in client.list_audio():
         job = _new_job(device_id, item.audio_id, item.filename)

@@ -7,6 +7,7 @@ from io import StringIO
 from types import SimpleNamespace
 from unittest.mock import patch
 import json
+import hashlib
 import struct
 import unittest
 
@@ -14,6 +15,7 @@ from pocket_journal_partner import cli
 from pocket_journal_partner.device import AudioItem
 from pocket_journal_partner.storage import PartnerStore
 from pocket_journal_partner.sync import DEVICE_TRANSCRIPT_MAX_BYTES, sync_device_audio
+from pocket_journal_partner.transcription import FakeTranscriptionBackend
 
 
 def wav_bytes(samples: bytes = b"\x00\x00\x01\x00") -> bytes:
@@ -224,6 +226,26 @@ class SyncTests(unittest.TestCase):
         self.assertNotEqual(first[0]["source_sha256"], second[0]["source_sha256"])
         self.assertEqual(client.uploaded, ["note.wav", "note.wav"])
 
+    def test_device_digest_detects_same_size_remote_source_mutation(self) -> None:
+        first_payload = wav_bytes()
+        second_payload = wav_bytes(b"\x02\x00\x03\x00")
+        item = AudioItem("note.wav", "note.wav", size=len(first_payload), data_bytes=4)
+        item.source_sha256 = hashlib.sha256(first_payload).hexdigest()  # type: ignore[attr-defined]
+        with TemporaryDirectory() as tmp:
+            client = FakeClient([item])
+            client.payloads["note.wav"] = first_payload
+            store = PartnerStore(Path(tmp))
+            backend = FakeBackend()
+            first = sync_device_audio("pj-test", client, store, backend)  # type: ignore[arg-type]
+            item.synced = True
+            client.payloads["note.wav"] = second_payload
+            item.source_sha256 = hashlib.sha256(second_payload).hexdigest()  # type: ignore[attr-defined]
+            second = sync_device_audio("pj-test", client, store, backend)  # type: ignore[arg-type]
+
+        self.assertEqual(client.downloaded, ["note.wav", "note.wav"])
+        self.assertEqual(backend.calls, 2)
+        self.assertNotEqual(first[0]["source_sha256"], second[0]["source_sha256"])
+
     def test_identical_synced_prior_upload_is_idempotent(self) -> None:
         payload = wav_bytes()
         item = AudioItem("note.wav", "note.wav", size=len(payload), data_bytes=4)
@@ -283,6 +305,16 @@ class SyncTests(unittest.TestCase):
         self.assertEqual(job["stage"], "transcribed")  # type: ignore[index]
         self.assertEqual(client.uploaded, [])
 
+    def test_real_fake_backend_is_always_local_only(self) -> None:
+        with TemporaryDirectory() as tmp:
+            client = FakeClient()
+            results = sync_device_audio(  # type: ignore[arg-type]
+                "pj-test", client, PartnerStore(Path(tmp)), FakeTranscriptionBackend()
+            )
+
+        self.assertEqual(results[0]["status"], "transcribed")
+        self.assertEqual(client.uploaded, [])
+
     def test_changed_same_size_audio_invalidates_cached_transcript(self) -> None:
         with TemporaryDirectory() as tmp:
             client = FakeClient()
@@ -332,6 +364,20 @@ class SyncTests(unittest.TestCase):
         self.assertNotIn("cached", second[0])
         self.assertEqual(client.downloaded, ["bad.wav", "bad.wav"])
         self.assertEqual(job["attempt_count"], 2)  # type: ignore[index]
+
+    def test_advertised_invalid_source_is_cached_as_permanent(self) -> None:
+        item = AudioItem("bad.wav", "bad.wav", size=4, data_bytes=0)
+        item.source_sha256 = hashlib.sha256(b"RIFF").hexdigest()  # type: ignore[attr-defined]
+        with TemporaryDirectory() as tmp:
+            client = FakeClient([item])
+            client.payloads["bad.wav"] = b"RIFF"
+            store = PartnerStore(Path(tmp))
+            first = sync_device_audio("pj-test", client, store, FakeBackend())  # type: ignore[arg-type]
+            second = sync_device_audio("pj-test", client, store, FakeBackend())  # type: ignore[arg-type]
+
+        self.assertFalse(first[0]["retryable"])
+        self.assertTrue(second[0]["cached"])
+        self.assertEqual(client.downloaded, ["bad.wav"])
 
     def test_initial_job_save_failure_does_not_block_later_items(self) -> None:
         class SelectiveFailStore(PartnerStore):
