@@ -6866,10 +6866,15 @@ static esp_err_t transcript_put_handler(httpd_req_t *req)
         drain_body(req);
         return send_json(req, "{\"error\":\"audio not found\"}");
     }
-    if (req->content_len <= 0 || req->content_len > (int)PJ_TRANSCRIPT_MAX_BODY_BYTES) {
+    if (req->content_len <= 0) {
         drain_body(req);
         httpd_resp_set_status(req, "400 Bad Request");
-        return send_json(req, "{\"error\":\"invalid transcript body\"}");
+        return send_json(req, "{\"error\":\"transcript body is required\"}");
+    }
+    if (req->content_len > (int)PJ_TRANSCRIPT_MAX_BODY_BYTES) {
+        drain_body(req);
+        httpd_resp_set_status(req, "413 Payload Too Large");
+        return send_json(req, "{\"error\":\"transcript body exceeds 65536 bytes\"}");
     }
     char *body = malloc((size_t)req->content_len + 1u);
     if (body == NULL) {
@@ -6880,9 +6885,19 @@ static esp_err_t transcript_put_handler(httpd_req_t *req)
     if (!read_body(req, body, (size_t)req->content_len + 1u)) {
         free(body);
         httpd_resp_set_status(req, "400 Bad Request");
-        return send_json(req, "{\"error\":\"invalid transcript body\"}");
+        return send_json(req, "{\"error\":\"incomplete transcript body\"}");
     }
-    cJSON *json = cJSON_Parse(body);
+    if (memchr(body, '\0', (size_t)req->content_len) != NULL) {
+        free(body);
+        httpd_resp_set_status(req, "400 Bad Request");
+        return send_json(req, "{\"error\":\"malformed transcript JSON\"}");
+    }
+    cJSON *json = cJSON_ParseWithLengthOpts(body, (size_t)req->content_len + 1u, NULL, true);
+    if (json == NULL) {
+        free(body);
+        httpd_resp_set_status(req, "400 Bad Request");
+        return send_json(req, "{\"error\":\"malformed transcript JSON\"}");
+    }
     cJSON *text = json == NULL ? NULL : cJSON_GetObjectItemCaseSensitive(json, "text");
     if (!cJSON_IsObject(json) || !cJSON_IsString(text) || text->valuestring == NULL ||
         text->valuestring[0] == '\0') {
@@ -6894,7 +6909,7 @@ static esp_err_t transcript_put_handler(httpd_req_t *req)
     cJSON_Delete(json);
     char path[PJ_NOTE_TRANSCRIPT_PATH_LEN];
     transcript_path_for_audio(path, sizeof(path), id + 1);
-    esp_err_t write_err = json_write_file_atomic(path, body, strlen(body));
+    esp_err_t write_err = json_write_file_atomic(path, body, (size_t)req->content_len);
     free(body);
     if (write_err == ESP_ERR_NO_MEM && g_status.storage_health == PJ_STORAGE_HEALTH_FULL) {
         httpd_resp_set_status(req, "507 Insufficient Storage");
