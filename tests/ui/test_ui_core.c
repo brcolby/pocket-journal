@@ -217,6 +217,23 @@ static void test_aux_primary_actions(void)
 {
     pj_ui_context_t ui;
     pj_ui_init(&ui);
+    ui.state = PJ_UI_STATE_HOME;
+
+    assert(pj_ui_handle_aux_short(&ui) == 1);
+    assert(pj_ui_current_state(&ui) == PJ_UI_STATE_NOTES);
+
+    assert(pj_ui_handle_aux_long(&ui) == 1);
+    assert(pj_ui_current_state(&ui) == PJ_UI_STATE_HOME);
+
+    ui.state = PJ_UI_STATE_SETTINGS;
+    assert(pj_ui_handle_aux_short(&ui) == 1);
+    assert(pj_ui_current_state(&ui) == PJ_UI_STATE_VOLUME);
+    int initial_volume = ui.volume;
+    assert(pj_ui_handle_aux_short(&ui) == 1);
+    assert(ui.volume == initial_volume + 1);
+    assert(pj_ui_handle_aux_long(&ui) == 1);
+    assert(pj_ui_current_state(&ui) == PJ_UI_STATE_SETTINGS);
+
     ui.state = PJ_UI_STATE_NOTES;
 
     assert(pj_ui_handle_aux_short(&ui) == 1);
