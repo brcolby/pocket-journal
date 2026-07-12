@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -400,7 +400,7 @@ class SyncTests(unittest.TestCase):
             {"audio_id": "bad.wav", "status": "failed", "error": "invalid WAV"},
         ]
         args = SimpleNamespace(
-            data_dir=None, backend="fake", allow_fake_upload=False, reprocess=False
+            data_dir=None, backend="fake", reprocess=False
         )
         stdout = StringIO()
         with patch("pocket_journal_partner.cli._lan_session_from_args", return_value=FakeSession()):
@@ -415,6 +415,21 @@ class SyncTests(unittest.TestCase):
         self.assertEqual(payload["result"]["synced"], results)
         self.assertEqual(payload["result"]["count"], 2)
         self.assertEqual(payload["result"]["results"], results)
+
+    def test_cli_has_no_fake_upload_escape_hatch(self) -> None:
+        parser = cli.build_parser()
+        with redirect_stderr(StringIO()):
+            with self.assertRaises(SystemExit):
+                parser.parse_args(
+                    [
+                        "sync",
+                        "--device",
+                        "pj-test",
+                        "--backend",
+                        "fake",
+                        "--allow-fake-upload",
+                    ]
+                )
 
 
 if __name__ == "__main__":
