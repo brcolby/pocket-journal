@@ -151,6 +151,14 @@ static size_t home_tiles(const pj_ui_context_t *ctx, tile_t tiles[PJ_HOME_MAX_SL
     return count;
 }
 
+static pj_ui_state_t home_primary_state(const pj_ui_context_t *ctx)
+{
+    if (ctx->home_layout.slot_count == 0) {
+        return PJ_UI_STATE_HOME;
+    }
+    return state_from_destination(ctx->home_layout.slots[0].destination);
+}
+
 static const char *weekday_name(int weekday)
 {
     static const char *names[] = {"SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"};
@@ -1108,7 +1116,11 @@ int pj_ui_handle_aux_short(pj_ui_context_t *ctx)
         if (ctx->record_state != PJ_RECORD_IDLE || ctx->playback_state != PJ_PLAYBACK_IDLE) {
             return 0;
         }
-        set_state(ctx, PJ_UI_STATE_NOTES);
+        pj_ui_state_t primary = home_primary_state(ctx);
+        if (primary == PJ_UI_STATE_HOME) {
+            return 0;
+        }
+        set_state(ctx, primary);
         return 1;
     case PJ_UI_STATE_NOTES:
         ctx->record_state = PJ_RECORD_ACTIVE;

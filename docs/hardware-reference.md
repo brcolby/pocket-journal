@@ -42,7 +42,7 @@ hardware.
 
 | GPIO | Board signal | Project use and constraint |
 | ---: | --- | --- |
-| 0 | `BOOT0` / BOOT key | Active-low AUX input and ROM download strap. Do not hold low through reset unless entering download mode. |
+| 0 | `BOOT0` / BOOT key | Active-low AUX input and ROM download strap. Runtime long press is 650 ms on release. Do not reset or power-cycle while holding it unless entering download mode. |
 | 3 | LED | Onboard LED; also an ESP32-S3 JTAG-selection strapping pin, so avoid external drive during reset. |
 | 4 | `BAT_ADC` | ADC1 channel 3, through the board's 200 kOhm / 200 kOhm divider; battery voltage is approximately 2x ADC input voltage. |
 | 5 | `RTC_INT` | PCF85063ATL open-drain, active-low alarm interrupt and RTC-capable external wake input. |
