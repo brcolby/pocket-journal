@@ -30,6 +30,7 @@ def _new_job(device_id: str, audio_id: str, filename: str) -> dict[str, Any]:
         "filename": filename,
         "stage": "discovered",
         "attempt_count": 0,
+        "item_identity": None,
         "source": None,
         "transcription_fingerprint": None,
         "last_error": None,
@@ -228,6 +229,34 @@ def _failure_result(
     }
 
 
+def _item_identity(item: Any) -> dict[str, Any]:
+    return {
+        "filename": item.filename,
+        "size": item.size,
+        "data_bytes": item.data_bytes,
+    }
+
+
+def _cached_permanent_failure(
+    job: dict[str, Any], item: Any, fingerprint: dict[str, Any]
+) -> dict[str, Any] | None:
+    error = job.get("last_error")
+    if not isinstance(error, dict) or error.get("retryable") is not False:
+        return None
+    if job.get("item_identity") != _item_identity(item):
+        return None
+    if error.get("operation") == "transcribe" and job.get("transcription_fingerprint") != fingerprint:
+        return None
+    return {
+        "device_id": job.get("device_id"),
+        "audio_id": job.get("audio_id"),
+        "status": "failed",
+        "stage": job.get("stage", "discovered"),
+        "operation": error.get("operation", "unknown"),
+        "retryable": False,
+        "error": error.get("message", "permanent failure"),
+        "cached": True,
+    }
 def sync_device_audio(
     device_id: str,
     client: DeviceClient,
@@ -240,33 +269,43 @@ def sync_device_audio(
     results: list[dict[str, Any]] = []
     fingerprint = backend.fingerprint()
     for item in client.list_audio():
-        completed_job = store.load_job(device_id, item.audio_id)
-        if item.synced or item.transcript_uploaded:
-            completed_transcript = store.load_transcript(device_id, item.audio_id)
-            completed_source = completed_job.get("source") if isinstance(completed_job, dict) else None
-            if not reprocess_synced and (
-                isinstance(completed_job, dict)
-                and completed_job.get("audio_id") == item.audio_id
-                and completed_job.get("stage") == "uploaded"
-                and isinstance(completed_source, dict)
-                and _transcript_matches(completed_transcript, completed_source, fingerprint)
-            ):
-                completed_job["stage"] = "uploaded"
-                completed_job["last_error"] = None
-                _save_job(store, device_id, item.audio_id, completed_job)
-                continue
-            if not reprocess_synced and not isinstance(completed_job, dict):
-                continue
-
-        job = _load_job(store, device_id, item.audio_id, item.filename)
-        job["attempt_count"] = int(job.get("attempt_count", 0)) + 1
-        job["stage"] = "discovered"
-        job["source"] = None
-        job["transcription_fingerprint"] = None
-        job["last_error"] = None
-        operation = "download_audio"
-        _save_job(store, device_id, item.audio_id, job)
+        job = _new_job(device_id, item.audio_id, item.filename)
+        operation = "load_state"
         try:
+            completed_job = store.load_job(device_id, item.audio_id)
+            if item.synced or item.transcript_uploaded:
+                completed_transcript = store.load_transcript(device_id, item.audio_id)
+                completed_source = (
+                    completed_job.get("source") if isinstance(completed_job, dict) else None
+                )
+                if not reprocess_synced and (
+                    isinstance(completed_job, dict)
+                    and completed_job.get("audio_id") == item.audio_id
+                    and completed_job.get("stage") == "uploaded"
+                    and isinstance(completed_source, dict)
+                    and _transcript_matches(completed_transcript, completed_source, fingerprint)
+                ):
+                    completed_job["last_error"] = None
+                    _save_job(store, device_id, item.audio_id, completed_job)
+                    continue
+                if not reprocess_synced and not isinstance(completed_job, dict):
+                    continue
+
+            job = _load_job(store, device_id, item.audio_id, item.filename)
+            cached_failure = _cached_permanent_failure(job, item, fingerprint)
+            if cached_failure is not None:
+                results.append(cached_failure)
+                continue
+            job["attempt_count"] = int(job.get("attempt_count", 0)) + 1
+            job["item_identity"] = _item_identity(item)
+            job["stage"] = "discovered"
+            job["source"] = None
+            job["transcription_fingerprint"] = None
+            job["last_error"] = None
+            operation = "save_job"
+            _save_job(store, device_id, item.audio_id, job)
+
+            operation = "download_audio"
             audio_path, audio_metadata = _download_and_inspect(client, store, device_id, item)
             source = _source_identity(audio_metadata)
             job["stage"] = "audio_verified"
@@ -274,12 +313,12 @@ def sync_device_audio(
             _save_job(store, device_id, item.audio_id, job)
 
             operation = "transcribe"
+            job["transcription_fingerprint"] = fingerprint
             transcript = store.load_transcript(device_id, item.audio_id)
             if not _transcript_matches(transcript, source, fingerprint):
                 transcript = _prepare_transcript(backend.transcribe(audio_path), source, fingerprint)
                 store.save_transcript(device_id, item.audio_id, transcript)
             job["stage"] = "transcribed"
-            job["transcription_fingerprint"] = fingerprint
             _save_job(store, device_id, item.audio_id, job)
 
             if upload_transcripts:

@@ -229,6 +229,44 @@ class SyncTests(unittest.TestCase):
         self.assertEqual(client.uploaded, ["good.wav"])
         self.assertEqual(backend.calls, 1)
 
+    def test_permanent_invalid_audio_is_not_retried_unchanged(self) -> None:
+        item = AudioItem("bad.wav", "bad.wav", size=4, data_bytes=0)
+        with TemporaryDirectory() as tmp:
+            client = FakeClient([item])
+            client.payloads["bad.wav"] = b"RIFF"
+            store = PartnerStore(Path(tmp))
+            first = sync_device_audio("pj-test", client, store, FakeBackend())  # type: ignore[arg-type]
+            second = sync_device_audio("pj-test", client, store, FakeBackend())  # type: ignore[arg-type]
+            job = store.load_job("pj-test", "bad.wav")
+
+        self.assertFalse(first[0]["retryable"])
+        self.assertTrue(second[0]["cached"])
+        self.assertEqual(client.downloaded, ["bad.wav"])
+        self.assertEqual(job["attempt_count"], 1)  # type: ignore[index]
+
+    def test_initial_job_save_failure_does_not_block_later_items(self) -> None:
+        class SelectiveFailStore(PartnerStore):
+            def save_job(self, device_id, audio_id, job):  # type: ignore[no-untyped-def]
+                if audio_id == "bad.wav":
+                    raise OSError("disk unavailable")
+                return super().save_job(device_id, audio_id, job)
+
+        payload = wav_bytes()
+        items = [
+            AudioItem("bad.wav", "bad.wav", size=len(payload), data_bytes=4),
+            AudioItem("good.wav", "good.wav", size=len(payload), data_bytes=4),
+        ]
+        with TemporaryDirectory() as tmp:
+            client = FakeClient(items)
+            results = sync_device_audio(  # type: ignore[arg-type]
+                "pj-test", client, SelectiveFailStore(Path(tmp)), FakeBackend()
+            )
+
+        self.assertEqual([result["status"] for result in results], ["failed", "uploaded"])
+        self.assertEqual(results[0]["operation"], "save_job")
+        self.assertIn("disk unavailable", results[0]["error"])
+        self.assertEqual(client.uploaded, ["good.wav"])
+
     def test_legacy_transcript_without_identity_is_not_reused(self) -> None:
         with TemporaryDirectory() as tmp:
             client = FakeClient()
