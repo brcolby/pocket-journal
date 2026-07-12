@@ -14,6 +14,7 @@ from .config import DeviceProfile, load_config, save_config
 from .device import DeviceClient, DeviceError, SerialDeviceClient, discover_mdns, resolve_serial_port
 from .home_design import normalize_home_design
 from .operations import DeviceSession
+from .ota import inspect_firmware_image, ota_preflight, ota_status, stream_firmware_image, wait_for_ota_result
 from .storage import PartnerStore
 from .sync import sync_device_audio
 from .transcription import FakeTranscriptionBackend, backend_from_name
@@ -223,6 +224,50 @@ def cmd_device_status(args: argparse.Namespace) -> int:
     session = _session_from_args(args)
     _print_json(session.envelope(session.status()))
     return 0
+
+
+def cmd_firmware_status(args: argparse.Namespace) -> int:
+    session = _lan_session_from_args(args)
+    session.require("ota.read")
+    _print_json(session.envelope(ota_status(session.client)))  # type: ignore[arg-type]
+    return 0
+
+
+def cmd_firmware_update(args: argparse.Namespace) -> int:
+    session = _lan_session_from_args(args)
+    session.require("ota.write", destructive=True)
+    image = inspect_firmware_image(Path(args.file))
+    preflight = ota_preflight(session.client, image)  # type: ignore[arg-type]
+    if not args.yes:
+        if not sys.stdin.isatty():
+            raise DeviceError("refusing firmware update without --yes in a non-interactive session")
+        answer = input(
+            f"Update {session.device_id} with {image.path.name} ({image.size} bytes)? [y/N] "
+        )
+        if answer.strip().lower() not in {"y", "yes"}:
+            raise DeviceError("firmware update cancelled")
+
+    last_percent = -1
+    def report_progress(sent: int, total: int) -> None:
+        nonlocal last_percent
+        percent = sent * 100 // total
+        if percent != last_percent:
+            print(f"Uploading firmware: {percent}%", file=sys.stderr)
+            last_percent = percent
+
+    upload = stream_firmware_image(session.client, image, progress=report_progress)  # type: ignore[arg-type]
+    _, outcome = wait_for_ota_result(
+        session.client,  # type: ignore[arg-type]
+        session.device_id,
+        timeout=args.reconnect_timeout,
+    )
+    _print_json(session.envelope({
+        "image": {"path": str(image.path), "size": image.size, "sha256": image.sha256},
+        "preflight": preflight,
+        "upload": upload,
+        "outcome": outcome,
+    }))
+    return 0 if outcome.get("state") == "confirmed" else 1
 
 
 def cmd_recordings_wipe(args: argparse.Namespace) -> int:
@@ -469,6 +514,24 @@ def build_parser() -> argparse.ArgumentParser:
     device_mic_check.add_argument("--duration-ms", type=int, default=1500)
     device_mic_check.add_argument("--gain-db", type=int, help="temporarily set ES8311 input gain for this check, 0..42 dB")
     device_mic_check.set_defaults(func=cmd_device_mic_check)
+
+    firmware = sub.add_parser("firmware", help="firmware update commands")
+    firmware_sub = firmware.add_subparsers(dest="firmware_command", required=True)
+    firmware_status = firmware_sub.add_parser("status", help="read OTA status over LAN/Wi-Fi")
+    firmware_status.add_argument("--device", required=True)
+    firmware_status.add_argument("--base-url")
+    firmware_status.add_argument("--token", help="override the stored LAN bearer token")
+    firmware_status.add_argument("--data-dir")
+    firmware_status.set_defaults(func=cmd_firmware_status)
+    firmware_update = firmware_sub.add_parser("update", help="upload and activate a firmware image")
+    firmware_update.add_argument("--device", required=True)
+    firmware_update.add_argument("--base-url")
+    firmware_update.add_argument("--token", help="override the stored LAN bearer token")
+    firmware_update.add_argument("--data-dir")
+    firmware_update.add_argument("--file", required=True)
+    firmware_update.add_argument("--yes", action="store_true", help="confirm firmware activation")
+    firmware_update.add_argument("--reconnect-timeout", type=float, default=90.0)
+    firmware_update.set_defaults(func=cmd_firmware_update)
 
     sync = sub.add_parser("sync", help="download audio, transcribe, and upload transcripts")
     sync.add_argument("--device", required=True)
