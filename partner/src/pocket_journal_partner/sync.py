@@ -9,15 +9,12 @@ import tempfile
 
 from .device import DeviceClient
 from .storage import PartnerStore
+from .transcript_payload import DEVICE_TRANSCRIPT_MAX_BYTES, build_device_transcript_payload
 from .transcription import FakeTranscriptionBackend, TranscriptionBackend, inspect_wav
 
 
 JOB_SCHEMA_VERSION = 2
 TRANSCRIPT_SCHEMA_VERSION = 2
-DEVICE_TRANSCRIPT_SCHEMA_VERSION = 1
-DEVICE_TRANSCRIPT_MAX_BYTES = 60 * 1024
-
-
 class PermanentAudioError(ValueError):
     pass
 
@@ -119,10 +116,6 @@ def _json_bytes(payload: dict[str, Any]) -> bytes:
     )
 
 
-def _fingerprint_digest(fingerprint: dict[str, Any]) -> str:
-    return hashlib.sha256(_json_bytes(fingerprint)).hexdigest()
-
-
 def _cache_key(source: dict[str, Any], fingerprint: dict[str, Any]) -> str:
     identity = {
         "source": {
@@ -152,28 +145,6 @@ def _verified_cached_source(
     if expected_sha256 is not None and metadata["sha256"] != expected_sha256:
         return None
     return _source_identity(metadata)
-
-
-def _device_transcript_payload(
-    transcript: dict[str, Any],
-    source: dict[str, Any],
-    fingerprint: dict[str, Any],
-) -> dict[str, Any]:
-    """Return a compact payload that fits the current firmware transcript handler."""
-    text = str(transcript.get("text", "")).strip()
-    model = str(transcript.get("model", fingerprint.get("model_id", ""))).strip()
-    payload: dict[str, Any] = {
-        "v": DEVICE_TRANSCRIPT_SCHEMA_VERSION,
-        "text": text,
-        "model": model[:96],
-        "source_sha256": str(source["sha256"]),
-        "fingerprint_sha256": _fingerprint_digest(fingerprint),
-    }
-    if len(_json_bytes(payload)) > DEVICE_TRANSCRIPT_MAX_BYTES:
-        raise ValueError(
-            f"transcript exceeds the {DEVICE_TRANSCRIPT_MAX_BYTES}-byte device upload limit"
-        )
-    return payload
 
 
 def _download_and_inspect(
@@ -305,6 +276,107 @@ def _cached_permanent_failure(
         "error": error.get("message", "permanent failure"),
         "cached": True,
     }
+def _sync_audio_item(
+    device_id: str,
+    client: DeviceClient,
+    store: PartnerStore,
+    backend: TranscriptionBackend,
+    fingerprint: dict[str, Any],
+    item: Any,
+    upload_transcripts: bool = True,
+    reprocess_synced: bool = False,
+) -> dict[str, Any] | None:
+    job = _new_job(device_id, item.audio_id, item.filename)
+    operation = "load_state"
+    try:
+        completed_job = store.load_job(device_id, item.audio_id)
+        if item.synced or item.transcript_uploaded:
+            completed_transcript = store.load_transcript(device_id, item.audio_id)
+            completed_source = (
+                completed_job.get("source") if isinstance(completed_job, dict) else None
+            )
+            cached_source = _verified_cached_source(store, device_id, item)
+            if not reprocess_synced and (
+                isinstance(completed_job, dict)
+                and completed_job.get("audio_id") == item.audio_id
+                and completed_job.get("stage") == "uploaded"
+                and isinstance(completed_source, dict)
+                and cached_source == completed_source
+                and _transcript_matches(completed_transcript, cached_source, fingerprint)
+            ):
+                completed_job["last_error"] = None
+                _save_job(store, device_id, item.audio_id, completed_job)
+                return None
+            if not reprocess_synced and not isinstance(completed_job, dict):
+                return None
+
+        job = _load_job(store, device_id, item.audio_id, item.filename)
+        cached_failure = _cached_permanent_failure(job, item, fingerprint)
+        if cached_failure is not None:
+            return cached_failure
+        job["attempt_count"] = int(job.get("attempt_count", 0)) + 1
+        job["item_identity"] = _item_identity(item)
+        job["stage"] = "discovered"
+        job["source"] = None
+        job["transcription_fingerprint"] = None
+        job["cache_key"] = None
+        job["last_error"] = None
+        operation = "save_job"
+        _save_job(store, device_id, item.audio_id, job)
+
+        operation = "download_audio"
+        audio_path, audio_metadata = _download_and_inspect(
+            client,
+            store,
+            device_id,
+            item,
+            force_download=reprocess_synced and (item.synced or item.transcript_uploaded),
+        )
+        source = _source_identity(audio_metadata)
+        job["stage"] = "audio_verified"
+        job["source"] = source
+        job["cache_key"] = _cache_key(source, fingerprint)
+        _save_job(store, device_id, item.audio_id, job)
+
+        operation = "transcribe"
+        job["transcription_fingerprint"] = fingerprint
+        transcript = store.load_transcript(device_id, item.audio_id)
+        if not _transcript_matches(transcript, source, fingerprint):
+            transcript = _prepare_transcript(backend.transcribe(audio_path), source, fingerprint)
+            store.save_transcript(device_id, item.audio_id, transcript)
+        job["stage"] = "transcribed"
+        _save_job(store, device_id, item.audio_id, job)
+
+        if upload_transcripts:
+            operation = "prepare_upload"
+            device_payload = build_device_transcript_payload(transcript, source, fingerprint)
+            operation = "upload_transcript"
+            client.upload_transcript(item.audio_id, device_payload)
+            job["stage"] = "uploaded"
+        else:
+            job["stage"] = "transcribed"
+        job["last_error"] = None
+        _save_job(store, device_id, item.audio_id, job)
+
+        entry = {
+            "device_id": device_id,
+            "audio_id": item.audio_id,
+            "audio_file": str(audio_path),
+            "status": "uploaded" if upload_transcripts else "transcribed",
+            "source_sha256": source["sha256"],
+            "synced_at": _now(),
+            "model": transcript.get("model", ""),
+            "uploaded": upload_transcripts,
+        }
+        operation = "append_sync_log"
+        store.append_sync_log(entry)
+        return entry
+    except Exception as error:
+        if operation == "download_audio" and isinstance(error, ValueError):
+            operation = "verify_audio"
+        return _failure_result(store, device_id, item.audio_id, job, operation, error)
+
+
 def sync_device_audio(
     device_id: str,
     client: DeviceClient,
@@ -318,97 +390,19 @@ def sync_device_audio(
     if isinstance(backend, FakeTranscriptionBackend):
         upload_transcripts = False
     fingerprint = backend.fingerprint()
-    for item in client.list_audio():
-        job = _new_job(device_id, item.audio_id, item.filename)
-        operation = "load_state"
-        try:
-            completed_job = store.load_job(device_id, item.audio_id)
-            if item.synced or item.transcript_uploaded:
-                completed_transcript = store.load_transcript(device_id, item.audio_id)
-                completed_source = (
-                    completed_job.get("source") if isinstance(completed_job, dict) else None
+    with store.workflow_lock(device_id, "__device_sync__"):
+        for item in client.list_audio():
+            with store.workflow_lock(device_id, item.audio_id):
+                result = _sync_audio_item(
+                    device_id,
+                    client,
+                    store,
+                    backend,
+                    fingerprint,
+                    item,
+                    upload_transcripts,
+                    reprocess_synced,
                 )
-                cached_source = _verified_cached_source(store, device_id, item)
-                if not reprocess_synced and (
-                    isinstance(completed_job, dict)
-                    and completed_job.get("audio_id") == item.audio_id
-                    and completed_job.get("stage") == "uploaded"
-                    and isinstance(completed_source, dict)
-                    and cached_source == completed_source
-                    and _transcript_matches(completed_transcript, cached_source, fingerprint)
-                ):
-                    completed_job["last_error"] = None
-                    _save_job(store, device_id, item.audio_id, completed_job)
-                    continue
-                if not reprocess_synced and not isinstance(completed_job, dict):
-                    continue
-
-            job = _load_job(store, device_id, item.audio_id, item.filename)
-            cached_failure = _cached_permanent_failure(job, item, fingerprint)
-            if cached_failure is not None:
-                results.append(cached_failure)
-                continue
-            job["attempt_count"] = int(job.get("attempt_count", 0)) + 1
-            job["item_identity"] = _item_identity(item)
-            job["stage"] = "discovered"
-            job["source"] = None
-            job["transcription_fingerprint"] = None
-            job["cache_key"] = None
-            job["last_error"] = None
-            operation = "save_job"
-            _save_job(store, device_id, item.audio_id, job)
-
-            operation = "download_audio"
-            audio_path, audio_metadata = _download_and_inspect(
-                client,
-                store,
-                device_id,
-                item,
-                force_download=reprocess_synced and (item.synced or item.transcript_uploaded),
-            )
-            source = _source_identity(audio_metadata)
-            job["stage"] = "audio_verified"
-            job["source"] = source
-            job["cache_key"] = _cache_key(source, fingerprint)
-            _save_job(store, device_id, item.audio_id, job)
-
-            operation = "transcribe"
-            job["transcription_fingerprint"] = fingerprint
-            transcript = store.load_transcript(device_id, item.audio_id)
-            if not _transcript_matches(transcript, source, fingerprint):
-                transcript = _prepare_transcript(backend.transcribe(audio_path), source, fingerprint)
-                store.save_transcript(device_id, item.audio_id, transcript)
-            job["stage"] = "transcribed"
-            _save_job(store, device_id, item.audio_id, job)
-
-            if upload_transcripts:
-                operation = "prepare_upload"
-                device_payload = _device_transcript_payload(transcript, source, fingerprint)
-                operation = "upload_transcript"
-                client.upload_transcript(item.audio_id, device_payload)
-                job["stage"] = "uploaded"
-            else:
-                job["stage"] = "transcribed"
-            job["last_error"] = None
-            _save_job(store, device_id, item.audio_id, job)
-
-            entry = {
-                "device_id": device_id,
-                "audio_id": item.audio_id,
-                "audio_file": str(audio_path),
-                "status": "uploaded" if upload_transcripts else "transcribed",
-                "source_sha256": source["sha256"],
-                "synced_at": _now(),
-                "model": transcript.get("model", ""),
-                "uploaded": upload_transcripts,
-            }
-            operation = "append_sync_log"
-            store.append_sync_log(entry)
-            results.append(entry)
-        except Exception as error:
-            if operation == "download_audio" and isinstance(error, ValueError):
-                operation = "verify_audio"
-            results.append(
-                _failure_result(store, device_id, item.audio_id, job, operation, error)
-            )
+            if result is not None:
+                results.append(result)
     return results

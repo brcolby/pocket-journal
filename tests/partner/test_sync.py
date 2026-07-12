@@ -9,6 +9,7 @@ from unittest.mock import patch
 import json
 import hashlib
 import struct
+import threading
 import unittest
 
 from pocket_journal_partner import cli
@@ -291,6 +292,62 @@ class SyncTests(unittest.TestCase):
         self.assertEqual(results[0]["status"], "uploaded")
         self.assertEqual(client.upload_payloads[0]["text"], text)
         self.assertLessEqual(len(wire_bytes), DEVICE_TRANSCRIPT_MAX_BYTES)
+
+    def test_rich_backend_metadata_survives_device_payload(self) -> None:
+        class RichBackend(FakeBackend):
+            def transcribe(self, audio_path: Path) -> dict[str, object]:
+                self.calls += 1
+                return {
+                    "text": "hello world",
+                    "model": self.model,
+                    "language": "en",
+                    "segments": [{"start": 0.0, "end": 1.2, "text": "hello world"}],
+                    "timestamps": True,
+                    "backend_extra": {"confidence": 0.9},
+                }
+
+        with TemporaryDirectory() as tmp:
+            client = FakeClient()
+            sync_device_audio(  # type: ignore[arg-type]
+                "pj-test", client, PartnerStore(Path(tmp)), RichBackend()
+            )
+
+        payload = client.upload_payloads[0]
+        self.assertEqual(payload["language"], "en")
+        self.assertEqual(payload["segments"][0]["start"], 0.0)  # type: ignore[index]
+        self.assertEqual(payload["backend_extra"], {"confidence": 0.9})
+        self.assertEqual(len(payload["source"]["sha256"]), 64)  # type: ignore[index]
+        self.assertIn("transcription", payload)
+
+    def test_concurrent_syncs_upload_once(self) -> None:
+        payload = wav_bytes()
+        item = AudioItem("note.wav", "note.wav", size=len(payload), data_bytes=4)
+
+        class UpdatingClient(FakeClient):
+            def upload_transcript(self, audio_id: str, transcript: dict[str, object]) -> None:
+                super().upload_transcript(audio_id, transcript)
+                self.items[0].synced = True
+
+        with TemporaryDirectory() as tmp:
+            client = UpdatingClient([item])
+            store = PartnerStore(Path(tmp))
+            backend = FakeBackend()
+            results: list[list[dict[str, object]]] = []
+
+            def run_sync() -> None:
+                results.append(
+                    sync_device_audio("pj-test", client, store, backend)  # type: ignore[arg-type]
+                )
+
+            threads = [threading.Thread(target=run_sync) for _ in range(2)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+
+        self.assertEqual(client.uploaded, ["note.wav"])
+        self.assertEqual(backend.calls, 1)
+        self.assertEqual(sorted(len(result) for result in results), [0, 1])
 
     def test_local_only_transcription_does_not_upload_placeholder(self) -> None:
         with TemporaryDirectory() as tmp:
