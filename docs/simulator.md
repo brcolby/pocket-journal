@@ -55,6 +55,18 @@ Open:
 http://127.0.0.1:8765
 ```
 
+The review panel can open each major screen through its normal firmware input
+sequence. This is intended for rapid comparison and screenshot capture; it does
+not bypass the firmware state machine. The PNG control saves the exact 200x200
+display canvas without the simulator shell.
+
+Keyboard controls mirror the two hardware buttons:
+
+- `A`: AUX short press. Press twice within 350 ms for AUX double press.
+- `Shift+A`: AUX long press.
+- `D`: power or wake.
+- `R`: reset the simulator.
+
 While running through `make simulator`, browser debug events are posted back to the local simulator server and written under `.logs/`:
 
 - `.logs/simulator-debug.jsonl`: append-only event records.
@@ -66,14 +78,13 @@ The inline bootstrap logger writes to the same endpoint before `src/main.js` loa
 
 - `static`: tap or short-press BOOT/AUX to `time_temp`.
 - `time_temp`: short-press BOOT/AUX or tap to `home`; long-press BOOT/AUX returns to `static`.
-- `home`: bubble buttons from firmware; notes is the large bubble, with time and settings as smaller bubbles.
+- `home`: configurable firmware tiles for notes, time, and settings by default.
 - `notes`: record, listen, read.
 - `time`: alarm, stopwatch, timer, interval.
 - `settings`: sync, volume, dark/light toggle, off.
 - `volume`: volume changes inline by tapping the left or right side of the screen.
-- `sync`: tap to advance dummy pending/transferred counters; intended as a partial-refresh region.
-- `volume`: tap left to lower, right to raise.
-- `record`: entering starts recording; pause/resume/finish update only the control/status region.
+- `sync`: shows the pending, transferred, and connection status supplied by firmware.
+- `record`: entering starts recording; AUX stops it and returns home.
 - `listen` and `read`: show dummy recordings ordered newest first; tap a note to enter detail.
 - AUX double-click jumps from any idle screen, including the resting screen, directly into recording. It is ignored while recording, playback, stopwatch, timer, or interval activity is in progress.
 - AUX single-click actions wait 350 ms so a second click can be recognized; release after holding for at least 650 ms to trigger a long press.
