@@ -107,9 +107,7 @@ def cmd_sync(args: argparse.Namespace) -> int:
     backend = backend_from_name(args.backend)
     session = _lan_session_from_args(args)
     session.require("audio.sync")
-    upload_transcripts = not isinstance(backend, FakeTranscriptionBackend) or bool(
-        getattr(args, "allow_fake_upload", False)
-    )
+    upload_transcripts = not isinstance(backend, FakeTranscriptionBackend)
     results = sync_device_audio(
         session.device_id,
         session.client,
@@ -477,7 +475,6 @@ def build_parser() -> argparse.ArgumentParser:
     sync.add_argument("--base-url")
     sync.add_argument("--token", help="override the stored LAN bearer token")
     sync.add_argument("--backend", choices=["fake", "hf"], default="hf")
-    sync.add_argument("--allow-fake-upload", action="store_true", help=argparse.SUPPRESS)
     sync.add_argument("--reprocess", action="store_true", help="reprocess notes already marked synced")
     sync.add_argument("--data-dir")
     sync.set_defaults(func=cmd_sync)

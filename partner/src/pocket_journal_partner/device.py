@@ -13,6 +13,13 @@ class DeviceError(RuntimeError):
     pass
 
 
+class DeviceHTTPError(DeviceError):
+    def __init__(self, message: str, status_code: int, retryable: bool) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.retryable = retryable
+
+
 DEFAULT_SERIAL_PORT = "/dev/cu.usbmodem1101"
 SERIAL_PORT_PATTERNS = (
     "/dev/cu.usbmodem*",
@@ -41,11 +48,20 @@ class AudioItem:
     label: str | None = None
     size: int | None = None
     data_bytes: int | None = None
+    source_sha256: str | None = None
     created_at: str | None = None
     duration_ms: int | None = None
     synced: bool = False
     transcript_uploaded: bool = False
     transcript_path: str | None = None
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.source_sha256, str)
+            or len(self.source_sha256) != 64
+            or any(ch not in "0123456789abcdef" for ch in self.source_sha256)
+        ):
+            self.source_sha256 = None
 
 
 class DeviceClient:
@@ -69,7 +85,11 @@ class DeviceClient:
         headers = {"Authorization": f"Bearer {self.token}"}
         if body is not None:
             data = json.dumps(
-                body, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+                body,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+                allow_nan=False,
             ).encode("utf-8")
             headers["Content-Type"] = "application/json"
         req = request.Request(self._url(path), data=data, method=method, headers=headers)
@@ -94,7 +114,10 @@ class DeviceClient:
                 detail = "device is busy; stop recording or playback and retry"
             else:
                 detail = f"HTTP {exc.code}"
-            raise DeviceError(f"{method} {path} failed: {detail}") from exc
+            retryable = exc.code in {408, 409, 425, 429} or 500 <= exc.code < 600
+            raise DeviceHTTPError(
+                f"{method} {path} failed: {detail}", exc.code, retryable
+            ) from exc
         except error.URLError as exc:
             raise DeviceError(f"{method} {path} failed: {exc.reason}") from exc
 

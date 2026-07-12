@@ -18,6 +18,7 @@ STORAGE_TEST_BIN := build/test_storage
 TIME_CLOCK_TEST_BIN := build/test_time_clock
 RTC_WAKE_TEST_BIN := build/test_rtc_wake
 TIME_CONTROLLER_TEST_BIN := build/test_time_controller
+TRANSCRIPT_UPLOAD_TEST_BIN := build/test_transcript_upload
 LVGL_DIR := firmware/managed_components/lvgl__lvgl
 ifneq ($(wildcard $(LVGL_DIR)/src),)
 LVGL_SRCS := $(wildcard $(LVGL_DIR)/src/*.c)
@@ -142,6 +143,15 @@ test-input:
 		tests/board/test_time_controller.c \
 		-o $(TIME_CONTROLLER_TEST_BIN)
 	$(TIME_CONTROLLER_TEST_BIN)
+	$(CC) $(CFLAGS) \
+		-Ifirmware/components/pj_board/include \
+		-Ifirmware/managed_components/espressif__cjson/cJSON \
+		firmware/managed_components/espressif__cjson/cJSON/cJSON.c \
+		firmware/components/pj_board/pj_transcript_upload.c \
+		tests/board/test_transcript_upload.c \
+		-lm \
+		-o $(TRANSCRIPT_UPLOAD_TEST_BIN)
+	$(TRANSCRIPT_UPLOAD_TEST_BIN)
 
 test-partner:
 	cd partner && PYTHONPATH=src python -m unittest discover -s ../tests/partner -p 'test_*.py'

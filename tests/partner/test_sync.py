@@ -2,18 +2,21 @@ from __future__ import annotations
 
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 from types import SimpleNamespace
 from unittest.mock import patch
 import json
+import hashlib
 import struct
+import threading
 import unittest
 
 from pocket_journal_partner import cli
-from pocket_journal_partner.device import AudioItem
+from pocket_journal_partner.device import AudioItem, DeviceHTTPError
 from pocket_journal_partner.storage import PartnerStore
 from pocket_journal_partner.sync import DEVICE_TRANSCRIPT_MAX_BYTES, sync_device_audio
+from pocket_journal_partner.transcription import FakeTranscriptionBackend
 
 
 def wav_bytes(samples: bytes = b"\x00\x00\x01\x00") -> bytes:
@@ -64,13 +67,19 @@ class FakeClient:
 
 
 class FakeBackend:
-    def __init__(self, model: str = "fake-v1", text: str = "transcript") -> None:
+    def __init__(
+        self,
+        model: str = "fake-v1",
+        text: str = "transcript",
+        parameters: dict[str, object] | None = None,
+    ) -> None:
         self.model = model
         self.text = text
+        self.parameters = parameters or {}
         self.calls = 0
 
     def fingerprint(self) -> dict[str, object]:
-        return {"backend": "fake", "model": self.model, "parameters": {}}
+        return {"backend": "fake", "model": self.model, "parameters": self.parameters}
 
     def transcribe(self, audio_path: Path) -> dict[str, object]:
         self.calls += 1
@@ -95,6 +104,7 @@ class SyncTests(unittest.TestCase):
         self.assertEqual(job["attempt_count"], 1)  # type: ignore[index]
         self.assertEqual(job["source"]["sha256"], results[0]["source_sha256"])  # type: ignore[index]
         self.assertEqual(transcript["sync"]["source"], job["source"])  # type: ignore[index]
+        self.assertEqual(transcript["sync"]["cache_key"], job["cache_key"])  # type: ignore[index]
         self.assertNotIn("sync", client.upload_payloads[0])
         self.assertLessEqual(
             len(json.dumps(client.upload_payloads[0], separators=(",", ":")).encode()),
@@ -134,6 +144,39 @@ class SyncTests(unittest.TestCase):
         self.assertEqual(client.uploaded, ["new.wav"])
         self.assertEqual(backend.calls, 1)
 
+    def test_permanent_upload_http_error_is_cached(self) -> None:
+        class UnauthorizedClient(FakeClient):
+            def upload_transcript(self, audio_id: str, transcript: dict[str, object]) -> None:
+                self.uploaded.append(audio_id)
+                raise DeviceHTTPError("authentication failed", 401, False)
+
+        with TemporaryDirectory() as tmp:
+            client = UnauthorizedClient()
+            store = PartnerStore(Path(tmp))
+            first = sync_device_audio("pj-test", client, store, FakeBackend())  # type: ignore[arg-type]
+            second = sync_device_audio("pj-test", client, store, FakeBackend())  # type: ignore[arg-type]
+
+        self.assertFalse(first[0]["retryable"])
+        self.assertTrue(second[0]["cached"])
+        self.assertEqual(client.uploaded, ["new.wav"])
+
+    def test_retryable_upload_http_error_is_retried(self) -> None:
+        class BusyClient(FakeClient):
+            def upload_transcript(self, audio_id: str, transcript: dict[str, object]) -> None:
+                self.uploaded.append(audio_id)
+                if len(self.uploaded) == 1:
+                    raise DeviceHTTPError("device busy", 409, True)
+
+        with TemporaryDirectory() as tmp:
+            client = BusyClient()
+            store = PartnerStore(Path(tmp))
+            first = sync_device_audio("pj-test", client, store, FakeBackend())  # type: ignore[arg-type]
+            second = sync_device_audio("pj-test", client, store, FakeBackend())  # type: ignore[arg-type]
+
+        self.assertTrue(first[0]["retryable"])
+        self.assertEqual(second[0]["status"], "uploaded")
+        self.assertEqual(client.uploaded, ["new.wav", "new.wav"])
+
     def test_fingerprint_change_invalidates_cached_transcript(self) -> None:
         with TemporaryDirectory() as tmp:
             client = FakeClient()
@@ -148,6 +191,23 @@ class SyncTests(unittest.TestCase):
         self.assertEqual(first.calls, 1)
         self.assertEqual(second.calls, 1)
         self.assertEqual(transcript["model"], "model-b")  # type: ignore[index]
+
+    def test_parameter_change_invalidates_cached_transcript(self) -> None:
+        with TemporaryDirectory() as tmp:
+            client = FakeClient()
+            store = PartnerStore(Path(tmp))
+            first = FakeBackend(parameters={"beam_size": 1})
+            second = FakeBackend(parameters={"beam_size": 5})
+            sync_device_audio("pj-test", client, store, first)  # type: ignore[arg-type]
+            sync_device_audio("pj-test", client, store, second)  # type: ignore[arg-type]
+            transcript = store.load_transcript("pj-test", "new.wav")
+
+        self.assertEqual(first.calls, 1)
+        self.assertEqual(second.calls, 1)
+        self.assertEqual(
+            transcript["sync"]["transcription_fingerprint"]["parameters"],  # type: ignore[index]
+            {"beam_size": 5},
+        )
 
     def test_explicit_reprocess_includes_device_synced_note(self) -> None:
         payload = wav_bytes()
@@ -166,7 +226,7 @@ class SyncTests(unittest.TestCase):
         self.assertEqual(client.downloaded, ["done.wav"])
         self.assertEqual(client.uploaded, ["done.wav"])
 
-    def test_synced_fingerprint_change_requires_explicit_reprocess(self) -> None:
+    def test_synced_fingerprint_change_reprocesses_known_prior_upload(self) -> None:
         payload = wav_bytes()
         item = AudioItem("note.wav", "note.wav", size=len(payload), data_bytes=4)
         with TemporaryDirectory() as tmp:
@@ -176,15 +236,65 @@ class SyncTests(unittest.TestCase):
             second = FakeBackend("model-b")
             sync_device_audio("pj-test", client, store, first)  # type: ignore[arg-type]
             item.synced = True
-            skipped = sync_device_audio("pj-test", client, store, second)  # type: ignore[arg-type]
-            processed = sync_device_audio(  # type: ignore[arg-type]
-                "pj-test", client, store, second, reprocess_synced=True
-            )
+            processed = sync_device_audio("pj-test", client, store, second)  # type: ignore[arg-type]
 
-        self.assertEqual(skipped, [])
         self.assertEqual(second.calls, 1)
         self.assertEqual(processed[0]["model"], "model-b")
+        self.assertEqual(client.downloaded, ["note.wav"])
+        self.assertEqual(client.uploaded, ["note.wav", "note.wav"])
+
+    def test_synced_source_mutation_reprocesses_known_prior_upload(self) -> None:
+        payload = wav_bytes()
+        item = AudioItem("note.wav", "note.wav", size=len(payload), data_bytes=4)
+        with TemporaryDirectory() as tmp:
+            client = FakeClient([item])
+            store = PartnerStore(Path(tmp))
+            backend = FakeBackend()
+            first = sync_device_audio("pj-test", client, store, backend)  # type: ignore[arg-type]
+            item.synced = True
+            cached = store.audio_path("pj-test", "note.wav", "note.wav")
+            cached.write_bytes(wav_bytes(b"\x02\x00\x03\x00"))
+            second = sync_device_audio("pj-test", client, store, backend)  # type: ignore[arg-type]
+
+        self.assertEqual(backend.calls, 2)
+        self.assertNotEqual(first[0]["source_sha256"], second[0]["source_sha256"])
+        self.assertEqual(client.uploaded, ["note.wav", "note.wav"])
+
+    def test_device_digest_detects_same_size_remote_source_mutation(self) -> None:
+        first_payload = wav_bytes()
+        second_payload = wav_bytes(b"\x02\x00\x03\x00")
+        item = AudioItem("note.wav", "note.wav", size=len(first_payload), data_bytes=4)
+        item.source_sha256 = hashlib.sha256(first_payload).hexdigest()  # type: ignore[attr-defined]
+        with TemporaryDirectory() as tmp:
+            client = FakeClient([item])
+            client.payloads["note.wav"] = first_payload
+            store = PartnerStore(Path(tmp))
+            backend = FakeBackend()
+            first = sync_device_audio("pj-test", client, store, backend)  # type: ignore[arg-type]
+            item.synced = True
+            client.payloads["note.wav"] = second_payload
+            item.source_sha256 = hashlib.sha256(second_payload).hexdigest()  # type: ignore[attr-defined]
+            second = sync_device_audio("pj-test", client, store, backend)  # type: ignore[arg-type]
+
         self.assertEqual(client.downloaded, ["note.wav", "note.wav"])
+        self.assertEqual(backend.calls, 2)
+        self.assertNotEqual(first[0]["source_sha256"], second[0]["source_sha256"])
+
+    def test_identical_synced_prior_upload_is_idempotent(self) -> None:
+        payload = wav_bytes()
+        item = AudioItem("note.wav", "note.wav", size=len(payload), data_bytes=4)
+        with TemporaryDirectory() as tmp:
+            client = FakeClient([item])
+            store = PartnerStore(Path(tmp))
+            backend = FakeBackend()
+            sync_device_audio("pj-test", client, store, backend)  # type: ignore[arg-type]
+            item.synced = True
+            repeated = sync_device_audio("pj-test", client, store, backend)  # type: ignore[arg-type]
+
+        self.assertEqual(repeated, [])
+        self.assertEqual(backend.calls, 1)
+        self.assertEqual(client.downloaded, ["note.wav"])
+        self.assertEqual(client.uploaded, ["note.wav"])
 
     def test_complete_long_text_is_uploaded_without_truncation(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -216,6 +326,62 @@ class SyncTests(unittest.TestCase):
         self.assertEqual(client.upload_payloads[0]["text"], text)
         self.assertLessEqual(len(wire_bytes), DEVICE_TRANSCRIPT_MAX_BYTES)
 
+    def test_rich_backend_metadata_survives_device_payload(self) -> None:
+        class RichBackend(FakeBackend):
+            def transcribe(self, audio_path: Path) -> dict[str, object]:
+                self.calls += 1
+                return {
+                    "text": "hello world",
+                    "model": self.model,
+                    "language": "en",
+                    "segments": [{"start": 0.0, "end": 1.2, "text": "hello world"}],
+                    "timestamps": True,
+                    "backend_extra": {"confidence": 0.9},
+                }
+
+        with TemporaryDirectory() as tmp:
+            client = FakeClient()
+            sync_device_audio(  # type: ignore[arg-type]
+                "pj-test", client, PartnerStore(Path(tmp)), RichBackend()
+            )
+
+        payload = client.upload_payloads[0]
+        self.assertEqual(payload["language"], "en")
+        self.assertEqual(payload["segments"][0]["start"], 0.0)  # type: ignore[index]
+        self.assertEqual(payload["backend_extra"], {"confidence": 0.9})
+        self.assertEqual(len(payload["source"]["sha256"]), 64)  # type: ignore[index]
+        self.assertIn("transcription", payload)
+
+    def test_concurrent_syncs_upload_once(self) -> None:
+        payload = wav_bytes()
+        item = AudioItem("note.wav", "note.wav", size=len(payload), data_bytes=4)
+
+        class UpdatingClient(FakeClient):
+            def upload_transcript(self, audio_id: str, transcript: dict[str, object]) -> None:
+                super().upload_transcript(audio_id, transcript)
+                self.items[0].synced = True
+
+        with TemporaryDirectory() as tmp:
+            client = UpdatingClient([item])
+            store = PartnerStore(Path(tmp))
+            backend = FakeBackend()
+            results: list[list[dict[str, object]]] = []
+
+            def run_sync() -> None:
+                results.append(
+                    sync_device_audio("pj-test", client, store, backend)  # type: ignore[arg-type]
+                )
+
+            threads = [threading.Thread(target=run_sync) for _ in range(2)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+
+        self.assertEqual(client.uploaded, ["note.wav"])
+        self.assertEqual(backend.calls, 1)
+        self.assertEqual(sorted(len(result) for result in results), [0, 1])
+
     def test_local_only_transcription_does_not_upload_placeholder(self) -> None:
         with TemporaryDirectory() as tmp:
             client = FakeClient()
@@ -227,6 +393,16 @@ class SyncTests(unittest.TestCase):
 
         self.assertEqual(results[0]["status"], "transcribed")
         self.assertEqual(job["stage"], "transcribed")  # type: ignore[index]
+        self.assertEqual(client.uploaded, [])
+
+    def test_real_fake_backend_is_always_local_only(self) -> None:
+        with TemporaryDirectory() as tmp:
+            client = FakeClient()
+            results = sync_device_audio(  # type: ignore[arg-type]
+                "pj-test", client, PartnerStore(Path(tmp)), FakeTranscriptionBackend()
+            )
+
+        self.assertEqual(results[0]["status"], "transcribed")
         self.assertEqual(client.uploaded, [])
 
     def test_changed_same_size_audio_invalidates_cached_transcript(self) -> None:
@@ -278,6 +454,20 @@ class SyncTests(unittest.TestCase):
         self.assertNotIn("cached", second[0])
         self.assertEqual(client.downloaded, ["bad.wav", "bad.wav"])
         self.assertEqual(job["attempt_count"], 2)  # type: ignore[index]
+
+    def test_advertised_invalid_source_is_cached_as_permanent(self) -> None:
+        item = AudioItem("bad.wav", "bad.wav", size=4, data_bytes=0)
+        item.source_sha256 = hashlib.sha256(b"RIFF").hexdigest()  # type: ignore[attr-defined]
+        with TemporaryDirectory() as tmp:
+            client = FakeClient([item])
+            client.payloads["bad.wav"] = b"RIFF"
+            store = PartnerStore(Path(tmp))
+            first = sync_device_audio("pj-test", client, store, FakeBackend())  # type: ignore[arg-type]
+            second = sync_device_audio("pj-test", client, store, FakeBackend())  # type: ignore[arg-type]
+
+        self.assertFalse(first[0]["retryable"])
+        self.assertTrue(second[0]["cached"])
+        self.assertEqual(client.downloaded, ["bad.wav"])
 
     def test_initial_job_save_failure_does_not_block_later_items(self) -> None:
         class SelectiveFailStore(PartnerStore):
@@ -346,7 +536,7 @@ class SyncTests(unittest.TestCase):
             {"audio_id": "bad.wav", "status": "failed", "error": "invalid WAV"},
         ]
         args = SimpleNamespace(
-            data_dir=None, backend="fake", allow_fake_upload=False, reprocess=False
+            data_dir=None, backend="fake", reprocess=False
         )
         stdout = StringIO()
         with patch("pocket_journal_partner.cli._lan_session_from_args", return_value=FakeSession()):
@@ -361,6 +551,21 @@ class SyncTests(unittest.TestCase):
         self.assertEqual(payload["result"]["synced"], results)
         self.assertEqual(payload["result"]["count"], 2)
         self.assertEqual(payload["result"]["results"], results)
+
+    def test_cli_has_no_fake_upload_escape_hatch(self) -> None:
+        parser = cli.build_parser()
+        with redirect_stderr(StringIO()):
+            with self.assertRaises(SystemExit):
+                parser.parse_args(
+                    [
+                        "sync",
+                        "--device",
+                        "pj-test",
+                        "--backend",
+                        "fake",
+                        "--allow-fake-upload",
+                    ]
+                )
 
 
 if __name__ == "__main__":
