@@ -170,6 +170,7 @@ class ConfigTests(unittest.TestCase):
                     "label": "REC",
                     "size": 88,
                     "data_bytes": 44,
+                    "source_sha256": "a" * 64,
                     "created_at": "2026-07-11T09:34:00",
                     "duration_ms": 1,
                     "synced": True,
@@ -182,12 +183,30 @@ class ConfigTests(unittest.TestCase):
 
         audio = client.list_audio()
         self.assertEqual(audio[0].data_bytes, 44)
+        self.assertEqual(audio[0].source_sha256, "a" * 64)
         self.assertTrue(audio[0].synced)
         self.assertEqual(audio[0].duration_ms, 1)
         self.assertEqual(client.wipe_recordings(), {"deleted": 1})
 
         self.assertEqual(calls[0], ("GET", "/v1/audio", None))
         self.assertEqual(calls[1], ("DELETE", "/v1/audio", None))
+
+    def test_audio_source_digest_is_optional_for_older_or_failed_device_hashing(self) -> None:
+        client = DeviceClient("http://127.0.0.1", "token")
+        client._request = lambda method, path: {  # type: ignore[method-assign]
+            "audio": [
+                {"audio_id": "old.wav", "filename": "old.wav"},
+                {
+                    "audio_id": "invalid.wav",
+                    "filename": "invalid.wav",
+                    "source_sha256": "NOT-A-DIGEST",
+                },
+            ]
+        }
+
+        audio = client.list_audio()
+        self.assertIsNone(audio[0].source_sha256)
+        self.assertIsNone(audio[1].source_sha256)
 
     def test_serial_wifi_provisioning_command(self) -> None:
         calls = []
