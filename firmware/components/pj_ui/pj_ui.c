@@ -1267,6 +1267,10 @@ int pj_ui_handle_aux_double(pj_ui_context_t *ctx)
     if (focus_count(ctx) > 1) {
         return cycle_focus(ctx);
     }
+    if (ctx->state != PJ_UI_STATE_STATIC && ctx->state != PJ_UI_STATE_TIME_TEMP &&
+        ctx->state != PJ_UI_STATE_HOME) {
+        return 0;
+    }
     if (ctx->state == PJ_UI_STATE_RECORD ||
         ctx->record_state != PJ_RECORD_IDLE || ctx->playback_state != PJ_PLAYBACK_IDLE ||
         ctx->stopwatch_running || ctx->timer_running || ctx->interval_running) {
