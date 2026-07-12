@@ -33,7 +33,45 @@ class StoragePathTests(unittest.TestCase):
 
             path = store.audio_path("device", "audio", "recording.not-an-extension")
 
-            self.assertEqual(path.name, "5-audio")
+            self.assertFalse(path.name.endswith(".not-an-extension"))
+
+    def test_case_distinct_identifiers_have_distinct_persisted_paths(self) -> None:
+        with TemporaryDirectory() as tmp:
+            store = PartnerStore(Path(tmp))
+
+            self.assertNotEqual(store.audio_dir("Device"), store.audio_dir("device"))
+            self.assertNotEqual(
+                store.audio_path("device", "Audio", "recording.wav"),
+                store.audio_path("device", "audio", "recording.wav"),
+            )
+            self.assertNotEqual(
+                store.transcript_path("device", "Audio"),
+                store.transcript_path("device", "audio"),
+            )
+            self.assertNotEqual(
+                store.job_path("device", "Audio"),
+                store.job_path("device", "audio"),
+            )
+
+    def test_unicode_normalization_distinct_identifiers_have_distinct_paths(self) -> None:
+        with TemporaryDirectory() as tmp:
+            store = PartnerStore(Path(tmp))
+            composed = "caf\u00e9"
+            decomposed = "cafe\u0301"
+
+            self.assertNotEqual(store.audio_dir(composed), store.audio_dir(decomposed))
+            self.assertNotEqual(
+                store.audio_path("device", composed, "recording.wav"),
+                store.audio_path("device", decomposed, "recording.wav"),
+            )
+            self.assertNotEqual(
+                store.transcript_path("device", composed),
+                store.transcript_path("device", decomposed),
+            )
+            self.assertNotEqual(
+                store.job_path("device", composed),
+                store.job_path("device", decomposed),
+            )
 
     def test_job_path_is_contained_for_path_like_identifiers(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -110,7 +148,7 @@ class JsonStorageTests(unittest.TestCase):
             path = store.save_transcript("device", "audio", {"text": "first"})
             store.save_transcript("device", "audio", {"text": "replacement"})
 
-            self.assertEqual(path, root / "transcripts" / "device" / "audio.json")
+            self.assertEqual(path, store.transcript_path("device", "audio"))
             self.assertEqual(store.load_transcript("device", "audio"), {"text": "replacement"})
             self.assertEqual(list(path.parent.iterdir()), [path])
 

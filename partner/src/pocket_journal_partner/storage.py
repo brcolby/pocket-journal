@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
+import hashlib
 import json
 import os
 import re
@@ -15,13 +16,10 @@ _SAFE_SUFFIX = re.compile(r"\.[A-Za-z0-9]{1,16}\Z")
 
 
 def _path_component(value: str) -> str:
-    """Encode an identifier as one non-traversing path component."""
+    """Encode an identifier as one non-traversing, case-stable path component."""
     encoded = quote(value, safe="")
-    if not encoded:
-        return "%EMPTY"
-    if encoded in {".", ".."}:
-        return encoded.replace(".", "%2E")
-    return encoded
+    digest = hashlib.sha256(value.encode("utf-8", "surrogatepass")).hexdigest()[:16]
+    return f"{digest}-{encoded or '%EMPTY'}"
 
 
 def _audio_filename(audio_id: str, filename: str) -> str:
@@ -45,7 +43,7 @@ class PartnerStore:
         return self.root / "transcripts" / _path_component(device_id)
 
     def transcript_path(self, device_id: str, audio_id: str) -> Path:
-        return self.transcript_dir(device_id) / f"{quote(audio_id, safe='')}.json"
+        return self.transcript_dir(device_id) / f"{_path_component(audio_id)}.json"
 
     def job_dir(self, device_id: str) -> Path:
         return self.root / "jobs" / _path_component(device_id)
