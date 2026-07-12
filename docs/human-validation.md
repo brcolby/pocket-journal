@@ -21,6 +21,11 @@ Last synchronized with `bd human list`: 2026-07-12.
 - [ ] **E-paper and touch baseline** (`pocket-journal-jjt`)
   - Exercise primary screens, touch targets, rapid navigation, wake, and repeated partial refreshes.
   - Record stale pixels, clipping, missed touches, ghosting, and approximate refresh latency.
+- [ ] **Editorial UI redesign** (`pocket-journal-nz5`)
+  - Inspect mixed-case headers, restrained rules, inverted focus rows, large time values, and compact action strips for physical legibility.
+  - On Home, short-press cycles destinations and double-press activates the focused secondary destination; focus-zero double-press remains quick record.
+  - In Notes, Time, and Settings, double-press cycles visible focus, short-press activates, and long-press returns to the immediate parent.
+  - Verify record elapsed time, wrapped transcript preview, tappable Play, alert dismiss/snooze, long Home-title ellipsis, and note paging beyond four items.
 - [ ] **Home layout persistence** (`pocket-journal-bmz`)
   - Change the layout, reboot and sleep/wake, and confirm order and navigation persist.
 - [ ] **Static art persistence** (`pocket-journal-lhl`)
