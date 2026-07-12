@@ -6,7 +6,7 @@ import {
   createAuxClickDetector,
 } from "../../simulator/src/aux_input.js";
 
-assert.equal(AUX_LONG_PRESS_MS, 1000);
+assert.equal(AUX_LONG_PRESS_MS, 650);
 assert.equal(AUX_DOUBLE_CLICK_MS, 350);
 
 let clock = 0;

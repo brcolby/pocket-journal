@@ -7,7 +7,7 @@ extern "C" {
 #endif
 
 #define PJ_AUX_DEBOUNCE_MS 30U
-#define PJ_AUX_LONG_PRESS_MS 1000U
+#define PJ_AUX_LONG_PRESS_MS 650U
 #define PJ_AUX_DOUBLE_CLICK_MS 350U
 
 typedef enum {

@@ -73,7 +73,7 @@ assert.match(simulatorJs, /DOUBLE_CLICK_MS = AUX_DOUBLE_CLICK_MS/);
 assert.match(simulatorJs, /scheduleAuxShort/);
 assert.match(simulatorJs, /handleAuxDouble/);
 assert.equal(simulatorJs.match(/!event\.repeat/g)?.length, 3);
-assert.match(simulatorAuxJs, /AUX_LONG_PRESS_MS = 1000/);
+assert.match(simulatorAuxJs, /AUX_LONG_PRESS_MS = 650/);
 assert.match(simulatorAuxJs, /AUX_DOUBLE_CLICK_MS = 350/);
 assert.match(simulatorJs, /putImageData\(framebufferImage, 0, 0, region\.x, region\.y, region\.width, region\.height\)/);
 assert.match(simulatorJs, /boot failed; check \.logs\/simulator-debug-latest\.json/);
