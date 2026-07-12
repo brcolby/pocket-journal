@@ -11,6 +11,13 @@ from typing import Any, Mapping
 
 MODEL_ID = "distil-whisper/distil-large-v3.5"
 MODEL_REVISION = "728a7691f3ff1d3d971528d3203a6e9559165d41"
+DEVICE_SAMPLE_RATE = 16_000
+DEVICE_CHANNELS = 1
+DEVICE_BITS_PER_SAMPLE = 16
+MODEL_ARTIFACT_DIGEST_UNAVAILABLE_REASON = (
+    "no canonical SHA-256 exists for the multi-file Hugging Face snapshot; "
+    "model_revision pins its immutable contents"
+)
 
 
 def inspect_wav(path: Path) -> dict[str, Any]:
@@ -82,6 +89,16 @@ def inspect_wav(path: Path) -> dict[str, Any]:
         raise ValueError("WAV data chunk is missing or empty")
 
     audio_format, channels, sample_rate, byte_rate, block_align, bits_per_sample = format_fields
+    if (
+        channels != DEVICE_CHANNELS
+        or sample_rate != DEVICE_SAMPLE_RATE
+        or bits_per_sample != DEVICE_BITS_PER_SAMPLE
+    ):
+        raise ValueError(
+            "unsupported device PCM layout: expected "
+            f"{DEVICE_SAMPLE_RATE} Hz, {DEVICE_CHANNELS} channel, "
+            f"{DEVICE_BITS_PER_SAMPLE}-bit"
+        )
     if any(chunk_size % block_align != 0 for chunk_size in data_chunk_sizes):
         raise ValueError("WAV data chunk is not frame aligned")
     return {
@@ -136,10 +153,19 @@ class HuggingFaceTranscriptionBackend(TranscriptionBackend):
         self,
         model_id: str = MODEL_ID,
         model_revision: str = MODEL_REVISION,
+        model_artifact_sha256: str | None = None,
         decoding_parameters: Mapping[str, Any] | None = None,
     ) -> None:
+        if not model_revision.strip():
+            raise ValueError("model_revision must pin an immutable model revision")
+        if model_artifact_sha256 is not None:
+            digest = model_artifact_sha256.lower()
+            if len(digest) != 64 or any(character not in "0123456789abcdef" for character in digest):
+                raise ValueError("model_artifact_sha256 must be a 64-character hexadecimal digest")
+            model_artifact_sha256 = digest
         self.model_id = model_id
         self.model_revision = model_revision
+        self.model_artifact_sha256 = model_artifact_sha256
         # A JSON round trip both validates and detaches caller-owned structures.
         self.decoding_parameters = json.loads(
             json.dumps(decoding_parameters or {}, sort_keys=True)
@@ -151,12 +177,20 @@ class HuggingFaceTranscriptionBackend(TranscriptionBackend):
             runtime_version: str | None = metadata.version("transformers")
         except metadata.PackageNotFoundError:
             runtime_version = None
+        artifact_identity = {
+            "algorithm": "sha256",
+            "digest": self.model_artifact_sha256,
+            "status": "verified" if self.model_artifact_sha256 is not None else "unavailable",
+        }
+        if self.model_artifact_sha256 is None:
+            artifact_identity["reason"] = MODEL_ARTIFACT_DIGEST_UNAVAILABLE_REASON
         return {
             "backend": "huggingface",
             "runtime": "transformers",
             "runtime_version": runtime_version,
             "model_id": self.model_id,
             "model_revision": self.model_revision,
+            "model_artifact": artifact_identity,
             "decoding_parameters": self.decoding_parameters,
         }
 
