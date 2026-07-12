@@ -14,6 +14,7 @@ from pocket_journal_partner.transcription import (
     FakeTranscriptionBackend,
     HuggingFaceTranscriptionBackend,
     MODEL_REVISION,
+    MODEL_ARTIFACT_DIGEST_UNAVAILABLE_REASON,
     inspect_wav,
 )
 
@@ -84,6 +85,30 @@ class TranscriptionTests(unittest.TestCase):
                     with self.assertRaises(ValueError):
                         inspect_wav(path)
 
+    def test_inspect_rejects_pcm_layout_not_emitted_by_device(self) -> None:
+        cases = {
+            "stereo": (1, 2, 16_000, 64_000, 4, 16),
+            "wrong sample rate": (1, 1, 8_000, 16_000, 2, 16),
+            "wrong sample width": (1, 1, 16_000, 16_000, 1, 8),
+        }
+        with TemporaryDirectory() as tmp:
+            for name, fields in cases.items():
+                with self.subTest(name=name):
+                    fmt = struct.pack("<HHIIHH", *fields)
+                    block_align = fields[4]
+                    samples = bytes(block_align)
+                    chunks = b"fmt " + struct.pack("<I", len(fmt)) + fmt
+                    chunks += b"data" + struct.pack("<I", len(samples)) + samples
+                    if len(samples) & 1:
+                        chunks += b"\x00"
+                    path = Path(tmp) / f"{name}.wav"
+                    path.write_bytes(
+                        b"RIFF" + struct.pack("<I", 4 + len(chunks)) + b"WAVE" + chunks
+                    )
+
+                    with self.assertRaisesRegex(ValueError, "unsupported device PCM layout"):
+                        inspect_wav(path)
+
     def test_inspect_rejects_incomplete_audio_frame(self) -> None:
         with TemporaryDirectory() as tmp:
             path = Path(tmp) / "partial-frame.wav"
@@ -128,6 +153,15 @@ class TranscriptionTests(unittest.TestCase):
         self.assertNotEqual(fake.fingerprint(), hf.fingerprint())
         self.assertEqual(hf.fingerprint()["model_id"], "distil-whisper/distil-large-v3.5")
         self.assertEqual(hf.fingerprint()["model_revision"], MODEL_REVISION)
+        self.assertEqual(
+            hf.fingerprint()["model_artifact"],
+            {
+                "algorithm": "sha256",
+                "digest": None,
+                "status": "unavailable",
+                "reason": MODEL_ARTIFACT_DIGEST_UNAVAILABLE_REASON,
+            },
+        )
         self.assertEqual(hf.fingerprint()["decoding_parameters"], {"language": "en"})
         json.dumps(fake.fingerprint())
         json.dumps(hf.fingerprint())
@@ -138,10 +172,29 @@ class TranscriptionTests(unittest.TestCase):
         second = HuggingFaceTranscriptionBackend(model_id="model-b")
         third = HuggingFaceTranscriptionBackend(model_id="model-a", decoding_parameters={"task": "translate"})
         fourth = HuggingFaceTranscriptionBackend(model_id="model-a", model_revision="other-revision")
+        fifth = HuggingFaceTranscriptionBackend(
+            model_id="model-a", model_artifact_sha256="a" * 64
+        )
 
         self.assertNotEqual(first.fingerprint(), second.fingerprint())
         self.assertNotEqual(first.fingerprint(), third.fingerprint())
         self.assertNotEqual(first.fingerprint(), fourth.fingerprint())
+        self.assertNotEqual(first.fingerprint(), fifth.fingerprint())
+        self.assertEqual(fifth.fingerprint()["model_artifact"]["status"], "verified")
+
+    def test_huggingface_rejects_unpinned_revision_and_invalid_artifact_digest(self) -> None:
+        with self.assertRaisesRegex(ValueError, "model_revision"):
+            HuggingFaceTranscriptionBackend(model_revision="")
+        with self.assertRaisesRegex(ValueError, "model_artifact_sha256"):
+            HuggingFaceTranscriptionBackend(model_artifact_sha256="not-a-digest")
+
+    def test_huggingface_fingerprint_does_not_load_pipeline(self) -> None:
+        backend = HuggingFaceTranscriptionBackend(model_artifact_sha256="A" * 64)
+
+        fingerprint = backend.fingerprint()
+
+        self.assertIsNone(backend._pipeline)
+        self.assertEqual(fingerprint["model_artifact"]["digest"], "a" * 64)
 
     def test_huggingface_pipeline_uses_pinned_revision(self) -> None:
         calls: list[tuple[str, dict[str, str]]] = []
