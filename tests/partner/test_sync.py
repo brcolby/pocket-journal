@@ -201,6 +201,21 @@ class SyncTests(unittest.TestCase):
             DEVICE_TRANSCRIPT_MAX_BYTES,
         )
 
+    def test_non_ascii_payload_uses_utf8_size_boundary(self) -> None:
+        text = "\u00e9" * 30_000
+        with TemporaryDirectory() as tmp:
+            client = FakeClient()
+            results = sync_device_audio(  # type: ignore[arg-type]
+                "pj-test", client, PartnerStore(Path(tmp)), FakeBackend(text=text)
+            )
+
+        wire_bytes = json.dumps(
+            client.upload_payloads[0], ensure_ascii=False, separators=(",", ":"), sort_keys=True
+        ).encode("utf-8")
+        self.assertEqual(results[0]["status"], "uploaded")
+        self.assertEqual(client.upload_payloads[0]["text"], text)
+        self.assertLessEqual(len(wire_bytes), DEVICE_TRANSCRIPT_MAX_BYTES)
+
     def test_local_only_transcription_does_not_upload_placeholder(self) -> None:
         with TemporaryDirectory() as tmp:
             client = FakeClient()
