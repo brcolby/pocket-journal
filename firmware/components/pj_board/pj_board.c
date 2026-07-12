@@ -176,6 +176,7 @@
 #define PJ_STORAGE_RESERVE_BYTES (256ULL * 1024ULL)
 #define PJ_STORAGE_RECORD_START_BYTES (64ULL * 1024ULL)
 #define PJ_STORAGE_CAPACITY_CHECK_BYTES (64U * 1024U)
+#define PJ_TRANSCRIPT_MAX_BODY_BYTES (64U * 1024U)
 #endif
 
 static pj_board_status_t g_status;
@@ -6865,13 +6866,19 @@ static esp_err_t transcript_put_handler(httpd_req_t *req)
         drain_body(req);
         return send_json(req, "{\"error\":\"audio not found\"}");
     }
-    char body[1024];
-    if (req->content_len <= 0 || req->content_len >= (int)sizeof(body)) {
+    if (req->content_len <= 0 || req->content_len > (int)PJ_TRANSCRIPT_MAX_BODY_BYTES) {
         drain_body(req);
         httpd_resp_set_status(req, "400 Bad Request");
         return send_json(req, "{\"error\":\"invalid transcript body\"}");
     }
-    if (!read_body(req, body, sizeof(body))) {
+    char *body = malloc((size_t)req->content_len + 1u);
+    if (body == NULL) {
+        drain_body(req);
+        httpd_resp_set_status(req, "503 Service Unavailable");
+        return send_json(req, "{\"error\":\"transcript upload out of memory\"}");
+    }
+    if (!read_body(req, body, (size_t)req->content_len + 1u)) {
+        free(body);
         httpd_resp_set_status(req, "400 Bad Request");
         return send_json(req, "{\"error\":\"invalid transcript body\"}");
     }
@@ -6880,6 +6887,7 @@ static esp_err_t transcript_put_handler(httpd_req_t *req)
     if (!cJSON_IsObject(json) || !cJSON_IsString(text) || text->valuestring == NULL ||
         text->valuestring[0] == '\0') {
         cJSON_Delete(json);
+        free(body);
         httpd_resp_set_status(req, "400 Bad Request");
         return send_json(req, "{\"error\":\"transcript must be a JSON object with non-empty text\"}");
     }
@@ -6887,6 +6895,7 @@ static esp_err_t transcript_put_handler(httpd_req_t *req)
     char path[PJ_NOTE_TRANSCRIPT_PATH_LEN];
     transcript_path_for_audio(path, sizeof(path), id + 1);
     esp_err_t write_err = json_write_file_atomic(path, body, strlen(body));
+    free(body);
     if (write_err == ESP_ERR_NO_MEM && g_status.storage_health == PJ_STORAGE_HEALTH_FULL) {
         httpd_resp_set_status(req, "507 Insufficient Storage");
         return send_json(req, "{\"error\":\"insufficient storage for transcript\"}");
