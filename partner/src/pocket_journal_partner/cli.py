@@ -124,7 +124,7 @@ def cmd_sync(args: argparse.Namespace) -> int:
     _print_json(session.envelope({
         "results": results,
         "count": len(results),
-        "synced": uploaded_count,
+        "synced": results,
         "uploaded_count": uploaded_count,
         "failed_count": failed_count,
         "transcribed_count": transcribed_count,

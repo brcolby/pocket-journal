@@ -166,16 +166,36 @@ class SyncTests(unittest.TestCase):
         self.assertEqual(client.downloaded, ["done.wav"])
         self.assertEqual(client.uploaded, ["done.wav"])
 
-    def test_oversized_text_is_bounded_for_device_upload(self) -> None:
+    def test_synced_fingerprint_change_requires_explicit_reprocess(self) -> None:
+        payload = wav_bytes()
+        item = AudioItem("note.wav", "note.wav", size=len(payload), data_bytes=4)
+        with TemporaryDirectory() as tmp:
+            client = FakeClient([item])
+            store = PartnerStore(Path(tmp))
+            first = FakeBackend("model-a")
+            second = FakeBackend("model-b")
+            sync_device_audio("pj-test", client, store, first)  # type: ignore[arg-type]
+            item.synced = True
+            skipped = sync_device_audio("pj-test", client, store, second)  # type: ignore[arg-type]
+            processed = sync_device_audio(  # type: ignore[arg-type]
+                "pj-test", client, store, second, reprocess_synced=True
+            )
+
+        self.assertEqual(skipped, [])
+        self.assertEqual(second.calls, 1)
+        self.assertEqual(processed[0]["model"], "model-b")
+        self.assertEqual(client.downloaded, ["note.wav", "note.wav"])
+
+    def test_complete_long_text_is_uploaded_without_truncation(self) -> None:
         with TemporaryDirectory() as tmp:
             client = FakeClient()
             store = PartnerStore(Path(tmp))
             results = sync_device_audio(  # type: ignore[arg-type]
-                "pj-test", client, store, FakeBackend(text="x" * 2000)
+                "pj-test", client, store, FakeBackend(text="x" * 20_000)
             )
 
         self.assertEqual(results[0]["status"], "uploaded")
-        self.assertTrue(client.upload_payloads[0]["truncated"])
+        self.assertEqual(client.upload_payloads[0]["text"], "x" * 20_000)
         self.assertLessEqual(
             len(json.dumps(client.upload_payloads[0], separators=(",", ":")).encode()),
             DEVICE_TRANSCRIPT_MAX_BYTES,
@@ -224,12 +244,12 @@ class SyncTests(unittest.TestCase):
 
         self.assertEqual([result["status"] for result in results], ["failed", "uploaded"])
         self.assertEqual(results[0]["operation"], "verify_audio")
-        self.assertFalse(results[0]["retryable"])
+        self.assertTrue(results[0]["retryable"])
         self.assertEqual(failed_job["stage"], "discovered")  # type: ignore[index]
         self.assertEqual(client.uploaded, ["good.wav"])
         self.assertEqual(backend.calls, 1)
 
-    def test_permanent_invalid_audio_is_not_retried_unchanged(self) -> None:
+    def test_invalid_download_is_retried_unchanged(self) -> None:
         item = AudioItem("bad.wav", "bad.wav", size=4, data_bytes=0)
         with TemporaryDirectory() as tmp:
             client = FakeClient([item])
@@ -239,10 +259,10 @@ class SyncTests(unittest.TestCase):
             second = sync_device_audio("pj-test", client, store, FakeBackend())  # type: ignore[arg-type]
             job = store.load_job("pj-test", "bad.wav")
 
-        self.assertFalse(first[0]["retryable"])
-        self.assertTrue(second[0]["cached"])
-        self.assertEqual(client.downloaded, ["bad.wav"])
-        self.assertEqual(job["attempt_count"], 1)  # type: ignore[index]
+        self.assertTrue(first[0]["retryable"])
+        self.assertNotIn("cached", second[0])
+        self.assertEqual(client.downloaded, ["bad.wav", "bad.wav"])
+        self.assertEqual(job["attempt_count"], 2)  # type: ignore[index]
 
     def test_initial_job_save_failure_does_not_block_later_items(self) -> None:
         class SelectiveFailStore(PartnerStore):
@@ -323,7 +343,7 @@ class SyncTests(unittest.TestCase):
         self.assertEqual(exit_code, 1)
         self.assertEqual(payload["result"]["uploaded_count"], 1)
         self.assertEqual(payload["result"]["failed_count"], 1)
-        self.assertEqual(payload["result"]["synced"], 1)
+        self.assertEqual(payload["result"]["synced"], results)
         self.assertEqual(payload["result"]["count"], 2)
         self.assertEqual(payload["result"]["results"], results)
 

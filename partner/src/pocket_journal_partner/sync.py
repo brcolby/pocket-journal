@@ -15,7 +15,7 @@ from .transcription import TranscriptionBackend, inspect_wav
 JOB_SCHEMA_VERSION = 1
 TRANSCRIPT_SCHEMA_VERSION = 1
 DEVICE_TRANSCRIPT_SCHEMA_VERSION = 1
-DEVICE_TRANSCRIPT_MAX_BYTES = 1000
+DEVICE_TRANSCRIPT_MAX_BYTES = 60 * 1024
 
 
 def _now() -> str:
@@ -130,23 +130,10 @@ def _device_transcript_payload(
         "source_sha256": str(source["sha256"]),
         "fingerprint_sha256": _fingerprint_digest(fingerprint),
     }
-    if len(_json_bytes(payload)) <= DEVICE_TRANSCRIPT_MAX_BYTES:
-        return payload
-
-    payload["truncated"] = True
-    ellipsis = "..."
-    low = 0
-    high = max(0, len(text))
-    while low < high:
-        mid = (low + high + 1) // 2
-        payload["text"] = text[:mid].rstrip() + ellipsis
-        if len(_json_bytes(payload)) <= DEVICE_TRANSCRIPT_MAX_BYTES:
-            low = mid
-        else:
-            high = mid - 1
-    payload["text"] = (text[:low].rstrip() + ellipsis).strip()
-    if not payload["text"] or len(_json_bytes(payload)) > DEVICE_TRANSCRIPT_MAX_BYTES:
-        raise ValueError("transcript is too large for device upload")
+    if len(_json_bytes(payload)) > DEVICE_TRANSCRIPT_MAX_BYTES:
+        raise ValueError(
+            f"transcript exceeds the {DEVICE_TRANSCRIPT_MAX_BYTES}-byte device upload limit"
+        )
     return payload
 
 
@@ -155,10 +142,12 @@ def _download_and_inspect(
     store: PartnerStore,
     device_id: str,
     item: Any,
+    *,
+    force_download: bool = False,
 ) -> tuple[Path, dict[str, Any]]:
     audio_path = store.audio_path(device_id, item.audio_id, item.filename)
     metadata: dict[str, Any] | None = None
-    if audio_path.exists():
+    if audio_path.exists() and not force_download:
         try:
             metadata = inspect_wav(audio_path)
         except (OSError, ValueError):
@@ -204,7 +193,7 @@ def _failure_result(
     error: Exception,
 ) -> dict[str, Any]:
     message = str(error).strip() or error.__class__.__name__
-    retryable = operation not in {"verify_audio", "prepare_upload"}
+    retryable = operation != "prepare_upload"
     if operation == "transcribe" and isinstance(error, ValueError):
         retryable = False
     job["last_error"] = {
@@ -288,7 +277,7 @@ def sync_device_audio(
                     completed_job["last_error"] = None
                     _save_job(store, device_id, item.audio_id, completed_job)
                     continue
-                if not reprocess_synced and not isinstance(completed_job, dict):
+                if not reprocess_synced:
                     continue
 
             job = _load_job(store, device_id, item.audio_id, item.filename)
@@ -306,7 +295,13 @@ def sync_device_audio(
             _save_job(store, device_id, item.audio_id, job)
 
             operation = "download_audio"
-            audio_path, audio_metadata = _download_and_inspect(client, store, device_id, item)
+            audio_path, audio_metadata = _download_and_inspect(
+                client,
+                store,
+                device_id,
+                item,
+                force_download=reprocess_synced and (item.synced or item.transcript_uploaded),
+            )
             source = _source_identity(audio_metadata)
             job["stage"] = "audio_verified"
             job["source"] = source
