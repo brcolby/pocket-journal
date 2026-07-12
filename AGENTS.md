@@ -77,6 +77,10 @@ section in status reports and handoffs.
   bead id, what the human should check, and what evidence would allow closure.
 - Do not mix human-validation beads into the normal ready-work list unless the
   next action is still agent-executable without new human evidence.
+- Keep `docs/human-validation.md` synchronized whenever a human-validation
+  bead is created, materially updated, validated, or closed. The document is a
+  concise operator checklist; Beads remains the source of truth for status,
+  acceptance criteria, implementation notes, and evidence.
 
 <!-- BEGIN BEADS INTEGRATION v:1 profile:minimal hash:970c3bf2 -->
 ## Beads Issue Tracker
