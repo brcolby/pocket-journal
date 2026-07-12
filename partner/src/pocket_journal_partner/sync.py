@@ -3,6 +3,9 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+import hashlib
+import json
+import tempfile
 
 from .device import DeviceClient
 from .storage import PartnerStore
@@ -11,6 +14,8 @@ from .transcription import TranscriptionBackend, inspect_wav
 
 JOB_SCHEMA_VERSION = 1
 TRANSCRIPT_SCHEMA_VERSION = 1
+DEVICE_TRANSCRIPT_SCHEMA_VERSION = 1
+DEVICE_TRANSCRIPT_MAX_BYTES = 1000
 
 
 def _now() -> str:
@@ -99,6 +104,51 @@ def _prepare_transcript(
     return prepared
 
 
+def _json_bytes(payload: dict[str, Any]) -> bytes:
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode(
+        "utf-8"
+    )
+
+
+def _fingerprint_digest(fingerprint: dict[str, Any]) -> str:
+    return hashlib.sha256(_json_bytes(fingerprint)).hexdigest()
+
+
+def _device_transcript_payload(
+    transcript: dict[str, Any],
+    source: dict[str, Any],
+    fingerprint: dict[str, Any],
+) -> dict[str, Any]:
+    """Return a compact payload that fits the current firmware transcript handler."""
+    text = str(transcript.get("text", "")).strip()
+    model = str(transcript.get("model", fingerprint.get("model_id", ""))).strip()
+    payload: dict[str, Any] = {
+        "v": DEVICE_TRANSCRIPT_SCHEMA_VERSION,
+        "text": text,
+        "model": model[:96],
+        "source_sha256": str(source["sha256"]),
+        "fingerprint_sha256": _fingerprint_digest(fingerprint),
+    }
+    if len(_json_bytes(payload)) <= DEVICE_TRANSCRIPT_MAX_BYTES:
+        return payload
+
+    payload["truncated"] = True
+    ellipsis = "..."
+    low = 0
+    high = max(0, len(text))
+    while low < high:
+        mid = (low + high + 1) // 2
+        payload["text"] = text[:mid].rstrip() + ellipsis
+        if len(_json_bytes(payload)) <= DEVICE_TRANSCRIPT_MAX_BYTES:
+            low = mid
+        else:
+            high = mid - 1
+    payload["text"] = (text[:low].rstrip() + ellipsis).strip()
+    if not payload["text"] or len(_json_bytes(payload)) > DEVICE_TRANSCRIPT_MAX_BYTES:
+        raise ValueError("transcript is too large for device upload")
+    return payload
+
+
 def _download_and_inspect(
     client: DeviceClient,
     store: PartnerStore,
@@ -111,17 +161,26 @@ def _download_and_inspect(
         try:
             metadata = inspect_wav(audio_path)
         except (OSError, ValueError):
-            audio_path.unlink()
+            metadata = None
         if metadata is not None and item.size is not None and metadata["bytes"] != item.size:
-            audio_path.unlink()
             metadata = None
 
     if metadata is None:
-        downloaded = client.download_audio(item, audio_path.parent)
         audio_path.parent.mkdir(parents=True, exist_ok=True)
-        if downloaded != audio_path:
+        with tempfile.TemporaryDirectory(prefix=".download-", dir=audio_path.parent) as tmp:
+            downloaded = client.download_audio(item, Path(tmp))
+            metadata = inspect_wav(downloaded)
+            if item.size is not None and metadata["bytes"] != item.size:
+                raise ValueError(
+                    f"downloaded WAV size mismatch: expected {item.size} bytes, "
+                    f"got {metadata['bytes']}"
+                )
+            if item.data_bytes is not None and metadata["data_bytes"] != item.data_bytes:
+                raise ValueError(
+                    "downloaded WAV data length mismatch: "
+                    f"expected {item.data_bytes} bytes, got {metadata['data_bytes']}"
+                )
             downloaded.replace(audio_path)
-        metadata = inspect_wav(audio_path)
 
     if item.size is not None and metadata["bytes"] != item.size:
         raise ValueError(
@@ -144,7 +203,9 @@ def _failure_result(
     error: Exception,
 ) -> dict[str, Any]:
     message = str(error).strip() or error.__class__.__name__
-    retryable = operation != "verify_audio"
+    retryable = operation not in {"verify_audio", "prepare_upload"}
+    if operation == "transcribe" and isinstance(error, ValueError):
+        retryable = False
     job["last_error"] = {
         "operation": operation,
         "type": error.__class__.__name__,
@@ -152,7 +213,10 @@ def _failure_result(
         "retryable": retryable,
         "at": _now(),
     }
-    _save_job(store, device_id, audio_id, job)
+    try:
+        _save_job(store, device_id, audio_id, job)
+    except Exception as save_error:
+        message = f"{message}; failed to save job state: {save_error}"
     return {
         "device_id": device_id,
         "audio_id": audio_id,
@@ -169,16 +233,30 @@ def sync_device_audio(
     client: DeviceClient,
     store: PartnerStore,
     backend: TranscriptionBackend,
+    *,
+    upload_transcripts: bool = True,
+    reprocess_synced: bool = False,
 ) -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
+    fingerprint = backend.fingerprint()
     for item in client.list_audio():
+        completed_job = store.load_job(device_id, item.audio_id)
         if item.synced or item.transcript_uploaded:
-            completed_job = store.load_job(device_id, item.audio_id)
-            if isinstance(completed_job, dict) and completed_job.get("audio_id") == item.audio_id:
+            completed_transcript = store.load_transcript(device_id, item.audio_id)
+            completed_source = completed_job.get("source") if isinstance(completed_job, dict) else None
+            if not reprocess_synced and (
+                isinstance(completed_job, dict)
+                and completed_job.get("audio_id") == item.audio_id
+                and completed_job.get("stage") == "uploaded"
+                and isinstance(completed_source, dict)
+                and _transcript_matches(completed_transcript, completed_source, fingerprint)
+            ):
                 completed_job["stage"] = "uploaded"
                 completed_job["last_error"] = None
                 _save_job(store, device_id, item.audio_id, completed_job)
-            continue
+                continue
+            if not reprocess_synced and not isinstance(completed_job, dict):
+                continue
 
         job = _load_job(store, device_id, item.audio_id, item.filename)
         job["attempt_count"] = int(job.get("attempt_count", 0)) + 1
@@ -196,7 +274,6 @@ def sync_device_audio(
             _save_job(store, device_id, item.audio_id, job)
 
             operation = "transcribe"
-            fingerprint = backend.fingerprint()
             transcript = store.load_transcript(device_id, item.audio_id)
             if not _transcript_matches(transcript, source, fingerprint):
                 transcript = _prepare_transcript(backend.transcribe(audio_path), source, fingerprint)
@@ -205,9 +282,14 @@ def sync_device_audio(
             job["transcription_fingerprint"] = fingerprint
             _save_job(store, device_id, item.audio_id, job)
 
-            operation = "upload_transcript"
-            client.upload_transcript(item.audio_id, transcript)
-            job["stage"] = "uploaded"
+            if upload_transcripts:
+                operation = "prepare_upload"
+                device_payload = _device_transcript_payload(transcript, source, fingerprint)
+                operation = "upload_transcript"
+                client.upload_transcript(item.audio_id, device_payload)
+                job["stage"] = "uploaded"
+            else:
+                job["stage"] = "transcribed"
             job["last_error"] = None
             _save_job(store, device_id, item.audio_id, job)
 
@@ -215,10 +297,11 @@ def sync_device_audio(
                 "device_id": device_id,
                 "audio_id": item.audio_id,
                 "audio_file": str(audio_path),
-                "status": "uploaded",
+                "status": "uploaded" if upload_transcripts else "transcribed",
                 "source_sha256": source["sha256"],
                 "synced_at": _now(),
                 "model": transcript.get("model", ""),
+                "uploaded": upload_transcripts,
             }
             operation = "append_sync_log"
             store.append_sync_log(entry)
