@@ -139,6 +139,15 @@ static void test_note_paging_tracks_hardware_focus_and_swipes(void)
     assert(ui.note_page == 1 && ui.focus_index == 4);
     assert(pj_ui_handle_touch(&ui, 100, 100, PJ_TOUCH_SWIPE_RIGHT) == 1);
     assert(ui.note_page == 0 && ui.focus_index == 0);
+
+    ui.note_page = 1;
+    ui.focus_index = 4;
+    assert(pj_ui_handle_aux_long(&ui) == 1);
+    assert(ui.state == PJ_UI_STATE_NOTES);
+    ui.focus_index = 2;
+    assert(pj_ui_handle_aux_short(&ui) == 1);
+    assert(ui.state == PJ_UI_STATE_READ);
+    assert(ui.note_page == 1 && ui.focus_index == 4);
 }
 
 static void test_read_opens_transcript_detail_without_playback(void)

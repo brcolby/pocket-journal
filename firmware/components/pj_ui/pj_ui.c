@@ -23,6 +23,7 @@
 #include <string.h>
 
 #define PJ_UI_MAX_DURATION_SECONDS 86400
+#define PJ_UI_NOTES_PER_PAGE 4
 
 #if defined(PJ_UI_USE_LVGL)
 #define PJ_LVGL_PALETTE_BYTES 8
@@ -197,7 +198,8 @@ static void set_state(pj_ui_context_t *ctx, pj_ui_state_t state)
 {
     if (state >= 0 && state < PJ_UI_STATE_COUNT) {
         ctx->state = state;
-        ctx->focus_index = 0;
+        ctx->focus_index = (state == PJ_UI_STATE_LISTEN || state == PJ_UI_STATE_READ) ?
+            ctx->note_page * PJ_UI_NOTES_PER_PAGE : 0;
         mark_full(ctx);
     }
 }
@@ -763,7 +765,7 @@ static void clamp_volume(pj_ui_context_t *ctx)
 
 static int notes_per_page(void)
 {
-    return 4;
+    return PJ_UI_NOTES_PER_PAGE;
 }
 
 static int note_page_count(const pj_ui_context_t *ctx)
