@@ -56,6 +56,7 @@
 #include "freertos/task.h"
 #include "nvs.h"
 #include "nvs_flash.h"
+#include "psa/crypto.h"
 #include "sdmmc_cmd.h"
 #include "lwip/ip4_addr.h"
 #include "mdns.h"
@@ -6733,6 +6734,50 @@ static esp_err_t static_art_put_handler(httpd_req_t *req)
     return send_json(req, "{\"updated\":true}");
 }
 
+static int audio_sha256_hex(const char *filename, char out[65])
+{
+    char path[160];
+    uint8_t buffer[1024];
+    uint8_t digest[PSA_HASH_LENGTH(PSA_ALG_SHA_256)];
+    size_t digest_length = 0;
+    psa_hash_operation_t operation = PSA_HASH_OPERATION_INIT;
+    int valid = 0;
+    (void)snprintf(path, sizeof(path), PJ_AUDIO_DIR "/%s", filename);
+    FILE *file = fopen(path, "rb");
+    if (file == NULL || psa_crypto_init() != PSA_SUCCESS ||
+        psa_hash_setup(&operation, PSA_ALG_SHA_256) != PSA_SUCCESS) {
+        if (file != NULL) {
+            fclose(file);
+        }
+        return 0;
+    }
+    for (;;) {
+        size_t read = fread(buffer, 1, sizeof(buffer), file);
+        if (read > 0 && psa_hash_update(&operation, buffer, read) != PSA_SUCCESS) {
+            break;
+        }
+        if (read < sizeof(buffer)) {
+            if (ferror(file) == 0 &&
+                psa_hash_finish(&operation, digest, sizeof(digest), &digest_length) == PSA_SUCCESS &&
+                digest_length == sizeof(digest)) {
+                static const char HEX[] = "0123456789abcdef";
+                for (size_t i = 0; i < sizeof(digest); i++) {
+                    out[i * 2] = HEX[digest[i] >> 4];
+                    out[i * 2 + 1] = HEX[digest[i] & 0x0f];
+                }
+                out[64] = '\0';
+                valid = 1;
+            }
+            break;
+        }
+    }
+    fclose(file);
+    if (!valid) {
+        (void)psa_hash_abort(&operation);
+    }
+    return valid;
+}
+
 static esp_err_t audio_list_handler(httpd_req_t *req)
 {
     if (require_auth(req) != ESP_OK) {
@@ -6758,6 +6803,12 @@ static esp_err_t audio_list_handler(httpd_req_t *req)
             cJSON_AddStringToObject(item, "label", entries[i].label);
             cJSON_AddNumberToObject(item, "size", entries[i].size_bytes);
             cJSON_AddNumberToObject(item, "data_bytes", entries[i].data_bytes);
+            char source_sha256[65];
+            if (audio_sha256_hex(entries[i].filename, source_sha256)) {
+                cJSON_AddStringToObject(item, "source_sha256", source_sha256);
+            } else {
+                cJSON_AddNullToObject(item, "source_sha256");
+            }
             cJSON_AddStringToObject(item, "created_at", entries[i].note.created_at);
             cJSON_AddNumberToObject(item, "duration_ms", entries[i].note.duration_ms);
             cJSON_AddBoolToObject(item, "synced", entries[i].note.synced != 0);
@@ -6866,10 +6917,15 @@ static esp_err_t transcript_put_handler(httpd_req_t *req)
         drain_body(req);
         return send_json(req, "{\"error\":\"audio not found\"}");
     }
-    if (req->content_len <= 0 || req->content_len > (int)PJ_TRANSCRIPT_MAX_BODY_BYTES) {
+    if (req->content_len <= 0) {
         drain_body(req);
         httpd_resp_set_status(req, "400 Bad Request");
-        return send_json(req, "{\"error\":\"invalid transcript body\"}");
+        return send_json(req, "{\"error\":\"transcript body is required\"}");
+    }
+    if (req->content_len > (int)PJ_TRANSCRIPT_MAX_BODY_BYTES) {
+        drain_body(req);
+        httpd_resp_set_status(req, "413 Payload Too Large");
+        return send_json(req, "{\"error\":\"transcript body exceeds 65536 bytes\"}");
     }
     char *body = malloc((size_t)req->content_len + 1u);
     if (body == NULL) {
@@ -6880,9 +6936,19 @@ static esp_err_t transcript_put_handler(httpd_req_t *req)
     if (!read_body(req, body, (size_t)req->content_len + 1u)) {
         free(body);
         httpd_resp_set_status(req, "400 Bad Request");
-        return send_json(req, "{\"error\":\"invalid transcript body\"}");
+        return send_json(req, "{\"error\":\"incomplete transcript body\"}");
     }
-    cJSON *json = cJSON_Parse(body);
+    if (memchr(body, '\0', (size_t)req->content_len) != NULL) {
+        free(body);
+        httpd_resp_set_status(req, "400 Bad Request");
+        return send_json(req, "{\"error\":\"malformed transcript JSON\"}");
+    }
+    cJSON *json = cJSON_ParseWithLengthOpts(body, (size_t)req->content_len + 1u, NULL, true);
+    if (json == NULL) {
+        free(body);
+        httpd_resp_set_status(req, "400 Bad Request");
+        return send_json(req, "{\"error\":\"malformed transcript JSON\"}");
+    }
     cJSON *text = json == NULL ? NULL : cJSON_GetObjectItemCaseSensitive(json, "text");
     if (!cJSON_IsObject(json) || !cJSON_IsString(text) || text->valuestring == NULL ||
         text->valuestring[0] == '\0') {
@@ -6894,7 +6960,7 @@ static esp_err_t transcript_put_handler(httpd_req_t *req)
     cJSON_Delete(json);
     char path[PJ_NOTE_TRANSCRIPT_PATH_LEN];
     transcript_path_for_audio(path, sizeof(path), id + 1);
-    esp_err_t write_err = json_write_file_atomic(path, body, strlen(body));
+    esp_err_t write_err = json_write_file_atomic(path, body, (size_t)req->content_len);
     free(body);
     if (write_err == ESP_ERR_NO_MEM && g_status.storage_health == PJ_STORAGE_HEALTH_FULL) {
         httpd_resp_set_status(req, "507 Insufficient Storage");

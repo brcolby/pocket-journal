@@ -41,11 +41,20 @@ class AudioItem:
     label: str | None = None
     size: int | None = None
     data_bytes: int | None = None
+    source_sha256: str | None = None
     created_at: str | None = None
     duration_ms: int | None = None
     synced: bool = False
     transcript_uploaded: bool = False
     transcript_path: str | None = None
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.source_sha256, str)
+            or len(self.source_sha256) != 64
+            or any(ch not in "0123456789abcdef" for ch in self.source_sha256)
+        ):
+            self.source_sha256 = None
 
 
 class DeviceClient:
