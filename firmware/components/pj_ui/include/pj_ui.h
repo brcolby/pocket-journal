@@ -14,7 +14,7 @@ extern "C" {
 #define PJ_DISPLAY_HEIGHT 200
 #define PJ_FRAMEBUFFER_BYTES ((PJ_DISPLAY_WIDTH * PJ_DISPLAY_HEIGHT) / 8)
 #define PJ_UI_MAX_NOTES 12
-#define PJ_UI_NOTE_LABEL_LEN 18
+#define PJ_UI_NOTE_LABEL_LEN 96
 
 typedef enum {
     PJ_UI_STATE_STATIC = 0,
@@ -136,11 +136,14 @@ typedef struct {
     int alarm_minute;
     int note_page;
     int selected_note;
+    int focus_index;
+    int note_detail_transcript;
     pj_home_layout_t home_layout;
     char note_labels[PJ_UI_MAX_NOTES][PJ_UI_NOTE_LABEL_LEN];
     uint8_t static_art[PJ_FRAMEBUFFER_BYTES];
     int static_art_valid;
     pj_record_state_t record_state;
+    int recording_seconds;
     pj_playback_state_t playback_state;
     int playback_exit_pending;
     pj_time_alert_t active_alert;

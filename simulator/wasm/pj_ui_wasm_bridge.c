@@ -94,6 +94,16 @@ void pj_sim_set_audio_state(int recording, int playback_active)
 }
 
 EMSCRIPTEN_KEEPALIVE
+void pj_sim_set_alert(int source)
+{
+    pj_ui_time_projection_t projection;
+    memset(&projection, 0, sizeof(projection));
+    projection.active_alert.id = source > 0 ? 42u : 0u;
+    projection.active_alert.source = source;
+    pj_ui_set_time_projection(&g_ctx, &projection);
+}
+
+EMSCRIPTEN_KEEPALIVE
 int pj_sim_record_state(void)
 {
     return (int)g_ctx.record_state;
@@ -125,6 +135,22 @@ void pj_sim_set_note_label(int index, const char *label)
     }
     strncpy(g_note_labels[index], label, PJ_UI_NOTE_LABEL_LEN - 1);
     g_note_labels[index][PJ_UI_NOTE_LABEL_LEN - 1] = '\0';
+    sync_notes();
+}
+
+EMSCRIPTEN_KEEPALIVE
+void pj_sim_seed_review_notes(void)
+{
+    static const char *labels[] = {
+        "Walked by the river after the rain and remembered the cedar trees.",
+        "Project reflection",
+        "Morning idea",
+    };
+    memset(g_note_labels, 0, sizeof(g_note_labels));
+    g_note_count = 3;
+    for (int i = 0; i < g_note_count; i++) {
+        strncpy(g_note_labels[i], labels[i], PJ_UI_NOTE_LABEL_LEN - 1);
+    }
     sync_notes();
 }
 

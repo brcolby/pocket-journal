@@ -2382,7 +2382,7 @@ static int transcript_label_for_audio(const char *filename, char *label, size_t 
         if (pending_space && used + 1 < label_size) {
             label[used++] = ' ';
         }
-        label[used++] = (char)toupper(ch);
+        label[used++] = (char)ch;
         pending_space = 0;
     }
     label[used] = '\0';

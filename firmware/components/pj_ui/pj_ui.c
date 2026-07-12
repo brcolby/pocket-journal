@@ -18,13 +18,10 @@
 #include "src/widgets/line/lv_line.h"
 #endif
 
-#include <ctype.h>
 #include <limits.h>
-#include <math.h>
 #include <stdio.h>
 #include <string.h>
 
-#define PJ_PI 3.14159265358979323846
 #define PJ_UI_MAX_DURATION_SECONDS 86400
 
 #if defined(PJ_UI_USE_LVGL)
@@ -68,39 +65,39 @@ static const state_meta_t STATE_META[PJ_UI_STATE_COUNT] = {
     [PJ_UI_STATE_TIME_TEMP] = {PJ_UI_STATE_TIME_TEMP, "time_temp", "TIME/TEMP", PJ_UI_STATE_STATIC},
     [PJ_UI_STATE_HOME] = {PJ_UI_STATE_HOME, "home", "HOME", PJ_UI_STATE_TIME_TEMP},
     [PJ_UI_STATE_NOTES] = {PJ_UI_STATE_NOTES, "notes", "NOTES", PJ_UI_STATE_HOME},
-    [PJ_UI_STATE_RECORD] = {PJ_UI_STATE_RECORD, "record", "RECORD", PJ_UI_STATE_HOME},
-    [PJ_UI_STATE_LISTEN] = {PJ_UI_STATE_LISTEN, "listen", "LISTEN", PJ_UI_STATE_HOME},
-    [PJ_UI_STATE_READ] = {PJ_UI_STATE_READ, "read", "READ", PJ_UI_STATE_HOME},
+    [PJ_UI_STATE_RECORD] = {PJ_UI_STATE_RECORD, "record", "Record", PJ_UI_STATE_NOTES},
+    [PJ_UI_STATE_LISTEN] = {PJ_UI_STATE_LISTEN, "listen", "Listen", PJ_UI_STATE_NOTES},
+    [PJ_UI_STATE_READ] = {PJ_UI_STATE_READ, "read", "Read", PJ_UI_STATE_NOTES},
     [PJ_UI_STATE_TIME] = {PJ_UI_STATE_TIME, "time", "TIME", PJ_UI_STATE_HOME},
-    [PJ_UI_STATE_ALARM] = {PJ_UI_STATE_ALARM, "alarm", "ALARM", PJ_UI_STATE_HOME},
-    [PJ_UI_STATE_STOPWATCH] = {PJ_UI_STATE_STOPWATCH, "stopwatch", "STOPWATCH", PJ_UI_STATE_HOME},
-    [PJ_UI_STATE_TIMER] = {PJ_UI_STATE_TIMER, "timer", "TIMER", PJ_UI_STATE_HOME},
-    [PJ_UI_STATE_INTERVAL] = {PJ_UI_STATE_INTERVAL, "interval", "INTERVAL", PJ_UI_STATE_HOME},
+    [PJ_UI_STATE_ALARM] = {PJ_UI_STATE_ALARM, "alarm", "Alarm", PJ_UI_STATE_TIME},
+    [PJ_UI_STATE_STOPWATCH] = {PJ_UI_STATE_STOPWATCH, "stopwatch", "Stopwatch", PJ_UI_STATE_TIME},
+    [PJ_UI_STATE_TIMER] = {PJ_UI_STATE_TIMER, "timer", "Timer", PJ_UI_STATE_TIME},
+    [PJ_UI_STATE_INTERVAL] = {PJ_UI_STATE_INTERVAL, "interval", "Interval", PJ_UI_STATE_TIME},
     [PJ_UI_STATE_SETTINGS] = {PJ_UI_STATE_SETTINGS, "settings", "SETTINGS", PJ_UI_STATE_HOME},
     [PJ_UI_STATE_SYNC] = {PJ_UI_STATE_SYNC, "sync", "SYNC", PJ_UI_STATE_SETTINGS},
     [PJ_UI_STATE_VOLUME] = {PJ_UI_STATE_VOLUME, "volume", "VOLUME", PJ_UI_STATE_SETTINGS},
     [PJ_UI_STATE_CALENDAR] = {PJ_UI_STATE_CALENDAR, "calendar", "CALENDAR", PJ_UI_STATE_HOME},
-    [PJ_UI_STATE_NOTE_DETAIL] = {PJ_UI_STATE_NOTE_DETAIL, "note_detail", "NOTE", PJ_UI_STATE_HOME},
+    [PJ_UI_STATE_NOTE_DETAIL] = {PJ_UI_STATE_NOTE_DETAIL, "note_detail", "Note", PJ_UI_STATE_LISTEN},
 };
 
 static const tile_t NOTES_TILES[] = {
-    {"RECORD", "REC", PJ_UI_STATE_RECORD, 8, 8, 184, 84},
-    {"LISTEN", "PLAY", PJ_UI_STATE_LISTEN, 8, 104, 88, 88},
-    {"READ", "TXT", PJ_UI_STATE_READ, 104, 104, 88, 88},
+    {"Record", "REC", PJ_UI_STATE_RECORD, 10, 38, 180, 58},
+    {"Listen", "PLAY", PJ_UI_STATE_LISTEN, 10, 106, 180, 38},
+    {"Read", "TXT", PJ_UI_STATE_READ, 10, 152, 180, 38},
 };
 
 static const tile_t TIME_TILES[] = {
-    {"ALARM", "ALM", PJ_UI_STATE_ALARM, 8, 8, 88, 88},
-    {"STOPWATCH", "SW", PJ_UI_STATE_STOPWATCH, 104, 8, 88, 88},
-    {"TIMER", "TMR", PJ_UI_STATE_TIMER, 8, 104, 88, 88},
-    {"INTERVAL", "INT", PJ_UI_STATE_INTERVAL, 104, 104, 88, 88},
+    {"Alarm", "ALM", PJ_UI_STATE_ALARM, 10, 38, 180, 34},
+    {"Stopwatch", "SW", PJ_UI_STATE_STOPWATCH, 10, 77, 180, 34},
+    {"Timer", "TMR", PJ_UI_STATE_TIMER, 10, 116, 180, 34},
+    {"Interval", "INT", PJ_UI_STATE_INTERVAL, 10, 155, 180, 34},
 };
 
 static const tile_t SETTINGS_TILES[] = {
-    {"SYNC", "NET", PJ_UI_STATE_SYNC, 8, 8, 88, 88},
-    {"VOLUME", "VOL", PJ_UI_STATE_VOLUME, 104, 8, 88, 88},
-    {"MODE", "MODE", PJ_UI_STATE_SETTINGS, 8, 104, 88, 88},
-    {"POWER", "OFF", PJ_UI_STATE_STATIC, 104, 104, 88, 88},
+    {"Sync status", "NET", PJ_UI_STATE_SYNC, 10, 38, 180, 34},
+    {"Volume", "VOL", PJ_UI_STATE_VOLUME, 10, 77, 180, 34},
+    {"Appearance", "MODE", PJ_UI_STATE_SETTINGS, 10, 116, 180, 34},
+    {"Sleep", "OFF", PJ_UI_STATE_STATIC, 10, 155, 180, 34},
 };
 
 static int weekday_from_date(int year, int month, int day)
@@ -130,9 +127,10 @@ static pj_ui_state_t state_from_destination(const char *destination)
 
 static size_t home_tiles(const pj_ui_context_t *ctx, tile_t tiles[PJ_HOME_MAX_SLOTS])
 {
-    static const int x[PJ_HOME_MAX_SLOTS] = {8, 104, 8, 104};
-    static const int y[PJ_HOME_MAX_SLOTS] = {20, 20, 110, 110};
-    static const int h[PJ_HOME_MAX_SLOTS] = {82, 82, 82, 82};
+    static const int y[PJ_HOME_MAX_SLOTS] = {38, 112, 150, 150};
+    static const int x[PJ_HOME_MAX_SLOTS] = {10, 10, 10, 102};
+    static const int w[PJ_HOME_MAX_SLOTS] = {180, 180, 84, 88};
+    static const int h[PJ_HOME_MAX_SLOTS] = {64, 32, 40, 40};
     size_t count = ctx->home_layout.slot_count;
     if (count > PJ_HOME_MAX_SLOTS) {
         count = PJ_HOME_MAX_SLOTS;
@@ -144,7 +142,7 @@ static size_t home_tiles(const pj_ui_context_t *ctx, tile_t tiles[PJ_HOME_MAX_SL
             .next = state_from_destination(ctx->home_layout.slots[i].destination),
             .x = x[i],
             .y = y[i],
-            .w = 88,
+            .w = w[i],
             .h = h[i],
         };
     }
@@ -161,7 +159,7 @@ static pj_ui_state_t home_primary_state(const pj_ui_context_t *ctx)
 
 static const char *weekday_name(int weekday)
 {
-    static const char *names[] = {"SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"};
+    static const char *names[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
     if (weekday < 0 || weekday > 6) {
         return "---";
     }
@@ -207,6 +205,7 @@ static void set_state(pj_ui_context_t *ctx, pj_ui_state_t state)
 {
     if (state >= 0 && state < PJ_UI_STATE_COUNT) {
         ctx->state = state;
+        ctx->focus_index = 0;
         mark_full(ctx);
     }
 }
@@ -306,29 +305,11 @@ static void draw_round_rect(pj_framebuffer_t *fb, int x, int y, int w, int h, in
     }
 }
 
-static void draw_round_rect_width(pj_framebuffer_t *fb, int x, int y, int w, int h, int r, int width)
-{
-    for (int i = 0; i < width; i++) {
-        draw_round_rect(fb, x + i, y + i, w - 2 * i, h - 2 * i, r > i ? r - i : 1);
-    }
-}
-
 static void fill_rect(pj_framebuffer_t *fb, int x, int y, int w, int h)
 {
     for (int yy = y; yy < y + h; yy++) {
         for (int xx = x; xx < x + w; xx++) {
             fb_set(fb, xx, yy, 1);
-        }
-    }
-}
-
-static void fill_circle(pj_framebuffer_t *fb, int cx, int cy, int r)
-{
-    for (int y = -r; y <= r; y++) {
-        for (int x = -r; x <= r; x++) {
-            if (x * x + y * y <= r * r) {
-                fb_set(fb, cx + x, cy + y, 1);
-            }
         }
     }
 }
@@ -341,33 +322,6 @@ static int min_int(int a, int b)
 static int max_int(int a, int b)
 {
     return a > b ? a : b;
-}
-
-static int edge_value(int ax, int ay, int bx, int by, int px, int py)
-{
-    return (px - ax) * (by - ay) - (py - ay) * (bx - ax);
-}
-
-static void fill_triangle(pj_framebuffer_t *fb, int ax, int ay, int bx, int by, int cx, int cy)
-{
-    int min_x = max_int(0, min_int(ax, min_int(bx, cx)));
-    int max_x = min_int(PJ_DISPLAY_WIDTH - 1, max_int(ax, max_int(bx, cx)));
-    int min_y = max_int(0, min_int(ay, min_int(by, cy)));
-    int max_y = min_int(PJ_DISPLAY_HEIGHT - 1, max_int(ay, max_int(by, cy)));
-    int area = edge_value(ax, ay, bx, by, cx, cy);
-    if (area == 0) {
-        return;
-    }
-    for (int y = min_y; y <= max_y; y++) {
-        for (int x = min_x; x <= max_x; x++) {
-            int w0 = edge_value(bx, by, cx, cy, x, y);
-            int w1 = edge_value(cx, cy, ax, ay, x, y);
-            int w2 = edge_value(ax, ay, bx, by, x, y);
-            if ((w0 >= 0 && w1 >= 0 && w2 >= 0) || (w0 <= 0 && w1 <= 0 && w2 <= 0)) {
-                fb_set(fb, x, y, 1);
-            }
-        }
-    }
 }
 
 static void invert_framebuffer(pj_framebuffer_t *fb)
@@ -438,7 +392,7 @@ static int text_width(const char *text, int scale)
     const pj_font_size_t *font_size = font_size_for_scale(scale);
     int width = 0;
     while (*text != '\0') {
-        width += glyph_for_char(font_size, (char)toupper((unsigned char)*text))->advance;
+        width += glyph_for_char(font_size, *text)->advance;
         text++;
     }
     return width;
@@ -449,9 +403,8 @@ static void draw_text(pj_framebuffer_t *fb, int x, int y, const char *text, int 
     const pj_font_size_t *font_size = font_size_for_scale(scale);
     int cursor = x;
     while (*text != '\0') {
-        char display_char = (char)toupper((unsigned char)*text);
-        draw_char(fb, cursor, y, display_char, scale);
-        cursor += glyph_for_char(font_size, display_char)->advance;
+        draw_char(fb, cursor, y, *text, scale);
+        cursor += glyph_for_char(font_size, *text)->advance;
         text++;
     }
 }
@@ -514,68 +467,38 @@ static void draw_text_centered_ellipsized(pj_framebuffer_t *fb, int cx, int cy,
     draw_text_center_at(fb, cx, cy, clipped, scale);
 }
 
-static void draw_line_width(pj_framebuffer_t *fb, int x0, int y0, int x1, int y1, int width)
+static void draw_wrapped_text(pj_framebuffer_t *fb, int x, int y, const char *text,
+                              int scale, int max_width, int max_lines)
 {
-    int dx = x1 - x0;
-    int dy = y1 - y0;
-    int steps = dx < 0 ? -dx : dx;
-    int abs_dy = dy < 0 ? -dy : dy;
-    if (abs_dy > steps) {
-        steps = abs_dy;
-    }
-    if (steps == 0) {
-        fill_circle(fb, x0, y0, width);
-        return;
-    }
-    for (int i = 0; i <= steps; i++) {
-        int x = x0 + (dx * i) / steps;
-        int y = y0 + (dy * i) / steps;
-        fill_circle(fb, x, y, width);
-    }
-}
+    char line[PJ_UI_NOTE_LABEL_LEN];
+    size_t used = 0;
+    int line_number = 0;
+    const pj_font_size_t *font_size = font_size_for_scale(scale);
 
-static void analog_endpoint(int cx, int cy, int radius, double degrees, int *x, int *y)
-{
-    double radians = degrees * PJ_PI / 180.0;
-    *x = cx + (int)(sin(radians) * radius);
-    *y = cy - (int)(cos(radians) * radius);
-}
-
-static void draw_octagon(pj_framebuffer_t *fb, int cx, int cy, int r, int cut)
-{
-    int x0 = cx - r;
-    int x1 = cx + r;
-    int y0 = cy - r;
-    int y1 = cy + r;
-    draw_line_width(fb, x0 + cut, y0, x1 - cut, y0, 1);
-    draw_line_width(fb, x1 - cut, y0, x1, y0 + cut, 1);
-    draw_line_width(fb, x1, y0 + cut, x1, y1 - cut, 1);
-    draw_line_width(fb, x1, y1 - cut, x1 - cut, y1, 1);
-    draw_line_width(fb, x1 - cut, y1, x0 + cut, y1, 1);
-    draw_line_width(fb, x0 + cut, y1, x0, y1 - cut, 1);
-    draw_line_width(fb, x0, y1 - cut, x0, y0 + cut, 1);
-    draw_line_width(fb, x0, y0 + cut, x0 + cut, y0, 1);
-}
-
-static void draw_kite_hand(pj_framebuffer_t *fb, int cx, int cy, double degrees, int inner, int middle, int outer, int middle_half)
-{
-    double radians = degrees * PJ_PI / 180.0;
-    double sx = sin(radians);
-    double sy = -cos(radians);
-    double px = cos(radians);
-    double py = sin(radians);
-    int ix = cx + (int)(sx * inner);
-    int iy = cy + (int)(sy * inner);
-    int mx = cx + (int)(sx * middle);
-    int my = cy + (int)(sy * middle);
-    int ox = cx + (int)(sx * outer);
-    int oy = cy + (int)(sy * outer);
-    fill_triangle(fb, ix, iy,
-                  mx + (int)(px * middle_half), my + (int)(py * middle_half),
-                  mx - (int)(px * middle_half), my - (int)(py * middle_half));
-    fill_triangle(fb, ox, oy,
-                  mx + (int)(px * middle_half), my + (int)(py * middle_half),
-                  mx - (int)(px * middle_half), my - (int)(py * middle_half));
+    while (*text != '\0' && line_number < max_lines) {
+        if (*text == ' ' && used == 0) {
+            text++;
+            continue;
+        }
+        line[used] = *text;
+        line[used + 1u] = '\0';
+        if (text_width(line, scale) > max_width && used > 0) {
+            line[used] = '\0';
+            draw_text(fb, x, y + line_number * (font_size->line_height + 5), line, scale);
+            line_number++;
+            used = 0;
+            continue;
+        }
+        used++;
+        text++;
+        if (used + 1u >= sizeof(line)) {
+            break;
+        }
+    }
+    if (used > 0 && line_number < max_lines) {
+        line[used] = '\0';
+        draw_text(fb, x, y + line_number * (font_size->line_height + 5), line, scale);
+    }
 }
 
 static void draw_battery_indicator(pj_framebuffer_t *fb, int x, int y, int w, int h, int percent)
@@ -660,21 +583,63 @@ static void draw_icon(pj_framebuffer_t *fb, const char *icon, int cx, int cy, in
     }
 }
 
-static void draw_tiles(pj_framebuffer_t *fb, const tile_t *tiles, size_t count)
+static void invert_region(pj_framebuffer_t *fb, int x, int y, int w, int h)
+{
+    for (int yy = y; yy < y + h; yy++) {
+        for (int xx = x; xx < x + w; xx++) {
+            fb_set(fb, xx, yy, !pj_framebuffer_get(fb, xx, yy));
+        }
+    }
+}
+
+static void draw_screen_header(pj_framebuffer_t *fb, const char *title, int show_back)
+{
+    if (show_back) {
+        draw_text(fb, 10, 8, "<", 2);
+    }
+    draw_text(fb, show_back ? 34 : 10, 8, title, 2);
+    draw_hline(fb, 10, 189, 31);
+}
+
+static void draw_menu_rows(pj_framebuffer_t *fb, const tile_t *tiles, size_t count,
+                           int focus_index)
 {
     for (size_t i = 0; i < count; i++) {
-        int icon_size = tiles[i].w > 100 ? 58 : 40;
-        if (!lvgl_widgets_active()) {
-            draw_round_rect_width(fb, tiles[i].x, tiles[i].y, tiles[i].w, tiles[i].h, 12, 3);
+        const tile_t *tile = &tiles[i];
+        int primary = tile->h >= 50;
+        if (primary) {
+            draw_rect(fb, tile->x, tile->y, tile->w, tile->h);
+            draw_icon(fb, tile->icon, tile->x + 33, tile->y + tile->h / 2,
+                      34);
+            draw_text(fb, tile->x + 62, tile->y + 12, tile->label, 2);
+            const char *caption = strcmp(tile->label, "Record") == 0 ? "New entry" :
+                                  strcmp(tile->label, "Notes") == 0 ? "Capture and revisit" : "Open";
+            draw_text_ellipsized(fb, tile->x + 62, tile->y + 39, caption, 1,
+                                 tile->w - 70);
+        } else {
+            draw_icon(fb, tile->icon, tile->x + 18, tile->y + tile->h / 2, 22);
+            draw_text(fb, tile->x + 38, tile->y + 8, tile->label, 1);
+            draw_text(fb, tile->x + tile->w - 16, tile->y + 8, ">", 1);
+            draw_hline(fb, tile->x + 38, tile->x + tile->w - 1,
+                       tile->y + tile->h - 1);
         }
-        int icon_y = tiles[i].y + tiles[i].h / 2;
-        if (tiles[i].label[0] != '\0') {
-            icon_y -= 7;
+        if ((int)i == focus_index) {
+            invert_region(fb, tile->x, tile->y, tile->w, tile->h);
         }
-        draw_icon(fb, tiles[i].icon, tiles[i].x + tiles[i].w / 2, icon_y, icon_size);
-        if (tiles[i].label[0] != '\0') {
-            draw_text_center_at(fb, tiles[i].x + tiles[i].w / 2,
-                                tiles[i].y + tiles[i].h - 9, tiles[i].label, 1);
+    }
+}
+
+static void draw_action_strip(pj_framebuffer_t *fb, const char *const labels[],
+                              int count, int focus_index)
+{
+    int gap = 3;
+    int width = (180 - gap * (count - 1)) / count;
+    for (int i = 0; i < count; i++) {
+        int x = 10 + i * (width + gap);
+        draw_rect(fb, x, 160, width, 30);
+        draw_text_center_at(fb, x + width / 2, 175, labels[i], 1);
+        if (i == focus_index) {
+            invert_region(fb, x, 160, width, 30);
         }
     }
 }
@@ -791,7 +756,7 @@ void pj_ui_request_full_refresh(pj_ui_context_t *ctx)
 
 const char *pj_ui_default_font_name(void)
 {
-    return "IBM Plex Mono Bold";
+    return "Space Mono";
 }
 
 static void clamp_volume(pj_ui_context_t *ctx)
@@ -805,7 +770,7 @@ static void clamp_volume(pj_ui_context_t *ctx)
 
 static int notes_per_page(void)
 {
-    return 3;
+    return 4;
 }
 
 static int note_page_count(const pj_ui_context_t *ctx)
@@ -1070,10 +1035,43 @@ static void queue_time_command(pj_ui_context_t *ctx, pj_ui_time_command_type_t t
     ctx->time_command.secondary_duration_ms = secondary_duration_ms;
 }
 
+static int focus_count(const pj_ui_context_t *ctx)
+{
+    switch (ctx->state) {
+    case PJ_UI_STATE_NOTES: return 3;
+    case PJ_UI_STATE_TIME: return 4;
+    case PJ_UI_STATE_SETTINGS: return 4;
+    case PJ_UI_STATE_VOLUME: return 2;
+    case PJ_UI_STATE_ALARM: return 5;
+    case PJ_UI_STATE_STOPWATCH: return 2;
+    case PJ_UI_STATE_TIMER:
+    case PJ_UI_STATE_INTERVAL: return 4;
+    case PJ_UI_STATE_LISTEN:
+    case PJ_UI_STATE_READ: return ctx->note_count;
+    default: return 0;
+    }
+}
+
+static int cycle_focus(pj_ui_context_t *ctx)
+{
+    int count = focus_count(ctx);
+    if (count <= 1) {
+        return 0;
+    }
+    ctx->focus_index = (ctx->focus_index + 1) % count;
+    mark_full(ctx);
+    return 1;
+}
+
 int pj_ui_handle_aux_long(pj_ui_context_t *ctx)
 {
     if (active_alert_present(ctx)) {
-        return 0;
+        if (ctx->time_command.type != PJ_UI_TIME_COMMAND_NONE) {
+            return 0;
+        }
+        ctx->time_command.type = PJ_UI_TIME_COMMAND_ALERT_DISMISS;
+        ctx->time_command.alert_id = ctx->active_alert.id;
+        return 1;
     }
     if (ctx->state == PJ_UI_STATE_STATIC) {
         return 0;
@@ -1096,14 +1094,23 @@ int pj_ui_handle_aux_long(pj_ui_context_t *ctx)
         mark_partial(ctx, 0, 144, PJ_DISPLAY_WIDTH, 40);
         return 1;
     }
-    set_state(ctx, pj_ui_parent_state(ctx->state));
+    if (ctx->state == PJ_UI_STATE_NOTE_DETAIL && ctx->note_detail_transcript) {
+        set_state(ctx, PJ_UI_STATE_READ);
+    } else {
+        set_state(ctx, pj_ui_parent_state(ctx->state));
+    }
     return 1;
 }
 
 int pj_ui_handle_aux_short(pj_ui_context_t *ctx)
 {
     if (active_alert_present(ctx)) {
-        return 0;
+        if (ctx->time_command.type != PJ_UI_TIME_COMMAND_NONE) {
+            return 0;
+        }
+        ctx->time_command.type = PJ_UI_TIME_COMMAND_ALERT_DISMISS;
+        ctx->time_command.alert_id = ctx->active_alert.id;
+        return 1;
     }
     switch (ctx->state) {
     case PJ_UI_STATE_STATIC:
@@ -1123,8 +1130,11 @@ int pj_ui_handle_aux_short(pj_ui_context_t *ctx)
         set_state(ctx, primary);
         return 1;
     case PJ_UI_STATE_NOTES:
-        ctx->record_state = PJ_RECORD_ACTIVE;
-        set_state(ctx, PJ_UI_STATE_RECORD);
+        if (ctx->focus_index == 0) {
+            ctx->record_state = PJ_RECORD_ACTIVE;
+            ctx->recording_seconds = 0;
+        }
+        set_state(ctx, NOTES_TILES[ctx->focus_index].next);
         return 1;
     case PJ_UI_STATE_RECORD:
         if (ctx->record_state != PJ_RECORD_ACTIVE) {
@@ -1134,7 +1144,19 @@ int pj_ui_handle_aux_short(pj_ui_context_t *ctx)
         set_state(ctx, PJ_UI_STATE_HOME);
         return 1;
     case PJ_UI_STATE_LISTEN:
+    case PJ_UI_STATE_READ:
+        if (ctx->note_count <= 0) {
+            return 0;
+        }
+        ctx->selected_note = ctx->focus_index;
+        ctx->note_detail_transcript = ctx->state == PJ_UI_STATE_READ;
+        set_state(ctx, PJ_UI_STATE_NOTE_DETAIL);
+        return 1;
     case PJ_UI_STATE_NOTE_DETAIL:
+        if (ctx->note_detail_transcript) {
+            set_state(ctx, PJ_UI_STATE_READ);
+            return 1;
+        }
         if (ctx->playback_state == PJ_PLAYBACK_STOPPING) {
             return 0;
         }
@@ -1144,46 +1166,87 @@ int pj_ui_handle_aux_short(pj_ui_context_t *ctx)
         mark_partial(ctx, 0, 144, PJ_DISPLAY_WIDTH, 40);
         return 1;
     case PJ_UI_STATE_TIME:
-        set_state(ctx, PJ_UI_STATE_STOPWATCH);
+        set_state(ctx, TIME_TILES[ctx->focus_index].next);
         return 1;
     case PJ_UI_STATE_ALARM:
-        ctx->alarm_on = !ctx->alarm_on;
-        mark_partial(ctx, 0, 92, PJ_DISPLAY_WIDTH, 34);
+        if (ctx->focus_index == 0) ctx->alarm_on = !ctx->alarm_on;
+        else if (ctx->focus_index == 1) ctx->alarm_hour = (ctx->alarm_hour + 23) % 24;
+        else if (ctx->focus_index == 2) ctx->alarm_hour = (ctx->alarm_hour + 1) % 24;
+        else if (ctx->focus_index == 3) ctx->alarm_minute = (ctx->alarm_minute + 45) % 60;
+        else ctx->alarm_minute = (ctx->alarm_minute + 15) % 60;
+        mark_full(ctx);
         return 1;
     case PJ_UI_STATE_STOPWATCH:
-        ctx->stopwatch_running = !ctx->stopwatch_running;
-        queue_time_command(ctx, ctx->stopwatch_running ? PJ_UI_TIME_COMMAND_STOPWATCH_START :
-                           PJ_UI_TIME_COMMAND_STOPWATCH_PAUSE, 0, 0);
-        mark_partial(ctx, 0, 40, PJ_DISPLAY_WIDTH, 96);
+        if (ctx->focus_index == 1) {
+            ctx->stopwatch_seconds = 0;
+            ctx->stopwatch_running = 0;
+            queue_time_command(ctx, PJ_UI_TIME_COMMAND_STOPWATCH_RESET, 0, 0);
+        } else {
+            ctx->stopwatch_running = !ctx->stopwatch_running;
+            queue_time_command(ctx, ctx->stopwatch_running ? PJ_UI_TIME_COMMAND_STOPWATCH_START :
+                               PJ_UI_TIME_COMMAND_STOPWATCH_PAUSE, 0, 0);
+        }
+        mark_full(ctx);
         return 1;
     case PJ_UI_STATE_TIMER:
-        if (!ctx->timer_running && ctx->timer_seconds <= 0) {
+        if (ctx->focus_index == 0) {
+            if (!ctx->timer_running && ctx->timer_seconds <= 0) ctx->timer_seconds = ctx->timer_preset_seconds;
+            ctx->timer_running = !ctx->timer_running;
+            queue_time_command(ctx, ctx->timer_running ? PJ_UI_TIME_COMMAND_TIMER_START :
+                               PJ_UI_TIME_COMMAND_TIMER_PAUSE,
+                               (uint64_t)ctx->timer_seconds * 1000u, 0);
+        } else if (ctx->focus_index == 1) {
+            ctx->timer_seconds = max_int(30, ctx->timer_seconds - 30);
+            ctx->timer_preset_seconds = ctx->timer_seconds;
+        } else if (ctx->focus_index == 2) {
+            ctx->timer_seconds = min_int(PJ_UI_MAX_DURATION_SECONDS, ctx->timer_seconds + 30);
+            ctx->timer_preset_seconds = ctx->timer_seconds;
+        } else {
             ctx->timer_seconds = ctx->timer_preset_seconds;
+            ctx->timer_running = 0;
         }
-        ctx->timer_running = !ctx->timer_running;
-        queue_time_command(ctx, ctx->timer_running ? PJ_UI_TIME_COMMAND_TIMER_START :
-                           PJ_UI_TIME_COMMAND_TIMER_PAUSE,
-                           (uint64_t)ctx->timer_seconds * 1000u, 0);
-        mark_partial(ctx, 0, 40, PJ_DISPLAY_WIDTH, 96);
+        if (ctx->focus_index != 0) {
+            queue_time_command(ctx, ctx->timer_running ? PJ_UI_TIME_COMMAND_TIMER_START :
+                               PJ_UI_TIME_COMMAND_TIMER_RESET,
+                               (uint64_t)ctx->timer_seconds * 1000u, 0);
+        }
+        mark_full(ctx);
         return 1;
     case PJ_UI_STATE_INTERVAL:
-        ctx->interval_running = !ctx->interval_running;
-        queue_time_command(ctx, ctx->interval_running ? PJ_UI_TIME_COMMAND_INTERVAL_START :
-                           PJ_UI_TIME_COMMAND_INTERVAL_PAUSE,
-                           (uint64_t)ctx->interval_seconds * 1000u,
-                           5ull * 60ull * 1000ull);
-        mark_partial(ctx, 0, 72, PJ_DISPLAY_WIDTH, 74);
+        if (ctx->focus_index == 0) {
+            ctx->interval_running = !ctx->interval_running;
+            queue_time_command(ctx, ctx->interval_running ? PJ_UI_TIME_COMMAND_INTERVAL_START :
+                               PJ_UI_TIME_COMMAND_INTERVAL_PAUSE,
+                               (uint64_t)ctx->interval_seconds * 1000u,
+                               5ull * 60ull * 1000ull);
+        }
+        else if (ctx->focus_index == 1) ctx->interval_seconds = max_int(60, ctx->interval_seconds - 60);
+        else if (ctx->focus_index == 2) ctx->interval_seconds = min_int(PJ_UI_MAX_DURATION_SECONDS, ctx->interval_seconds + 60);
+        else { ctx->interval_seconds = ctx->interval_preset_seconds; ctx->interval_round = 0; ctx->interval_running = 0; }
+        if (ctx->focus_index == 1 || ctx->focus_index == 2) ctx->interval_preset_seconds = ctx->interval_seconds;
+        if (ctx->focus_index != 0) {
+            queue_time_command(ctx, ctx->interval_running ? PJ_UI_TIME_COMMAND_INTERVAL_START :
+                               PJ_UI_TIME_COMMAND_INTERVAL_RESET,
+                               (uint64_t)ctx->interval_seconds * 1000u,
+                               5ull * 60ull * 1000ull);
+        }
+        mark_full(ctx);
         return 1;
     case PJ_UI_STATE_SYNC:
-        return 0;
+        set_state(ctx, PJ_UI_STATE_SETTINGS);
+        return 1;
     case PJ_UI_STATE_SETTINGS:
-        set_state(ctx, PJ_UI_STATE_VOLUME);
+        if (ctx->focus_index == 2) {
+            ctx->dark_mode = !ctx->dark_mode;
+            mark_full(ctx);
+        } else {
+            set_state(ctx, SETTINGS_TILES[ctx->focus_index].next);
+        }
         return 1;
     case PJ_UI_STATE_VOLUME:
-        if (ctx->volume < 10) {
-            ctx->volume++;
-            mark_partial(ctx, 0, 48, PJ_DISPLAY_WIDTH, 144);
-        }
+        ctx->volume += ctx->focus_index == 0 ? -1 : 1;
+        clamp_volume(ctx);
+        mark_full(ctx);
         return 1;
     default:
         return 0;
@@ -1192,13 +1255,26 @@ int pj_ui_handle_aux_short(pj_ui_context_t *ctx)
 
 int pj_ui_handle_aux_double(pj_ui_context_t *ctx)
 {
-    if (active_alert_present(ctx) || ctx->state == PJ_UI_STATE_RECORD ||
+    if (active_alert_present(ctx)) {
+        if (ctx->active_alert.source != PJ_TIME_ALERT_ALARM ||
+            ctx->time_command.type != PJ_UI_TIME_COMMAND_NONE) {
+            return 0;
+        }
+        ctx->time_command.type = PJ_UI_TIME_COMMAND_ALARM_SNOOZE;
+        ctx->time_command.alert_id = ctx->active_alert.id;
+        return 1;
+    }
+    if (focus_count(ctx) > 1) {
+        return cycle_focus(ctx);
+    }
+    if (ctx->state == PJ_UI_STATE_RECORD ||
         ctx->record_state != PJ_RECORD_IDLE || ctx->playback_state != PJ_PLAYBACK_IDLE ||
         ctx->stopwatch_running || ctx->timer_running || ctx->interval_running) {
         return 0;
     }
 
     ctx->record_state = PJ_RECORD_ACTIVE;
+    ctx->recording_seconds = 0;
     set_state(ctx, PJ_UI_STATE_RECORD);
     return 1;
 }
@@ -1206,6 +1282,13 @@ int pj_ui_handle_aux_double(pj_ui_context_t *ctx)
 int pj_ui_tick(pj_ui_context_t *ctx)
 {
     switch (ctx->state) {
+    case PJ_UI_STATE_RECORD:
+        if (ctx->record_state == PJ_RECORD_ACTIVE) {
+            ctx->recording_seconds++;
+            mark_partial(ctx, 10, 90, 180, 56);
+            return 1;
+        }
+        break;
     case PJ_UI_STATE_STOPWATCH:
         if (ctx->stopwatch_running) {
             ctx->stopwatch_seconds++;
@@ -1272,6 +1355,10 @@ int pj_ui_handle_touch(pj_ui_context_t *ctx, int x, int y, pj_touch_kind_t kind)
     if (kind != PJ_TOUCH_TAP) {
         return 0;
     }
+    if (x < 34 && y < 32 && ctx->state != PJ_UI_STATE_STATIC &&
+        ctx->state != PJ_UI_STATE_TIME_TEMP && ctx->state != PJ_UI_STATE_HOME) {
+        return pj_ui_handle_aux_long(ctx);
+    }
 
     switch (ctx->state) {
     case PJ_UI_STATE_STATIC:
@@ -1291,8 +1378,12 @@ int pj_ui_handle_touch(pj_ui_context_t *ctx, int x, int y, pj_touch_kind_t kind)
     }
     case PJ_UI_STATE_NOTES:
         if (tile_hit(NOTES_TILES, sizeof(NOTES_TILES) / sizeof(NOTES_TILES[0]), x, y, &next)) {
+            for (size_t i = 0; i < sizeof(NOTES_TILES) / sizeof(NOTES_TILES[0]); i++) {
+                if (next == NOTES_TILES[i].next) ctx->focus_index = (int)i;
+            }
             if (next == PJ_UI_STATE_RECORD) {
                 ctx->record_state = PJ_RECORD_ACTIVE;
+                ctx->recording_seconds = 0;
             }
             set_state(ctx, next);
             return 1;
@@ -1300,13 +1391,19 @@ int pj_ui_handle_touch(pj_ui_context_t *ctx, int x, int y, pj_touch_kind_t kind)
         break;
     case PJ_UI_STATE_TIME:
         if (tile_hit(TIME_TILES, sizeof(TIME_TILES) / sizeof(TIME_TILES[0]), x, y, &next)) {
+            for (size_t i = 0; i < sizeof(TIME_TILES) / sizeof(TIME_TILES[0]); i++) {
+                if (next == TIME_TILES[i].next) ctx->focus_index = (int)i;
+            }
             set_state(ctx, next);
             return 1;
         }
         break;
     case PJ_UI_STATE_SETTINGS:
         if (tile_hit(SETTINGS_TILES, sizeof(SETTINGS_TILES) / sizeof(SETTINGS_TILES[0]), x, y, &next)) {
-            if (x < 100 && y >= 100) {
+            for (size_t i = 0; i < sizeof(SETTINGS_TILES) / sizeof(SETTINGS_TILES[0]); i++) {
+                if (next == SETTINGS_TILES[i].next) ctx->focus_index = (int)i;
+            }
+            if (next == PJ_UI_STATE_SETTINGS) {
                 ctx->dark_mode = !ctx->dark_mode;
                 mark_full(ctx);
                 return 1;
@@ -1316,128 +1413,71 @@ int pj_ui_handle_touch(pj_ui_context_t *ctx, int x, int y, pj_touch_kind_t kind)
         }
         break;
     case PJ_UI_STATE_VOLUME:
-        if (y < 140 || y >= 192) {
+        if (y < 160 || y >= 190) {
             return 0;
         }
-        if (x >= 8 && x < 96) {
-            ctx->volume--;
-        } else if (x >= 104 && x < 192) {
-            ctx->volume++;
+        if (x >= 10 && x < 98) {
+            ctx->focus_index = 0;
+        } else if (x >= 101 && x < 190) {
+            ctx->focus_index = 1;
         } else {
             return 0;
         }
-        clamp_volume(ctx);
-        mark_partial(ctx, 20, 48, 160, 80);
-        return 1;
+        return pj_ui_handle_aux_short(ctx);
     case PJ_UI_STATE_LISTEN:
     case PJ_UI_STATE_READ:
-        if (x >= 148 && y < 92) {
-            if (ctx->note_page > 0) {
-                ctx->note_page--;
-                mark_full(ctx);
-            }
-            return 1;
-        }
-        if (x >= 148 && y >= 108) {
-            if (ctx->note_page + 1 < note_page_count(ctx)) {
-                ctx->note_page++;
-                mark_full(ctx);
-            }
-            return 1;
-        }
-        if (x < 148 && y >= 8 && y < 180 && ctx->note_count > 0) {
-            int row = (y - 8) / 58;
+        if (x >= 10 && x < 190 && y >= 39 && y < 183 && ctx->note_count > 0) {
+            int row = (y - 39) / 36;
             int index = ctx->note_page * notes_per_page() + row;
             if (row >= 0 && row < notes_per_page() && index < ctx->note_count) {
                 ctx->selected_note = index;
+                ctx->focus_index = row;
+                ctx->note_detail_transcript = ctx->state == PJ_UI_STATE_READ;
                 set_state(ctx, PJ_UI_STATE_NOTE_DETAIL);
             }
             return 1;
         }
         break;
-    case PJ_UI_STATE_ALARM:
-        if (y < 118) {
-            ctx->alarm_on = !ctx->alarm_on;
-            mark_partial(ctx, 0, 92, PJ_DISPLAY_WIDTH, 34);
+    case PJ_UI_STATE_NOTE_DETAIL:
+        if (ctx->note_detail_transcript) {
+            return 0;
+        }
+        if (x >= 58 && x < 142 && y >= 55 && y < 140 &&
+            ctx->playback_state != PJ_PLAYBACK_STOPPING) {
+            ctx->playback_state = ctx->playback_state == PJ_PLAYBACK_ACTIVE ?
+                PJ_PLAYBACK_STOPPING : PJ_PLAYBACK_ACTIVE;
+            ctx->playback_exit_pending = 0;
+            mark_full(ctx);
             return 1;
         }
-        if (y >= 136) {
-            if (x < 50) {
-                ctx->alarm_hour = (ctx->alarm_hour + 23) % 24;
-            } else if (x < 100) {
-                ctx->alarm_hour = (ctx->alarm_hour + 1) % 24;
-            } else if (x < 150) {
-                ctx->alarm_minute = (ctx->alarm_minute + 45) % 60;
-            } else {
-                ctx->alarm_minute = (ctx->alarm_minute + 15) % 60;
-            }
-            mark_partial(ctx, 0, 28, PJ_DISPLAY_WIDTH, 66);
-            return 1;
+        break;
+    case PJ_UI_STATE_ALARM:
+        if (y >= 160 && y < 190 && x >= 10 && x < 190) {
+            ctx->focus_index = min_int(4, (x - 10) / 36);
+            return pj_ui_handle_aux_short(ctx);
         }
         break;
     case PJ_UI_STATE_STOPWATCH:
-        if (y >= 138 && x >= 128) {
-            ctx->stopwatch_seconds = 0;
-            ctx->stopwatch_running = 0;
-            queue_time_command(ctx, PJ_UI_TIME_COMMAND_STOPWATCH_RESET, 0, 0);
-            mark_partial(ctx, 0, 40, PJ_DISPLAY_WIDTH, 96);
-            return 1;
+        if (y >= 160 && y < 190 && x >= 10 && x < 190) {
+            ctx->focus_index = x < 100 ? 0 : 1;
+            return pj_ui_handle_aux_short(ctx);
         }
         break;
     case PJ_UI_STATE_TIMER:
-        if (y >= 138) {
-            if (x < 70) {
-                ctx->timer_seconds -= 30;
-                if (ctx->timer_seconds < 30) {
-                    ctx->timer_seconds = 30;
-                }
-            } else if (x < 132) {
-                ctx->timer_seconds += 30;
-                if (ctx->timer_seconds > PJ_UI_MAX_DURATION_SECONDS) {
-                    ctx->timer_seconds = PJ_UI_MAX_DURATION_SECONDS;
-                }
-            } else {
-                ctx->timer_seconds = ctx->timer_preset_seconds;
-                ctx->timer_running = 0;
-                queue_time_command(ctx, PJ_UI_TIME_COMMAND_TIMER_RESET, 0, 0);
-            }
-            if (x < 132) {
-                ctx->timer_preset_seconds = ctx->timer_seconds;
-                queue_time_command(ctx, ctx->timer_running ? PJ_UI_TIME_COMMAND_TIMER_START :
-                                   PJ_UI_TIME_COMMAND_TIMER_RESET,
-                                   (uint64_t)ctx->timer_seconds * 1000u, 0);
-            }
-            mark_partial(ctx, 0, 40, PJ_DISPLAY_WIDTH, 96);
-            return 1;
+        if (y >= 160 && y < 190 && x >= 10 && x < 190) {
+            ctx->focus_index = min_int(3, (x - 10) / 45);
+            return pj_ui_handle_aux_short(ctx);
         }
         break;
     case PJ_UI_STATE_INTERVAL:
-        if (y >= 138) {
-            if (x < 70) {
-                ctx->interval_seconds -= 60;
-                if (ctx->interval_seconds < 60) {
-                    ctx->interval_seconds = 60;
-                }
-            } else if (x < 132) {
-                ctx->interval_seconds += 60;
-                if (ctx->interval_seconds > PJ_UI_MAX_DURATION_SECONDS) {
-                    ctx->interval_seconds = PJ_UI_MAX_DURATION_SECONDS;
-                }
-            } else {
-                ctx->interval_seconds = ctx->interval_preset_seconds;
-                ctx->interval_round = 0;
-                ctx->interval_running = 0;
-                queue_time_command(ctx, PJ_UI_TIME_COMMAND_INTERVAL_RESET, 0, 0);
-            }
-            if (x < 132) {
-                ctx->interval_preset_seconds = ctx->interval_seconds;
-                queue_time_command(ctx, ctx->interval_running ? PJ_UI_TIME_COMMAND_INTERVAL_START :
-                                   PJ_UI_TIME_COMMAND_INTERVAL_RESET,
-                                   (uint64_t)ctx->interval_seconds * 1000u,
-                                   5ull * 60ull * 1000ull);
-            }
-            mark_partial(ctx, 0, 24, PJ_DISPLAY_WIDTH, 120);
-            return 1;
+        if (y >= 160 && y < 190 && x >= 10 && x < 190) {
+            ctx->focus_index = min_int(3, (x - 10) / 45);
+            return pj_ui_handle_aux_short(ctx);
+        }
+        break;
+    case PJ_UI_STATE_RECORD:
+        if (y >= 145) {
+            return pj_ui_handle_aux_short(ctx);
         }
         break;
     default:
@@ -1461,183 +1501,115 @@ static void draw_home_static(const pj_ui_context_t *ctx, pj_framebuffer_t *fb)
         return;
     }
     char text[24];
-    draw_text_center_at(fb, 100, 58, "POCKET", 3);
-    draw_text_center_at(fb, 100, 94, "JOURNAL", 3);
-    draw_hline(fb, 44, 126, 112);
+    draw_text(fb, 16, 28, "Pocket", 3);
+    draw_text(fb, 16, 64, "Journal", 3);
+    draw_hline(fb, 16, 184, 112);
     (void)snprintf(text, sizeof(text), "%02d:%02d", ctx->hour, ctx->minute);
-    draw_text_center_at(fb, 100, 154, text, 2);
+    draw_text(fb, 16, 136, text, 2);
     (void)snprintf(text, sizeof(text), "%02d/%02d", ctx->month, ctx->day);
-    draw_text_center_at(fb, 100, 181, text, 1);
+    draw_text(fb, 16, 174, text, 1);
 }
 
 static void draw_time_temp(const pj_ui_context_t *ctx, pj_framebuffer_t *fb)
 {
     char text[24];
-    int cx = 58;
-    int cy = 65;
-    int r = 52;
-
-    draw_octagon(fb, cx, cy, r, 20);
-    draw_octagon(fb, cx, cy, r - 2, 18);
-    for (int i = 0; i < 60; i++) {
-        int x0;
-        int y0;
-        int x1;
-        int y1;
-        int major = (i % 5) == 0;
-        analog_endpoint(cx, cy, major ? r - 13 : r - 7, i * 6.0, &x0, &y0);
-        analog_endpoint(cx, cy, r - 3, i * 6.0, &x1, &y1);
-        draw_line_width(fb, x0, y0, x1, y1, major ? 1 : 0);
-    }
-
-    double hour_degrees = (double)(ctx->hour % 12) * 30.0 + (double)ctx->minute * 0.5;
-    double minute_degrees = (double)ctx->minute * 6.0;
-    draw_kite_hand(fb, cx, cy, hour_degrees, 10, 22, 31, 3);
-    draw_kite_hand(fb, cx, cy, minute_degrees, 13, 31, 45, 2);
-
     (void)snprintf(text, sizeof(text), "%02d:%02d", ctx->hour, ctx->minute);
-    draw_text_center_at(fb, 154, 70, text, 2);
-    draw_text_center_at(fb, 154, 96, "LOCAL", 1);
-
-    (void)snprintf(text, sizeof(text), "%02d%02d", ctx->month, ctx->day);
-    draw_text_center_at(fb, 33, 177, text, 2);
-    draw_text_center_at(fb, 82, 177, weekday_name(ctx->weekday), 2);
-    (void)snprintf(text, sizeof(text), "%dC", ctx->temperature_c);
-    draw_text_center_at(fb, 126, 164, text, 2);
-    (void)snprintf(text, sizeof(text), "%dF", (ctx->temperature_c * 9) / 5 + 32);
-    draw_text_center_at(fb, 126, 190, text, 2);
-    draw_battery_indicator(fb, 162, 158, 30, 20, ctx->battery_percent);
+    draw_text_center_at(fb, 100, 58, text, 4);
+    draw_text_center_at(fb, 100, 90, "Local time", 1);
+    draw_hline(fb, 12, 188, 112);
+    (void)snprintf(text, sizeof(text), "%s  %02d/%02d", weekday_name(ctx->weekday), ctx->month, ctx->day);
+    draw_text(fb, 12, 128, text, 2);
+    (void)snprintf(text, sizeof(text), "%d C", ctx->temperature_c);
+    draw_text(fb, 12, 162, text, 2);
+    draw_battery_indicator(fb, 151, 160, 37, 18, ctx->battery_percent);
     (void)snprintf(text, sizeof(text), "%d%%", ctx->battery_percent);
-    draw_text_center_at(fb, 177, 191, text, 2);
+    draw_text_center_at(fb, 169, 190, text, 1);
 }
 
 static void draw_record(const pj_ui_context_t *ctx, pj_framebuffer_t *fb)
 {
-    draw_icon(fb, "REC", 100, 76, ctx->record_state == PJ_RECORD_ACTIVE ? 76 : 62);
+    char elapsed[16];
+    draw_screen_header(fb, "Record", 1);
+    draw_icon(fb, "REC", 36, 74, 34);
     if (ctx->record_state == PJ_RECORD_ACTIVE) {
-        fill_rect(fb, 90, 128, 20, 20);
-        draw_text_center_at(fb, 100, 174, "RECORDING", 2);
+        draw_text(fb, 62, 53, "Recording", 2);
+        (void)snprintf(elapsed, sizeof(elapsed), "%02d:%02d",
+                       ctx->recording_seconds / 60, ctx->recording_seconds % 60);
+        draw_text_center_at(fb, 100, 111, elapsed, 4);
+        draw_text(fb, 12, 138, "Capture in progress", 1);
+        draw_text_center_at(fb, 100, 176, "Stop", 2);
     } else if (ctx->record_state == PJ_RECORD_STOPPING) {
-        draw_text_center_at(fb, 100, 174, "STOPPING", 2);
+        draw_text(fb, 62, 53, "Finishing", 2);
+        draw_text(fb, 12, 105, "Saving in background", 1);
     } else {
-        draw_text_center_at(fb, 100, 174, "READY", 2);
+        draw_text(fb, 62, 53, "Ready", 2);
+        draw_text(fb, 12, 105, "Press to begin", 1);
     }
 }
 
 static void draw_notes_list(const pj_ui_context_t *ctx, pj_framebuffer_t *fb, const char *kind)
 {
     char text[24];
+    draw_screen_header(fb, strcmp(kind, "AUD") == 0 ? "Listen" : "Read", 1);
     if (ctx->note_count <= 0) {
-        draw_text_center_at(fb, 78, 90, "NO NOTES", 2);
+        draw_text_center_at(fb, 100, 96, strcmp(kind, "AUD") == 0 ? "No recordings" : "No transcripts", 2);
+        draw_text_center_at(fb, 100, 128, "Record something first", 1);
     }
     for (int i = 0; i < notes_per_page(); i++) {
-        int y = 8 + i * 58;
+        int y = 39 + i * 36;
         int note_index = ctx->note_page * notes_per_page() + i;
         if (note_index >= ctx->note_count) {
             continue;
         }
-        if (!lvgl_widgets_active()) {
-            draw_round_rect_width(fb, 8, y, 136, 46, 10, 2);
-        }
-        draw_icon(fb, strcmp(kind, "AUD") == 0 ? "PLAY" : "TXT", 28, y + 23, 24);
+        draw_icon(fb, strcmp(kind, "AUD") == 0 ? "PLAY" : "TXT", 22, y + 16, 20);
         draw_text_ellipsized(
-            fb, 50, y + 13,
+            fb, 42, y + 7,
             ctx->note_labels[note_index][0] != '\0'
                 ? ctx->note_labels[note_index]
                 : "RECORDING",
-            1, 92);
+            1, 132);
+        draw_text(fb, 178, y + 7, ">", 1);
+        draw_hline(fb, 42, 189, y + 31);
+        if (note_index == ctx->focus_index) invert_region(fb, 10, y, 180, 32);
     }
-    if (!lvgl_widgets_active()) {
-        draw_round_rect_width(fb, 152, 8, 40, 78, 10, 2);
-    }
-    draw_icon(fb, "MINUS", 172, 47, 24);
-    if (!lvgl_widgets_active()) {
-        draw_round_rect_width(fb, 152, 114, 40, 78, 10, 2);
-    }
-    draw_icon(fb, "PLUS", 172, 153, 24);
     (void)snprintf(text, sizeof(text), "%d/%d", ctx->note_page + 1, note_page_count(ctx));
-    draw_text_center_at(fb, 172, 101, text, 1);
+    draw_text_center_at(fb, 100, 190, text, 1);
 }
 
 static void draw_settings(const pj_ui_context_t *ctx, pj_framebuffer_t *fb)
 {
-    (void)ctx;
-    for (size_t i = 0; i < sizeof(SETTINGS_TILES) / sizeof(SETTINGS_TILES[0]); i++) {
-        const tile_t *tile = &SETTINGS_TILES[i];
-        if (!lvgl_widgets_active()) {
-            draw_round_rect_width(fb, tile->x, tile->y, tile->w, tile->h, 12, 3);
-        }
-        int icon_y = tile->y + tile->h / 2 - 7;
-        draw_icon(fb, tile->icon, tile->x + tile->w / 2, icon_y, 40);
-        draw_text_center_at(fb, tile->x + tile->w / 2,
-                            tile->y + tile->h - 9, tile->label, 1);
-    }
+    draw_screen_header(fb, "Settings", 1);
+    draw_menu_rows(fb, SETTINGS_TILES, sizeof(SETTINGS_TILES) / sizeof(SETTINGS_TILES[0]),
+                   ctx->focus_index);
 }
 
 static void draw_volume(const pj_ui_context_t *ctx, pj_framebuffer_t *fb)
 {
     char text[8];
-    draw_text_center_at(fb, 100, 24, "VOLUME", 2);
+    draw_screen_header(fb, "Volume", 1);
     (void)snprintf(text, sizeof(text), "%d", ctx->volume);
-    draw_text_center_at(fb, 100, 76, text, 4);
+    draw_text_center_at(fb, 100, 75, text, 4);
     if (!lvgl_widgets_active()) {
-        draw_round_rect_width(fb, 24, 106, 152, 18, 7, 2);
-        int width = (ctx->volume * 142) / 10;
+        draw_rect(fb, 20, 108, 160, 12);
+        int width = (ctx->volume * 154) / 10;
         if (width > 0) {
-            fill_rect(fb, 29, 111, width, 8);
+            fill_rect(fb, 23, 111, width, 6);
         }
-        draw_round_rect_width(fb, 8, 140, 88, 52, 12, 3);
-        draw_round_rect_width(fb, 104, 140, 88, 52, 12, 3);
     }
-    draw_icon(fb, "MINUS", 52, 166, 26);
-    draw_icon(fb, "PLUS", 148, 166, 26);
+    const char *actions[] = {"-", "+"};
+    draw_action_strip(fb, actions, 2, ctx->focus_index);
 }
 
 static void draw_sync(const pj_ui_context_t *ctx, pj_framebuffer_t *fb)
 {
     char text[20];
-    draw_centered_text(fb, 34, "SYNC", 3);
+    draw_screen_header(fb, "Sync", 1);
     (void)snprintf(text, sizeof(text), "PENDING %d", ctx->sync_pending);
-    draw_centered_text(fb, 92, text, 2);
+    draw_text(fb, 12, 58, text, 2);
     (void)snprintf(text, sizeof(text), "SENT %d", ctx->sync_transferred);
-    draw_centered_text(fb, 126, text, 2);
-    draw_centered_text(fb, 170, ctx->sync_online ? "ONLINE" : "OFFLINE", 1);
-}
-
-static void draw_change_buttons(pj_framebuffer_t *fb)
-{
-    if (!lvgl_widgets_active()) {
-        draw_round_rect_width(fb, 8, 140, 56, 52, 12, 3);
-    }
-    draw_icon(fb, "MINUS", 36, 166, 26);
-    if (!lvgl_widgets_active()) {
-        draw_round_rect_width(fb, 72, 140, 56, 52, 12, 3);
-    }
-    draw_icon(fb, "PLUS", 100, 166, 26);
-    if (!lvgl_widgets_active()) {
-        draw_round_rect_width(fb, 136, 140, 56, 52, 12, 3);
-    }
-    draw_icon(fb, "RESET", 164, 166, 26);
-}
-
-static void draw_alarm_buttons(pj_framebuffer_t *fb)
-{
-    if (!lvgl_widgets_active()) {
-        draw_round_rect_width(fb, 4, 140, 44, 52, 10, 3);
-    }
-    draw_text_center_at(fb, 26, 166, "H-", 2);
-    if (!lvgl_widgets_active()) {
-        draw_round_rect_width(fb, 52, 140, 44, 52, 10, 3);
-    }
-    draw_text_center_at(fb, 74, 166, "H+", 2);
-    if (!lvgl_widgets_active()) {
-        draw_round_rect_width(fb, 104, 140, 44, 52, 10, 3);
-    }
-    draw_text_center_at(fb, 126, 166, "M-", 2);
-    if (!lvgl_widgets_active()) {
-        draw_round_rect_width(fb, 152, 140, 44, 52, 10, 3);
-    }
-    draw_text_center_at(fb, 174, 166, "M+", 2);
+    draw_text(fb, 12, 94, text, 2);
+    draw_hline(fb, 12, 188, 132);
+    draw_text(fb, 12, 150, ctx->sync_online ? "Online" : "Offline", 2);
 }
 
 static const char *alert_title(const pj_time_alert_t *alert)
@@ -1656,26 +1628,23 @@ static const char *alert_title(const pj_time_alert_t *alert)
 
 static void draw_alert_overlay(const pj_ui_context_t *ctx, pj_framebuffer_t *fb)
 {
-    draw_text_center_at(fb, 100, 35, alert_title(&ctx->active_alert), 3);
+    draw_text(fb, 12, 18, alert_title(&ctx->active_alert), 3);
+    draw_hline(fb, 12, 188, 60);
     if (ctx->active_alert.recovered || ctx->recovery_time_uncertain) {
-        draw_text_center_at(fb, 100, 80, "RECOVERED", 1);
+        draw_text(fb, 12, 78, "Recovered", 1);
     } else if (ctx->active_alert.reason == PJ_TIME_ALERT_SNOOZE) {
-        draw_text_center_at(fb, 100, 80, "SNOOZED", 1);
+        draw_text(fb, 12, 78, "Snoozed", 1);
     } else {
-        draw_text_center_at(fb, 100, 80, "NOW", 2);
+        draw_text(fb, 12, 78, "Now", 2);
     }
     if (ctx->alert_audio_deferred) {
-        draw_text_center_at(fb, 100, 110, "AUDIO DEFERRED", 1);
+        draw_text(fb, 12, 112, "Audio deferred", 1);
     }
-    if (!lvgl_widgets_active()) {
-        draw_round_rect_width(fb, 8, 140, 88, 52, 12, 3);
-    }
-    draw_text_center_at(fb, 52, 166, "DISMISS", 1);
+    const char *actions[] = {"Dismiss", "Snooze"};
     if (ctx->active_alert.source == PJ_TIME_ALERT_ALARM) {
-        if (!lvgl_widgets_active()) {
-            draw_round_rect_width(fb, 104, 140, 88, 52, 12, 3);
-        }
-        draw_text_center_at(fb, 148, 166, "SNOOZE", 1);
+        draw_action_strip(fb, actions, 2, 0);
+    } else {
+        draw_action_strip(fb, actions, 1, 0);
     }
 }
 
@@ -1705,15 +1674,17 @@ static void render_scene(const pj_ui_context_t *ctx, pj_framebuffer_t *fb)
     case PJ_UI_STATE_HOME: {
         tile_t tiles[PJ_HOME_MAX_SLOTS];
         size_t tile_count = home_tiles(ctx, tiles);
-        draw_text_center_at(fb, PJ_DISPLAY_WIDTH / 2, 13, ctx->home_layout.title, 1);
-        draw_tiles(fb, tiles, tile_count);
+        draw_screen_header(fb, ctx->home_layout.title, 0);
+        draw_menu_rows(fb, tiles, tile_count, 0);
         break;
     }
     case PJ_UI_STATE_NOTES:
-        draw_tiles(fb, NOTES_TILES, sizeof(NOTES_TILES) / sizeof(NOTES_TILES[0]));
+        draw_screen_header(fb, "Notes", 1);
+        draw_menu_rows(fb, NOTES_TILES, sizeof(NOTES_TILES) / sizeof(NOTES_TILES[0]), ctx->focus_index);
         break;
     case PJ_UI_STATE_TIME:
-        draw_tiles(fb, TIME_TILES, sizeof(TIME_TILES) / sizeof(TIME_TILES[0]));
+        draw_screen_header(fb, "Time", 1);
+        draw_menu_rows(fb, TIME_TILES, sizeof(TIME_TILES) / sizeof(TIME_TILES[0]), ctx->focus_index);
         break;
     case PJ_UI_STATE_SETTINGS:
         draw_settings(ctx, fb);
@@ -1728,52 +1699,67 @@ static void render_scene(const pj_ui_context_t *ctx, pj_framebuffer_t *fb)
         draw_notes_list(ctx, fb, "TXT");
         break;
     case PJ_UI_STATE_ALARM:
+        draw_screen_header(fb, "Alarm", 1);
         (void)snprintf(text, sizeof(text), "%02d:%02d", ctx->alarm_hour, ctx->alarm_minute);
-        draw_text_center_at(fb, 100, 52, text, 4);
-        draw_text_center_at(fb, 100, 108, ctx->alarm_on ? "ON" : "OFF", 3);
-        draw_alarm_buttons(fb);
+        draw_text_center_at(fb, 100, 73, text, 4);
+        draw_text_center_at(fb, 100, 124, ctx->alarm_on ? "On" : "Off", 2);
+        { const char *actions[] = {ctx->alarm_on ? "Off" : "On", "H-", "H+", "M-", "M+"};
+          draw_action_strip(fb, actions, 5, ctx->focus_index); }
         break;
     case PJ_UI_STATE_STOPWATCH:
+        draw_screen_header(fb, "Stopwatch", 1);
         format_hms(text, sizeof(text), ctx->stopwatch_seconds);
-        draw_text_center_at(fb, 100, 62, text, 4);
-        draw_text_center_at(fb, 100, 116, ctx->stopwatch_running ? "RUN" : "STOP", 2);
-        if (!lvgl_widgets_active()) {
-            draw_round_rect_width(fb, 136, 140, 56, 52, 12, 3);
-        }
-        draw_icon(fb, "RESET", 164, 166, 26);
+        draw_text_center_at(fb, 100, 75, text, 4);
+        draw_text_center_at(fb, 100, 126, ctx->stopwatch_running ? "Running" : "Paused", 2);
+        { const char *actions[] = {ctx->stopwatch_running ? "Pause" : "Start", "Reset"};
+          draw_action_strip(fb, actions, 2, ctx->focus_index); }
         break;
     case PJ_UI_STATE_TIMER:
+        draw_screen_header(fb, "Timer", 1);
         format_hms(text, sizeof(text), ctx->timer_seconds);
-        draw_text_center_at(fb, 100, 62, text, 4);
-        draw_text_center_at(fb, 100, 116, ctx->timer_running ? "RUN" : "STOP", 2);
-        draw_change_buttons(fb);
+        draw_text_center_at(fb, 100, 75, text, 4);
+        draw_text_center_at(fb, 100, 126, ctx->timer_running ? "Running" : "Paused", 2);
+        { const char *actions[] = {ctx->timer_running ? "Pause" : "Start", "-30", "+30", "Reset"};
+          draw_action_strip(fb, actions, 4, ctx->focus_index); }
         break;
     case PJ_UI_STATE_INTERVAL:
+        draw_screen_header(fb, "Interval", 1);
         (void)snprintf(text, sizeof(text), "%d", ctx->interval_round);
-        draw_text_center_at(fb, 100, 34, text, 4);
+        draw_text(fb, 12, 45, "Round", 1);
+        draw_text(fb, 66, 39, text, 2);
         format_hms(text, sizeof(text), ctx->interval_seconds);
-        draw_text_center_at(fb, 100, 90, text, 4);
-        draw_text_center_at(fb, 100, 130, ctx->interval_running ? "RUN" : "STOP", 1);
-        draw_change_buttons(fb);
+        draw_text_center_at(fb, 100, 92, text, 4);
+        draw_text_center_at(fb, 100, 132, ctx->interval_running ? "Running" : "Paused", 1);
+        { const char *actions[] = {ctx->interval_running ? "Pause" : "Start", "-1m", "+1m", "Reset"};
+          draw_action_strip(fb, actions, 4, ctx->focus_index); }
         break;
     case PJ_UI_STATE_CALENDAR:
+        draw_screen_header(fb, "Calendar", 1);
         (void)snprintf(text, sizeof(text), "%02d/%02d", ctx->month, ctx->day);
-        draw_text_center_at(fb, 100, 42, text, 3);
-        draw_hline(fb, 36, 164, 76);
-        draw_text_center_at(fb, 100, 118, "NO EVENTS", 2);
+        draw_text(fb, 12, 50, text, 3);
+        draw_hline(fb, 12, 188, 91);
+        draw_text(fb, 12, 112, "No events", 2);
         break;
     case PJ_UI_STATE_NOTE_DETAIL:
-        draw_text_centered_ellipsized(
-            fb, 100, 30,
-            ctx->note_labels[ctx->selected_note][0] != '\0'
-                ? ctx->note_labels[ctx->selected_note]
-                : "NOTE",
-            2, 184);
-        draw_icon(fb, "PLAY", 100, 94, 54);
-        draw_text_center_at(fb, 100, 158,
-                            ctx->playback_state == PJ_PLAYBACK_ACTIVE ? "PLAYING" :
-                            ctx->playback_state == PJ_PLAYBACK_STOPPING ? "STOPPING" : "READY",
-                            2);
+        draw_screen_header(fb, ctx->note_detail_transcript ? "Transcript" : "Recording", 1);
+        if (ctx->note_detail_transcript) {
+            draw_text(fb, 12, 48, "\"", 2);
+            draw_wrapped_text(fb, 30, 52,
+                ctx->note_labels[ctx->selected_note][0] != '\0' ? ctx->note_labels[ctx->selected_note] : "Transcript pending",
+                1, 154, 5);
+            draw_text(fb, 176, 126, "\"", 2);
+            draw_hline(fb, 12, 188, 151);
+            draw_text(fb, 12, 167, "Synced text", 1);
+        } else {
+            draw_text_centered_ellipsized(fb, 100, 52,
+                ctx->note_labels[ctx->selected_note][0] != '\0' ? ctx->note_labels[ctx->selected_note] : "Recording",
+                1, 176);
+            draw_icon(fb, "PLAY", 100, 102, 48);
+            draw_text_center_at(fb, 100, 146,
+                                ctx->playback_state == PJ_PLAYBACK_ACTIVE ? "Playing" :
+                                ctx->playback_state == PJ_PLAYBACK_STOPPING ? "Stopping" : "Play",
+                                2);
+        }
         break;
     case PJ_UI_STATE_SYNC:
         draw_sync(ctx, fb);
@@ -2005,139 +1991,9 @@ static void lvgl_copy_framebuffer_area(pj_framebuffer_t *dst, const pj_framebuff
     }
 }
 
-static lv_obj_t *lvgl_outline_button(int x, int y, int w, int h, int radius, int border_width, int color_index)
-{
-    lv_obj_t *button = lv_button_create(lv_screen_active());
-
-    lv_obj_remove_style_all(button);
-    lv_obj_set_pos(button, x, y);
-    lv_obj_set_size(button, w, h);
-    lv_obj_set_style_bg_opa(button, LV_OPA_TRANSP, LV_PART_MAIN);
-    lv_obj_set_style_border_color(button, lvgl_i1_color(color_index), LV_PART_MAIN);
-    lv_obj_set_style_border_opa(button, LV_OPA_COVER, LV_PART_MAIN);
-    lv_obj_set_style_border_side(button, LV_BORDER_SIDE_FULL, LV_PART_MAIN);
-    lv_obj_set_style_border_width(button, border_width, LV_PART_MAIN);
-    lv_obj_set_style_radius(button, radius, LV_PART_MAIN);
-    lv_obj_set_style_pad_all(button, 0, LV_PART_MAIN);
-    return button;
-}
-
-static void lvgl_tile_buttons(const tile_t *tiles, size_t count, int color_index)
-{
-    for (size_t i = 0; i < count; i++) {
-        lvgl_outline_button(tiles[i].x, tiles[i].y, tiles[i].w, tiles[i].h, 12, 3, color_index);
-    }
-}
-
-static void lvgl_note_list_widgets(const pj_ui_context_t *ctx, int color_index)
-{
-    for (int i = 0; i < notes_per_page(); i++) {
-        int note_index = ctx->note_page * notes_per_page() + i;
-        if (note_index >= ctx->note_count) {
-            continue;
-        }
-        lvgl_outline_button(8, 8 + i * 58, 136, 46, 10, 2, color_index);
-    }
-    lvgl_outline_button(152, 8, 40, 78, 10, 2, color_index);
-    lvgl_outline_button(152, 114, 40, 78, 10, 2, color_index);
-}
-
-static void lvgl_settings_widgets(int color_index)
-{
-    lvgl_tile_buttons(SETTINGS_TILES, sizeof(SETTINGS_TILES) / sizeof(SETTINGS_TILES[0]), color_index);
-}
-
-static void lvgl_volume_widgets(const pj_ui_context_t *ctx, int color_index)
-{
-    lv_obj_t *bar = lv_bar_create(lv_screen_active());
-    lv_obj_remove_style_all(bar);
-    lv_obj_set_pos(bar, 24, 106);
-    lv_obj_set_size(bar, 152, 18);
-    lv_obj_set_style_bg_opa(bar, LV_OPA_TRANSP, LV_PART_MAIN);
-    lv_obj_set_style_border_color(bar, lvgl_i1_color(color_index), LV_PART_MAIN);
-    lv_obj_set_style_border_opa(bar, LV_OPA_COVER, LV_PART_MAIN);
-    lv_obj_set_style_border_side(bar, LV_BORDER_SIDE_FULL, LV_PART_MAIN);
-    lv_obj_set_style_border_width(bar, 2, LV_PART_MAIN);
-    lv_obj_set_style_radius(bar, 7, LV_PART_MAIN);
-    lv_obj_set_style_pad_all(bar, 4, LV_PART_MAIN);
-    lv_obj_set_style_bg_color(bar, lvgl_i1_color(color_index), LV_PART_INDICATOR);
-    lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, LV_PART_INDICATOR);
-    lv_obj_set_style_radius(bar, 4, LV_PART_INDICATOR);
-    lv_bar_set_range(bar, 0, 10);
-    lv_bar_set_value(bar, ctx->volume, LV_ANIM_OFF);
-
-    lvgl_outline_button(8, 140, 88, 52, 12, 3, color_index);
-    lvgl_outline_button(104, 140, 88, 52, 12, 3, color_index);
-}
-
-static void lvgl_change_buttons(int color_index)
-{
-    lvgl_outline_button(8, 140, 56, 52, 12, 3, color_index);
-    lvgl_outline_button(72, 140, 56, 52, 12, 3, color_index);
-    lvgl_outline_button(136, 140, 56, 52, 12, 3, color_index);
-}
-
-static void lvgl_alarm_buttons(int color_index)
-{
-    lvgl_outline_button(4, 140, 44, 52, 10, 3, color_index);
-    lvgl_outline_button(52, 140, 44, 52, 10, 3, color_index);
-    lvgl_outline_button(104, 140, 44, 52, 10, 3, color_index);
-    lvgl_outline_button(152, 140, 44, 52, 10, 3, color_index);
-}
-
-static void lvgl_alert_buttons(const pj_ui_context_t *ctx, int color_index)
-{
-    lvgl_outline_button(8, 140, 88, 52, 12, 3, color_index);
-    if (ctx->active_alert.source == PJ_TIME_ALERT_ALARM) {
-        lvgl_outline_button(104, 140, 88, 52, 12, 3, color_index);
-    }
-}
-
 static void lvgl_add_widgets(const pj_ui_context_t *ctx)
 {
-    int color_index = ctx->dark_mode ? 0 : 1;
-
-    if (active_alert_present(ctx)) {
-        lvgl_alert_buttons(ctx, color_index);
-        return;
-    }
-
-    switch (ctx->state) {
-    case PJ_UI_STATE_HOME: {
-        tile_t tiles[PJ_HOME_MAX_SLOTS];
-        size_t tile_count = home_tiles(ctx, tiles);
-        lvgl_tile_buttons(tiles, tile_count, color_index);
-        break;
-    }
-    case PJ_UI_STATE_NOTES:
-        lvgl_tile_buttons(NOTES_TILES, sizeof(NOTES_TILES) / sizeof(NOTES_TILES[0]), color_index);
-        break;
-    case PJ_UI_STATE_TIME:
-        lvgl_tile_buttons(TIME_TILES, sizeof(TIME_TILES) / sizeof(TIME_TILES[0]), color_index);
-        break;
-    case PJ_UI_STATE_SETTINGS:
-        lvgl_settings_widgets(color_index);
-        break;
-    case PJ_UI_STATE_VOLUME:
-        lvgl_volume_widgets(ctx, color_index);
-        break;
-    case PJ_UI_STATE_LISTEN:
-    case PJ_UI_STATE_READ:
-        lvgl_note_list_widgets(ctx, color_index);
-        break;
-    case PJ_UI_STATE_ALARM:
-        lvgl_alarm_buttons(color_index);
-        break;
-    case PJ_UI_STATE_STOPWATCH:
-        lvgl_outline_button(136, 140, 56, 52, 12, 3, color_index);
-        break;
-    case PJ_UI_STATE_TIMER:
-    case PJ_UI_STATE_INTERVAL:
-        lvgl_change_buttons(color_index);
-        break;
-    default:
-        break;
-    }
+    (void)ctx;
 }
 
 void pj_ui_render(const pj_ui_context_t *ctx, pj_framebuffer_t *fb)
