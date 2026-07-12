@@ -10,6 +10,7 @@ import struct
 from typing import Any, Mapping
 
 MODEL_ID = "distil-whisper/distil-large-v3.5"
+MODEL_REVISION = "728a7691f3ff1d3d971528d3203a6e9559165d41"
 
 
 def inspect_wav(path: Path) -> dict[str, Any]:
@@ -28,9 +29,11 @@ def inspect_wav(path: Path) -> dict[str, Any]:
         raise ValueError("invalid RIFF size")
     if riff_end > byte_length:
         raise ValueError("truncated RIFF payload")
+    if riff_end != byte_length:
+        raise ValueError("WAV file has trailing bytes after RIFF payload")
 
-    format_fields: tuple[int, int, int, int] | None = None
-    data_bytes = 0
+    format_fields: tuple[int, int, int, int, int, int] | None = None
+    data_chunk_sizes: list[int] = []
     offset = 12
     while offset < riff_end:
         if riff_end - offset < 8:
@@ -48,22 +51,39 @@ def inspect_wav(path: Path) -> dict[str, Any]:
         if chunk_id == b"fmt " and format_fields is None:
             if chunk_size < 16:
                 raise ValueError("truncated WAV format chunk")
-            audio_format, channels, sample_rate = struct.unpack_from("<HHI", blob, payload_start)
-            bits_per_sample = struct.unpack_from("<H", blob, payload_start + 14)[0]
-            if channels == 0 or sample_rate == 0 or bits_per_sample == 0:
+            audio_format, channels, sample_rate, byte_rate, block_align, bits_per_sample = (
+                struct.unpack_from("<HHIIHH", blob, payload_start)
+            )
+            if audio_format != 1:
+                raise ValueError("unsupported WAV format: expected PCM")
+            if channels == 0 or sample_rate == 0 or bits_per_sample == 0 or block_align == 0:
                 raise ValueError("invalid WAV format values")
-            format_fields = audio_format, channels, sample_rate, bits_per_sample
+            expected_block_align = channels * ((bits_per_sample + 7) // 8)
+            expected_byte_rate = sample_rate * expected_block_align
+            if block_align != expected_block_align or byte_rate != expected_byte_rate:
+                raise ValueError("inconsistent WAV byte rate or block alignment")
+            format_fields = (
+                audio_format,
+                channels,
+                sample_rate,
+                byte_rate,
+                block_align,
+                bits_per_sample,
+            )
         elif chunk_id == b"data":
-            data_bytes += chunk_size
+            data_chunk_sizes.append(chunk_size)
 
         offset = padded_end
 
     if format_fields is None:
         raise ValueError("WAV format chunk is missing")
+    data_bytes = sum(data_chunk_sizes)
     if data_bytes == 0:
         raise ValueError("WAV data chunk is missing or empty")
 
-    audio_format, channels, sample_rate, bits_per_sample = format_fields
+    audio_format, channels, sample_rate, byte_rate, block_align, bits_per_sample = format_fields
+    if any(chunk_size % block_align != 0 for chunk_size in data_chunk_sizes):
+        raise ValueError("WAV data chunk is not frame aligned")
     return {
         "sha256": hashlib.sha256(blob).hexdigest(),
         "bytes": byte_length,
@@ -75,6 +95,8 @@ def inspect_wav(path: Path) -> dict[str, Any]:
         "sample_width": (bits_per_sample + 7) // 8,
         "bits_per_sample": bits_per_sample,
         "audio_format": audio_format,
+        "byte_rate": byte_rate,
+        "block_align": block_align,
     }
 
 
@@ -113,9 +135,11 @@ class HuggingFaceTranscriptionBackend(TranscriptionBackend):
     def __init__(
         self,
         model_id: str = MODEL_ID,
+        model_revision: str = MODEL_REVISION,
         decoding_parameters: Mapping[str, Any] | None = None,
     ) -> None:
         self.model_id = model_id
+        self.model_revision = model_revision
         # A JSON round trip both validates and detaches caller-owned structures.
         self.decoding_parameters = json.loads(
             json.dumps(decoding_parameters or {}, sort_keys=True)
@@ -132,6 +156,7 @@ class HuggingFaceTranscriptionBackend(TranscriptionBackend):
             "runtime": "transformers",
             "runtime_version": runtime_version,
             "model_id": self.model_id,
+            "model_revision": self.model_revision,
             "decoding_parameters": self.decoding_parameters,
         }
 
@@ -141,7 +166,11 @@ class HuggingFaceTranscriptionBackend(TranscriptionBackend):
                 from transformers import pipeline  # type: ignore
             except ImportError as exc:
                 raise RuntimeError("Install transcription dependencies: pip install -e '.[transcription]'") from exc
-            self._pipeline = pipeline("automatic-speech-recognition", model=self.model_id)
+            self._pipeline = pipeline(
+                "automatic-speech-recognition",
+                model=self.model_id,
+                revision=self.model_revision,
+            )
         return self._pipeline
 
     def transcribe(self, audio_path: Path) -> dict[str, Any]:
