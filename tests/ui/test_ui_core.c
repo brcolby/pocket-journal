@@ -310,8 +310,6 @@ static void test_aux_focus_and_activation(void)
 
     ui.state = PJ_UI_STATE_SETTINGS;
     ui.focus_index = 0;
-    assert(pj_ui_handle_aux_double(&ui) == 1);
-    assert(ui.focus_index == 1);
     assert(pj_ui_handle_aux_short(&ui) == 1);
     assert(pj_ui_current_state(&ui) == PJ_UI_STATE_VOLUME);
     int initial_volume = ui.volume;
@@ -407,13 +405,30 @@ static void test_time_value_typography_fits_refresh_regions(void)
     }
 }
 
+static void test_interval_round_is_rendered_zero_indexed(void)
+{
+    pj_ui_context_t ui;
+    pj_framebuffer_t zero;
+    pj_framebuffer_t one;
+    pj_ui_init(&ui);
+    assert(ui.interval_round == 0);
+    ui.state = PJ_UI_STATE_INTERVAL;
+    pj_ui_render(&ui, &zero);
+
+    ui.interval_round = 1;
+    pj_ui_render(&ui, &one);
+    assert(memcmp(&zero, &one, sizeof(zero)) != 0);
+    assert(count_black_pixels_in_region(&zero, 0, 0, 200, 60) >
+           count_black_pixels_in_region(&one, 0, 0, 200, 60));
+}
+
 static void test_aux_double_cycles_visible_actions_and_falls_back_to_record(void)
 {
     pj_ui_context_t ui;
     pj_ui_init(&ui);
 
     const struct { pj_ui_state_t state; int count; } menus[] = {
-        {PJ_UI_STATE_NOTES, 3}, {PJ_UI_STATE_TIME, 4}, {PJ_UI_STATE_SETTINGS, 4},
+        {PJ_UI_STATE_NOTES, 3}, {PJ_UI_STATE_TIME, 4}, {PJ_UI_STATE_SETTINGS, 3},
         {PJ_UI_STATE_VOLUME, 2}, {PJ_UI_STATE_ALARM, 5},
         {PJ_UI_STATE_STOPWATCH, 2}, {PJ_UI_STATE_TIMER, 4}, {PJ_UI_STATE_INTERVAL, 4},
     };
@@ -524,21 +539,80 @@ static void test_audio_lifecycle_reconciliation(void)
     assert(ui.record_state == PJ_RECORD_IDLE);
 }
 
-static void test_display_preferences_toggle(void)
+static void test_settings_rows_control_volume_appearance_and_clock(void)
 {
     pj_ui_context_t ui;
     pj_ui_init(&ui);
     ui.state = PJ_UI_STATE_SETTINGS;
-    assert(pj_ui_handle_touch(&ui, 20, 130, PJ_TOUCH_TAP) == 1);
-    assert(pj_ui_current_state(&ui) == PJ_UI_STATE_DISPLAY);
-    assert(pj_ui_handle_touch(&ui, 120, 30, PJ_TOUCH_TAP) == 1);
+
+    assert(pj_ui_handle_touch(&ui, 100, 20, PJ_TOUCH_TAP) == 1);
+    assert(pj_ui_current_state(&ui) == PJ_UI_STATE_VOLUME);
+    assert(pj_ui_handle_aux_long(&ui) == 1);
+    assert(pj_ui_current_state(&ui) == PJ_UI_STATE_SETTINGS);
+
+    assert(ui.dark_mode == 0);
+    assert(pj_ui_handle_touch(&ui, 100, 100, PJ_TOUCH_TAP) == 1);
+    assert(pj_ui_current_state(&ui) == PJ_UI_STATE_SETTINGS);
+    assert(ui.dark_mode == 1);
+
+    assert(ui.clock_24h == 1);
+    assert(pj_ui_handle_touch(&ui, 100, 170, PJ_TOUCH_TAP) == 1);
+    assert(pj_ui_current_state(&ui) == PJ_UI_STATE_SETTINGS);
     assert(ui.clock_24h == 0);
-    assert(pj_ui_handle_touch(&ui, 120, 100, PJ_TOUCH_TAP) == 1);
+    assert(ui.dirty.partial == 0);
+
+    pj_ui_init(&ui);
+    ui.state = PJ_UI_STATE_SETTINGS;
+    assert(ui.focus_index == 0);
+    assert(pj_ui_handle_aux_double(&ui) == 1 && ui.focus_index == 1);
+    assert(pj_ui_handle_aux_short(&ui) == 1 && ui.dark_mode == 1);
+    assert(pj_ui_handle_aux_double(&ui) == 1 && ui.focus_index == 2);
+    assert(pj_ui_handle_aux_short(&ui) == 1 && ui.clock_24h == 0);
+    assert(pj_ui_handle_aux_double(&ui) == 1 && ui.focus_index == 0);
+
+    pj_ui_init(&ui);
+    ui.state = PJ_UI_STATE_SETTINGS;
+    assert(pj_ui_handle_touch(&ui, 100, 65, PJ_TOUCH_TAP) == 1);
+    assert(ui.state == PJ_UI_STATE_VOLUME);
+    assert(pj_ui_handle_aux_long(&ui) == 1);
+    assert(pj_ui_handle_touch(&ui, 100, 66, PJ_TOUCH_TAP) == 1);
+    assert(ui.state == PJ_UI_STATE_SETTINGS && ui.dark_mode == 1);
+    assert(pj_ui_handle_touch(&ui, 100, 132, PJ_TOUCH_TAP) == 1);
+    assert(ui.dark_mode == 0);
+    assert(pj_ui_handle_touch(&ui, 100, 133, PJ_TOUCH_TAP) == 1);
+    assert(ui.clock_24h == 0);
+}
+
+static void test_alarm_touch_regions_match_enable_and_adjustment_controls(void)
+{
+    pj_ui_context_t ui;
+    pj_ui_init(&ui);
+    ui.state = PJ_UI_STATE_ALARM;
+
+    assert(ui.alarm_on == 0);
+    assert(pj_ui_handle_touch(&ui, 100, 105, PJ_TOUCH_TAP) == 1);
+    assert(ui.alarm_on == 1 && ui.focus_index == 0);
+
+    assert(pj_ui_handle_touch(&ui, 50, 140, PJ_TOUCH_TAP) == 1);
+    assert(ui.alarm_hour == 6 && ui.focus_index == 1);
+    assert(pj_ui_handle_touch(&ui, 150, 140, PJ_TOUCH_TAP) == 1);
+    assert(ui.alarm_hour == 7 && ui.focus_index == 2);
+    assert(pj_ui_handle_touch(&ui, 50, 180, PJ_TOUCH_TAP) == 1);
+    assert(ui.alarm_minute == 15 && ui.focus_index == 3);
+    assert(pj_ui_handle_touch(&ui, 150, 180, PJ_TOUCH_TAP) == 1);
+    assert(ui.alarm_minute == 30 && ui.focus_index == 4);
+}
+
+static void test_api_preferences_remain_available_after_settings_flattening(void)
+{
+    pj_ui_context_t ui;
+    pj_ui_init(&ui);
+    pj_ui_mark_displayed(&ui);
+
+    pj_ui_set_preferences(&ui, 0, 1, 2);
+    assert(ui.clock_24h == 0);
     assert(ui.temperature_fahrenheit == 1);
-    assert(pj_ui_handle_touch(&ui, 120, 170, PJ_TOUCH_TAP) == 1);
     assert(ui.transcript_font_size == 2);
-    assert(pj_ui_handle_touch(&ui, 120, 170, PJ_TOUCH_TAP) == 1);
-    assert(ui.transcript_font_size == 3);
     assert(ui.dirty.partial == 0);
 }
 
@@ -549,7 +623,7 @@ static void test_settings_volume_opens_dedicated_screen(void)
     ui.state = PJ_UI_STATE_SETTINGS;
     ui.volume = 4;
 
-    assert(pj_ui_handle_touch(&ui, 150, 70, PJ_TOUCH_TAP) == 1);
+    assert(pj_ui_handle_touch(&ui, 100, 20, PJ_TOUCH_TAP) == 1);
     assert(pj_ui_current_state(&ui) == PJ_UI_STATE_VOLUME);
     assert(ui.volume == 4);
 }
@@ -1007,18 +1081,31 @@ static void test_record_partial_render_replaces_status_through_bottom_edge(void)
                &before, &partial, 0, 0, PJ_DISPLAY_WIDTH, PJ_DISPLAY_HEIGHT) > 0);
 }
 
-static void test_back_affordance_is_visible_on_child_screens(void)
+static void test_child_screens_have_no_back_affordance_or_hidden_touch_target(void)
 {
     pj_ui_context_t ui;
-    pj_framebuffer_t fb;
     pj_ui_init(&ui);
 
     ui.state = PJ_UI_STATE_TIMER;
-    pj_ui_render(&ui, &fb);
-    assert(count_black_pixels_in_region(&fb, 8, 6, 24, 24) > 0);
-    assert(count_black_pixels_in_region(&fb, 44, 0, 146, 30) == 0);
-    assert(pj_ui_handle_touch(&ui, 16, 16, PJ_TOUCH_TAP) == 1);
-    assert(ui.state == PJ_UI_STATE_TIME);
+    (void)pj_ui_handle_touch(&ui, 16, 16, PJ_TOUCH_TAP);
+    assert(ui.state == PJ_UI_STATE_TIMER);
+    assert(pj_ui_handle_touch(&ui, 100, 100, PJ_TOUCH_LONG_PRESS) == 0);
+    assert(ui.state == PJ_UI_STATE_TIMER);
+    assert(pj_ui_handle_touch(&ui, 100, 100, PJ_TOUCH_SWIPE_RIGHT) == 0);
+    assert(ui.state == PJ_UI_STATE_TIMER);
+
+    ui.state = PJ_UI_STATE_LISTEN;
+    (void)pj_ui_handle_touch(&ui, 16, 16, PJ_TOUCH_TAP);
+    assert(ui.state == PJ_UI_STATE_LISTEN);
+
+    ui.state = PJ_UI_STATE_READ;
+    (void)pj_ui_handle_touch(&ui, 16, 16, PJ_TOUCH_TAP);
+    assert(ui.state == PJ_UI_STATE_READ);
+
+    ui.state = PJ_UI_STATE_NOTE_DETAIL;
+    ui.note_detail_transcript = 1;
+    (void)pj_ui_handle_touch(&ui, 16, 16, PJ_TOUCH_TAP);
+    assert(ui.state == PJ_UI_STATE_NOTE_DETAIL);
 }
 
 static void test_voice_note_back_paths_are_consistent(void)
@@ -1030,44 +1117,36 @@ static void test_voice_note_back_paths_are_consistent(void)
         PJ_UI_STATE_NOTES, PJ_UI_STATE_NOTES, PJ_UI_STATE_LISTEN,
     };
     for (size_t i = 0; i < sizeof(states) / sizeof(states[0]); i++) {
-        for (int touch = 0; touch < 2; touch++) {
-            pj_ui_context_t ui;
-            pj_ui_init(&ui);
-            ui.state = states[i];
-            assert((touch ? pj_ui_handle_touch(&ui, 16, 16, PJ_TOUCH_TAP) :
-                            pj_ui_handle_aux_long(&ui)) == 1);
-            assert(ui.state == parents[i]);
-        }
-    }
-
-    for (int touch = 0; touch < 2; touch++) {
         pj_ui_context_t ui;
         pj_ui_init(&ui);
-        ui.state = PJ_UI_STATE_NOTE_DETAIL;
-        ui.note_detail_transcript = 1;
-        assert((touch ? pj_ui_handle_touch(&ui, 16, 16, PJ_TOUCH_TAP) :
-                        pj_ui_handle_aux_long(&ui)) == 1);
-        assert(ui.state == PJ_UI_STATE_READ);
-
-        pj_ui_init(&ui);
-        ui.state = PJ_UI_STATE_NOTE_DETAIL;
-        ui.playback_state = PJ_PLAYBACK_ACTIVE;
-        assert((touch ? pj_ui_handle_touch(&ui, 16, 16, PJ_TOUCH_TAP) :
-                        pj_ui_handle_aux_long(&ui)) == 1);
-        assert(ui.state == PJ_UI_STATE_NOTE_DETAIL);
-        assert(ui.playback_state == PJ_PLAYBACK_STOPPING);
-        assert(ui.playback_exit_pending == 1);
-        pj_ui_set_audio_state(&ui, 0, 0);
-        assert(ui.state == PJ_UI_STATE_LISTEN);
-
-        pj_ui_init(&ui);
-        ui.state = PJ_UI_STATE_RECORD;
-        ui.record_state = PJ_RECORD_ACTIVE;
-        assert((touch ? pj_ui_handle_touch(&ui, 16, 16, PJ_TOUCH_TAP) :
-                        pj_ui_handle_aux_long(&ui)) == 1);
-        assert(ui.state == PJ_UI_STATE_HOME);
-        assert(ui.record_state == PJ_RECORD_STOPPING);
+        ui.state = states[i];
+        assert(pj_ui_handle_aux_long(&ui) == 1);
+        assert(ui.state == parents[i]);
     }
+
+    pj_ui_context_t ui;
+    pj_ui_init(&ui);
+    ui.state = PJ_UI_STATE_NOTE_DETAIL;
+    ui.note_detail_transcript = 1;
+    assert(pj_ui_handle_aux_long(&ui) == 1);
+    assert(ui.state == PJ_UI_STATE_READ);
+
+    pj_ui_init(&ui);
+    ui.state = PJ_UI_STATE_NOTE_DETAIL;
+    ui.playback_state = PJ_PLAYBACK_ACTIVE;
+    assert(pj_ui_handle_aux_long(&ui) == 1);
+    assert(ui.state == PJ_UI_STATE_NOTE_DETAIL);
+    assert(ui.playback_state == PJ_PLAYBACK_STOPPING);
+    assert(ui.playback_exit_pending == 1);
+    pj_ui_set_audio_state(&ui, 0, 0);
+    assert(ui.state == PJ_UI_STATE_LISTEN);
+
+    pj_ui_init(&ui);
+    ui.state = PJ_UI_STATE_RECORD;
+    ui.record_state = PJ_RECORD_ACTIVE;
+    assert(pj_ui_handle_aux_long(&ui) == 1);
+    assert(ui.state == PJ_UI_STATE_HOME);
+    assert(ui.record_state == PJ_RECORD_STOPPING);
 }
 
 static void test_note_detail_back_restores_selected_page(void)
@@ -1076,30 +1155,17 @@ static void test_note_detail_back_restores_selected_page(void)
         "One", "Two", "Three", "Four", "Five", "Six",
     };
 
-    for (int touch = 0; touch < 2; touch++) {
+    for (int transcript = 0; transcript < 2; transcript++) {
         pj_ui_context_t ui;
         pj_ui_init(&ui);
         pj_ui_set_notes(&ui, 6, labels);
-        ui.state = PJ_UI_STATE_LISTEN;
+        ui.state = transcript ? PJ_UI_STATE_READ : PJ_UI_STATE_LISTEN;
         ui.note_page = 2;
         ui.focus_index = 4;
         assert(pj_ui_handle_aux_short(&ui) == 1);
         assert(ui.state == PJ_UI_STATE_NOTE_DETAIL && ui.selected_note == 4);
-        assert((touch ? pj_ui_handle_touch(&ui, 16, 16, PJ_TOUCH_TAP) :
-                        pj_ui_handle_aux_long(&ui)) == 1);
-        assert(ui.state == PJ_UI_STATE_LISTEN);
-        assert(ui.note_page == 2 && ui.focus_index == 4);
-
-        pj_ui_init(&ui);
-        pj_ui_set_notes(&ui, 6, labels);
-        ui.state = PJ_UI_STATE_READ;
-        ui.note_page = 2;
-        ui.focus_index = 4;
-        assert(pj_ui_handle_aux_short(&ui) == 1);
-        assert(ui.note_detail_transcript == 1 && ui.selected_note == 4);
-        assert((touch ? pj_ui_handle_touch(&ui, 16, 16, PJ_TOUCH_TAP) :
-                        pj_ui_handle_aux_long(&ui)) == 1);
-        assert(ui.state == PJ_UI_STATE_READ);
+        assert(pj_ui_handle_aux_long(&ui) == 1);
+        assert(ui.state == (transcript ? PJ_UI_STATE_READ : PJ_UI_STATE_LISTEN));
         assert(ui.note_page == 2 && ui.focus_index == 4);
     }
 
@@ -1319,9 +1385,12 @@ int main(void)
     test_home_layout_setter_canonicalizes_inactive_slots();
     test_aux_focus_and_activation();
     test_time_value_typography_fits_refresh_regions();
+    test_interval_round_is_rendered_zero_indexed();
     test_aux_double_cycles_visible_actions_and_falls_back_to_record();
     test_audio_lifecycle_reconciliation();
-    test_display_preferences_toggle();
+    test_settings_rows_control_volume_appearance_and_clock();
+    test_alarm_touch_regions_match_enable_and_adjustment_controls();
+    test_api_preferences_remain_available_after_settings_flattening();
     test_settings_volume_opens_dedicated_screen();
     test_volume_only_bottom_controls_adjust_and_clamp();
     test_timer_presets_are_not_runtime_counters();
@@ -1336,7 +1405,7 @@ int main(void)
     test_dirty_lifecycle();
     test_partial_render_preserves_outside_region();
     test_record_partial_render_replaces_status_through_bottom_edge();
-    test_back_affordance_is_visible_on_child_screens();
+    test_child_screens_have_no_back_affordance_or_hidden_touch_target();
     test_voice_note_back_paths_are_consistent();
     test_note_detail_back_restores_selected_page();
     test_twelve_hour_alarm_distinguishes_am_and_pm();

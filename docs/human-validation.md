@@ -12,9 +12,11 @@ Last synchronized with `bd human list`: 2026-07-12.
 ### Controls and display
 
 - [ ] **Button navigation and typography** (`pocket-journal-2ji`)
-  - AUX long/back triggers reliably at the reduced threshold without accidental activation.
+  - AUX long-hold is the sole Back action and triggers reliably at 500 ms without accidental activation.
+  - Confirm there is no rendered or touch Back control on child screens.
   - Common Home, Settings, Volume, Timer, Stopwatch, and Interval actions are usable with buttons.
-  - Button labels no longer dominate; timer and other essential values are legible.
+  - Confirm time values are substantially larger, sub-information remains readable, alarm adjustments use clear HR/MIN controls, and control labels are bold without dominating.
+  - Confirm interval rounds begin at zero and advance from that zero-indexed value.
 - [ ] **Display SPI correction** (`pocket-journal-0bd`)
   - Navigation and refreshes remain reliable with the panel clock capped at 20 MHz.
   - Note any new corruption, timeout, flicker, or ghosting.
@@ -25,17 +27,19 @@ Last synchronized with `bd human list`: 2026-07-12.
   - Confirm Static shows only the placeholder notebook splash art, with no clock or status text.
   - Confirm Time/Temp uses the full display for the enlarged clock and equal-scale date, temperature/humidity, and battery percentage without clipping or stale pixels.
   - Confirm Home is exactly three contiguous full-width icon buttons; all other button groups are contiguous, reach the screen edges, and have no gutters.
-  - Confirm every child screen has a large, high-contrast on-screen back chevron as an alternative to AUX long/back, with no page title or separator below it.
-  - Inspect the icon-only Notes, Time, and Settings grids plus full-screen playback, timer controls, alarm, and volume controls for physical legibility and unambiguous meaning.
+  - Confirm child screens have no rendered or touch Back control; a 500 ms AUX long-hold is the sole Back action.
+  - Inspect the icon-only Notes and Time menus, text-led Settings rows, full-screen playback, timer controls, alarm, and volume controls for physical legibility and unambiguous meaning.
   - On Home, short-press cycles destinations and double-press activates the focused secondary destination; focus-zero double-press remains quick record.
   - In Notes, Time, and Settings, double-press cycles visible focus, short-press activates, and long-press returns to the immediate parent.
   - Verify note names and transcript text render uppercase with a correct baseline, no downward-shifted capital letters, word wrapping, and clean ellipses.
-  - During playback, use both on-screen back and AUX back; audio must stop before returning to the same selected note and page in Listen. During recording, either back path must save and return immediately while processing continues asynchronously.
-  - Verify the record elapsed value, 2x2 timer/interval controls, 90-second interval default, large round number, filled volume bar, and large Sync values.
-  - Start and stop timer, stopwatch, and interval activity while watching for stale START/PAUSE icons; change Sync counts across one and two digits and watch for partially refreshed text.
-  - Confirm the top-left Time and Settings icons remain visually separate from Back and timer/stopwatch values do not touch Back.
+  - During active playback, AUX long-hold must stop audio safely before returning to the same selected note and page in Listen; when playback is paused, AUX long-hold must return without restarting audio. During recording, AUX long-hold must save and return immediately while processing continues asynchronously.
+  - Verify the record elapsed value, substantially enlarged time values and sub-information, bold controls, clear HR/MIN alarm adjustments, 2x2 timer/interval controls, 90-second interval default, zero-indexed interval round, and filled volume bar.
+  - Start and stop timer, stopwatch, and interval activity while watching for stale START/PAUSE icons.
+  - Confirm Settings presents direct rows for Volume, Light/Dark, and 12/24-hour mode, with no nested Display screen.
 - [ ] **Clock, unit, and reading-size persistence** (`pocket-journal-aw7`)
-  - Toggle 12/24-hour mode, Celsius/Fahrenheit, and transcript font size through Settings > Display; verify each change appears immediately.
+  - Toggle 12/24-hour mode directly from the Settings row; verify the change appears immediately and there is no nested Display screen.
+  - Confirm Settings rows are Volume, Light/Dark, and 12/24-hour mode.
+  - Verify Celsius/Fahrenheit and transcript font-size preferences still round-trip through the settings API and persist without requiring compact-device navigation rows.
   - In 12-hour mode, verify both the main clock and alarm clearly distinguish AM from PM.
   - Reboot and sleep/wake, then confirm all three preferences persist.
   - Compare displayed temperature and humidity with a nearby reference; report whether the values are plausible and stable. When the humidity sensor is unavailable, the clock must show `--%` and `/v1/status` must return `null`, never a plausible placeholder value.

@@ -86,7 +86,7 @@ assert.match(simulatorJs, /openReviewView/);
 assert.match(simulatorJs, /captureDisplay/);
 assert.match(simulatorJs, /event\.shiftKey/);
 assert.equal(simulatorJs.match(/!event\.repeat/g)?.length, 5);
-assert.match(simulatorAuxJs, /AUX_LONG_PRESS_MS = 650/);
+assert.match(simulatorAuxJs, /AUX_LONG_PRESS_MS = 500/);
 assert.match(simulatorAuxJs, /AUX_DOUBLE_CLICK_MS = 350/);
 assert.match(simulatorJs, /putImageData\(framebufferImage, 0, 0, region\.x, region\.y, region\.width, region\.height\)/);
 assert.match(simulatorJs, /boot failed; check \.logs\/simulator-debug-latest\.json/);

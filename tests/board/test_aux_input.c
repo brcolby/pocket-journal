@@ -56,10 +56,15 @@ static void test_late_second_click_preserves_both_singles(void)
 static void test_long_press_is_not_a_double_click(void)
 {
     pj_aux_input_t input;
+    assert(PJ_AUX_LONG_PRESS_MS == 500U);
     pj_aux_input_init(&input, 1, 0);
 
     assert(settle_level(&input, 0, 100) == PJ_AUX_GESTURE_NONE);
-    assert(settle_level(&input, 1, 100 + PJ_AUX_LONG_PRESS_MS) == PJ_AUX_GESTURE_LONG);
+    assert(settle_level(&input, 1, 100 + PJ_AUX_LONG_PRESS_MS - 1U) == PJ_AUX_GESTURE_NONE);
+
+    pj_aux_input_init(&input, 1, 1000);
+    assert(settle_level(&input, 0, 1100) == PJ_AUX_GESTURE_NONE);
+    assert(settle_level(&input, 1, 1100 + PJ_AUX_LONG_PRESS_MS) == PJ_AUX_GESTURE_LONG);
 
     uint32_t first_release = short_press(&input, 2000, 2080);
     assert(settle_level(&input, 0, 2200) == PJ_AUX_GESTURE_NONE);

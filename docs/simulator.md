@@ -81,13 +81,11 @@ The inline bootstrap logger writes to the same endpoint before `src/main.js` loa
 - `home`: configurable firmware tiles for notes, time, and settings by default.
 - `notes`: record, listen, read.
 - `time`: alarm, stopwatch, timer, interval.
-- `settings`: sync, volume, display preferences, off.
-- `display`: toggles 12/24-hour time, Celsius/Fahrenheit, and transcript font size.
+- `settings`: three direct rows for volume, light/dark appearance, and 12/24-hour time.
 - `volume`: volume changes through the full-height minus and plus controls.
-- `sync`: shows the pending, transferred, and connection status supplied by firmware.
-- `record`: entering starts recording; AUX or on-screen Back stops/saves it and returns home while processing continues asynchronously.
+- `record`: entering starts recording; AUX stops/saves it and returns home while processing continues asynchronously.
 - `listen` and `read`: show dummy recordings ordered newest first; tap a note to enter detail.
 - AUX double-click jumps from any idle screen, including the resting screen, directly into recording. It is ignored while recording, playback, stopwatch, timer, or interval activity is in progress.
-- AUX single-click actions wait 350 ms so a second click can be recognized; release after holding for at least 650 ms to trigger a long press.
-- AUX long press backs out through the firmware parent state graph.
+- AUX single-click actions wait 350 ms so a second click can be recognized; release after holding for at least 500 ms to trigger a long press.
+- A 500 ms AUX long press is the sole Back action and backs out through the firmware parent state graph; child screens have no rendered or touch Back target.
 - AUX short press follows the focused action on each screen; AUX double press cycles focus where a screen exposes multiple actions. Active media and time screens start, pause, or stop their current action without requiring touch.
