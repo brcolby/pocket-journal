@@ -12,9 +12,7 @@ export const states = {
   TIMER: "timer",
   INTERVAL: "interval",
   SETTINGS: "settings",
-  SYNC: "sync",
   VOLUME: "volume",
-  DISPLAY: "display",
   CALENDAR: "calendar",
   NOTE_DETAIL: "note_detail",
 };
@@ -33,9 +31,7 @@ export const meta = {
   timer: { title: "TIMER", parent: "time" },
   interval: { title: "INTERVAL", parent: "time" },
   settings: { title: "SETTINGS", parent: "home" },
-  sync: { title: "SYNC", parent: "settings" },
   volume: { title: "VOLUME", parent: "settings" },
-  display: { title: "DISPLAY", parent: "settings" },
   calendar: { title: "CALENDAR", parent: "home" },
   note_detail: { title: "NOTE", parent: "read" },
 };
@@ -67,10 +63,9 @@ const menus = {
     { label: "", icon: "repeat", state: "interval" },
   ],
   settings: [
-    { label: "", icon: "wifi", state: "sync" },
-    { label: "", icon: "volume_up", state: "volume" },
-    { label: "", icon: "settings_adjust", state: "display" },
-    { label: "", icon: "power", state: "static" },
+    { label: "Volume", value: "10", action: "volume", state: "volume" },
+    { label: "Light/Dark", value: "LIGHT", action: "theme", state: "settings" },
+    { label: "12/24", value: "24H", action: "clock", state: "settings" },
   ],
 };
 
@@ -130,7 +125,10 @@ export function menuFor(state) {
 }
 
 export function backHit(state, x, y) {
-  return !["static", "time_temp", "home"].includes(state) && x >= 0 && x < 60 && y >= 0 && y < 60;
+  void state;
+  void x;
+  void y;
+  return false;
 }
 
 export function tilesFor(state) {
@@ -138,14 +136,14 @@ export function tilesFor(state) {
   if (!menu) {
     return [];
   }
-  if (state === "notes" && menu.length === 3) {
+  if (["home", "settings"].includes(state) && menu.length >= 3) {
     return [
-      { ...menu[0], x: 0, y: 0, width: 200, height: 67 },
-      { ...menu[1], x: 0, y: 67, width: 200, height: 66 },
+      { ...menu[0], x: 0, y: 0, width: 200, height: 66 },
+      { ...menu[1], x: 0, y: 66, width: 200, height: 67 },
       { ...menu[2], x: 0, y: 133, width: 200, height: 67 },
     ];
   }
-  if (state === "home" && menu.length >= 3) {
+  if (state === "notes" && menu.length >= 3) {
     return [
       { ...menu[0], x: 0, y: 0, width: 200, height: 67 },
       { ...menu[1], x: 0, y: 67, width: 200, height: 66 },

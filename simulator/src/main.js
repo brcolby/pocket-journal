@@ -26,6 +26,7 @@ const DISPLAY_WIDTH = 200;
 const DISPLAY_HEIGHT = 200;
 const LONG_PRESS_MS = AUX_LONG_PRESS_MS;
 const DOUBLE_CLICK_MS = AUX_DOUBLE_CLICK_MS;
+const PLAYBACK_STOPPING = 2;
 
 let wasmModule = null;
 let api = null;
@@ -49,9 +50,7 @@ const REVIEW_ROUTES = {
   timer: ["wake", "aux", [20, 125], [40, 150]],
   interval: ["wake", "aux", [20, 125], [150, 150]],
   settings: ["wake", "aux", [20, 170]],
-  sync: ["wake", "aux", [20, 170], [40, 70]],
-  volume: ["wake", "aux", [20, 170], [150, 70]],
-  display: ["wake", "aux", [20, 170], [40, 150]],
+  volume: ["wake", "aux", [20, 170], [100, 30]],
 };
 
 window.__pocketJournalSimulatorModuleLoaded = true;
@@ -299,13 +298,17 @@ function paintFirmwareFramebuffer(action = "render") {
   traceDebug("firmware.render", { action, state, dirty, painted: region });
 }
 
-function dispatchFirmware(action, callback) {
+function dispatchFirmware(action, callback, acknowledgePlaybackStop = false) {
   if (!api) {
     logAction(`${action}: firmware runtime not ready`);
     return;
   }
   const previous = stateLabel();
   const changed = callback();
+  const playbackAcknowledged = acknowledgePlaybackStop && api.playbackState() === PLAYBACK_STOPPING;
+  if (playbackAcknowledged) {
+    api.setAudioState(api.recordState() !== 0 ? 1 : 0, 0);
+  }
   paintFirmwareFramebuffer(action);
   const current = stateLabel();
   logAction(`${action}: ${previous} -> ${current}${changed === 0 ? " (no change)" : ""}`);
@@ -314,6 +317,7 @@ function dispatchFirmware(action, callback) {
     previous,
     current,
     changed,
+    playbackAcknowledged,
     dirty: dirtyRegion(),
   });
 }
@@ -330,15 +334,15 @@ function handlePowerToggle(action = "power") {
 }
 
 function handleAuxShort(action = "A aux") {
-  dispatchFirmware(action, () => api.auxShort());
+  dispatchFirmware(action, () => api.auxShort(), true);
 }
 
 function handleAuxLong(action = "A aux long") {
-  dispatchFirmware(action, () => api.auxLong());
+  dispatchFirmware(action, () => api.auxLong(), true);
 }
 
 function handleAuxDouble(action = "A aux double") {
-  dispatchFirmware(action, () => api.auxDouble());
+  dispatchFirmware(action, () => api.auxDouble(), true);
 }
 
 const auxClickDetector = createAuxClickDetector({
@@ -406,7 +410,7 @@ function seedDynamicContent() {
 }
 
 function handleCanvasClick(x, y) {
-  dispatchFirmware("display tap", () => api.touchTap(x, y));
+  dispatchFirmware("display tap", () => api.touchTap(x, y), true);
 }
 
 function attachAuxButton(button, label) {

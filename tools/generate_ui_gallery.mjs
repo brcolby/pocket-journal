@@ -46,6 +46,7 @@ function png(pixels, width, height) {
   return Buffer.concat([Buffer.from("89504e470d0a1a0a", "hex"), chunk("IHDR", header), chunk("IDAT", deflateSync(raw)), chunk("IEND", Buffer.alloc(0))]);
 }
 function resetToHome() { api.pj_sim_reset(); api.pj_sim_wake(); api.pj_sim_aux_short(); }
+function resetToSettings() { resetToHome(); api.pj_sim_touch_tap(20, 170); }
 function frame() {
   api.pj_sim_render();
   const width = api.pj_sim_display_width(); const height = api.pj_sim_display_height();
@@ -75,15 +76,15 @@ const scenarios = [
     api.pj_sim_set_preferences(0, 0, 3);
     api.pj_sim_touch_tap(20, 125);
     api.pj_sim_touch_tap(40, 70);
-    for (let hour = 0; hour < 12; hour += 1) api.pj_sim_touch_tap(75, 170);
+    for (let hour = 0; hour < 12; hour += 1) api.pj_sim_touch_tap(150, 140);
   }, fullBleed()],
   ["stopwatch", "stopwatch", () => { resetToHome(); api.pj_sim_touch_tap(20, 125); api.pj_sim_touch_tap(150, 70); }, fullBleed(2)],
   ["timer", "timer", () => { resetToHome(); api.pj_sim_touch_tap(20, 125); api.pj_sim_touch_tap(40, 150); }, fullBleed()],
   ["interval", "interval", () => { resetToHome(); api.pj_sim_touch_tap(20, 125); api.pj_sim_touch_tap(150, 150); }, fullBleed()],
-  ["settings", "settings", () => { resetToHome(); api.pj_sim_touch_tap(20, 170); }, fullBleed(4)],
-  ["sync", "sync", () => { resetToHome(); api.pj_sim_touch_tap(20, 170); api.pj_sim_touch_tap(40, 70); }],
-  ["volume", "volume", () => { resetToHome(); api.pj_sim_touch_tap(20, 170); api.pj_sim_touch_tap(150, 70); }, fullBleed()],
-  ["display", "display", () => { resetToHome(); api.pj_sim_touch_tap(20, 170); api.pj_sim_touch_tap(40, 150); }, fullBleed()],
+  ["settings-light-24h", "settings", resetToSettings, fullBleed(3)],
+  ["volume-adjusted", "volume", () => { resetToSettings(); api.pj_sim_touch_tap(100, 30); api.pj_sim_touch_tap(150, 160); }, fullBleed()],
+  ["settings-dark-24h", "settings", () => { resetToSettings(); api.pj_sim_touch_tap(100, 100); }, { ...fullBleed(2), maxDensity: 1 }],
+  ["settings-light-12h", "settings", () => { resetToSettings(); api.pj_sim_touch_tap(100, 170); }, fullBleed(3)],
   ["alert-alarm", "home", () => { resetToHome(); api.pj_sim_set_alert(1); }, fullBleed(2)],
 ];
 
