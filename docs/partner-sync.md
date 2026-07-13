@@ -7,6 +7,7 @@ The partner CLI is the source of truth for laptop-side sync state.
 ```sh
 pj provision --ssid <ssid> --password <password>
 pj provision --ssid <ssid> --password <password> --serial-port /dev/cu.usbmodem1101
+pj provision --ssid <ssid> --password <password> --ble
 pj discover
 pj sync --device <device-id>
 pj calendar sync --device <device-id>
@@ -29,18 +30,18 @@ pj static-art get --device <device-id>
 pj static-art set --device <device-id> --file static-art.pbm
 ```
 
-Wi-Fi commands use the paired device config created by provisioning. For USB-C maintenance when Wi-Fi is unavailable, install the USB extra. The CLI auto-detects `/dev/cu.usbmodem1101` or the single attached USB serial port; pass `--serial-port` only to override detection.
+Wi-Fi commands use the paired device config created by provisioning. USB-C support is included in the standard partner CLI install. The CLI auto-detects `/dev/cu.usbmodem1101` or the single attached USB serial port; pass `--serial-port` only to override detection.
 
 ```sh
 cd partner
-pip install -e '.[usb]'
+pip install -e .
 pj device sync-time
 pj recordings wipe --yes
 ```
 
-`pj provision --serial-port ...` stores Wi-Fi credentials and a generated API bearer token on the device, then writes the paired device profile into the local partner config.
+`pj provision` uses USB-C by default. It stores Wi-Fi credentials and a generated API bearer token on the device, then writes the paired device profile into the local partner config. Pass `--serial-port` only when auto-detection cannot select the intended device.
 
-Without `--serial-port`, provisioning discovers a device advertising as `PJ-XXXXXX` and uses the Pocket Journal GATT service. The SSID, password, token, and commit characteristics require an encrypted paired BLE connection before firmware accepts writes. The current firmware uses LE Secure Connections with bonding and no-display/no-input pairing; this prevents unauthenticated plaintext credential writes, but a product-owner passkey or display-confirmation UX is still required before claiming MITM-resistant first-time provisioning. Credentials are written as separate bounded values, then committed asynchronously so the BLE request does not block on NVS or Wi-Fi startup.
+Pass `--ble` to provision without a cable. BLE provisioning discovers a device advertising as `PJ-XXXXXX` and uses the Pocket Journal GATT service. The SSID, password, token, and commit characteristics require an encrypted paired BLE connection before firmware accepts writes. The current firmware uses LE Secure Connections with bonding and no-display/no-input pairing; this prevents unauthenticated plaintext credential writes, but a product-owner passkey or display-confirmation UX is still required before claiming MITM-resistant first-time provisioning. Credentials are written as separate bounded values, then committed asynchronously so the BLE request does not block on NVS or Wi-Fi startup.
 
 | Value | UUID |
 | --- | --- |

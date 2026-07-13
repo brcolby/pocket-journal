@@ -1,6 +1,6 @@
 # Device API
 
-The ESP32 exposes a versioned LAN API after BLE provisioning and Wi-Fi connection.
+The ESP32 exposes a versioned LAN API after USB-C or BLE provisioning and Wi-Fi connection.
 
 All requests use a per-device bearer token created during provisioning:
 

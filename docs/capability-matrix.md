@@ -11,7 +11,7 @@ in command output or errors.
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | Device discovery | `pj discover` | No | Yes, mDNS | None for discovery; API remains authenticated | `_pocket-journal._tcp` advertisement | No | Safe to repeat |
 | Device status | `pj device status [--device ID]` | `PJ_STATUS` | `GET /v1/status` | Physical USB access or bearer token | v0 status command/endpoint | No | Safe to repeat |
-| Wi-Fi provisioning | `pj provision ... [--serial-port PORT]` | `PJ_WIFI_HEX` | No; BLE is the default wireless provisioning transport | Physical USB access or encrypted paired BLE; generates a new bearer token | v0 USB command or Pocket Journal BLE GATT service | Yes | Repeating intentionally replaces credentials and token |
+| Wi-Fi provisioning | `pj provision ... [--ble \| --serial-port PORT]` | `PJ_WIFI_HEX` (default) | No; BLE is an optional provisioning transport | Physical USB access or encrypted paired BLE; generates a new bearer token | v0 USB command or Pocket Journal BLE GATT service | Yes | Repeating intentionally replaces credentials and token |
 | Time sync | `pj device sync-time [--device ID]` | `PJ_TIME` | `PUT /v1/time` | Physical USB access or bearer token | v0 time command/endpoint | Yes | Safe to repeat; sets current host time |
 | Read settings | `pj settings get --device ID` | No | `GET /v1/settings` | Bearer token | v0 settings endpoint | No | Safe to repeat |
 | Update settings | `pj settings set --device ID KEY=VALUE...` | No | `PUT /v1/settings` | Bearer token | v0 settings endpoint | Yes | Safe to retry; updates are atomic values |
@@ -87,10 +87,9 @@ pj sync --device pj-123abc --backend hf
 pj recordings wipe --device pj-123abc --yes
 ```
 
-Install optional transports and integrations from `partner/` as needed:
+USB-C serial support is included in the standard partner CLI install. Install optional transports and integrations from `partner/` as needed:
 
 ```sh
-pip install -e '.[usb]'
 pip install -e '.[ble]'
 pip install -e '.[calendar]'
 pip install -e '.[transcription]'

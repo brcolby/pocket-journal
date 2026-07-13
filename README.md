@@ -47,6 +47,6 @@ PYTHONPATH=src python -m pocket_journal_partner --help
 - Target SKU: Waveshare `34211`, ESP32-S3-Touch-ePaper-1.54.
 - Display: 200x200, black/white e-paper.
 - Storage: FAT32 TF card required for audio and local device data.
-- Networking: BLE provisioning, then Wi-Fi station mode.
+- Networking: USB-C provisioning by default, optional BLE provisioning, then Wi-Fi station mode.
 - Partner host: Apple Silicon macOS and Linux first.
 - Google Calendar OAuth credentials stay on the partner host.

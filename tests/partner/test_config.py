@@ -143,6 +143,7 @@ class ConfigTests(unittest.TestCase):
                     "provision",
                     "--ssid", "Lab",
                     "--password", "very-secret-password",
+                    "--ble",
                     "--mock",
                     "--data-dir", tmp,
                 ])
@@ -155,6 +156,39 @@ class ConfigTests(unittest.TestCase):
         self.assertNotIn(token, output)
         self.assertNotIn("very-secret-password", output)
         self.assertNotIn("token", json.loads(output))
+
+    def test_provision_defaults_to_auto_detected_usb_serial(self) -> None:
+        with TemporaryDirectory() as tmp:
+            with patch("pocket_journal_partner.cli.resolve_serial_port", return_value="/dev/cu.usbmodem-test") as resolve:
+                with patch("pocket_journal_partner.cli.SerialDeviceClient") as serial_client:
+                    serial_client.return_value.provision_wifi.return_value = {"device_id": "pj-usb-test"}
+                    with redirect_stdout(StringIO()):
+                        exit_code = cli.main([
+                            "provision",
+                            "--ssid", "Lab",
+                            "--password", "very-secret-password",
+                            "--data-dir", tmp,
+                        ])
+
+        self.assertEqual(exit_code, 0)
+        resolve.assert_called_once_with(None)
+        serial_client.assert_called_once_with("/dev/cu.usbmodem-test", baudrate=115200, timeout=6.0)
+        provision_args = serial_client.return_value.provision_wifi.call_args.args
+        self.assertEqual(provision_args[:2], ("Lab", "very-secret-password"))
+        self.assertTrue(provision_args[2])
+
+    def test_ble_specific_options_require_explicit_ble_transport(self) -> None:
+        stderr = StringIO()
+        with redirect_stderr(stderr):
+            exit_code = cli.main([
+                "provision",
+                "--ssid", "Lab",
+                "--password", "secret",
+                "--ble-name", "PJ-TEST",
+            ])
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(stderr.getvalue(), "pj: error: --ble-name requires --ble\n")
 
     def test_audio_paths_escape_ids_and_contain_device_filenames(self) -> None:
         calls = []

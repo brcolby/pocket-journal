@@ -203,7 +203,7 @@ class SerialDeviceClient:
         try:
             import serial  # type: ignore
         except ImportError as exc:
-            raise DeviceError("install the USB extra first: pip install -e '.[usb]'") from exc
+            raise DeviceError("USB support requires pyserial; reinstall the partner CLI") from exc
 
         try:
             with serial.Serial(

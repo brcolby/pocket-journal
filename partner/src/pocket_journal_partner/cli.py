@@ -27,15 +27,19 @@ def _print_json(payload) -> None:
 def cmd_provision(args: argparse.Namespace) -> int:
     data_dir = Path(args.data_dir) if args.data_dir else None
     base_url = args.base_url or ""
-    if args.serial_port:
+    if args.ble_name and not args.ble:
+        raise DeviceError("--ble-name requires --ble")
+    if args.mock and not args.ble:
+        raise DeviceError("--mock requires --ble")
+
+    if not args.ble:
         token = secrets.token_urlsafe(24)
         client = SerialDeviceClient(resolve_serial_port(args.serial_port), baudrate=args.serial_baud, timeout=args.timeout)
         response = client.provision_wifi(args.ssid, args.password, token)
         device_id = str(response.get("device_id") or "pj-usb")
-        ble_name = args.ble_name or ""
         profile = DeviceProfile(
             device_id=device_id,
-            ble_name=ble_name,
+            ble_name="",
             token=token,
             base_url=base_url,
         )
@@ -468,16 +472,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="pj")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    provision = sub.add_parser("provision", help="provision Wi-Fi over BLE")
+    provision = sub.add_parser("provision", help="provision Wi-Fi over USB-C (default) or BLE")
     provision.add_argument("--ssid", required=True)
     provision.add_argument("--password", required=True)
-    provision.add_argument("--ble-name")
+    transport = provision.add_mutually_exclusive_group()
+    transport.add_argument("--ble", action="store_true", help="use BLE instead of the default USB-C transport")
+    transport.add_argument("--serial-port", metavar="PORT", help="USB-C serial port; auto-detected when omitted")
+    provision.add_argument("--ble-name", help="BLE advertising name; requires --ble")
     provision.add_argument("--base-url")
     provision.add_argument("--data-dir")
-    provision.add_argument("--serial-port", help="provision over USB-C serial instead of BLE")
     provision.add_argument("--serial-baud", type=int, default=115200)
     provision.add_argument("--timeout", type=float, default=6.0)
-    provision.add_argument("--mock", action="store_true", help="store a mock provisioned profile before hardware is available")
+    provision.add_argument("--mock", action="store_true", help="simulate BLE provisioning; requires --ble")
     provision.set_defaults(func=cmd_provision)
 
     discover = sub.add_parser("discover", help="discover Pocket Journal devices on LAN")

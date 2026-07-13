@@ -30,7 +30,7 @@ pj --help
 Optional extras:
 
 ```sh
-pip install -e '.[ble,calendar,transcription,usb]'
+pip install -e '.[ble,calendar,transcription]'
 ```
 
 For source-tree runs before installation:
@@ -44,11 +44,11 @@ After flashing, you can sync the device clock from the computer that built/flash
 
 ```sh
 cd partner
-pj provision --ssid <ssid> --password <password> --serial-port /dev/cu.usbmodem1101
+pj provision --ssid <ssid> --password <password>
 pj device sync-time
 ```
 
-USB maintenance commands auto-detect `/dev/cu.usbmodem1101` or the single attached USB serial port. Pass `--serial-port` only to override the detected port.
+Provisioning and USB maintenance commands auto-detect `/dev/cu.usbmodem1101` or the single attached USB serial port. Pass `--serial-port` only to override the detected port, or pass `--ble` to provision wirelessly.
 Stop `idf.py monitor` first, because the USB serial port cannot be shared.
 If the command times out even with no monitor running, rebuild/flash firmware with USB Serial/JTAG selected as the primary console input.
 

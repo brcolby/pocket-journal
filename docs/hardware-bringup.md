@@ -28,7 +28,7 @@ project.
 6. Record 16 kHz mono WAV from ES8311 microphone path.
 7. Play a short test tone through speaker output.
 8. Read RTC time and SHTC3 temperature/humidity.
-9. Provision Wi-Fi over BLE.
+9. Provision Wi-Fi over USB-C; validate optional BLE provisioning separately.
 10. Start LAN API and verify `/v1/status`.
 11. Run full sync: audio download, partner transcription, transcript upload.
 

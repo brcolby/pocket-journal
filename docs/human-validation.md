@@ -86,8 +86,9 @@ Last synchronized with `bd human list`: 2026-07-13 (25 beads).
 
 ### Connectivity, API, and storage
 
-- [ ] **Wi-Fi, BLE, mDNS, and reconnect** (`pocket-journal-d3d`)
-  - Provision over BLE, reboot, and confirm saved Wi-Fi reconnect and `_pocket-journal._tcp` discovery.
+- [ ] **Wi-Fi, USB-C/BLE provisioning, mDNS, and reconnect** (`pocket-journal-d3d`)
+  - Provision with the default USB-C flow, reboot, and confirm saved Wi-Fi reconnect and `_pocket-journal._tcp` discovery.
+  - Separately validate optional `--ble` provisioning; BLE security approval remains tracked in `pocket-journal-db1`.
   - Disconnect/reconnect the network and confirm status plus pending/uploaded sync counts remain accurate.
 - [ ] **LAN bearer authentication** (`pocket-journal-3ie`)
   - Confirm valid token access after reboot; missing, malformed, and wrong tokens consistently return 401.
