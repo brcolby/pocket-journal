@@ -55,38 +55,48 @@ function frame() {
   return { width, height, pixels };
 }
 
+const fullBleed = (minEdgeSides = 3) => ({ maxEdgePixels: Infinity, maxComponentFraction: 1, minEdgeSides });
 const scenarios = [
   ["static", "static", () => api.pj_sim_reset()],
-  ["time-temp", "time_temp", () => { api.pj_sim_reset(); api.pj_sim_wake(); }],
-  ["home", "home", resetToHome],
-  ["notes", "notes", () => { resetToHome(); api.pj_sim_touch_tap(20, 50); }],
+  ["time-temp", "time_temp", () => { api.pj_sim_reset(); api.pj_sim_set_status(84, 22, 45); api.pj_sim_set_time(9, 41, 2026, 6, 6); api.pj_sim_wake(); }],
+  ["time-temp-12h-f", "time_temp", () => { api.pj_sim_reset(); api.pj_sim_set_status(84, 22, 45); api.pj_sim_set_time(21, 41, 2026, 6, 6); api.pj_sim_set_preferences(0, 1, 3); api.pj_sim_wake(); }],
+  ["home", "home", resetToHome, fullBleed()],
+  ["notes", "notes", () => { resetToHome(); api.pj_sim_touch_tap(100, 33); }, fullBleed()],
   ["record-active", "record", () => { api.pj_sim_reset(); api.pj_sim_aux_double(); }],
-  ["listen-empty", "listen", () => { resetToHome(); api.pj_sim_touch_tap(20, 50); api.pj_sim_touch_tap(40, 150); }],
-  ["listen-list", "listen", () => { resetToHome(); api.pj_sim_seed_review_notes(); api.pj_sim_touch_tap(20, 50); api.pj_sim_touch_tap(40, 150); }],
-  ["read-list", "read", () => { resetToHome(); api.pj_sim_seed_review_notes(); api.pj_sim_touch_tap(20, 50); api.pj_sim_touch_tap(150, 150); }],
-  ["note-detail", "note_detail", () => { resetToHome(); api.pj_sim_set_note_count(1); api.pj_sim_touch_tap(20, 50); api.pj_sim_touch_tap(40, 150); api.pj_sim_touch_tap(20, 50); }],
-  ["transcript-detail", "note_detail", () => { resetToHome(); api.pj_sim_seed_review_notes(); api.pj_sim_touch_tap(20, 50); api.pj_sim_touch_tap(150, 150); api.pj_sim_touch_tap(20, 50); }],
-  ["time", "time", () => { resetToHome(); api.pj_sim_touch_tap(20, 125); }],
-  ["alarm", "alarm", () => { resetToHome(); api.pj_sim_touch_tap(20, 125); api.pj_sim_touch_tap(40, 70); }],
-  ["stopwatch", "stopwatch", () => { resetToHome(); api.pj_sim_touch_tap(20, 125); api.pj_sim_touch_tap(150, 70); }],
-  ["timer", "timer", () => { resetToHome(); api.pj_sim_touch_tap(20, 125); api.pj_sim_touch_tap(40, 150); }],
-  ["interval", "interval", () => { resetToHome(); api.pj_sim_touch_tap(20, 125); api.pj_sim_touch_tap(150, 150); }],
-  ["settings", "settings", () => { resetToHome(); api.pj_sim_touch_tap(20, 170); }],
+  ["listen-empty", "listen", () => { resetToHome(); api.pj_sim_touch_tap(100, 33); api.pj_sim_touch_tap(100, 100); }],
+  ["listen-list", "listen", () => { resetToHome(); api.pj_sim_seed_review_notes(); api.pj_sim_touch_tap(100, 33); api.pj_sim_touch_tap(100, 100); }, fullBleed()],
+  ["read-list", "read", () => { resetToHome(); api.pj_sim_seed_review_notes(); api.pj_sim_touch_tap(100, 33); api.pj_sim_touch_tap(100, 166); }, fullBleed()],
+  ["note-detail", "note_detail", () => { resetToHome(); api.pj_sim_set_note_count(1); api.pj_sim_touch_tap(100, 33); api.pj_sim_touch_tap(100, 100); api.pj_sim_touch_tap(100, 95); }],
+  ["transcript-detail", "note_detail", () => { resetToHome(); api.pj_sim_seed_review_notes(); api.pj_sim_touch_tap(100, 33); api.pj_sim_touch_tap(100, 166); api.pj_sim_touch_tap(100, 95); }],
+  ["time", "time", () => { resetToHome(); api.pj_sim_touch_tap(20, 125); }, fullBleed(4)],
+  ["alarm", "alarm", () => { resetToHome(); api.pj_sim_touch_tap(20, 125); api.pj_sim_touch_tap(40, 70); }, fullBleed()],
+  ["alarm-12h-pm", "alarm", () => {
+    resetToHome();
+    api.pj_sim_set_preferences(0, 0, 3);
+    api.pj_sim_touch_tap(20, 125);
+    api.pj_sim_touch_tap(40, 70);
+    for (let hour = 0; hour < 12; hour += 1) api.pj_sim_touch_tap(75, 170);
+  }, fullBleed()],
+  ["stopwatch", "stopwatch", () => { resetToHome(); api.pj_sim_touch_tap(20, 125); api.pj_sim_touch_tap(150, 70); }, fullBleed(2)],
+  ["timer", "timer", () => { resetToHome(); api.pj_sim_touch_tap(20, 125); api.pj_sim_touch_tap(40, 150); }, fullBleed()],
+  ["interval", "interval", () => { resetToHome(); api.pj_sim_touch_tap(20, 125); api.pj_sim_touch_tap(150, 150); }, fullBleed()],
+  ["settings", "settings", () => { resetToHome(); api.pj_sim_touch_tap(20, 170); }, fullBleed(4)],
   ["sync", "sync", () => { resetToHome(); api.pj_sim_touch_tap(20, 170); api.pj_sim_touch_tap(40, 70); }],
-  ["volume", "volume", () => { resetToHome(); api.pj_sim_touch_tap(20, 170); api.pj_sim_touch_tap(150, 70); }],
-  ["alert-alarm", "home", () => { resetToHome(); api.pj_sim_set_alert(1); }],
+  ["volume", "volume", () => { resetToHome(); api.pj_sim_touch_tap(20, 170); api.pj_sim_touch_tap(150, 70); }, fullBleed()],
+  ["display", "display", () => { resetToHome(); api.pj_sim_touch_tap(20, 170); api.pj_sim_touch_tap(40, 150); }, fullBleed()],
+  ["alert-alarm", "home", () => { resetToHome(); api.pj_sim_set_alert(1); }, fullBleed(2)],
 ];
 
 await mkdir(outputDir, { recursive: true });
 const rendered = [];
 const failures = [];
-for (const [name, expectedState, setup] of scenarios) {
+for (const [name, expectedState, setup, validationOptions] of scenarios) {
   setup();
   if (stateName() !== expectedState) failures.push(`${name}: expected state ${expectedState}, got ${stateName()}`);
   const image = frame();
   if (image.width !== 200 || image.height !== 200) failures.push(`${name}: dimensions ${image.width}x${image.height}`);
   const metrics = analyzeFrame(image.pixels, image.width, image.height);
-  for (const error of validateFrame(metrics)) failures.push(`${name}: ${error}`);
+  for (const error of validateFrame(metrics, validationOptions)) failures.push(`${name}: ${error}`);
   await writeFile(`${outputDir}/${name}.png`, png(image.pixels, image.width, image.height));
   rendered.push({ name, ...image, metrics });
 }

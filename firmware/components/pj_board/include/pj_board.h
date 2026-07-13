@@ -57,6 +57,7 @@ typedef struct {
     pj_board_service_state_t http;
     int battery_percent;
     int temperature_c;
+    int humidity_percent;
     int storage_mounted;
     uint64_t storage_total_bytes;
     uint64_t storage_free_bytes;

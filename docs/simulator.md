@@ -41,7 +41,7 @@ Rebuild and test the generated WebAssembly runtime boundary:
 make test-simulator-runtime
 ```
 
-For custom resting art, set `localStorage.pocketJournalStaticArt` to the same `/v1/static-art` JSON shape. If none is present, the simulator renders the default smiley bitmap. The generated raster source for that default is `assets/static/smiley.pbm`.
+For custom resting art, set `localStorage.pocketJournalStaticArt` to the same `/v1/static-art` JSON shape. If none is present, the firmware renderer shows the text-free placeholder notebook splash.
 
 Run it:
 
@@ -81,12 +81,13 @@ The inline bootstrap logger writes to the same endpoint before `src/main.js` loa
 - `home`: configurable firmware tiles for notes, time, and settings by default.
 - `notes`: record, listen, read.
 - `time`: alarm, stopwatch, timer, interval.
-- `settings`: sync, volume, dark/light toggle, off.
-- `volume`: volume changes inline by tapping the left or right side of the screen.
+- `settings`: sync, volume, display preferences, off.
+- `display`: toggles 12/24-hour time, Celsius/Fahrenheit, and transcript font size.
+- `volume`: volume changes through the full-height minus and plus controls.
 - `sync`: shows the pending, transferred, and connection status supplied by firmware.
-- `record`: entering starts recording; AUX stops it and returns home.
+- `record`: entering starts recording; AUX or on-screen Back stops/saves it and returns home while processing continues asynchronously.
 - `listen` and `read`: show dummy recordings ordered newest first; tap a note to enter detail.
 - AUX double-click jumps from any idle screen, including the resting screen, directly into recording. It is ignored while recording, playback, stopwatch, timer, or interval activity is in progress.
 - AUX single-click actions wait 350 ms so a second click can be recognized; release after holding for at least 650 ms to trigger a long press.
 - AUX long press backs out through the firmware parent state graph.
-- AUX short press follows the primary action on each screen: Home opens its configured first tile, Settings opens Volume, Volume raises one step, and active media/time screens start, pause, or stop their current action.
+- AUX short press follows the focused action on each screen; AUX double press cycles focus where a screen exposes multiple actions. Active media and time screens start, pause, or stop their current action without requiring touch.

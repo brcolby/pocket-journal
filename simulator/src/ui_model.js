@@ -14,6 +14,7 @@ export const states = {
   SETTINGS: "settings",
   SYNC: "sync",
   VOLUME: "volume",
+  DISPLAY: "display",
   CALENDAR: "calendar",
   NOTE_DETAIL: "note_detail",
 };
@@ -34,6 +35,7 @@ export const meta = {
   settings: { title: "SETTINGS", parent: "home" },
   sync: { title: "SYNC", parent: "settings" },
   volume: { title: "VOLUME", parent: "settings" },
+  display: { title: "DISPLAY", parent: "settings" },
   calendar: { title: "CALENDAR", parent: "home" },
   note_detail: { title: "NOTE", parent: "read" },
 };
@@ -66,8 +68,8 @@ const menus = {
   ],
   settings: [
     { label: "", icon: "wifi", state: "sync" },
-    { label: "", icon: "volume_up", state: "settings" },
-    { label: "", icon: "settings_adjust", state: "toggle_theme" },
+    { label: "", icon: "volume_up", state: "volume" },
+    { label: "", icon: "settings_adjust", state: "display" },
     { label: "", icon: "power", state: "static" },
   ],
 };
@@ -128,10 +130,7 @@ export function menuFor(state) {
 }
 
 export function backHit(state, x, y) {
-  void state;
-  void x;
-  void y;
-  return false;
+  return !["static", "time_temp", "home"].includes(state) && x >= 0 && x < 60 && y >= 0 && y < 60;
 }
 
 export function tilesFor(state) {
@@ -141,24 +140,24 @@ export function tilesFor(state) {
   }
   if (state === "notes" && menu.length === 3) {
     return [
-      { ...menu[0], x: 8, y: 8, width: 184, height: 84 },
-      { ...menu[1], x: 8, y: 104, width: 88, height: 88 },
-      { ...menu[2], x: 104, y: 104, width: 88, height: 88 },
+      { ...menu[0], x: 0, y: 0, width: 200, height: 67 },
+      { ...menu[1], x: 0, y: 67, width: 200, height: 66 },
+      { ...menu[2], x: 0, y: 133, width: 200, height: 67 },
     ];
   }
   if (state === "home" && menu.length >= 3) {
     return [
-      { ...menu[0], x: 8, y: 8, width: 118, height: 184 },
-      { ...menu[1], x: 134, y: 8, width: 58, height: 86 },
-      { ...menu[2], x: 134, y: 106, width: 58, height: 86 },
+      { ...menu[0], x: 0, y: 0, width: 200, height: 67 },
+      { ...menu[1], x: 0, y: 67, width: 200, height: 66 },
+      { ...menu[2], x: 0, y: 133, width: 200, height: 67 },
     ];
   }
   return menu.slice(0, 4).map((item, index) => ({
     ...item,
-    x: index % 2 === 0 ? 8 : 104,
-    y: index < 2 ? 8 : 104,
-    width: 88,
-    height: 88,
+    x: index % 2 === 0 ? 0 : 100,
+    y: index < 2 ? 0 : 100,
+    width: 100,
+    height: 100,
   }));
 }
 
@@ -208,8 +207,5 @@ export function handleTap(state, x, y) {
   }
 
   const item = menuHit(state, x, y);
-  if (item?.state === "toggle_theme") {
-    return state;
-  }
   return item?.state ?? state;
 }

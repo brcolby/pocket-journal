@@ -21,11 +21,6 @@ LOGICAL_SIZES = {
     4: 30,
 }
 THRESHOLD = 220
-Y_OFFSET_ADJUSTMENTS = {
-    "+": {1: 1, 2: 2, 3: 3, 4: 5},
-    "-": {1: 1, 2: 2, 3: 3, 4: 5},
-    "/": {1: -1, 2: -2, 3: -3, 4: -4},
-}
 
 
 @dataclass
@@ -40,13 +35,14 @@ class Glyph:
 
 
 def rasterize_glyph(font: ImageFont.FreeTypeFont, char: str) -> Glyph:
-    bbox = font.getbbox(char, anchor="lt")
+    ascent, _ = font.getmetrics()
+    bbox = font.getbbox(char, anchor="ls")
     advance = max(1, int(round(font.getlength(char))))
     width = max(1, bbox[2] - bbox[0])
     height = max(1, bbox[3] - bbox[1])
     image = Image.new("L", (width + 4, height + 4), 255)
     draw = ImageDraw.Draw(image)
-    draw.text((2 - bbox[0], 2 - bbox[1]), char, font=font, fill=0, anchor="lt")
+    draw.text((2 - bbox[0], 2 - bbox[1]), char, font=font, fill=0, anchor="ls")
     ink_mask = image.point(lambda pixel: 255 if pixel < THRESHOLD else 0)
     bbox_image = ink_mask.getbbox()
     if bbox_image is None:
@@ -66,7 +62,7 @@ def rasterize_glyph(font: ImageFont.FreeTypeFont, char: str) -> Glyph:
         height=cropped.height,
         advance=advance,
         x_offset=bbox_image[0] - 2 + bbox[0],
-        y_offset=bbox_image[1] - 2 + bbox[1],
+        y_offset=ascent + bbox_image[1] - 2 + bbox[1],
         rows=rows,
     )
 
@@ -79,7 +75,11 @@ def generate(font_path: Path) -> dict:
         glyphs = {}
         for char in ASCII_CHARS:
             glyph = rasterize_glyph(font, char)
-            glyph.y_offset += Y_OFFSET_ADJUSTMENTS.get(char, {}).get(logical_size, 0)
+            if glyph.y_offset < 0 or glyph.y_offset + glyph.height > sum(metrics):
+                raise ValueError(
+                    f"glyph {char!r} at size {logical_size} exceeds its line box: "
+                    f"offset={glyph.y_offset} height={glyph.height} line={sum(metrics)}"
+                )
             glyphs[char] = glyph.__dict__
         sizes[str(logical_size)] = {
             "pixel_size": pixel_size,

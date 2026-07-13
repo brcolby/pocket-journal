@@ -74,10 +74,11 @@ api.pj_sim_reset();
 api.pj_sim_wake();
 api.pj_sim_aux_short();
 api.pj_sim_set_note_count(1);
-assert.equal(api.pj_sim_touch_tap(20, 50), 1);
+assert.equal(api.pj_sim_touch_tap(100, 33), 1);
 assertRendered("notes");
-assert.equal(api.pj_sim_touch_tap(40, 150), 1);
+assert.equal(api.pj_sim_touch_tap(100, 100), 1);
 assertRendered("listen");
+
 assert.equal(api.pj_sim_aux_short(), 1);
 assert.equal(api.pj_sim_aux_double(), 0);
 assertRendered("note_detail");
@@ -98,6 +99,27 @@ assert.equal(api.pj_sim_playback_state(), 2);
 api.pj_sim_set_audio_state(0, 0);
 assert.equal(api.pj_sim_playback_state(), 0);
 assertRendered("listen");
+
+api.pj_sim_reset();
+api.pj_sim_wake();
+api.pj_sim_aux_short();
+api.pj_sim_set_note_count(1);
+api.pj_sim_touch_tap(100, 33);
+api.pj_sim_touch_tap(100, 100);
+api.pj_sim_touch_tap(100, 95);
+api.pj_sim_set_audio_state(0, 1);
+assert.equal(api.pj_sim_touch_tap(20, 30), 1);
+assert.equal(api.pj_sim_playback_state(), 2);
+assertRendered("note_detail");
+api.pj_sim_set_audio_state(0, 0);
+assertRendered("listen");
+
+api.pj_sim_reset();
+api.pj_sim_wake();
+api.pj_sim_set_status(84, 22, 45);
+api.pj_sim_set_time(21, 41, 2026, 6, 6);
+api.pj_sim_set_preferences(0, 1, 3);
+assertRendered("time_temp");
 
 api.pj_sim_reset();
 api.pj_sim_wake();

@@ -18,7 +18,7 @@ Every `/v1` route is protected. Missing, malformed, or invalid credentials recei
 GET /v1/status
 ```
 
-Returns device id, firmware version, board profile, Wi-Fi state, storage state, battery state if available, and pending sync counts.
+Returns device id, firmware version, board profile, Wi-Fi state, storage state, battery state if available, temperature, relative humidity, and pending sync counts. Environmental readings use `temperature_c` and `humidity_percent`; humidity is `null` until the sensor returns a CRC-valid sample. Unit conversion is a presentation preference and does not alter the canonical Celsius value.
 
 The time/temp screen can display battery percentage when firmware can read it from the board power-management path. Until hardware bring-up confirms that path, simulator and native tests use a dummy percentage.
 
@@ -54,11 +54,14 @@ Reads or atomically updates the persisted settings surface. A PUT may contain an
   "alarm_hour": 7,
   "alarm_minute": 30,
   "timer_seconds": 300,
-  "interval_seconds": 1500
+  "interval_seconds": 90,
+  "clock_24h": true,
+  "temperature_unit": "c",
+  "transcript_font_size": 3
 }
 ```
 
-`theme` is `light` or `dark`; `volume` is `0` through `10`; alarm time uses a 24-hour clock; `timer_seconds` is `30` through `86400`; and `interval_seconds` is `60` through `86400`. GET also returns the derived `sync_pending` and `sync_transferred` counters. When NVS has no valid stored value, defaults preserve full codec volume (`10`), light mode, a disabled `07:30` alarm, a five-minute timer, and a 25-minute interval.
+`theme` is `light` or `dark`; `volume` is `0` through `10`; alarm time uses a 24-hour stored value; `timer_seconds` is `30` through `86400`; `interval_seconds` is `60` through `86400`; `clock_24h` is boolean; `temperature_unit` is `c` or `f`; and `transcript_font_size` is `2` or `3`. GET also returns the derived `sync_pending` and `sync_transferred` counters. When NVS has no valid stored value, defaults preserve full codec volume (`10`), light mode, a disabled `07:30` alarm, a five-minute timer, a 90-second interval, 24-hour time, Celsius, and the larger transcript font. Firmware settings schema 2 also migrates the former stored 1500-second interval default to 90 seconds.
 
 ```http
 GET /v1/home

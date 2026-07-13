@@ -5,12 +5,17 @@ export function analyzeFrame(pixels, width, height) {
 
   let blackPixels = 0;
   let edgePixels = 0;
+  const edges = { top: 0, right: 0, bottom: 0, left: 0 };
   const halves = { left: 0, right: 0, top: 0, bottom: 0 };
   for (let y = 0; y < height; y += 1) {
     for (let x = 0; x < width; x += 1) {
       if (!pixels[y * width + x]) continue;
       blackPixels += 1;
       if (x === 0 || y === 0 || x === width - 1 || y === height - 1) edgePixels += 1;
+      if (y === 0) edges.top += 1;
+      if (x === width - 1) edges.right += 1;
+      if (y === height - 1) edges.bottom += 1;
+      if (x === 0) edges.left += 1;
       if (x < width / 2) halves.left += 1; else halves.right += 1;
       if (y < height / 2) halves.top += 1; else halves.bottom += 1;
     }
@@ -51,18 +56,20 @@ export function analyzeFrame(pixels, width, height) {
   const density = blackPixels / pixels.length;
   const horizontalImbalance = blackPixels ? Math.abs(halves.left - halves.right) / blackPixels : 1;
   const verticalImbalance = blackPixels ? Math.abs(halves.top - halves.bottom) / blackPixels : 1;
-  return { width, height, blackPixels, density, edgePixels, horizontalImbalance, verticalImbalance,
+  const edgeSides = Object.values(edges).filter((count) => count > 0).length;
+  return { width, height, blackPixels, density, edgePixels, edges, edgeSides, horizontalImbalance, verticalImbalance,
     componentCount: components.length, largestComponent: components[0] ?? null };
 }
 
 export function validateFrame(metrics, options = {}) {
-  const limits = { minDensity: 0.002, maxDensity: 0.55, maxEdgePixels: 0,
+  const limits = { minDensity: 0.002, maxDensity: 0.55, maxEdgePixels: 0, minEdgeSides: 0,
     maxImbalance: 0.96, maxComponentFraction: 0.96, ...options };
   const errors = [];
   if (metrics.blackPixels === 0) errors.push("frame is blank");
   if (metrics.density < limits.minDensity) errors.push(`density ${metrics.density.toFixed(4)} is too low`);
   if (metrics.density > limits.maxDensity) errors.push(`density ${metrics.density.toFixed(4)} is too high`);
   if (metrics.edgePixels > limits.maxEdgePixels) errors.push(`${metrics.edgePixels} black pixels touch the display edge`);
+  if (metrics.edgeSides < limits.minEdgeSides) errors.push(`content reaches only ${metrics.edgeSides} display edges`);
   if (metrics.horizontalImbalance > limits.maxImbalance || metrics.verticalImbalance > limits.maxImbalance) {
     errors.push("ink distribution is extremely imbalanced");
   }

@@ -13,7 +13,10 @@ int main(void)
     assert(settings.alarm_hour == 7);
     assert(settings.alarm_minute == 30);
     assert(settings.timer_seconds == 300);
-    assert(settings.interval_seconds == 1500);
+    assert(settings.interval_seconds == 90);
+    assert(settings.clock_24h == 1);
+    assert(settings.temperature_fahrenheit == 0);
+    assert(settings.transcript_font_size == 3);
 
     assert(pj_settings_codec_volume(-1) == 0);
     assert(pj_settings_codec_volume(0) == 0);
@@ -32,6 +35,15 @@ int main(void)
     assert(!pj_settings_valid(&settings));
     pj_settings_defaults(&settings);
     settings.interval_seconds = 86401;
+    assert(!pj_settings_valid(&settings));
+    pj_settings_defaults(&settings);
+    settings.clock_24h = 2;
+    assert(!pj_settings_valid(&settings));
+    pj_settings_defaults(&settings);
+    settings.temperature_fahrenheit = -1;
+    assert(!pj_settings_valid(&settings));
+    pj_settings_defaults(&settings);
+    settings.transcript_font_size = 4;
     assert(!pj_settings_valid(&settings));
 
     puts("settings tests passed");

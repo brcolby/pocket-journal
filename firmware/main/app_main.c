@@ -60,8 +60,7 @@ static void apply_board_state_effects(pj_ui_state_t previous, pj_ui_state_t curr
 
     if (state_is_playback(previous) && !state_is_playback(current)) {
         set_playback_active(0, 0);
-    } else if ((event->type == PJ_BOARD_EVENT_AUX_SHORT || event->type == PJ_BOARD_EVENT_AUX_LONG) &&
-               state_is_playback(current)) {
+    } else if (state_is_playback(current)) {
         set_playback_active(g_ui.playback_state == PJ_PLAYBACK_ACTIVE, g_ui.selected_note);
     }
     sync_ui_audio_from_board(&g_ui);

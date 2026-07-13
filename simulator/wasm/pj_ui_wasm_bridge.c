@@ -76,9 +76,17 @@ int pj_sim_tick(void)
 }
 
 EMSCRIPTEN_KEEPALIVE
-void pj_sim_set_status(int battery_percent, int temperature_c)
+void pj_sim_set_status(int battery_percent, int temperature_c, int humidity_percent)
 {
-    pj_ui_set_status(&g_ctx, battery_percent, temperature_c);
+    pj_ui_set_status(&g_ctx, battery_percent, temperature_c, humidity_percent);
+}
+
+EMSCRIPTEN_KEEPALIVE
+void pj_sim_set_preferences(int clock_24h, int temperature_fahrenheit,
+                            int transcript_font_size)
+{
+    pj_ui_set_preferences(&g_ctx, clock_24h, temperature_fahrenheit,
+                          transcript_font_size);
 }
 
 EMSCRIPTEN_KEEPALIVE

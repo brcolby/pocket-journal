@@ -22,6 +22,9 @@ for (let x = 0; x < 20; x += 1) set(pixels, 20, x, 0);
 metrics = analyzeFrame(pixels, 20, 20);
 assert.ok(validateFrame(metrics).some((error) => error.includes("display edge")));
 assert.ok(validateFrame(metrics).some((error) => error.includes("connected component")));
+assert.deepEqual(validateFrame(metrics, { maxEdgePixels: Infinity, maxComponentFraction: 1, maxImbalance: 1, minEdgeSides: 1 }), []);
+assert.ok(validateFrame(metrics, { maxEdgePixels: Infinity, maxComponentFraction: 1, maxImbalance: 1, minEdgeSides: 4 })
+  .some((error) => error.includes("only 3 display edges")));
 
 pixels = frame();
 for (let y = 1; y < 19; y += 1) for (let x = 1; x < 19; x += 1) set(pixels, 20, x, y);

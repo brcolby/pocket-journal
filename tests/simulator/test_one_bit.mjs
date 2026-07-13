@@ -30,6 +30,12 @@ assert.equal(fontAsset.source, "assets/fonts/IBMPlexMono-Bold.ttf");
 assert.ok(Number.isInteger(fontAsset.sizes["2"].line_height));
 assert.ok(fontAsset.sizes["2"].glyphs.A.rows.join("").includes("1"));
 assert.ok(fontAsset.sizes["2"].glyphs.Z.rows.join("").includes("1"));
+for (const size of Object.values(fontAsset.sizes)) {
+  const capitals = [..."ABCDEFGHIJKLMNOPQRSTUVWXYZ"].map((char) => size.glyphs[char]);
+  assert.ok(capitals[0].y_offset < size.ascent);
+  assert.ok(capitals.every((glyph) => glyph.y_offset === capitals[0].y_offset));
+  assert.ok(capitals.every((glyph) => glyph.y_offset + glyph.height <= size.line_height));
+}
 assert.equal(iconAsset.family, "Carbon Icons");
 assert.equal(iconAsset.source, "assets/icons/carbon/svg/32");
 for (const iconName of ["notebook", "microphone", "document_audio", "read_me", "settings", "wifi"]) {

@@ -39,10 +39,10 @@ const REVIEW_ROUTES = {
   static: [],
   time_temp: ["wake"],
   home: ["wake", "aux"],
-  notes: ["wake", "aux", [20, 50]],
-  record: ["wake", "aux", [20, 50], [20, 55]],
-  listen: ["wake", "aux", [20, 50], [40, 150]],
-  read: ["wake", "aux", [20, 50], [150, 150]],
+  notes: ["wake", "aux", [100, 33]],
+  record: ["wake", "aux", [100, 33], [100, 33]],
+  listen: ["wake", "aux", [100, 33], [100, 100]],
+  read: ["wake", "aux", [100, 33], [100, 166]],
   time: ["wake", "aux", [20, 125]],
   alarm: ["wake", "aux", [20, 125], [40, 70]],
   stopwatch: ["wake", "aux", [20, 125], [150, 70]],
@@ -51,6 +51,7 @@ const REVIEW_ROUTES = {
   settings: ["wake", "aux", [20, 170]],
   sync: ["wake", "aux", [20, 170], [40, 70]],
   volume: ["wake", "aux", [20, 170], [150, 70]],
+  display: ["wake", "aux", [20, 170], [40, 150]],
 };
 
 window.__pocketJournalSimulatorModuleLoaded = true;
@@ -219,7 +220,8 @@ function bindApi(module) {
     auxDouble: module.cwrap("pj_sim_aux_double", "number", []),
     touchTap: module.cwrap("pj_sim_touch_tap", "number", ["number", "number"]),
     tick: module.cwrap("pj_sim_tick", "number", []),
-    setStatus: module.cwrap("pj_sim_set_status", null, ["number", "number"]),
+    setStatus: module.cwrap("pj_sim_set_status", null, ["number", "number", "number"]),
+    setPreferences: module.cwrap("pj_sim_set_preferences", null, ["number", "number", "number"]),
     setTime: module.cwrap("pj_sim_set_time", null, ["number", "number", "number", "number", "number"]),
     setAudioState: module.cwrap("pj_sim_set_audio_state", null, ["number", "number"]),
     setAlert: module.cwrap("pj_sim_set_alert", null, ["number"]),
@@ -395,7 +397,7 @@ function captureDisplay() {
 }
 
 function seedDynamicContent() {
-  api.setStatus(84, 22);
+  api.setStatus(84, 22, 45);
   api.setTime(9, 41, 2026, 6, 6);
   api.setNoteCount(3);
   ["SAT 09:41", "FRI 18:12", "THU 07:30"].forEach((label, index) => {

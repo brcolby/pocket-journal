@@ -12,6 +12,9 @@ typedef struct {
     int alarm_minute;
     int timer_seconds;
     int interval_seconds;
+    int clock_24h;
+    int temperature_fahrenheit;
+    int transcript_font_size;
 } pj_settings_t;
 
 void pj_settings_defaults(pj_settings_t *settings);

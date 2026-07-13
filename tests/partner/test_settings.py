@@ -7,9 +7,11 @@ class SettingsCliTests(unittest.TestCase):
     def test_assignments_use_api_scalar_types(self) -> None:
         self.assertEqual(
             _parse_settings_assignments(
-                ["volume=8", "theme=dark", "alarm_enabled=true", "timer_seconds=600"]
+                ["volume=8", "theme=dark", "alarm_enabled=true", "timer_seconds=600",
+                 "clock_24h=false", "temperature_unit=f", "transcript_font_size=3"]
             ),
-            {"volume": 8, "theme": "dark", "alarm_enabled": True, "timer_seconds": 600},
+            {"volume": 8, "theme": "dark", "alarm_enabled": True, "timer_seconds": 600,
+             "clock_24h": False, "temperature_unit": "f", "transcript_font_size": 3},
         )
 
     def test_rejects_unsupported_and_malformed_assignments(self) -> None:
@@ -24,6 +26,9 @@ class SettingsCliTests(unittest.TestCase):
             ["interval_seconds=86401"],
             ["theme=blue"],
             ["alarm_enabled=yes"],
+            ["clock_24h=yes"],
+            ["temperature_unit=k"],
+            ["transcript_font_size=4"],
         ):
             with self.subTest(assignments=assignments), self.assertRaises(SystemExit):
                 _parse_settings_assignments(assignments)

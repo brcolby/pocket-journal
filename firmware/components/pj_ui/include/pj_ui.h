@@ -32,6 +32,7 @@ typedef enum {
     PJ_UI_STATE_SETTINGS,
     PJ_UI_STATE_SYNC,
     PJ_UI_STATE_VOLUME,
+    PJ_UI_STATE_DISPLAY,
     PJ_UI_STATE_CALENDAR,
     PJ_UI_STATE_NOTE_DETAIL,
     PJ_UI_STATE_COUNT
@@ -116,6 +117,10 @@ typedef struct {
     int sync_online;
     int battery_percent;
     int temperature_c;
+    int humidity_percent;
+    int clock_24h;
+    int temperature_fahrenheit;
+    int transcript_font_size;
     int hour;
     int minute;
     int year;
@@ -164,7 +169,10 @@ int pj_ui_handle_aux_long(pj_ui_context_t *ctx);
 int pj_ui_handle_aux_double(pj_ui_context_t *ctx);
 void pj_ui_wake(pj_ui_context_t *ctx);
 void pj_ui_sleep(pj_ui_context_t *ctx);
-void pj_ui_set_status(pj_ui_context_t *ctx, int battery_percent, int temperature_c);
+void pj_ui_set_status(pj_ui_context_t *ctx, int battery_percent, int temperature_c,
+                      int humidity_percent);
+void pj_ui_set_preferences(pj_ui_context_t *ctx, int clock_24h,
+                           int temperature_fahrenheit, int transcript_font_size);
 void pj_ui_set_time(pj_ui_context_t *ctx, int hour, int minute, int year, int month, int day);
 void pj_ui_set_notes(pj_ui_context_t *ctx, int count, const char labels[][PJ_UI_NOTE_LABEL_LEN]);
 void pj_ui_set_audio_state(pj_ui_context_t *ctx, int recording, int playback_active);

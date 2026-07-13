@@ -161,8 +161,11 @@ def _parse_settings_assignments(assignments: list[str]) -> dict[str, object]:
         "alarm_minute",
         "timer_seconds",
         "interval_seconds",
+        "transcript_font_size",
     }
-    supported_keys = integer_keys | {"theme", "alarm_enabled"}
+    supported_keys = integer_keys | {
+        "theme", "alarm_enabled", "clock_24h", "temperature_unit"
+    }
     settings: dict[str, object] = {}
     for assignment in assignments:
         if "=" not in assignment:
@@ -175,13 +178,17 @@ def _parse_settings_assignments(assignments: list[str]) -> dict[str, object]:
                 settings[key] = int(value)
             except ValueError as exc:
                 raise SystemExit(f"expected integer for {key}, got {value}") from exc
-        elif key == "alarm_enabled":
+        elif key in {"alarm_enabled", "clock_24h"}:
             if value.lower() not in {"true", "false"}:
                 raise SystemExit(f"expected true or false for {key}, got {value}")
             settings[key] = value.lower() == "true"
-        else:
+        elif key == "theme":
             if value not in {"light", "dark"}:
                 raise SystemExit(f"expected light or dark for theme, got {value}")
+            settings[key] = value
+        else:
+            if value not in {"c", "f"}:
+                raise SystemExit(f"expected c or f for temperature_unit, got {value}")
             settings[key] = value
     ranges = {
         "volume": (0, 10),
@@ -189,6 +196,7 @@ def _parse_settings_assignments(assignments: list[str]) -> dict[str, object]:
         "alarm_minute": (0, 59),
         "timer_seconds": (30, 86400),
         "interval_seconds": (60, 86400),
+        "transcript_font_size": (2, 3),
     }
     for key, (minimum, maximum) in ranges.items():
         if key in settings and not minimum <= int(settings[key]) <= maximum:

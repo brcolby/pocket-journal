@@ -23,12 +23,22 @@ Last synchronized with `bd human list`: 2026-07-12.
   - Record stale pixels, clipping, missed touches, ghosting, and approximate refresh latency.
 - [ ] **Editorial UI redesign** (`pocket-journal-nz5`)
   - Confirm Static shows only the placeholder notebook splash art, with no clock or status text.
-  - Confirm Time/Temp uses the full display for the enlarged clock, date, temperature, and battery without clipping or stale pixels.
-  - Confirm every child screen has a reliable on-screen back chevron as an alternative to AUX long/back, and no title text beside it.
-  - Inspect the icon-only Notes, Time, and Settings grids plus icon-only play/pause/reset/volume controls for physical legibility and unambiguous meaning.
+  - Confirm Time/Temp uses the full display for the enlarged clock and equal-scale date, temperature/humidity, and battery percentage without clipping or stale pixels.
+  - Confirm Home is exactly three contiguous full-width icon buttons; all other button groups are contiguous, reach the screen edges, and have no gutters.
+  - Confirm every child screen has a large, high-contrast on-screen back chevron as an alternative to AUX long/back, with no page title or separator below it.
+  - Inspect the icon-only Notes, Time, and Settings grids plus full-screen playback, timer controls, alarm, and volume controls for physical legibility and unambiguous meaning.
   - On Home, short-press cycles destinations and double-press activates the focused secondary destination; focus-zero double-press remains quick record.
   - In Notes, Time, and Settings, double-press cycles visible focus, short-press activates, and long-press returns to the immediate parent.
-  - Verify record elapsed time, wrapped transcript preview, tappable Play, alert dismiss/snooze, long Home-title ellipsis, and note paging beyond four items.
+  - Verify note names and transcript text render uppercase with a correct baseline, no downward-shifted capital letters, word wrapping, and clean ellipses.
+  - During playback, use both on-screen back and AUX back; audio must stop before returning to the same selected note and page in Listen. During recording, either back path must save and return immediately while processing continues asynchronously.
+  - Verify the record elapsed value, 2x2 timer/interval controls, 90-second interval default, large round number, filled volume bar, and large Sync values.
+  - Start and stop timer, stopwatch, and interval activity while watching for stale START/PAUSE icons; change Sync counts across one and two digits and watch for partially refreshed text.
+  - Confirm the top-left Time and Settings icons remain visually separate from Back and timer/stopwatch values do not touch Back.
+- [ ] **Clock, unit, and reading-size persistence** (`pocket-journal-aw7`)
+  - Toggle 12/24-hour mode, Celsius/Fahrenheit, and transcript font size through Settings > Display; verify each change appears immediately.
+  - In 12-hour mode, verify both the main clock and alarm clearly distinguish AM from PM.
+  - Reboot and sleep/wake, then confirm all three preferences persist.
+  - Compare displayed temperature and humidity with a nearby reference; report whether the values are plausible and stable. When the humidity sensor is unavailable, the clock must show `--%` and `/v1/status` must return `null`, never a plausible placeholder value.
 - [ ] **Home layout persistence** (`pocket-journal-bmz`)
   - Change the layout, reboot and sleep/wake, and confirm order and navigation persist.
 - [ ] **Static art persistence** (`pocket-journal-lhl`)

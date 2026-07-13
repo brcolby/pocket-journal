@@ -13,6 +13,7 @@ pj calendar sync --device <device-id>
 pj settings get --device <device-id>
 pj settings set --device <device-id> volume=8 theme=dark
 pj settings set --device <device-id> alarm_enabled=true alarm_hour=7 alarm_minute=30
+pj settings set --device <device-id> clock_24h=false temperature_unit=f transcript_font_size=3
 pj device sync-time --device <device-id>
 pj device tone
 pj device tone --pa-level 1

@@ -86,6 +86,11 @@
 #define PJ_NVS_ALARM_MINUTE "alarm_min"
 #define PJ_NVS_TIMER_SECONDS "timer_sec"
 #define PJ_NVS_INTERVAL_SECONDS "intvl_sec"
+#define PJ_NVS_CLOCK_24H "clock_24h"
+#define PJ_NVS_TEMP_F "temp_f"
+#define PJ_NVS_TEXT_SIZE "text_size"
+#define PJ_NVS_SETTINGS_VERSION "set_ver"
+#define PJ_SETTINGS_VERSION 2
 #define PJ_NVS_STATIC_ART_SLOT "art_slot"
 #define PJ_NVS_HOME_LAYOUT "home_layout"
 #define PJ_NVS_TIME_STATE "time_state"
@@ -1306,8 +1311,25 @@ static void settings_load(void)
     if (nvs_read_i32(nvs, PJ_NVS_TIMER_SECONDS, &value) && value >= 30 && value <= 86400) {
         loaded.timer_seconds = value;
     }
-    if (nvs_read_i32(nvs, PJ_NVS_INTERVAL_SECONDS, &value) && value >= 60 && value <= 86400) {
+    int interval_loaded = nvs_read_i32(nvs, PJ_NVS_INTERVAL_SECONDS, &value) &&
+        value >= 60 && value <= 86400;
+    if (interval_loaded) {
         loaded.interval_seconds = value;
+    }
+    if (nvs_read_i32(nvs, PJ_NVS_CLOCK_24H, &value) && (value == 0 || value == 1)) {
+        loaded.clock_24h = value;
+    }
+    if (nvs_read_i32(nvs, PJ_NVS_TEMP_F, &value) && (value == 0 || value == 1)) {
+        loaded.temperature_fahrenheit = value;
+    }
+    if (nvs_read_i32(nvs, PJ_NVS_TEXT_SIZE, &value) && value >= 2 && value <= 3) {
+        loaded.transcript_font_size = value;
+    }
+    int settings_version = 0;
+    (void)nvs_read_i32(nvs, PJ_NVS_SETTINGS_VERSION, &settings_version);
+    if (settings_version < PJ_SETTINGS_VERSION && interval_loaded &&
+        loaded.interval_seconds == 1500) {
+        loaded.interval_seconds = 90;
     }
     nvs_close(nvs);
     g_settings = loaded;
@@ -1334,6 +1356,10 @@ static esp_err_t settings_save(const pj_settings_t *settings)
     SET_SETTING(PJ_NVS_ALARM_MINUTE, settings->alarm_minute);
     SET_SETTING(PJ_NVS_TIMER_SECONDS, settings->timer_seconds);
     SET_SETTING(PJ_NVS_INTERVAL_SECONDS, settings->interval_seconds);
+    SET_SETTING(PJ_NVS_CLOCK_24H, settings->clock_24h);
+    SET_SETTING(PJ_NVS_TEMP_F, settings->temperature_fahrenheit);
+    SET_SETTING(PJ_NVS_TEXT_SIZE, settings->transcript_font_size);
+    SET_SETTING(PJ_NVS_SETTINGS_VERSION, PJ_SETTINGS_VERSION);
 #undef SET_SETTING
     if (err == ESP_OK) {
         err = nvs_commit(nvs);
@@ -2780,12 +2806,11 @@ static uint8_t shtc3_crc(const uint8_t *data, int len)
 static esp_err_t shtc3_init(void)
 {
     ESP_RETURN_ON_ERROR(i2c_add_device(I2C_SHTC3_DEV_ADDRESS, &g_shtc3_dev), TAG, "shtc3 i2c add failed");
-    ESP_ERROR_CHECK_WITHOUT_ABORT(shtc3_write_cmd(SHTC3_CMD_WAKEUP));
+    ESP_RETURN_ON_ERROR(shtc3_write_cmd(SHTC3_CMD_WAKEUP), TAG, "shtc3 wakeup failed");
     vTaskDelay(pdMS_TO_TICKS(50));
-    ESP_ERROR_CHECK_WITHOUT_ABORT(shtc3_write_cmd(SHTC3_CMD_SOFT_RESET));
+    ESP_RETURN_ON_ERROR(shtc3_write_cmd(SHTC3_CMD_SOFT_RESET), TAG, "shtc3 reset failed");
     vTaskDelay(pdMS_TO_TICKS(20));
-    ESP_ERROR_CHECK_WITHOUT_ABORT(shtc3_write_cmd(SHTC3_CMD_SLEEP));
-    return ESP_OK;
+    return shtc3_write_cmd(SHTC3_CMD_SLEEP);
 }
 
 static void shtc3_refresh_status(void)
@@ -2797,16 +2822,29 @@ static void shtc3_refresh_status(void)
         return;
     }
     uint8_t bytes[6] = {0};
-    ESP_ERROR_CHECK_WITHOUT_ABORT(shtc3_write_cmd(SHTC3_CMD_WAKEUP));
-    vTaskDelay(pdMS_TO_TICKS(50));
-    if (shtc3_write_cmd(SHTC3_CMD_MEAS_T_RH_POLLING) == ESP_OK) {
+    int humidity_valid = 0;
+    int awake = shtc3_write_cmd(SHTC3_CMD_WAKEUP) == ESP_OK;
+    if (awake) {
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+    if (awake && shtc3_write_cmd(SHTC3_CMD_MEAS_T_RH_POLLING) == ESP_OK) {
         vTaskDelay(pdMS_TO_TICKS(20));
-        if (i2c_master_receive(g_shtc3_dev, bytes, sizeof(bytes), 1000) == ESP_OK &&
-            shtc3_crc(bytes, 2) == bytes[2]) {
-            uint16_t raw_temp = ((uint16_t)bytes[0] << 8) | bytes[1];
-            float temp = 175.0f * (float)raw_temp / 65536.0f - 45.0f - 4.0f;
-            g_status.temperature_c = (int)(temp + (temp >= 0 ? 0.5f : -0.5f));
+        if (i2c_master_receive(g_shtc3_dev, bytes, sizeof(bytes), 1000) == ESP_OK) {
+            if (shtc3_crc(bytes, 2) == bytes[2]) {
+                uint16_t raw_temp = ((uint16_t)bytes[0] << 8) | bytes[1];
+                float temp = 175.0f * (float)raw_temp / 65536.0f - 45.0f - 4.0f;
+                g_status.temperature_c = (int)(temp + (temp >= 0 ? 0.5f : -0.5f));
+            }
+            if (shtc3_crc(bytes + 3, 2) == bytes[5]) {
+                uint16_t raw_humidity = ((uint16_t)bytes[3] << 8) | bytes[4];
+                int humidity = (int)(100.0f * (float)raw_humidity / 65536.0f + 0.5f);
+                g_status.humidity_percent = humidity < 0 ? 0 : humidity > 100 ? 100 : humidity;
+                humidity_valid = 1;
+            }
         }
+    }
+    if (!humidity_valid) {
+        g_status.humidity_percent = -1;
     }
     ESP_ERROR_CHECK_WITHOUT_ABORT(shtc3_write_cmd(SHTC3_CMD_SLEEP));
     i2c_give();
@@ -4618,6 +4656,7 @@ static void init_default_status(const pj_board_profile_t *profile)
     g_status.http = PJ_BOARD_SERVICE_DISABLED;
     g_status.battery_percent = 84;
     g_status.temperature_c = 22;
+    g_status.humidity_percent = -1;
 #ifdef ESP_PLATFORM
     (void)board_time_publish(9, 41, 2026, 6, 6, 0, board_monotonic_ms(), 0);
 #else
@@ -4892,7 +4931,10 @@ static int settings_apply_to_ui(pj_ui_context_t *ui, const pj_settings_t *settin
                   ui->alarm_hour != settings->alarm_hour ||
                   ui->alarm_minute != settings->alarm_minute ||
                   ui->timer_preset_seconds != settings->timer_seconds ||
-                  ui->interval_preset_seconds != settings->interval_seconds;
+                  ui->interval_preset_seconds != settings->interval_seconds ||
+                  ui->clock_24h != settings->clock_24h ||
+                  ui->temperature_fahrenheit != settings->temperature_fahrenheit ||
+                  ui->transcript_font_size != settings->transcript_font_size;
     ui->volume = settings->volume;
     ui->dark_mode = settings->dark_mode;
     ui->alarm_on = settings->alarm_enabled;
@@ -4900,6 +4942,9 @@ static int settings_apply_to_ui(pj_ui_context_t *ui, const pj_settings_t *settin
     ui->alarm_minute = settings->alarm_minute;
     ui->timer_preset_seconds = settings->timer_seconds;
     ui->interval_preset_seconds = settings->interval_seconds;
+    ui->clock_24h = settings->clock_24h;
+    ui->temperature_fahrenheit = settings->temperature_fahrenheit;
+    ui->transcript_font_size = settings->transcript_font_size;
     if (!ui->timer_running) {
         ui->timer_seconds = settings->timer_seconds;
     }
@@ -4937,6 +4982,9 @@ int pj_board_store_settings_from_ui(const pj_ui_context_t *ui)
         .alarm_minute = ui->alarm_minute,
         .timer_seconds = ui->timer_preset_seconds,
         .interval_seconds = ui->interval_preset_seconds,
+        .clock_24h = ui->clock_24h,
+        .temperature_fahrenheit = ui->temperature_fahrenheit,
+        .transcript_font_size = ui->transcript_font_size,
     };
     if (!pj_settings_valid(&updated)) {
         return -1;
@@ -5055,7 +5103,8 @@ void pj_board_refresh_status(pj_ui_context_t *ui)
         pj_ui_set_time(ui, status.hour, status.minute, status.year, status.month, status.day);
     }
     pj_ui_set_audio_state(ui, g_status.recording, g_status.playback_active);
-    pj_ui_set_status(ui, g_status.battery_percent, g_status.temperature_c);
+    pj_ui_set_status(ui, g_status.battery_percent, g_status.temperature_c,
+                     g_status.humidity_percent);
 #ifdef ESP_PLATFORM
     if (g_status.storage == PJ_BOARD_SERVICE_READY) {
         refresh_ui_notes_from_sd(ui);
@@ -6200,6 +6249,11 @@ static esp_err_t status_handler(httpd_req_t *req)
     cJSON_AddBoolToObject(json, "wifi_provisioned", g_wifi_credentials_stored != 0);
     cJSON_AddNumberToObject(json, "battery_percent", g_status.battery_percent);
     cJSON_AddNumberToObject(json, "temperature_c", g_status.temperature_c);
+    if (g_status.humidity_percent < 0) {
+        cJSON_AddNullToObject(json, "humidity_percent");
+    } else {
+        cJSON_AddNumberToObject(json, "humidity_percent", g_status.humidity_percent);
+    }
     cJSON_AddNumberToObject(time, "hour", g_status.hour);
     cJSON_AddNumberToObject(time, "minute", g_status.minute);
     cJSON_AddNumberToObject(time, "year", g_status.year);
@@ -6279,11 +6333,13 @@ static esp_err_t settings_get_handler(httpd_req_t *req)
     int pending_sync = 0;
     int transferred_sync = 0;
     collect_sync_counts(&pending_sync, &transferred_sync);
-    char json[320];
+    char json[512];
     (void)snprintf(json, sizeof(json),
                    "{\"theme\":\"%s\",\"volume\":%d,\"alarm_enabled\":%s,"
                    "\"alarm_hour\":%d,\"alarm_minute\":%d,\"timer_seconds\":%d,"
-                   "\"interval_seconds\":%d,\"sync_pending\":%d,\"sync_transferred\":%d}",
+                   "\"interval_seconds\":%d,\"clock_24h\":%s,"
+                   "\"temperature_unit\":\"%s\",\"transcript_font_size\":%d,"
+                   "\"sync_pending\":%d,\"sync_transferred\":%d}",
                    settings.dark_mode ? "dark" : "light",
                    settings.volume,
                    settings.alarm_enabled ? "true" : "false",
@@ -6291,6 +6347,9 @@ static esp_err_t settings_get_handler(httpd_req_t *req)
                    settings.alarm_minute,
                    settings.timer_seconds,
                    settings.interval_seconds,
+                   settings.clock_24h ? "true" : "false",
+                   settings.temperature_fahrenheit ? "f" : "c",
+                   settings.transcript_font_size,
                    pending_sync,
                    transferred_sync);
     return send_json(req, json);
@@ -6351,6 +6410,26 @@ static int settings_parse_update(const cJSON *json, pj_settings_t *settings)
             if (!json_exact_int(item, &settings->interval_seconds)) {
                 return 0;
             }
+        } else if (strcmp(key, "clock_24h") == 0) {
+            if (!cJSON_IsBool(item)) {
+                return 0;
+            }
+            settings->clock_24h = cJSON_IsTrue(item) ? 1 : 0;
+        } else if (strcmp(key, "temperature_unit") == 0) {
+            if (!cJSON_IsString(item) || item->valuestring == NULL) {
+                return 0;
+            }
+            if (strcmp(item->valuestring, "c") == 0) {
+                settings->temperature_fahrenheit = 0;
+            } else if (strcmp(item->valuestring, "f") == 0) {
+                settings->temperature_fahrenheit = 1;
+            } else {
+                return 0;
+            }
+        } else if (strcmp(key, "transcript_font_size") == 0) {
+            if (!json_exact_int(item, &settings->transcript_font_size)) {
+                return 0;
+            }
         } else {
             return 0;
         }
@@ -6364,11 +6443,17 @@ static esp_err_t settings_put_handler(httpd_req_t *req)
         return ESP_OK;
     }
     char body[512];
+    if (req->content_len <= 0 || req->content_len >= (int)sizeof(body)) {
+        drain_body(req);
+        httpd_resp_set_status(req, req->content_len >= (int)sizeof(body) ?
+                                  "413 Payload Too Large" : "400 Bad Request");
+        return send_json(req, "{\"error\":\"invalid settings body\"}");
+    }
     if (!read_body(req, body, sizeof(body))) {
         httpd_resp_set_status(req, "400 Bad Request");
         return send_json(req, "{\"error\":\"invalid settings body\"}");
     }
-    cJSON *json = cJSON_Parse(body);
+    cJSON *json = cJSON_ParseWithOpts(body, NULL, 1);
     if (!settings_take(portMAX_DELAY)) {
         cJSON_Delete(json);
         httpd_resp_set_status(req, "503 Service Unavailable");
