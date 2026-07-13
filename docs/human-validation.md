@@ -5,7 +5,11 @@ after testing it and add a short result beneath it. Beads remains the source of
 truth; include the bead ID when reporting a result so an agent can update or
 close the correct issue.
 
-Last synchronized with `bd human list`: 2026-07-12.
+The current visual treatment is accepted as the initial-release baseline.
+Future visual refinement is non-blocking unless hardware testing finds a
+legibility, navigation, clipping, refresh, or other usability defect.
+
+Last synchronized with `bd human list`: 2026-07-13 (25 beads).
 
 ## Ready To Validate
 
@@ -25,6 +29,7 @@ Last synchronized with `bd human list`: 2026-07-12.
   - Exercise primary screens, touch targets, rapid navigation, wake, and repeated partial refreshes.
   - Record stale pixels, clipping, missed touches, ghosting, and approximate refresh latency.
 - [ ] **Editorial UI redesign** (`pocket-journal-nz5`)
+  - Treat the current simulator-validated layout as the initial-release baseline; record hardware usability defects here, while purely aesthetic refinement can follow after release.
   - Confirm Static shows only the placeholder notebook splash art, with no clock or status text.
   - Confirm Time/Temp uses the full display for the enlarged clock and equal-scale date, temperature/humidity, and battery percentage without clipping or stale pixels.
   - Confirm Home is exactly three contiguous full-width icon buttons; all other button groups are contiguous, reach the screen edges, and have no gutters.
