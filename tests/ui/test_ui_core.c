@@ -109,36 +109,58 @@ static void test_empty_notes_do_not_open_detail(void)
 static void test_note_paging_tracks_hardware_focus_and_swipes(void)
 {
     pj_ui_context_t ui;
-    const char labels[6][PJ_UI_NOTE_LABEL_LEN] = {
-        "One", "Two", "Three", "Four", "Five", "Six",
+    const char labels[7][PJ_UI_NOTE_LABEL_LEN] = {
+        "One", "Two", "Three", "Four", "Five", "Six", "Seven",
     };
     pj_ui_init(&ui);
-    pj_ui_set_notes(&ui, 6, labels);
+    pj_ui_set_notes(&ui, 7, labels);
     ui.state = PJ_UI_STATE_LISTEN;
 
-    for (int i = 0; i < 4; i++) assert(pj_ui_handle_aux_double(&ui) == 1);
-    assert(ui.focus_index == 4);
-    assert(ui.note_page == 2);
+    for (int i = 0; i < 3; i++) assert(pj_ui_handle_aux_double(&ui) == 1);
+    assert(ui.focus_index == 3);
+    assert(ui.note_page == 1);
     assert(pj_ui_handle_aux_short(&ui) == 1);
     assert(ui.state == PJ_UI_STATE_NOTE_DETAIL);
-    assert(ui.selected_note == 4);
+    assert(ui.selected_note == 3);
 
     ui.state = PJ_UI_STATE_READ;
     ui.note_page = 0;
     ui.focus_index = 0;
     assert(pj_ui_handle_touch(&ui, 100, 100, PJ_TOUCH_SWIPE_LEFT) == 1);
-    assert(ui.note_page == 1 && ui.focus_index == 2);
+    assert(ui.note_page == 1 && ui.focus_index == 3);
     assert(pj_ui_handle_touch(&ui, 100, 100, PJ_TOUCH_SWIPE_RIGHT) == 1);
     assert(ui.note_page == 0 && ui.focus_index == 0);
 
-    ui.note_page = 2;
+    ui.note_page = 1;
     ui.focus_index = 4;
     assert(pj_ui_handle_aux_long(&ui) == 1);
     assert(ui.state == PJ_UI_STATE_NOTES);
     ui.focus_index = 2;
     assert(pj_ui_handle_aux_short(&ui) == 1);
     assert(ui.state == PJ_UI_STATE_READ);
-    assert(ui.note_page == 2 && ui.focus_index == 4);
+    assert(ui.note_page == 1 && ui.focus_index == 3);
+}
+
+static void test_note_pager_arrows_move_exactly_three_items_and_stop_at_bounds(void)
+{
+    pj_ui_context_t ui;
+    char labels[7][PJ_UI_NOTE_LABEL_LEN] = {
+        "One", "Two", "Three", "Four", "Five", "Six", "Seven",
+    };
+    pj_ui_init(&ui);
+    pj_ui_set_notes(&ui, 7, labels);
+    ui.state = PJ_UI_STATE_LISTEN;
+
+    assert(pj_ui_handle_touch(&ui, 25, 175, PJ_TOUCH_TAP) == 0);
+    assert(ui.note_page == 0 && ui.focus_index == 0);
+    assert(pj_ui_handle_touch(&ui, 175, 175, PJ_TOUCH_TAP) == 1);
+    assert(ui.note_page == 1 && ui.focus_index == 3);
+    assert(pj_ui_handle_touch(&ui, 175, 175, PJ_TOUCH_TAP) == 1);
+    assert(ui.note_page == 2 && ui.focus_index == 6);
+    assert(pj_ui_handle_touch(&ui, 175, 175, PJ_TOUCH_TAP) == 0);
+    assert(ui.note_page == 2 && ui.focus_index == 6);
+    assert(pj_ui_handle_touch(&ui, 25, 175, PJ_TOUCH_TAP) == 1);
+    assert(ui.note_page == 1 && ui.focus_index == 3);
 }
 
 static void test_read_opens_transcript_detail_without_playback(void)
@@ -653,6 +675,26 @@ static void test_volume_only_bottom_controls_adjust_and_clamp(void)
     assert(ui.volume == 10);
 }
 
+static void test_volume_fill_uses_full_top_half_and_controls_have_thick_borders(void)
+{
+    pj_ui_context_t ui;
+    pj_framebuffer_t volume;
+    pj_framebuffer_t timer;
+    pj_ui_init(&ui);
+    ui.state = PJ_UI_STATE_VOLUME;
+    ui.volume = 5;
+    ui.focus_index = -1;
+    pj_ui_render(&ui, &volume);
+
+    assert(count_black_pixels_in_region(&volume, 25, 0, 1, 100) >= 98);
+    assert(count_black_pixels_in_region(&volume, 150, 3, 1, 94) == 0);
+
+    ui.state = PJ_UI_STATE_TIMER;
+    ui.focus_index = -1;
+    pj_ui_render(&ui, &timer);
+    assert(count_black_pixels_in_region(&timer, 99, 153, 3, 3) == 9);
+}
+
 static void test_timer_presets_are_not_runtime_counters(void)
 {
     pj_ui_context_t ui;
@@ -1160,20 +1202,20 @@ static void test_note_detail_back_restores_selected_page(void)
         pj_ui_init(&ui);
         pj_ui_set_notes(&ui, 6, labels);
         ui.state = transcript ? PJ_UI_STATE_READ : PJ_UI_STATE_LISTEN;
-        ui.note_page = 2;
+        ui.note_page = 1;
         ui.focus_index = 4;
         assert(pj_ui_handle_aux_short(&ui) == 1);
         assert(ui.state == PJ_UI_STATE_NOTE_DETAIL && ui.selected_note == 4);
         assert(pj_ui_handle_aux_long(&ui) == 1);
         assert(ui.state == (transcript ? PJ_UI_STATE_READ : PJ_UI_STATE_LISTEN));
-        assert(ui.note_page == 2 && ui.focus_index == 4);
+        assert(ui.note_page == 1 && ui.focus_index == 4);
     }
 
     pj_ui_context_t playback;
     pj_ui_init(&playback);
     pj_ui_set_notes(&playback, 6, labels);
     playback.state = PJ_UI_STATE_LISTEN;
-    playback.note_page = 2;
+    playback.note_page = 1;
     playback.focus_index = 4;
     assert(pj_ui_handle_aux_short(&playback) == 1);
     assert(pj_ui_handle_aux_short(&playback) == 1);
@@ -1181,7 +1223,7 @@ static void test_note_detail_back_restores_selected_page(void)
     assert(pj_ui_handle_aux_long(&playback) == 1);
     pj_ui_set_audio_state(&playback, 0, 0);
     assert(playback.state == PJ_UI_STATE_LISTEN);
-    assert(playback.note_page == 2 && playback.focus_index == 4);
+    assert(playback.note_page == 1 && playback.focus_index == 4);
 }
 
 static void test_twelve_hour_alarm_distinguishes_am_and_pm(void)
@@ -1197,6 +1239,22 @@ static void test_twelve_hour_alarm_distinguishes_am_and_pm(void)
     ui.alarm_hour = 19;
     pj_ui_render(&ui, &evening);
     assert(memcmp(&morning, &evening, sizeof(morning)) != 0);
+}
+
+static void test_twelve_hour_time_temp_omits_am_pm_suffix(void)
+{
+    pj_ui_context_t ui;
+    pj_framebuffer_t morning;
+    pj_framebuffer_t evening;
+    pj_ui_init(&ui);
+    ui.state = PJ_UI_STATE_TIME_TEMP;
+    ui.clock_24h = 0;
+    ui.hour = 7;
+    ui.minute = 41;
+    pj_ui_render(&ui, &morning);
+    ui.hour = 19;
+    pj_ui_render(&ui, &evening);
+    assert(memcmp(&morning, &evening, sizeof(morning)) == 0);
 }
 
 static void test_text_rendering_is_uppercase_at_the_boundary(void)
@@ -1272,7 +1330,7 @@ static void test_long_note_label_stays_inside_editorial_row(void)
 
     pj_ui_render(&ui, &fb);
     assert(count_black_pixels(&fb) > 0);
-    assert(count_black_pixels_in_region(&fb, 5, 70, 190, 40) > 100);
+    assert(count_black_pixels_in_region(&fb, 5, 5, 190, 40) > 100);
 }
 
 static void test_note_detail_title_respects_side_margins(void)
@@ -1377,6 +1435,7 @@ int main(void)
     test_state_graph();
     test_empty_notes_do_not_open_detail();
     test_note_paging_tracks_hardware_focus_and_swipes();
+    test_note_pager_arrows_move_exactly_three_items_and_stop_at_bounds();
     test_read_opens_transcript_detail_without_playback();
     test_note_detail_play_control_has_touch_parity();
     test_custom_home_slots_render_and_route_in_order();
@@ -1393,6 +1452,7 @@ int main(void)
     test_api_preferences_remain_available_after_settings_flattening();
     test_settings_volume_opens_dedicated_screen();
     test_volume_only_bottom_controls_adjust_and_clamp();
+    test_volume_fill_uses_full_top_half_and_controls_have_thick_borders();
     test_timer_presets_are_not_runtime_counters();
     test_time_projection_and_alert_repaint();
     test_time_projection_refreshes_changed_controls();
@@ -1409,6 +1469,7 @@ int main(void)
     test_voice_note_back_paths_are_consistent();
     test_note_detail_back_restores_selected_page();
     test_twelve_hour_alarm_distinguishes_am_and_pm();
+    test_twelve_hour_time_temp_omits_am_pm_suffix();
     test_text_rendering_is_uppercase_at_the_boundary();
     test_static_art_render_and_fallback();
     test_long_note_label_stays_inside_editorial_row();

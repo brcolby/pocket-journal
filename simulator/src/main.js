@@ -43,6 +43,7 @@ const REVIEW_ROUTES = {
   notes: ["wake", "aux", [100, 33]],
   record: ["wake", "aux", [100, 33], [100, 33]],
   listen: ["wake", "aux", [100, 33], [100, 100]],
+  listen_page_2: ["wake", "aux", [100, 33], [100, 100], [150, 175]],
   read: ["wake", "aux", [100, 33], [100, 166]],
   time: ["wake", "aux", [20, 125]],
   alarm: ["wake", "aux", [20, 125], [40, 70]],
@@ -389,6 +390,7 @@ function openReviewView(name) {
     }
   }
   paintFirmwareFramebuffer(`review ${name}`);
+  viewPicker.value = name;
   logAction(`opened ${stateLabel()} through firmware inputs`);
 }
 
@@ -403,10 +405,7 @@ function captureDisplay() {
 function seedDynamicContent() {
   api.setStatus(84, 22, 45);
   api.setTime(9, 41, 2026, 6, 6);
-  api.setNoteCount(3);
-  ["SAT 09:41", "FRI 18:12", "THU 07:30"].forEach((label, index) => {
-    api.setNoteLabel(index, label);
-  });
+  api.seedReviewNotes();
 }
 
 function handleCanvasClick(x, y) {

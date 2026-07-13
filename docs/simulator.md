@@ -82,9 +82,9 @@ The inline bootstrap logger writes to the same endpoint before `src/main.js` loa
 - `notes`: record, listen, read.
 - `time`: alarm, stopwatch, timer, interval.
 - `settings`: three direct rows for volume, light/dark appearance, and 12/24-hour time.
-- `volume`: volume changes through the full-height minus and plus controls.
+- `volume`: the filled meter uses the full upper half; the lower minus and plus controls adjust it.
 - `record`: entering starts recording; AUX stops/saves it and returns home while processing continues asynchronously.
-- `listen` and `read`: show dummy recordings ordered newest first; tap a note to enter detail.
+- `listen` and `read`: show three dummy recordings per page ordered newest first; tap a note to enter detail or use the bottom arrows to move one full page.
 - AUX double-click jumps from any idle screen, including the resting screen, directly into recording. It is ignored while recording, playback, stopwatch, timer, or interval activity is in progress.
 - AUX single-click actions wait 350 ms so a second click can be recognized; release after holding for at least 500 ms to trigger a long press.
 - A 500 ms AUX long press is the sole Back action and backs out through the firmware parent state graph; child screens have no rendered or touch Back target.

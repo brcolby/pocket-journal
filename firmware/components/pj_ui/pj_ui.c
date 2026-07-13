@@ -23,7 +23,9 @@
 #include <string.h>
 
 #define PJ_UI_MAX_DURATION_SECONDS 86400
-#define PJ_UI_NOTES_PER_PAGE 2
+#define PJ_UI_NOTES_PER_PAGE 3
+#define PJ_UI_NOTE_PAGER_TOP 150
+#define PJ_UI_BUTTON_BORDER_WIDTH 3
 
 #if defined(PJ_UI_USE_LVGL)
 #define PJ_LVGL_PALETTE_BYTES 8
@@ -252,10 +254,12 @@ static void draw_vline(pj_framebuffer_t *fb, int x, int y0, int y1)
 
 static void draw_rect(pj_framebuffer_t *fb, int x, int y, int w, int h)
 {
-    draw_hline(fb, x, x + w - 1, y);
-    draw_hline(fb, x, x + w - 1, y + h - 1);
-    draw_vline(fb, x, y, y + h - 1);
-    draw_vline(fb, x + w - 1, y, y + h - 1);
+    for (int inset = 0; inset < PJ_UI_BUTTON_BORDER_WIDTH; inset++) {
+        draw_hline(fb, x, x + w - 1, y + inset);
+        draw_hline(fb, x, x + w - 1, y + h - 1 - inset);
+        draw_vline(fb, x + inset, y, y + h - 1);
+        draw_vline(fb, x + w - 1 - inset, y, y + h - 1);
+    }
 }
 
 static void fill_rect(pj_framebuffer_t *fb, int x, int y, int w, int h)
@@ -518,6 +522,19 @@ static void draw_wrapped_text(pj_framebuffer_t *fb, int x, int y, const char *te
 
 static void draw_icon(pj_framebuffer_t *fb, const char *icon, int cx, int cy, int size)
 {
+    if (strcmp(icon, "LEFT") == 0 || strcmp(icon, "RIGHT") == 0) {
+        int half = max_int(12, size / 2);
+        int thickness = max_int(5, size / 6);
+        int points_right = strcmp(icon, "RIGHT") == 0;
+        fill_rect(fb, cx - half, cy - thickness / 2, 2 * half, thickness);
+        for (int offset = -half; offset <= half; offset++) {
+            int reach = half - (offset < 0 ? -offset : offset);
+            int x = points_right ? cx : cx - reach;
+            fill_rect(fb, x, cy + offset, reach + 1, 1);
+        }
+        return;
+    }
+
     if (strcmp(icon, "PLUS") == 0 || strcmp(icon, "MINUS") == 0) {
         int length = max_int(22, size);
         int thickness = max_int(6, size / 5);
@@ -816,6 +833,18 @@ static int note_page_count(const pj_ui_context_t *ctx)
         return 1;
     }
     return (ctx->note_count + notes_per_page() - 1) / notes_per_page();
+}
+
+static int jog_note_page(pj_ui_context_t *ctx, int direction)
+{
+    int target = ctx->note_page + direction;
+    if (target < 0 || target >= note_page_count(ctx)) {
+        return 0;
+    }
+    ctx->note_page = target;
+    ctx->focus_index = target * notes_per_page();
+    mark_full(ctx);
+    return 1;
 }
 
 static void clamp_note_page(pj_ui_context_t *ctx)
@@ -1172,8 +1201,9 @@ int pj_ui_handle_aux_long(pj_ui_context_t *ctx)
         mark_full(ctx);
         return 1;
     }
-    if (ctx->state == PJ_UI_STATE_NOTE_DETAIL && ctx->note_detail_transcript) {
-        restore_selected_note_list(ctx, PJ_UI_STATE_READ);
+    if (ctx->state == PJ_UI_STATE_NOTE_DETAIL) {
+        restore_selected_note_list(ctx, ctx->note_detail_transcript ?
+                                   PJ_UI_STATE_READ : PJ_UI_STATE_LISTEN);
     } else {
         set_state(ctx, pj_ui_parent_state(ctx->state));
     }
@@ -1458,19 +1488,11 @@ int pj_ui_handle_touch(pj_ui_context_t *ctx, int x, int y, pj_touch_kind_t kind)
 
     if (kind == PJ_TOUCH_SWIPE_LEFT &&
         (ctx->state == PJ_UI_STATE_LISTEN || ctx->state == PJ_UI_STATE_READ)) {
-        if (ctx->note_page + 1 >= note_page_count(ctx)) return 0;
-        ctx->note_page++;
-        ctx->focus_index = ctx->note_page * notes_per_page();
-        mark_full(ctx);
-        return 1;
+        return jog_note_page(ctx, 1);
     }
     if (kind == PJ_TOUCH_SWIPE_RIGHT &&
-        (ctx->state == PJ_UI_STATE_LISTEN || ctx->state == PJ_UI_STATE_READ) &&
-        ctx->note_page > 0) {
-        ctx->note_page--;
-        ctx->focus_index = ctx->note_page * notes_per_page();
-        mark_full(ctx);
-        return 1;
+        (ctx->state == PJ_UI_STATE_LISTEN || ctx->state == PJ_UI_STATE_READ)) {
+        return jog_note_page(ctx, -1);
     }
     if (kind != PJ_TOUCH_TAP) {
         return 0;
@@ -1527,8 +1549,12 @@ int pj_ui_handle_touch(pj_ui_context_t *ctx, int x, int y, pj_touch_kind_t kind)
         return pj_ui_handle_aux_short(ctx);
     case PJ_UI_STATE_LISTEN:
     case PJ_UI_STATE_READ:
+        if (y >= PJ_UI_NOTE_PAGER_TOP) {
+            return jog_note_page(ctx, x < PJ_DISPLAY_WIDTH / 2 ? -1 : 1);
+        }
         if (ctx->note_count > 0) {
-            int row = min_int(notes_per_page() - 1, y / 100);
+            int row = min_int(notes_per_page() - 1,
+                              y * notes_per_page() / PJ_UI_NOTE_PAGER_TOP);
             int index = ctx->note_page * notes_per_page() + row;
             if (row >= 0 && row < notes_per_page() && index < ctx->note_count) {
                 ctx->selected_note = index;
@@ -1611,10 +1637,8 @@ static void draw_home_static(const pj_ui_context_t *ctx, pj_framebuffer_t *fb)
 static void draw_time_temp(const pj_ui_context_t *ctx, pj_framebuffer_t *fb)
 {
     char text[32];
-    char suffix[3] = "";
     int display_hour = ctx->hour;
     if (!ctx->clock_24h) {
-        (void)snprintf(suffix, sizeof(suffix), "%s", ctx->hour < 12 ? "AM" : "PM");
         display_hour = ctx->hour % 12;
         if (display_hour == 0) display_hour = 12;
         (void)snprintf(text, sizeof(text), "%d:%02d", display_hour, ctx->minute);
@@ -1622,9 +1646,6 @@ static void draw_time_temp(const pj_ui_context_t *ctx, pj_framebuffer_t *fb)
         (void)snprintf(text, sizeof(text), "%02d:%02d", display_hour, ctx->minute);
     }
     draw_text_center_at_double(fb, 100, 43, text, 4);
-    if (suffix[0] != '\0') {
-        draw_text_center_at(fb, 170, 75, suffix, 2);
-    }
     (void)snprintf(text, sizeof(text), "%s %02d/%02d", weekday_name(ctx->weekday),
                    ctx->month, ctx->day);
     draw_text_center_at(fb, 100, 100, text, 4);
@@ -1654,24 +1675,35 @@ static void draw_record(const pj_ui_context_t *ctx, pj_framebuffer_t *fb)
 static void draw_notes_list(const pj_ui_context_t *ctx, pj_framebuffer_t *fb, const char *kind)
 {
     if (ctx->note_count <= 0) {
-        draw_text_center_at(fb, 100, 100,
+        draw_text_center_at(fb, 100, PJ_UI_NOTE_PAGER_TOP / 2,
                             strcmp(kind, "AUD") == 0 ? "NO AUDIO" : "NO TEXT", 4);
     }
     for (int i = 0; i < notes_per_page(); i++) {
-        int y = i * 100;
+        int y = i * PJ_UI_NOTE_PAGER_TOP / notes_per_page();
+        int next_y = (i + 1) * PJ_UI_NOTE_PAGER_TOP / notes_per_page();
         int note_index = ctx->note_page * notes_per_page() + i;
         if (note_index >= ctx->note_count) {
             continue;
         }
-        draw_rect(fb, 0, y, PJ_DISPLAY_WIDTH, 100);
+        draw_rect(fb, 0, y, PJ_DISPLAY_WIDTH, next_y - y);
         draw_text_centered_ellipsized(
-            fb, 100, y + 50,
+            fb, 100, (y + next_y) / 2,
             ctx->note_labels[note_index][0] != '\0'
                 ? ctx->note_labels[note_index]
                 : "RECORDING",
             4, 190);
-        if (note_index == ctx->focus_index) invert_region(fb, 0, y, 200, 100);
+        if (note_index == ctx->focus_index) {
+            invert_region(fb, 0, y, PJ_DISPLAY_WIDTH, next_y - y);
+        }
     }
+    draw_rect(fb, 0, PJ_UI_NOTE_PAGER_TOP, PJ_DISPLAY_WIDTH / 2,
+              PJ_DISPLAY_HEIGHT - PJ_UI_NOTE_PAGER_TOP);
+    draw_rect(fb, PJ_DISPLAY_WIDTH / 2, PJ_UI_NOTE_PAGER_TOP,
+              PJ_DISPLAY_WIDTH / 2, PJ_DISPLAY_HEIGHT - PJ_UI_NOTE_PAGER_TOP);
+    draw_icon(fb, "LEFT", PJ_DISPLAY_WIDTH / 4,
+              (PJ_UI_NOTE_PAGER_TOP + PJ_DISPLAY_HEIGHT) / 2, 34);
+    draw_icon(fb, "RIGHT", 3 * PJ_DISPLAY_WIDTH / 4,
+              (PJ_UI_NOTE_PAGER_TOP + PJ_DISPLAY_HEIGHT) / 2, 34);
 }
 
 static void draw_settings(const pj_ui_context_t *ctx, pj_framebuffer_t *fb)
@@ -1694,10 +1726,12 @@ static void draw_settings(const pj_ui_context_t *ctx, pj_framebuffer_t *fb)
 
 static void draw_volume(const pj_ui_context_t *ctx, pj_framebuffer_t *fb)
 {
-    draw_rect(fb, 0, 60, PJ_DISPLAY_WIDTH, 40);
-    int width = (ctx->volume * (PJ_DISPLAY_WIDTH - 4)) / 10;
+    draw_rect(fb, 0, 0, PJ_DISPLAY_WIDTH, 100);
+    int inner_width = PJ_DISPLAY_WIDTH - 2 * PJ_UI_BUTTON_BORDER_WIDTH;
+    int width = (ctx->volume * inner_width) / 10;
     if (width > 0) {
-        fill_rect(fb, 2, 62, width, 36);
+        fill_rect(fb, PJ_UI_BUTTON_BORDER_WIDTH, PJ_UI_BUTTON_BORDER_WIDTH,
+                  width, 100 - 2 * PJ_UI_BUTTON_BORDER_WIDTH);
     }
     const char *actions[] = {"MINUS", "PLUS"};
     draw_icon_controls(fb, actions, 2, ctx->focus_index, 100, 2);

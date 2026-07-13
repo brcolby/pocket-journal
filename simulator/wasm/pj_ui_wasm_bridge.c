@@ -153,9 +153,13 @@ void pj_sim_seed_review_notes(void)
         "Walked by the river after the rain and remembered the cedar trees.",
         "Project reflection",
         "Morning idea",
+        "Midweek review",
+        "Tuesday follow-up",
+        "Monday plan",
+        "Sunday walk",
     };
     memset(g_note_labels, 0, sizeof(g_note_labels));
-    g_note_count = 3;
+    g_note_count = (int)(sizeof(labels) / sizeof(labels[0]));
     for (int i = 0; i < g_note_count; i++) {
         strncpy(g_note_labels[i], labels[i], PJ_UI_NOTE_LABEL_LEN - 1);
     }

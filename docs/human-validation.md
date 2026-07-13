@@ -17,6 +17,7 @@ Last synchronized with `bd human list`: 2026-07-12.
   - Common Home, Settings, Volume, Timer, Stopwatch, and Interval actions are usable with buttons.
   - Confirm time values are substantially larger, sub-information remains readable, alarm adjustments use clear HR/MIN controls, and control labels are bold without dominating.
   - Confirm interval rounds begin at zero and advance from that zero-indexed value.
+  - Confirm button boundaries are consistently thicker on every screen and remain distinct after repeated refreshes.
 - [ ] **Display SPI correction** (`pocket-journal-0bd`)
   - Navigation and refreshes remain reliable with the panel clock capped at 20 MHz.
   - Note any new corruption, timeout, flicker, or ghosting.
@@ -32,15 +33,16 @@ Last synchronized with `bd human list`: 2026-07-12.
   - On Home, short-press cycles destinations and double-press activates the focused secondary destination; focus-zero double-press remains quick record.
   - In Notes, Time, and Settings, double-press cycles visible focus, short-press activates, and long-press returns to the immediate parent.
   - Verify note names and transcript text render uppercase with a correct baseline, no downward-shifted capital letters, word wrapping, and clean ellipses.
+  - Confirm note lists show exactly three notes per page; bottom previous/next arrows move exactly one page and never skip or repeat notes.
   - During active playback, AUX long-hold must stop audio safely before returning to the same selected note and page in Listen; when playback is paused, AUX long-hold must return without restarting audio. During recording, AUX long-hold must save and return immediately while processing continues asynchronously.
-  - Verify the record elapsed value, substantially enlarged time values and sub-information, bold controls, clear HR/MIN alarm adjustments, 2x2 timer/interval controls, 90-second interval default, zero-indexed interval round, and filled volume bar.
+  - Verify the record elapsed value, substantially enlarged time values and sub-information, bold controls, universally thicker button boundaries, clear HR/MIN alarm adjustments, 2x2 timer/interval controls, 90-second interval default, zero-indexed interval round, and full-height filled Volume bar.
   - Start and stop timer, stopwatch, and interval activity while watching for stale START/PAUSE icons.
   - Confirm Settings presents direct rows for Volume, Light/Dark, and 12/24-hour mode, with no nested Display screen.
 - [ ] **Clock, unit, and reading-size persistence** (`pocket-journal-aw7`)
   - Toggle 12/24-hour mode directly from the Settings row; verify the change appears immediately and there is no nested Display screen.
   - Confirm Settings rows are Volume, Light/Dark, and 12/24-hour mode.
   - Verify Celsius/Fahrenheit and transcript font-size preferences still round-trip through the settings API and persist without requiring compact-device navigation rows.
-  - In 12-hour mode, verify both the main clock and alarm clearly distinguish AM from PM.
+  - In 12-hour mode, confirm the main clock has no AM/PM suffix; verify the Alarm screen still disambiguates AM from PM.
   - Reboot and sleep/wake, then confirm all three preferences persist.
   - Compare displayed temperature and humidity with a nearby reference; report whether the values are plausible and stable. When the humidity sensor is unavailable, the clock must show `--%` and `/v1/status` must return `null`, never a plausible placeholder value.
 - [ ] **Home layout persistence** (`pocket-journal-bmz`)
