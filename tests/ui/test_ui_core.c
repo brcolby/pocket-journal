@@ -163,6 +163,22 @@ static void test_note_pager_arrows_move_exactly_three_items_and_stop_at_bounds(v
     assert(ui.note_page == 1 && ui.focus_index == 3);
 }
 
+static void test_note_pager_uses_chevrons_without_arrow_bars(void)
+{
+    pj_ui_context_t ui;
+    pj_framebuffer_t fb;
+    pj_ui_init(&ui);
+    seed_notes(&ui);
+    ui.state = PJ_UI_STATE_LISTEN;
+    ui.focus_index = -1;
+    pj_ui_render(&ui, &fb);
+
+    assert(count_black_pixels_in_region(&fb, 30, 160, 40, 30) > 20);
+    assert(count_black_pixels_in_region(&fb, 130, 160, 40, 30) > 20);
+    assert(count_black_pixels_in_region(&fb, 20, 174, 60, 3) < 20);
+    assert(count_black_pixels_in_region(&fb, 120, 174, 60, 3) < 20);
+}
+
 static void test_read_opens_transcript_detail_without_playback(void)
 {
     pj_ui_context_t ui;
@@ -387,6 +403,39 @@ static void test_aux_focus_and_activation(void)
     assert(pj_ui_handle_aux_short(&ui) == 1);
     assert(pj_ui_current_state(&ui) == PJ_UI_STATE_STOPWATCH);
     assert(ui.stopwatch_running == 0);
+}
+
+static void test_focus_marker_is_local_and_does_not_invert_buttons(void)
+{
+    pj_ui_context_t ui;
+    pj_framebuffer_t before;
+    pj_framebuffer_t partial;
+    pj_framebuffer_t expected;
+    pj_ui_init(&ui);
+    ui.state = PJ_UI_STATE_TIME;
+    pj_ui_render(&ui, &before);
+    partial = before;
+    pj_ui_mark_displayed(&ui);
+
+    assert(pj_ui_handle_aux_double(&ui) == 1);
+    assert(ui.focus_index == 1);
+    assert(ui.dirty.partial == 1);
+    assert(ui.dirty.width * ui.dirty.height < 1000);
+    assert(ui.dirty.height <= 7);
+    pj_ui_render(&ui, &partial);
+
+    pj_ui_context_t full = ui;
+    pj_ui_request_full_refresh(&full);
+    pj_ui_render(&full, &expected);
+    assert(memcmp(&partial, &expected, sizeof(expected)) == 0);
+    int changed = count_pixel_differences_in_region(
+        &before, &partial, 0, 0, PJ_DISPLAY_WIDTH, PJ_DISPLAY_HEIGHT);
+    assert(changed >= 70 && changed <= 110);
+
+    int before_first = count_black_pixels_in_region(&before, 0, 0, 100, 100);
+    int after_first = count_black_pixels_in_region(&partial, 0, 0, 100, 100);
+    int delta = before_first - after_first;
+    assert(delta >= -49 && delta <= 49);
 }
 
 static void test_time_value_typography_fits_refresh_regions(void)
@@ -701,7 +750,7 @@ static void test_timer_presets_are_not_runtime_counters(void)
     pj_ui_init(&ui);
     ui.state = PJ_UI_STATE_TIMER;
 
-    assert(pj_ui_handle_touch(&ui, 50, 177, PJ_TOUCH_TAP) == 1);
+    assert(pj_ui_handle_touch(&ui, 150, 177, PJ_TOUCH_TAP) == 1);
     assert(ui.timer_seconds == 330);
     assert(ui.timer_preset_seconds == 330);
     ui.timer_running = 1;
@@ -718,17 +767,81 @@ static void test_timer_presets_are_not_runtime_counters(void)
 
     pj_ui_init(&ui);
     ui.state = PJ_UI_STATE_INTERVAL;
-    assert(pj_ui_handle_touch(&ui, 50, 177, PJ_TOUCH_TAP) == 1);
+    assert(pj_ui_handle_touch(&ui, 150, 177, PJ_TOUCH_TAP) == 1);
     assert(ui.interval_seconds == 150);
     assert(ui.interval_preset_seconds == 150);
     ui.interval_running = 1;
     ui.interval_seconds = 1;
     assert(pj_ui_tick(&ui) == 1);
-    assert(ui.interval_seconds == 300);
+    assert(ui.interval_seconds == 150);
     assert(ui.interval_preset_seconds == 150);
     ui.interval_seconds = 1;
     assert(pj_ui_tick(&ui) == 1);
     assert(ui.interval_seconds == 150);
+    assert(ui.interval_round == 2);
+}
+
+static void test_interval_repeats_one_stable_duration_across_rounds(void)
+{
+    pj_ui_context_t ui;
+    pj_ui_init(&ui);
+    ui.state = PJ_UI_STATE_INTERVAL;
+    ui.interval_running = 1;
+    ui.interval_seconds = 2;
+    ui.interval_preset_seconds = 2;
+    pj_ui_mark_displayed(&ui);
+
+    for (int round = 0; round < 4; round++) {
+        assert(ui.interval_round == round);
+        assert(ui.interval_seconds == 2);
+        assert(pj_ui_tick(&ui) == 1);
+        assert(ui.interval_seconds == 1 && ui.interval_round == round);
+        assert(ui.dirty.partial == 1);
+        pj_ui_mark_displayed(&ui);
+        assert(pj_ui_tick(&ui) == 1);
+        assert(ui.interval_seconds == 2 && ui.interval_round == round + 1);
+        assert(ui.state == PJ_UI_STATE_INTERVAL);
+        assert(ui.dirty.partial == 1);
+        pj_ui_mark_displayed(&ui);
+    }
+}
+
+static void test_timer_geometry_and_adjustment_focus_timeout(void)
+{
+    pj_ui_context_t ui;
+    pj_ui_time_command_t command;
+    pj_framebuffer_t fb;
+    pj_ui_init(&ui);
+    ui.state = PJ_UI_STATE_TIMER;
+    ui.timer_seconds = 123;
+    ui.timer_preset_seconds = 300;
+    ui.timer_running = 1;
+    ui.focus_index = -1;
+    pj_ui_render(&ui, &fb);
+
+    assert(count_black_pixels_in_region(&fb, 0, 143, PJ_DISPLAY_WIDTH, 2) > 380);
+    assert(pj_ui_handle_touch(&ui, 150, 126, PJ_TOUCH_TAP) == 1);
+    assert(ui.focus_index == 1 && ui.timer_running == 0 && ui.timer_seconds == 300);
+    assert(pj_ui_consume_time_command(&ui, &command) == 1);
+    assert(command.type == PJ_UI_TIME_COMMAND_TIMER_RESET);
+
+    assert(pj_ui_handle_touch(&ui, 50, 170, PJ_TOUCH_TAP) == 1);
+    assert(ui.focus_index == 2 && ui.timer_seconds == 270);
+    assert(pj_ui_consume_time_command(&ui, &command) == 1);
+    assert(pj_ui_handle_touch(&ui, 150, 170, PJ_TOUCH_TAP) == 1);
+    assert(ui.focus_index == 3 && ui.timer_seconds == 300);
+    assert(pj_ui_consume_time_command(&ui, &command) == 1);
+
+    pj_ui_mark_displayed(&ui);
+    for (int tick = 1; tick < PJ_UI_FOCUS_TIMEOUT_TICKS; tick++) {
+        assert(pj_ui_tick(&ui) == 0);
+        assert(ui.focus_index == 3);
+    }
+    assert(pj_ui_tick(&ui) == 1);
+    assert(ui.focus_index == 0);
+    assert(ui.timer_running == 0);
+    assert(ui.dirty.partial == 1);
+    assert(ui.dirty.width * ui.dirty.height < PJ_DISPLAY_WIDTH * PJ_DISPLAY_HEIGHT);
 }
 
 static pj_ui_time_projection_t time_projection_with_alert(uint64_t id,
@@ -817,7 +930,8 @@ static void test_time_projection_refreshes_changed_controls(void)
         pj_ui_mark_displayed(&ui);
         pj_ui_set_time_projection(&ui, &projection);
         assert(pj_ui_is_dirty(&ui) == 1);
-        assert(ui.dirty.partial == 0);
+        assert(ui.dirty.partial == 1);
+        assert(ui.dirty.width * ui.dirty.height < PJ_DISPLAY_WIDTH * PJ_DISPLAY_HEIGHT);
     }
 
     pj_ui_context_t timer;
@@ -828,7 +942,7 @@ static void test_time_projection_refreshes_changed_controls(void)
     pj_ui_mark_displayed(&timer);
     assert(pj_ui_tick(&timer) == 1);
     assert(timer.timer_running == 0 && timer.timer_seconds == 0);
-    assert(timer.dirty.partial == 0);
+    assert(timer.dirty.partial == 1);
 
     pj_ui_context_t alarm;
     pj_ui_init(&alarm);
@@ -918,7 +1032,7 @@ static void test_time_controls_emit_explicit_commands(void)
     ui.state = PJ_UI_STATE_STOPWATCH;
     ui.stopwatch_running = 1;
     ui.stopwatch_seconds = 42;
-    assert(pj_ui_handle_touch(&ui, 170, 160, PJ_TOUCH_TAP) == 1);
+    assert(pj_ui_handle_touch(&ui, 170, 126, PJ_TOUCH_TAP) == 1);
     assert(pj_ui_consume_time_command(&ui, &command) == 1);
     assert(command.type == PJ_UI_TIME_COMMAND_STOPWATCH_RESET);
 
@@ -933,7 +1047,7 @@ static void test_time_controls_emit_explicit_commands(void)
     assert(pj_ui_handle_aux_short(&ui) == 1);
     assert(pj_ui_consume_time_command(&ui, &command) == 1);
     assert(command.type == PJ_UI_TIME_COMMAND_TIMER_PAUSE);
-    assert(pj_ui_handle_touch(&ui, 170, 160, PJ_TOUCH_TAP) == 1);
+    assert(pj_ui_handle_touch(&ui, 170, 126, PJ_TOUCH_TAP) == 1);
     assert(pj_ui_consume_time_command(&ui, &command) == 1);
     assert(command.type == PJ_UI_TIME_COMMAND_TIMER_RESET);
 
@@ -941,31 +1055,83 @@ static void test_time_controls_emit_explicit_commands(void)
     ui.focus_index = 0;
     ui.interval_running = 0;
     ui.interval_seconds = 120;
+    ui.interval_preset_seconds = 120;
     assert(pj_ui_handle_aux_short(&ui) == 1);
     assert(pj_ui_consume_time_command(&ui, &command) == 1);
     assert(command.type == PJ_UI_TIME_COMMAND_INTERVAL_START);
     assert(command.duration_ms == 120000);
-    assert(command.secondary_duration_ms == 300000);
+    assert(command.secondary_duration_ms == 120000);
     assert(pj_ui_handle_aux_short(&ui) == 1);
     assert(pj_ui_consume_time_command(&ui, &command) == 1);
     assert(command.type == PJ_UI_TIME_COMMAND_INTERVAL_PAUSE);
-    assert(pj_ui_handle_touch(&ui, 170, 160, PJ_TOUCH_TAP) == 1);
+    assert(pj_ui_handle_touch(&ui, 170, 126, PJ_TOUCH_TAP) == 1);
     assert(pj_ui_consume_time_command(&ui, &command) == 1);
     assert(command.type == PJ_UI_TIME_COMMAND_INTERVAL_RESET);
 
     ui.state = PJ_UI_STATE_TIMER;
     ui.timer_seconds = 86400;
-    assert(pj_ui_handle_touch(&ui, 50, 177, PJ_TOUCH_TAP) == 1);
+    assert(pj_ui_handle_touch(&ui, 150, 177, PJ_TOUCH_TAP) == 1);
     assert(ui.timer_seconds == 86400);
     assert(pj_ui_consume_time_command(&ui, &command) == 1);
     assert(command.duration_ms == 86400000);
 
     ui.state = PJ_UI_STATE_INTERVAL;
     ui.interval_seconds = 86400;
-    assert(pj_ui_handle_touch(&ui, 50, 177, PJ_TOUCH_TAP) == 1);
+    assert(pj_ui_handle_touch(&ui, 150, 177, PJ_TOUCH_TAP) == 1);
     assert(ui.interval_seconds == 86400);
     assert(pj_ui_consume_time_command(&ui, &command) == 1);
     assert(command.duration_ms == 86400000);
+}
+
+static void test_aux_back_resets_time_pages_before_returning(void)
+{
+    const struct {
+        pj_ui_state_t state;
+        pj_ui_time_command_type_t command;
+    } cases[] = {
+        {PJ_UI_STATE_STOPWATCH, PJ_UI_TIME_COMMAND_STOPWATCH_RESET},
+        {PJ_UI_STATE_TIMER, PJ_UI_TIME_COMMAND_TIMER_RESET},
+        {PJ_UI_STATE_INTERVAL, PJ_UI_TIME_COMMAND_INTERVAL_RESET},
+    };
+
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        pj_ui_context_t ui;
+        pj_ui_time_command_t command;
+        pj_ui_init(&ui);
+        ui.state = cases[i].state;
+        ui.stopwatch_running = 1;
+        ui.stopwatch_seconds = 42;
+        ui.timer_running = 1;
+        ui.timer_seconds = 17;
+        ui.timer_preset_seconds = 90;
+        ui.interval_running = 1;
+        ui.interval_seconds = 11;
+        ui.interval_preset_seconds = 120;
+        ui.interval_round = 4;
+
+        assert(pj_ui_handle_aux_long(&ui) == 1);
+        assert(ui.state == PJ_UI_STATE_TIME);
+        assert(pj_ui_consume_time_command(&ui, &command) == 1);
+        assert(command.type == cases[i].command);
+        if (cases[i].state == PJ_UI_STATE_STOPWATCH) {
+            assert(ui.stopwatch_running == 0 && ui.stopwatch_seconds == 0);
+        } else if (cases[i].state == PJ_UI_STATE_TIMER) {
+            assert(ui.timer_running == 0 && ui.timer_seconds == 90);
+        } else {
+            assert(ui.interval_running == 0 && ui.interval_seconds == 120);
+            assert(ui.interval_round == 0);
+        }
+    }
+
+    pj_ui_context_t pending;
+    pj_ui_init(&pending);
+    pending.state = PJ_UI_STATE_TIMER;
+    pending.time_command.type = PJ_UI_TIME_COMMAND_TIMER_START;
+    pending.timer_running = 1;
+    pending.timer_seconds = 30;
+    assert(pj_ui_handle_aux_long(&pending) == 0);
+    assert(pending.state == PJ_UI_STATE_TIMER);
+    assert(pending.timer_running == 1 && pending.timer_seconds == 30);
 }
 
 static void test_alert_overlay_commands_keep_model_authoritative(void)
@@ -1057,7 +1223,7 @@ static void test_dirty_lifecycle(void)
     assert(ui.dirty.x == 0);
     assert(ui.dirty.y == 0);
     assert(ui.dirty.width == PJ_DISPLAY_WIDTH);
-    assert(ui.dirty.height == 132);
+    assert(ui.dirty.height == 84);
 
     pj_ui_mark_displayed(&ui);
     pj_ui_set_time(&ui, 10, 43, 2026, 6, 7);
@@ -1067,6 +1233,49 @@ static void test_dirty_lifecycle(void)
     pj_ui_request_full_refresh(&ui);
     assert(pj_ui_is_dirty(&ui) == 1);
     assert(ui.dirty.partial == 0);
+}
+
+static void test_dynamic_updates_force_periodic_full_refresh(void)
+{
+    pj_ui_context_t ui;
+    pj_ui_init(&ui);
+    ui.state = PJ_UI_STATE_STOPWATCH;
+    ui.stopwatch_running = 1;
+    pj_ui_mark_displayed(&ui);
+
+    for (int update = 1; update < PJ_UI_DYNAMIC_FULL_REFRESH_PARTIALS; update++) {
+        assert(pj_ui_tick(&ui) == 1);
+        assert(ui.dirty.partial == 1);
+        assert(ui.dirty.x == 0 && ui.dirty.y == 0);
+        assert(ui.dirty.width == PJ_DISPLAY_WIDTH && ui.dirty.height == 108);
+        pj_ui_mark_displayed(&ui);
+    }
+    assert(ui.partial_refresh_count == PJ_UI_DYNAMIC_FULL_REFRESH_PARTIALS - 1);
+    assert(pj_ui_tick(&ui) == 1);
+    assert(ui.dirty.partial == 0);
+    assert(ui.dirty.width == PJ_DISPLAY_WIDTH && ui.dirty.height == PJ_DISPLAY_HEIGHT);
+    pj_ui_mark_displayed(&ui);
+    assert(ui.partial_refresh_count == 0);
+}
+
+static void test_recording_elapsed_projection_is_bounded_and_monotonic_by_seconds(void)
+{
+    pj_ui_context_t ui;
+    pj_ui_init(&ui);
+    ui.state = PJ_UI_STATE_RECORD;
+    ui.record_state = PJ_RECORD_ACTIVE;
+    pj_ui_mark_displayed(&ui);
+
+    pj_ui_set_recording_elapsed(&ui, 1999);
+    assert(ui.recording_seconds == 1);
+    assert(ui.dirty.partial == 1);
+    assert(ui.dirty.y == 55 && ui.dirty.height == 90);
+    pj_ui_mark_displayed(&ui);
+    pj_ui_set_recording_elapsed(&ui, 1999);
+    assert(pj_ui_is_dirty(&ui) == 0);
+    pj_ui_set_recording_elapsed(&ui, 2000);
+    assert(ui.recording_seconds == 2);
+    assert(ui.dirty.partial == 1);
 }
 
 static void test_partial_render_preserves_outside_region(void)
@@ -1436,6 +1645,7 @@ int main(void)
     test_empty_notes_do_not_open_detail();
     test_note_paging_tracks_hardware_focus_and_swipes();
     test_note_pager_arrows_move_exactly_three_items_and_stop_at_bounds();
+    test_note_pager_uses_chevrons_without_arrow_bars();
     test_read_opens_transcript_detail_without_playback();
     test_note_detail_play_control_has_touch_parity();
     test_custom_home_slots_render_and_route_in_order();
@@ -1443,6 +1653,7 @@ int main(void)
     test_every_supported_home_destination_routes();
     test_home_layout_setter_canonicalizes_inactive_slots();
     test_aux_focus_and_activation();
+    test_focus_marker_is_local_and_does_not_invert_buttons();
     test_time_value_typography_fits_refresh_regions();
     test_interval_round_is_rendered_zero_indexed();
     test_aux_double_cycles_visible_actions_and_falls_back_to_record();
@@ -1454,15 +1665,20 @@ int main(void)
     test_volume_only_bottom_controls_adjust_and_clamp();
     test_volume_fill_uses_full_top_half_and_controls_have_thick_borders();
     test_timer_presets_are_not_runtime_counters();
+    test_interval_repeats_one_stable_duration_across_rounds();
+    test_timer_geometry_and_adjustment_focus_timeout();
     test_time_projection_and_alert_repaint();
     test_time_projection_refreshes_changed_controls();
     test_active_alert_is_controllable_from_aux();
     test_sleep_preserves_durable_time_activity();
     test_recovery_notice_emits_acknowledgement();
     test_time_controls_emit_explicit_commands();
+    test_aux_back_resets_time_pages_before_returning();
     test_alert_overlay_commands_keep_model_authoritative();
     test_sync_state_is_board_driven();
     test_dirty_lifecycle();
+    test_dynamic_updates_force_periodic_full_refresh();
+    test_recording_elapsed_projection_is_bounded_and_monotonic_by_seconds();
     test_partial_render_preserves_outside_region();
     test_record_partial_render_replaces_status_through_bottom_edge();
     test_child_screens_have_no_back_affordance_or_hidden_touch_target();

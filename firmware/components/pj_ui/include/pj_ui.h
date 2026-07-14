@@ -15,6 +15,8 @@ extern "C" {
 #define PJ_FRAMEBUFFER_BYTES ((PJ_DISPLAY_WIDTH * PJ_DISPLAY_HEIGHT) / 8)
 #define PJ_UI_MAX_NOTES 12
 #define PJ_UI_NOTE_LABEL_LEN 96
+#define PJ_UI_FOCUS_TIMEOUT_TICKS 3
+#define PJ_UI_DYNAMIC_FULL_REFRESH_PARTIALS 30
 
 typedef enum {
     PJ_UI_STATE_STATIC = 0,
@@ -142,6 +144,7 @@ typedef struct {
     int note_page;
     int selected_note;
     int focus_index;
+    int focus_idle_ticks;
     int note_detail_transcript;
     pj_home_layout_t home_layout;
     char note_labels[PJ_UI_MAX_NOTES][PJ_UI_NOTE_LABEL_LEN];
@@ -156,6 +159,7 @@ typedef struct {
     int recovery_time_uncertain;
     pj_ui_time_command_t time_command;
     int note_count;
+    int partial_refresh_count;
     pj_ui_dirty_region_t dirty;
 } pj_ui_context_t;
 
@@ -176,6 +180,7 @@ void pj_ui_set_preferences(pj_ui_context_t *ctx, int clock_24h,
 void pj_ui_set_time(pj_ui_context_t *ctx, int hour, int minute, int year, int month, int day);
 void pj_ui_set_notes(pj_ui_context_t *ctx, int count, const char labels[][PJ_UI_NOTE_LABEL_LEN]);
 void pj_ui_set_audio_state(pj_ui_context_t *ctx, int recording, int playback_active);
+void pj_ui_set_recording_elapsed(pj_ui_context_t *ctx, uint64_t elapsed_ms);
 void pj_ui_set_time_projection(pj_ui_context_t *ctx, const pj_ui_time_projection_t *projection);
 int pj_ui_consume_time_command(pj_ui_context_t *ctx, pj_ui_time_command_t *command);
 void pj_ui_set_sync_state(pj_ui_context_t *ctx, int pending, int transferred, int online);
