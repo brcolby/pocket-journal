@@ -48,6 +48,7 @@ const simulatorJs = await readFile("simulator/src/main.js", "utf8");
 const simulatorAuxJs = await readFile("simulator/src/aux_input.js", "utf8");
 const makefile = await readFile("Makefile", "utf8");
 const wasmBridge = await readFile("simulator/wasm/pj_ui_wasm_bridge.c", "utf8");
+const appMain = await readFile("firmware/main/app_main.c", "utf8");
 
 assert.match(simulatorHtml, /id="powerButton"/);
 assert.match(simulatorHtml, /aria-label="Toggle power"/);
@@ -99,5 +100,9 @@ assert.match(wasmBridge, /pj_ui_handle_aux_short/);
 assert.match(wasmBridge, /pj_ui_handle_aux_long/);
 assert.match(wasmBridge, /pj_ui_handle_aux_double/);
 assert.match(wasmBridge, /pj_sim_dirty_partial/);
+assert.match(appMain, /PJ_UI_TICKS_PER_SECOND/);
+assert.match(appMain, /pj_ui_tick\(&g_ui\)/);
+assert.match(appMain, /pj_ui_set_recording_elapsed\(ui, status\.recording_elapsed_ms\)/);
+assert.match(appMain, /dynamic_changed \|= pj_board_update_time_state\(&g_ui\)/);
 
 console.log("simulator one-bit tests passed");

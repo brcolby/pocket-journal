@@ -8,6 +8,8 @@ static const char *TAG = "pocket-journal";
 static pj_ui_context_t g_ui;
 static pj_framebuffer_t g_framebuffer;
 
+#define PJ_MAIN_LOOP_PERIOD_MS 50
+#define PJ_UI_TICKS_PER_SECOND (1000 / PJ_MAIN_LOOP_PERIOD_MS)
 #define PJ_STATUS_REFRESH_TICKS 6000
 
 static void render_and_flush_if_dirty(pj_ui_context_t *ui)
@@ -40,6 +42,7 @@ static void sync_ui_audio_from_board(pj_ui_context_t *ui)
 {
     pj_board_status_t status = pj_board_status();
     pj_ui_set_audio_state(ui, status.recording, status.playback_active);
+    pj_ui_set_recording_elapsed(ui, status.recording_elapsed_ms);
 }
 
 static void apply_board_state_effects(pj_ui_state_t previous, pj_ui_state_t current, const pj_board_event_t *event)
@@ -144,17 +147,18 @@ void app_main(void)
         }
 
         second_ticks++;
-        if (second_ticks >= 20) {
+        if (second_ticks >= PJ_UI_TICKS_PER_SECOND) {
             second_ticks = 0;
-            if (pj_board_update_time_state(&g_ui)) {
-                render_and_flush_if_dirty(&g_ui);
-            }
+            int dynamic_changed = pj_ui_tick(&g_ui);
+            sync_ui_audio_from_board(&g_ui);
+            dynamic_changed |= pj_board_update_time_state(&g_ui);
             clock_seconds++;
             if (clock_seconds >= 60) {
                 clock_seconds = 0;
-                if (pj_board_tick_time(&g_ui)) {
-                    render_and_flush_if_dirty(&g_ui);
-                }
+                dynamic_changed |= pj_board_tick_time(&g_ui);
+            }
+            if (dynamic_changed || pj_ui_is_dirty(&g_ui)) {
+                render_and_flush_if_dirty(&g_ui);
             }
         }
 
@@ -197,6 +201,6 @@ void app_main(void)
         }
 
         loop_ticks++;
-        vTaskDelay(pdMS_TO_TICKS(50));
+        vTaskDelay(pdMS_TO_TICKS(PJ_MAIN_LOOP_PERIOD_MS));
     }
 }
