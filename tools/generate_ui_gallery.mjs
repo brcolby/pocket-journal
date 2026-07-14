@@ -93,7 +93,8 @@ const scenarios = [
   ["interval", "interval", () => { resetToHome(); api.pj_sim_touch_tap(20, 125); api.pj_sim_touch_tap(150, 150); }, fullBleed()],
   ["settings-light-24h", "settings", resetToSettings, fullBleed(3)],
   ["volume-adjusted", "volume", () => { resetToSettings(); api.pj_sim_touch_tap(100, 30); api.pj_sim_touch_tap(150, 160); }, fullBleed()],
-  ["settings-dark-24h", "settings", () => { resetToSettings(); api.pj_sim_touch_tap(100, 100); }, { ...fullBleed(2), maxDensity: 1 }],
+  ["settings-dark-24h", "settings", () => { resetToSettings(); api.pj_sim_touch_tap(100, 100); },
+    { ...fullBleed(4), maxDensity: 1, maxEdgeInset: 3 }],
   ["settings-light-12h", "settings", () => { resetToSettings(); api.pj_sim_touch_tap(100, 170); }, fullBleed(3)],
   ["alert-alarm", "home", () => { resetToHome(); api.pj_sim_set_alert(1); }, fullBleed(2)],
 ];

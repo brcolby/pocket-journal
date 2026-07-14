@@ -27,6 +27,16 @@ assert.ok(validateFrame(metrics, { maxEdgePixels: Infinity, maxComponentFraction
   .some((error) => error.includes("only 3 display edges")));
 
 pixels = frame();
+for (let y = 2; y < 18; y += 1) for (let x = 2; x < 18; x += 1) set(pixels, 20, x, y);
+metrics = analyzeFrame(pixels, 20, 20);
+assert.deepEqual(metrics.edgeInsets, { top: 2, right: 2, bottom: 2, left: 2 });
+const insetOptions = { maxEdgePixels: Infinity, maxComponentFraction: 1, maxImbalance: 1,
+  maxDensity: 1, minEdgeSides: 4, maxEdgeInset: 2 };
+assert.deepEqual(validateFrame(metrics, insetOptions), []);
+assert.ok(validateFrame(metrics, { ...insetOptions, maxEdgeInset: 1 })
+  .some((error) => error.includes("only 0 display edges within 1 px")));
+
+pixels = frame();
 for (let y = 1; y < 19; y += 1) for (let x = 1; x < 19; x += 1) set(pixels, 20, x, y);
 assert.ok(validateFrame(analyzeFrame(pixels, 20, 20)).some((error) => error.includes("too high")));
 
