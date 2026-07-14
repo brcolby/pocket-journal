@@ -2,6 +2,8 @@
 
 #include "pj_ui.h"
 #include "pj_storage.h"
+#include "pj_time_sync.h"
+#include "pj_wifi_state.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -77,6 +79,8 @@ typedef struct {
     char ip_addr[48];
     char storage_path[32];
     char last_error[128];
+    pj_wifi_state_t wifi_diagnostics;
+    pj_time_sync_state_t time_sync;
 } pj_board_status_t;
 
 pj_board_profile_t pj_board_default_profile(void);

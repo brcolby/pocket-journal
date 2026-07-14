@@ -20,6 +20,8 @@ TIME_CLOCK_TEST_BIN := build/test_time_clock
 RTC_WAKE_TEST_BIN := build/test_rtc_wake
 TIME_CONTROLLER_TEST_BIN := build/test_time_controller
 TRANSCRIPT_UPLOAD_TEST_BIN := build/test_transcript_upload
+WIFI_STATE_TEST_BIN := build/test_wifi_state
+TIME_SYNC_TEST_BIN := build/test_time_sync
 LVGL_DIR := firmware/managed_components/lvgl__lvgl
 ifneq ($(wildcard $(LVGL_DIR)/src),)
 LVGL_SRCS := $(wildcard $(LVGL_DIR)/src/*.c)
@@ -159,6 +161,18 @@ test-input:
 		-lm \
 		-o $(TRANSCRIPT_UPLOAD_TEST_BIN)
 	$(TRANSCRIPT_UPLOAD_TEST_BIN)
+	$(CC) $(CFLAGS) \
+		-Ifirmware/components/pj_board/include \
+		firmware/components/pj_board/pj_wifi_state.c \
+		tests/board/test_wifi_state.c \
+		-o $(WIFI_STATE_TEST_BIN)
+	$(WIFI_STATE_TEST_BIN)
+	$(CC) $(CFLAGS) \
+		-Ifirmware/components/pj_board/include \
+		firmware/components/pj_board/pj_time_sync.c \
+		tests/board/test_time_sync.c \
+		-o $(TIME_SYNC_TEST_BIN)
+	$(TIME_SYNC_TEST_BIN)
 
 test-partner:
 	cd partner && PYTHONPATH=src python -m unittest discover -s ../tests/partner -p 'test_*.py'

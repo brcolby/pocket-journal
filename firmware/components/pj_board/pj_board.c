@@ -12,7 +12,9 @@
 #include "pj_storage.h"
 #include "pj_time_clock.h"
 #include "pj_time_controller.h"
+#include "pj_time_sync.h"
 #include "pj_transcript_upload.h"
+#include "pj_wifi_state.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -25,6 +27,8 @@
 #include <limits.h>
 #include <strings.h>
 #include <sys/stat.h>
+#include <sys/time.h>
+#include <time.h>
 #include <unistd.h>
 #endif
 
@@ -41,7 +45,9 @@
 #include "esp_log.h"
 #include "esp_mac.h"
 #include "esp_netif.h"
+#include "esp_netif_sntp.h"
 #include "esp_sleep.h"
+#include "esp_sntp.h"
 #include "esp_system.h"
 #include "esp_timer.h"
 #include "esp_vfs_fat.h"
@@ -184,6 +190,9 @@
 #define PJ_NOTE_DIR "/sdcard/pj/notes"
 #define PJ_AUDIO_MAX_INDEXED_FILES 16
 #define PJ_SERIAL_COMMAND_TASK_STACK 4096
+#define PJ_CONNECTIVITY_TASK_STACK 4096
+#define PJ_CONNECTIVITY_POLL_MS 250
+#define PJ_WIFI_RECONNECT_SETTLE_MS 250
 #define PJ_STORAGE_RESERVE_BYTES (256ULL * 1024ULL)
 #define PJ_STORAGE_RECORD_START_BYTES (64ULL * 1024ULL)
 #define PJ_STORAGE_CAPACITY_CHECK_BYTES (64U * 1024U)
@@ -262,6 +271,13 @@ static int g_adc_cali_ready;
 static int g_network_stack_ready;
 static int g_wifi_started;
 static esp_netif_t *g_wifi_sta_netif;
+static int g_connectivity_task_started;
+static int g_connectivity_state_initialized;
+static int g_sntp_initialized;
+static int g_wifi_control_disconnect_pending;
+static portMUX_TYPE g_connectivity_lock = portMUX_INITIALIZER_UNLOCKED;
+static pj_wifi_state_t g_wifi_state;
+static pj_time_sync_state_t g_time_sync_state;
 static int g_mdns_started;
 static int g_ble_started;
 static uint8_t g_ble_addr_type;
@@ -328,6 +344,10 @@ static alert_audio_intent_t g_alert_audio_intent;
 
 static esp_err_t rtc_write_status_time(void);
 static uint64_t board_monotonic_ms(void);
+static esp_err_t connectivity_runtime_start(void);
+static void connectivity_state_init(void);
+static void connectivity_state_snapshot(pj_wifi_state_t *wifi,
+                                        pj_time_sync_state_t *time_sync);
 static int board_time_model_clock(pj_time_clock_t *clock);
 static int time_state_initialize(void);
 static int time_state_project(pj_ui_context_t *ui);
@@ -969,6 +989,184 @@ static esp_err_t network_stack_init(void)
     return ESP_OK;
 }
 
+static void connectivity_state_init(void)
+{
+    uint64_t now_ms = board_monotonic_ms();
+    portENTER_CRITICAL(&g_connectivity_lock);
+    pj_wifi_state_init(&g_wifi_state, g_wifi_credentials_stored, now_ms);
+    pj_time_sync_init(&g_time_sync_state, g_time_wall_trusted, now_ms);
+    g_connectivity_state_initialized = 1;
+    portEXIT_CRITICAL(&g_connectivity_lock);
+}
+
+static void connectivity_state_snapshot(pj_wifi_state_t *wifi,
+                                        pj_time_sync_state_t *time_sync)
+{
+    portENTER_CRITICAL(&g_connectivity_lock);
+    if (wifi != NULL) {
+        *wifi = g_wifi_state;
+    }
+    if (time_sync != NULL) {
+        *time_sync = g_time_sync_state;
+    }
+    portEXIT_CRITICAL(&g_connectivity_lock);
+}
+
+static int format_utc_time(int64_t epoch_s, char *out, size_t out_size)
+{
+    if (out == NULL || out_size == 0 || !pj_time_sync_epoch_valid(epoch_s)) {
+        return 0;
+    }
+    time_t value = (time_t)epoch_s;
+    struct tm utc;
+    if (gmtime_r(&value, &utc) == NULL) {
+        return 0;
+    }
+    return strftime(out, out_size, "%Y-%m-%dT%H:%M:%SZ", &utc) != 0;
+}
+
+/* LwIP provides this hook as weak. Validate the UTC response before allowing
+ * it to replace POSIX system time. Local civil/RTC publication stays gated
+ * until the product has an explicit timezone rule. */
+void sntp_sync_time(struct timeval *tv)
+{
+    uint64_t now_ms = board_monotonic_ms();
+    if (tv == NULL || tv->tv_usec < 0 || tv->tv_usec >= 1000000 ||
+        !pj_time_sync_epoch_valid((int64_t)tv->tv_sec)) {
+        portENTER_CRITICAL(&g_connectivity_lock);
+        (void)pj_time_sync_on_success(&g_time_sync_state,
+                                      tv == NULL ? 0 : (int64_t)tv->tv_sec,
+                                      0, 0, now_ms);
+        portEXIT_CRITICAL(&g_connectivity_lock);
+        esp_sntp_set_sync_status(SNTP_SYNC_STATUS_RESET);
+        ESP_LOGW(TAG, "SNTP response rejected outside supported UTC range");
+        return;
+    }
+
+    struct timeval old_time = {0};
+    (void)gettimeofday(&old_time, NULL);
+    int old_valid = pj_time_sync_epoch_valid((int64_t)old_time.tv_sec);
+    int64_t old_epoch_ms = (int64_t)old_time.tv_sec * 1000ll +
+                           old_time.tv_usec / 1000;
+    if (settimeofday(tv, NULL) != 0) {
+        portENTER_CRITICAL(&g_connectivity_lock);
+        pj_time_sync_on_system_clock_failed(&g_time_sync_state, now_ms);
+        portEXIT_CRITICAL(&g_connectivity_lock);
+        esp_sntp_set_sync_status(SNTP_SYNC_STATUS_RESET);
+        ESP_LOGE(TAG, "SNTP UTC could not be published to POSIX system time");
+        return;
+    }
+
+    portENTER_CRITICAL(&g_connectivity_lock);
+    (void)pj_time_sync_on_success(&g_time_sync_state, (int64_t)tv->tv_sec,
+                                  old_valid, old_epoch_ms, now_ms);
+    if (g_wifi_state.has_ip) {
+        pj_wifi_state_set_last_success_utc(&g_wifi_state,
+                                           (int64_t)tv->tv_sec);
+    }
+    pj_time_sync_correction_t correction = g_time_sync_state.correction;
+    portEXIT_CRITICAL(&g_connectivity_lock);
+    esp_sntp_set_sync_status(SNTP_SYNC_STATUS_COMPLETED);
+    ESP_LOGI(TAG,
+             "SNTP UTC acquired (%s); local civil/RTC publication awaits timezone policy",
+             pj_time_sync_correction_name(correction));
+}
+
+static esp_err_t connectivity_sntp_ensure_initialized(void)
+{
+    if (g_sntp_initialized) {
+        return ESP_OK;
+    }
+    esp_sntp_config_t config = ESP_NETIF_SNTP_DEFAULT_CONFIG("pool.ntp.org");
+    config.start = false;
+    config.wait_for_sync = false;
+    config.smooth_sync = false;
+    config.sync_cb = NULL;
+    esp_err_t err = esp_netif_sntp_init(&config);
+    if (err == ESP_OK) {
+        g_sntp_initialized = 1;
+    }
+    return err;
+}
+
+static void connectivity_task(void *arg)
+{
+    (void)arg;
+    while (1) {
+        uint64_t now_ms = board_monotonic_ms();
+        portENTER_CRITICAL(&g_connectivity_lock);
+        pj_wifi_action_t wifi_action = pj_wifi_state_tick(&g_wifi_state, now_ms);
+        pj_time_sync_action_t time_action = pj_time_sync_tick(&g_time_sync_state,
+                                                               now_ms);
+        portEXIT_CRITICAL(&g_connectivity_lock);
+
+        if (g_wifi_started && wifi_action != PJ_WIFI_ACTION_NONE) {
+            if (wifi_action == PJ_WIFI_ACTION_RECONNECT) {
+                portENTER_CRITICAL(&g_connectivity_lock);
+                g_wifi_control_disconnect_pending = 1;
+                portEXIT_CRITICAL(&g_connectivity_lock);
+                esp_err_t disconnect_err = esp_wifi_disconnect();
+                if (disconnect_err == ESP_OK) {
+                    vTaskDelay(pdMS_TO_TICKS(PJ_WIFI_RECONNECT_SETTLE_MS));
+                } else {
+                    portENTER_CRITICAL(&g_connectivity_lock);
+                    g_wifi_control_disconnect_pending = 0;
+                    portEXIT_CRITICAL(&g_connectivity_lock);
+                }
+            }
+            esp_err_t connect_err = esp_wifi_connect();
+            if (connect_err != ESP_OK) {
+                portENTER_CRITICAL(&g_connectivity_lock);
+                pj_wifi_state_on_connect_request_failed(&g_wifi_state,
+                                                        board_monotonic_ms());
+                portEXIT_CRITICAL(&g_connectivity_lock);
+                ESP_LOGW(TAG, "Wi-Fi connect request failed: %s",
+                         esp_err_to_name(connect_err));
+            }
+        }
+
+        if (time_action == PJ_TIME_SYNC_ACTION_START) {
+            esp_err_t start_err = connectivity_sntp_ensure_initialized();
+            if (start_err == ESP_OK) {
+                /* ESP-IDF restarts the underlying SNTP client here, which is
+                 * the supported path for bounded retries and refreshes. */
+                start_err = esp_netif_sntp_start();
+            }
+            if (start_err != ESP_OK) {
+                portENTER_CRITICAL(&g_connectivity_lock);
+                pj_time_sync_on_start_failed(&g_time_sync_state,
+                                             board_monotonic_ms());
+                portEXIT_CRITICAL(&g_connectivity_lock);
+                ESP_LOGW(TAG, "SNTP start failed: %s",
+                         esp_err_to_name(start_err));
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(PJ_CONNECTIVITY_POLL_MS));
+    }
+}
+
+static esp_err_t connectivity_runtime_start(void)
+{
+    if (!g_connectivity_state_initialized) {
+        connectivity_state_init();
+    }
+    esp_err_t sntp_err = connectivity_sntp_ensure_initialized();
+    if (sntp_err != ESP_OK) {
+        ESP_LOGW(TAG, "SNTP initialization deferred: %s",
+                 esp_err_to_name(sntp_err));
+    }
+    if (g_connectivity_task_started) {
+        return ESP_OK;
+    }
+    BaseType_t created = xTaskCreate(connectivity_task, "pj-connectivity",
+                                     PJ_CONNECTIVITY_TASK_STACK, NULL, 4, NULL);
+    if (created != pdPASS) {
+        return ESP_ERR_NO_MEM;
+    }
+    g_connectivity_task_started = 1;
+    return ESP_OK;
+}
+
 static esp_err_t mdns_start(void)
 {
     if (g_mdns_started) {
@@ -994,41 +1192,83 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
 {
     (void)arg;
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
-        if (g_wifi_credentials_stored) {
-            ESP_ERROR_CHECK_WITHOUT_ABORT(esp_wifi_connect());
-        }
+        portENTER_CRITICAL(&g_connectivity_lock);
+        pj_wifi_state_on_driver_started(&g_wifi_state, board_monotonic_ms());
+        portEXIT_CRITICAL(&g_connectivity_lock);
+        return;
+    }
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_CONNECTED) {
+        portENTER_CRITICAL(&g_connectivity_lock);
+        pj_wifi_state_on_associated(&g_wifi_state, board_monotonic_ms());
+        portEXIT_CRITICAL(&g_connectivity_lock);
         return;
     }
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
         const wifi_event_sta_disconnected_t *event = event_data;
+        unsigned reason = event == NULL ? 0U : (unsigned)event->reason;
+        int control_disconnect = 0;
+        portENTER_CRITICAL(&g_connectivity_lock);
+        if (g_wifi_control_disconnect_pending) {
+            /* A DHCP/reprovision reconnect is transport control, not a new
+             * connection failure to classify or count. */
+            g_wifi_control_disconnect_pending = 0;
+            control_disconnect = 1;
+        } else {
+            pj_wifi_state_on_disconnected(&g_wifi_state, reason,
+                                          board_monotonic_ms());
+        }
+        pj_time_sync_on_network_lost(&g_time_sync_state,
+                                     board_monotonic_ms());
+        portEXIT_CRITICAL(&g_connectivity_lock);
         g_status.wifi = PJ_BOARD_SERVICE_UNAVAILABLE;
         (void)snprintf(g_status.ip_addr, sizeof(g_status.ip_addr), "0.0.0.0");
-        (void)snprintf(g_status.last_error, sizeof(g_status.last_error),
-                       "Wi-Fi disconnected (reason %u); reconnecting",
-                       event == NULL ? 0U : (unsigned)event->reason);
-        if (g_wifi_credentials_stored) {
-            esp_err_t err = esp_wifi_connect();
-            if (err != ESP_OK) {
-                ESP_LOGW(TAG, "Wi-Fi reconnect request failed: %s", esp_err_to_name(err));
-            }
+        if (!control_disconnect) {
+            (void)snprintf(g_status.last_error, sizeof(g_status.last_error),
+                           "Wi-Fi disconnected (reason %u); retry scheduled",
+                           reason);
         }
         return;
     }
     if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         const ip_event_got_ip_t *event = event_data;
+        wifi_ap_record_t ap = {0};
+        int rssi_dbm = -127;
+        unsigned channel = 0;
+        if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) {
+            rssi_dbm = ap.rssi;
+            channel = ap.primary;
+        }
+        portENTER_CRITICAL(&g_connectivity_lock);
+        pj_wifi_state_on_got_ip(&g_wifi_state, board_monotonic_ms(),
+                                rssi_dbm, channel);
+        pj_time_sync_on_ip(&g_time_sync_state, board_monotonic_ms());
+        portEXIT_CRITICAL(&g_connectivity_lock);
         g_status.wifi = PJ_BOARD_SERVICE_READY;
         if (event != NULL) {
             (void)snprintf(g_status.ip_addr, sizeof(g_status.ip_addr), IPSTR,
                            IP2STR(&event->ip_info.ip));
         }
         g_status.last_error[0] = '\0';
-        ESP_LOGI(TAG, "Wi-Fi connected: ssid=%s ip=%s", g_wifi_ssid, g_status.ip_addr);
+        ESP_LOGI(TAG, "Wi-Fi connected: ip=%s rssi=%d channel=%u",
+                 g_status.ip_addr, rssi_dbm, channel);
         esp_err_t mdns_err = mdns_start();
         if (mdns_err != ESP_OK) {
             (void)snprintf(g_status.last_error, sizeof(g_status.last_error),
                            "mDNS start failed: %s", esp_err_to_name(mdns_err));
             ESP_LOGW(TAG, "%s", g_status.last_error);
         }
+        return;
+    }
+    if (event_base == IP_EVENT && event_id == IP_EVENT_STA_LOST_IP) {
+        portENTER_CRITICAL(&g_connectivity_lock);
+        pj_wifi_state_on_lost_ip(&g_wifi_state, board_monotonic_ms());
+        pj_time_sync_on_network_lost(&g_time_sync_state,
+                                     board_monotonic_ms());
+        portEXIT_CRITICAL(&g_connectivity_lock);
+        g_status.wifi = PJ_BOARD_SERVICE_UNAVAILABLE;
+        (void)snprintf(g_status.ip_addr, sizeof(g_status.ip_addr), "0.0.0.0");
+        (void)snprintf(g_status.last_error, sizeof(g_status.last_error),
+                       "Wi-Fi lost its DHCP lease; retry scheduled");
     }
 }
 
@@ -1064,18 +1304,37 @@ static esp_err_t wifi_start_or_reconfigure(void)
         ESP_RETURN_ON_ERROR(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
                                                        wifi_event_handler, NULL),
                             TAG, "IP event handler registration failed");
+        ESP_RETURN_ON_ERROR(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_LOST_IP,
+                                                       wifi_event_handler, NULL),
+                            TAG, "lost-IP event handler registration failed");
         ESP_RETURN_ON_ERROR(esp_wifi_set_storage(WIFI_STORAGE_RAM), TAG, "Wi-Fi RAM storage failed");
         ESP_RETURN_ON_ERROR(esp_wifi_set_mode(WIFI_MODE_STA), TAG, "Wi-Fi station mode failed");
         ESP_RETURN_ON_ERROR(wifi_apply_config(), TAG, "Wi-Fi station config failed");
         ESP_RETURN_ON_ERROR(esp_wifi_start(), TAG, "Wi-Fi start failed");
         g_wifi_started = 1;
     } else {
-        (void)esp_wifi_disconnect();
+        portENTER_CRITICAL(&g_connectivity_lock);
+        g_wifi_control_disconnect_pending = 1;
+        portEXIT_CRITICAL(&g_connectivity_lock);
+        esp_err_t disconnect_err = esp_wifi_disconnect();
+        if (disconnect_err == ESP_OK) {
+            vTaskDelay(pdMS_TO_TICKS(PJ_WIFI_RECONNECT_SETTLE_MS));
+        } else {
+            portENTER_CRITICAL(&g_connectivity_lock);
+            g_wifi_control_disconnect_pending = 0;
+            portEXIT_CRITICAL(&g_connectivity_lock);
+        }
         ESP_RETURN_ON_ERROR(wifi_apply_config(), TAG, "Wi-Fi station reconfiguration failed");
-        ESP_RETURN_ON_ERROR(esp_wifi_connect(), TAG, "Wi-Fi reconnect failed");
     }
+    portENTER_CRITICAL(&g_connectivity_lock);
+    pj_wifi_state_set_provisioned(&g_wifi_state, 1, board_monotonic_ms());
+    pj_wifi_state_on_driver_started(&g_wifi_state, board_monotonic_ms());
+    portEXIT_CRITICAL(&g_connectivity_lock);
+    ESP_RETURN_ON_ERROR(connectivity_runtime_start(), TAG,
+                        "connectivity task start failed");
     g_status.wifi = PJ_BOARD_SERVICE_UNAVAILABLE;
-    (void)snprintf(g_status.last_error, sizeof(g_status.last_error), "Wi-Fi connecting to %s", g_wifi_ssid);
+    (void)snprintf(g_status.last_error, sizeof(g_status.last_error),
+                   "Wi-Fi connecting");
     return ESP_OK;
 }
 
@@ -3480,21 +3739,23 @@ static int rtc_read_status_time(void)
                               board_monotonic_ms(), 1);
 }
 
-static esp_err_t rtc_write_status_time(void)
+static esp_err_t rtc_write_civil_time(int hour, int minute, int year,
+                                      int month, int day, int second)
 {
-    board_time_snapshot_t time = board_time_snapshot();
-    if (!g_rtc_ready || g_rtc_dev == NULL || !time.time_set) {
+    if (!g_rtc_ready || g_rtc_dev == NULL ||
+        !valid_time_date(hour, minute, year, month, day) ||
+        second < 0 || second > 59) {
         return ESP_ERR_INVALID_STATE;
     }
     uint8_t data[8] = {
         0x04,
-        u8_to_bcd(0),
-        u8_to_bcd((uint8_t)time.minute),
-        u8_to_bcd((uint8_t)time.hour),
-        u8_to_bcd((uint8_t)time.day),
-        u8_to_bcd((uint8_t)board_weekday_from_date(time.year, time.month, time.day)),
-        u8_to_bcd((uint8_t)time.month),
-        u8_to_bcd((uint8_t)(time.year - 2000)),
+        u8_to_bcd((uint8_t)second),
+        u8_to_bcd((uint8_t)minute),
+        u8_to_bcd((uint8_t)hour),
+        u8_to_bcd((uint8_t)day),
+        u8_to_bcd((uint8_t)board_weekday_from_date(year, month, day)),
+        u8_to_bcd((uint8_t)month),
+        u8_to_bcd((uint8_t)(year - 2000)),
     };
     if (!rtc_sequence_take(pdMS_TO_TICKS(200))) {
         return ESP_ERR_TIMEOUT;
@@ -3511,6 +3772,16 @@ static esp_err_t rtc_write_status_time(void)
     i2c_give();
     rtc_sequence_give();
     return err;
+}
+
+static esp_err_t rtc_write_status_time(void)
+{
+    board_time_snapshot_t time = board_time_snapshot();
+    if (!time.time_set) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    return rtc_write_civil_time(time.hour, time.minute, time.year,
+                                time.month, time.day, 0);
 }
 
 static uint32_t time_controller_next_boot_id(void *context)
@@ -5054,6 +5325,7 @@ void pj_board_init(const pj_board_profile_t *profile)
     } else {
         rtc_wake_restore();
     }
+    connectivity_state_init();
 
     esp_err_t display_err = display_init();
     if (display_err == ESP_OK) {
@@ -5143,6 +5415,7 @@ pj_board_status_t pj_board_status(void)
     status.month = time.month;
     status.day = time.day;
     status.time_set = time.time_set;
+    connectivity_state_snapshot(&status.wifi_diagnostics, &status.time_sync);
     return status;
 #else
     return g_status;
@@ -6062,27 +6335,33 @@ static int json_int_field(const char *json, const char *field, int *value)
     return 1;
 }
 
-static void board_set_time_date(int hour, int minute, int year, int month, int day, const char *source)
+static int board_set_time_date(int hour, int minute, int year, int month, int day,
+                               const char *source)
 {
-    if (!board_time_publish(hour, minute, year, month, day, 0,
-                            board_monotonic_ms(), 0)) {
+    if (!valid_time_date(hour, minute, year, month, day)) {
         ESP_LOGE(TAG, "Rejected invalid time/date from %s", source);
-        return;
+        return 0;
     }
-    esp_err_t err = rtc_write_status_time();
-    if (err == ESP_OK) {
-        portENTER_CRITICAL(&g_time_lock);
-        g_time_wall_trusted = 1;
-        portEXIT_CRITICAL(&g_time_lock);
-    } else {
+    esp_err_t err = rtc_write_civil_time(hour, minute, year, month, day, 0);
+    if (err != ESP_OK) {
         (void)snprintf(g_status.last_error, sizeof(g_status.last_error),
-                       "RTC write failed after %s time update: %s",
+                       "RTC write failed for %s time update: %s",
                        source, esp_err_to_name(err));
         ESP_LOGW(TAG, "%s", g_status.last_error);
+        return 0;
     }
+    if (!board_time_publish(hour, minute, year, month, day, 0,
+                            board_monotonic_ms(), 1)) {
+        ESP_LOGE(TAG, "Rejected invalid time/date from %s", source);
+        return 0;
+    }
+    portENTER_CRITICAL(&g_connectivity_lock);
+    g_time_sync_state.time_known = 1;
+    portEXIT_CRITICAL(&g_connectivity_lock);
     board_time_mark_pending();
     ESP_LOGI(TAG, "Time/date updated from %s: %02d:%02d %04d-%02d-%02d",
              source, hour, minute, year, month, day);
+    return 1;
 }
 
 static void serial_trim_line(char *line)
@@ -6186,6 +6465,117 @@ static int hex_decode_string(const char *hex, char *out, size_t out_size)
     return 1;
 }
 
+static int connectivity_add_json(cJSON *json, const pj_board_status_t *status)
+{
+    cJSON *wifi = cJSON_AddObjectToObject(json, "wifi_diagnostics");
+    cJSON *time_sync = cJSON_AddObjectToObject(json, "time_sync");
+    if (wifi == NULL || time_sync == NULL) {
+        return 0;
+    }
+
+    const pj_wifi_state_t *wifi_state = &status->wifi_diagnostics;
+    cJSON_AddBoolToObject(wifi, "provisioned", wifi_state->provisioned != 0);
+    cJSON_AddStringToObject(wifi, "state", service_name(status->wifi));
+    cJSON_AddStringToObject(wifi, "phase",
+                            pj_wifi_phase_name(wifi_state->phase));
+    cJSON_AddStringToObject(wifi, "ip", status->ip_addr);
+    cJSON_AddStringToObject(wifi, "dhcp_state",
+                            pj_wifi_dhcp_state_name(wifi_state->dhcp_state));
+    if (wifi_state->last_disconnect_reason == 0) {
+        cJSON_AddNullToObject(wifi, "last_disconnect_reason");
+    } else {
+        cJSON_AddNumberToObject(wifi, "last_disconnect_reason",
+                                wifi_state->last_disconnect_reason);
+    }
+    cJSON_AddStringToObject(wifi, "retry_state",
+                            pj_wifi_retry_state_name(wifi_state->retry_state));
+    cJSON_AddNumberToObject(wifi, "retry_count", wifi_state->retry_count);
+    cJSON_AddNumberToObject(wifi, "backoff_ms", wifi_state->backoff_ms);
+    if (wifi_state->ap_visible < 0) {
+        cJSON_AddNullToObject(wifi, "ap_visible");
+    } else {
+        cJSON_AddBoolToObject(wifi, "ap_visible",
+                              wifi_state->ap_visible != 0);
+    }
+    if (wifi_state->has_ip) {
+        cJSON_AddNumberToObject(wifi, "rssi_dbm", wifi_state->rssi_dbm);
+        cJSON_AddNumberToObject(wifi, "channel", wifi_state->channel);
+    } else {
+        cJSON_AddNullToObject(wifi, "rssi_dbm");
+        cJSON_AddNullToObject(wifi, "channel");
+    }
+    char wifi_success[32] = {0};
+    if (format_utc_time(wifi_state->last_success_utc_s, wifi_success,
+                        sizeof(wifi_success))) {
+        cJSON_AddStringToObject(wifi, "last_success_utc", wifi_success);
+    } else {
+        cJSON_AddNullToObject(wifi, "last_success_utc");
+    }
+
+    const pj_time_sync_state_t *sync_state = &status->time_sync;
+    cJSON_AddStringToObject(time_sync, "state",
+                            pj_time_sync_state_name(sync_state->state));
+    cJSON_AddStringToObject(time_sync, "failure",
+                            pj_time_sync_failure_name(sync_state->failure));
+    cJSON_AddStringToObject(time_sync, "publication",
+                            pj_time_sync_publication_name(sync_state->publication));
+    cJSON_AddStringToObject(time_sync, "correction",
+                            pj_time_sync_correction_name(sync_state->correction));
+    cJSON_AddStringToObject(time_sync, "system_clock", "utc");
+    cJSON_AddStringToObject(time_sync, "civil_time_semantics", "local");
+    cJSON_AddStringToObject(time_sync, "server", "pool.ntp.org");
+    cJSON_AddBoolToObject(time_sync, "has_ip", sync_state->has_ip != 0);
+    cJSON_AddNumberToObject(time_sync, "attempt_count",
+                            sync_state->attempt_count);
+    cJSON_AddNumberToObject(time_sync, "backoff_ms", sync_state->backoff_ms);
+    cJSON_AddNumberToObject(time_sync, "last_offset_ms",
+                            (double)sync_state->last_offset_ms);
+    char sync_success[32] = {0};
+    if (format_utc_time(sync_state->last_success_utc_s, sync_success,
+                        sizeof(sync_success))) {
+        cJSON_AddStringToObject(time_sync, "last_success_utc", sync_success);
+    } else {
+        cJSON_AddNullToObject(time_sync, "last_success_utc");
+    }
+    return 1;
+}
+
+static void serial_print_status(void)
+{
+    int pending_sync = 0;
+    int transferred_sync = 0;
+    collect_sync_counts(&pending_sync, &transferred_sync);
+    pj_board_status_t status = pj_board_status();
+    cJSON *json = cJSON_CreateObject();
+    if (json == NULL) {
+        printf("PJ_ERR {\"error\":\"status allocation failed\"}\n");
+        return;
+    }
+    cJSON_AddStringToObject(json, "device_id", status.device_id);
+    cJSON_AddStringToObject(json, "storage", service_name(status.storage));
+    cJSON_AddStringToObject(json, "audio", service_name(status.audio));
+    cJSON_AddBoolToObject(json, "time_set", status.time_set != 0);
+    cJSON_AddBoolToObject(json, "wifi_provisioned",
+                          status.wifi_diagnostics.provisioned != 0);
+    cJSON_AddStringToObject(json, "wifi", service_name(status.wifi));
+    cJSON_AddStringToObject(json, "ip", status.ip_addr);
+    cJSON_AddNumberToObject(json, "pending_sync", pending_sync);
+    cJSON_AddNumberToObject(json, "transferred_sync", transferred_sync);
+    if (!connectivity_add_json(json, &status)) {
+        cJSON_Delete(json);
+        printf("PJ_ERR {\"error\":\"status allocation failed\"}\n");
+        return;
+    }
+    char *encoded = cJSON_PrintUnformatted(json);
+    cJSON_Delete(json);
+    if (encoded == NULL) {
+        printf("PJ_ERR {\"error\":\"status encoding failed\"}\n");
+        return;
+    }
+    printf("PJ_OK %s\n", encoded);
+    cJSON_free(encoded);
+}
+
 static void serial_command_task(void *arg)
 {
     (void)arg;
@@ -6228,19 +6618,7 @@ static void serial_command_task(void *arg)
             continue;
         }
         if (strcmp(line, "PJ_STATUS") == 0) {
-            int pending_sync = 0;
-            int transferred_sync = 0;
-            collect_sync_counts(&pending_sync, &transferred_sync);
-            printf("PJ_OK {\"device_id\":\"%s\",\"storage\":\"%s\",\"audio\":\"%s\",\"time_set\":%s,\"wifi_provisioned\":%s,\"wifi\":\"%s\",\"ip\":\"%s\",\"pending_sync\":%d,\"transferred_sync\":%d}\n",
-                   g_status.device_id,
-                   service_name(g_status.storage),
-                   service_name(g_status.audio),
-                   g_status.time_set ? "true" : "false",
-                   g_wifi_credentials_stored ? "true" : "false",
-                   service_name(g_status.wifi),
-                   g_status.ip_addr,
-                   pending_sync,
-                   transferred_sync);
+            serial_print_status();
             fflush(stdout);
             continue;
         }
@@ -6455,9 +6833,13 @@ static void serial_command_task(void *arg)
             int minute = 0;
             if (sscanf(time_payload, "%d %d %d %d %d", &year, &month, &day, &hour, &minute) == 5 &&
                 valid_time_date(hour, minute, year, month, day)) {
-                board_set_time_date(hour, minute, year, month, day, "USB-C partner");
-                printf("PJ_OK {\"hour\":%d,\"minute\":%d,\"year\":%d,\"month\":%d,\"day\":%d}\n",
-                       hour, minute, year, month, day);
+                if (board_set_time_date(hour, minute, year, month, day,
+                                        "USB-C partner")) {
+                    printf("PJ_OK {\"hour\":%d,\"minute\":%d,\"year\":%d,\"month\":%d,\"day\":%d}\n",
+                           hour, minute, year, month, day);
+                } else {
+                    printf("PJ_ERR {\"error\":\"time update could not be persisted to RTC\"}\n");
+                }
             } else {
                 printf("PJ_ERR {\"error\":\"expected PJ_TIME yyyy mm dd hh mm\"}\n");
             }
@@ -6490,6 +6872,7 @@ static esp_err_t status_handler(httpd_req_t *req)
     }
     int pending_sync = 0;
     int transferred_sync = 0;
+    pj_board_status_t status = pj_board_status();
     if (g_status.storage_mounted) {
         (void)storage_refresh_capacity();
     }
@@ -6534,6 +6917,11 @@ static esp_err_t status_handler(httpd_req_t *req)
     cJSON_AddNumberToObject(json, "pending_sync", pending_sync);
     cJSON_AddNumberToObject(json, "transferred_sync", transferred_sync);
     cJSON_AddStringToObject(json, "last_error", g_status.last_error);
+    if (!connectivity_add_json(json, &status)) {
+        cJSON_Delete(json);
+        httpd_resp_set_status(req, "503 Service Unavailable");
+        return send_json(req, "{\"error\":\"status allocation failed\"}");
+    }
     char *encoded = cJSON_PrintUnformatted(json);
     cJSON_Delete(json);
     if (encoded == NULL) {
@@ -6583,7 +6971,11 @@ static esp_err_t time_put_handler(httpd_req_t *req)
         httpd_resp_set_status(req, "400 Bad Request");
         return send_json(req, "{\"error\":\"expected hour/minute/month/day integers; optional year\"}");
     }
-    board_set_time_date(hour, minute, year, month, day, "HTTP");
+    if (!board_set_time_date(hour, minute, year, month, day, "HTTP")) {
+        httpd_resp_set_status(req, "503 Service Unavailable");
+        return send_json(req,
+                         "{\"error\":\"time update could not be persisted to RTC\"}");
+    }
     return time_get_handler(req);
 }
 
