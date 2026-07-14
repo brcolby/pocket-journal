@@ -16,6 +16,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <inttypes.h>
 #ifdef ESP_PLATFORM
 #include <ctype.h>
 #include <dirent.h>
@@ -90,6 +91,8 @@
 #define PJ_NVS_TEMP_F "temp_f"
 #define PJ_NVS_TEXT_SIZE "text_size"
 #define PJ_NVS_SETTINGS_VERSION "set_ver"
+#define PJ_NVS_SETTINGS_SLOT_0 "settings_0"
+#define PJ_NVS_SETTINGS_SLOT_1 "settings_1"
 #define PJ_SETTINGS_VERSION 2
 #define PJ_NVS_STATIC_ART_SLOT "art_slot"
 #define PJ_NVS_HOME_LAYOUT "home_layout"
@@ -187,6 +190,11 @@
 
 static pj_board_status_t g_status;
 static pj_settings_t g_settings;
+#ifdef ESP_PLATFORM
+static pj_settings_store_t g_settings_store;
+static int g_settings_store_ready;
+static esp_err_t g_settings_io_error = ESP_OK;
+#endif
 static pj_static_art_t g_static_art;
 static pj_home_layout_t g_home_layout;
 static int g_static_art_valid;
@@ -1272,100 +1280,190 @@ static esp_err_t static_art_save(const pj_static_art_t *art, int *saved_slot)
     return err;
 }
 
-static int nvs_read_i32(nvs_handle_t nvs, const char *key, int *value)
+static esp_err_t nvs_read_optional_i32(nvs_handle_t nvs, const char *key,
+                                       int *value, int *found)
 {
     int32_t stored = 0;
-    if (nvs_get_i32(nvs, key, &stored) != ESP_OK) {
-        return 0;
+    esp_err_t err = nvs_get_i32(nvs, key, &stored);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        *found = 0;
+        return ESP_OK;
+    }
+    if (err != ESP_OK) {
+        return err;
     }
     *value = (int)stored;
-    return 1;
+    *found = 1;
+    return ESP_OK;
 }
 
-static void settings_load(void)
+static const char *settings_slot_key(unsigned slot)
 {
-    pj_settings_t loaded;
-    pj_settings_defaults(&loaded);
+    return slot == 0 ? PJ_NVS_SETTINGS_SLOT_0 : PJ_NVS_SETTINGS_SLOT_1;
+}
+
+static pj_settings_io_result_t settings_read_slot(
+    void *context, unsigned slot, uint8_t *record, size_t *record_size)
+{
+    (void)context;
+    if (slot >= PJ_SETTINGS_SLOT_COUNT || record == NULL || record_size == NULL) {
+        g_settings_io_error = ESP_ERR_INVALID_ARG;
+        return PJ_SETTINGS_IO_ERROR;
+    }
     nvs_handle_t nvs;
-    if (nvs_open(PJ_NVS_NAMESPACE, NVS_READONLY, &nvs) != ESP_OK) {
-        g_settings = loaded;
-        return;
+    esp_err_t err = nvs_open(PJ_NVS_NAMESPACE, NVS_READONLY, &nvs);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        return PJ_SETTINGS_IO_NOT_FOUND;
+    }
+    if (err != ESP_OK) {
+        g_settings_io_error = err;
+        return PJ_SETTINGS_IO_ERROR;
+    }
+
+    size_t stored_size = 0;
+    err = nvs_get_blob(nvs, settings_slot_key(slot), NULL, &stored_size);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        nvs_close(nvs);
+        return PJ_SETTINGS_IO_NOT_FOUND;
+    }
+    if (err != ESP_OK || stored_size > *record_size) {
+        nvs_close(nvs);
+        g_settings_io_error = err == ESP_OK ? ESP_ERR_INVALID_SIZE : err;
+        return PJ_SETTINGS_IO_ERROR;
+    }
+    err = nvs_get_blob(nvs, settings_slot_key(slot), record, &stored_size);
+    nvs_close(nvs);
+    if (err != ESP_OK) {
+        g_settings_io_error = err;
+        return PJ_SETTINGS_IO_ERROR;
+    }
+    *record_size = stored_size;
+    return PJ_SETTINGS_IO_OK;
+}
+
+static pj_settings_io_result_t settings_write_slot(
+    void *context, unsigned slot, const uint8_t *record, size_t record_size)
+{
+    (void)context;
+    if (slot >= PJ_SETTINGS_SLOT_COUNT || record == NULL ||
+        record_size != PJ_SETTINGS_RECORD_BYTES) {
+        g_settings_io_error = ESP_ERR_INVALID_ARG;
+        return PJ_SETTINGS_IO_ERROR;
+    }
+    nvs_handle_t nvs;
+    esp_err_t err = nvs_open(PJ_NVS_NAMESPACE, NVS_READWRITE, &nvs);
+    if (err == ESP_OK) {
+        err = nvs_set_blob(nvs, settings_slot_key(slot), record, record_size);
+        if (err == ESP_OK) {
+            err = nvs_commit(nvs);
+        }
+        nvs_close(nvs);
+    }
+    if (err != ESP_OK) {
+        g_settings_io_error = err;
+        return PJ_SETTINGS_IO_ERROR;
+    }
+    g_settings_io_error = ESP_OK;
+    return PJ_SETTINGS_IO_OK;
+}
+
+static esp_err_t settings_load_legacy(pj_settings_t *loaded)
+{
+    pj_settings_defaults(loaded);
+    nvs_handle_t nvs;
+    esp_err_t err = nvs_open(PJ_NVS_NAMESPACE, NVS_READONLY, &nvs);
+    if (err != ESP_OK) {
+        return err;
     }
 
     int value = 0;
-    if (nvs_read_i32(nvs, PJ_NVS_VOLUME, &value) && value >= 0 && value <= 10) {
-        loaded.volume = value;
-    }
-    if (nvs_read_i32(nvs, PJ_NVS_DARK_MODE, &value) && (value == 0 || value == 1)) {
-        loaded.dark_mode = value;
-    }
-    if (nvs_read_i32(nvs, PJ_NVS_ALARM_ENABLED, &value) && (value == 0 || value == 1)) {
-        loaded.alarm_enabled = value;
-    }
-    if (nvs_read_i32(nvs, PJ_NVS_ALARM_HOUR, &value) && value >= 0 && value <= 23) {
-        loaded.alarm_hour = value;
-    }
-    if (nvs_read_i32(nvs, PJ_NVS_ALARM_MINUTE, &value) && value >= 0 && value <= 59) {
-        loaded.alarm_minute = value;
-    }
-    if (nvs_read_i32(nvs, PJ_NVS_TIMER_SECONDS, &value) && value >= 30 && value <= 86400) {
-        loaded.timer_seconds = value;
-    }
-    int interval_loaded = nvs_read_i32(nvs, PJ_NVS_INTERVAL_SECONDS, &value) &&
-        value >= 60 && value <= 86400;
-    if (interval_loaded) {
-        loaded.interval_seconds = value;
-    }
-    if (nvs_read_i32(nvs, PJ_NVS_CLOCK_24H, &value) && (value == 0 || value == 1)) {
-        loaded.clock_24h = value;
-    }
-    if (nvs_read_i32(nvs, PJ_NVS_TEMP_F, &value) && (value == 0 || value == 1)) {
-        loaded.temperature_fahrenheit = value;
-    }
-    if (nvs_read_i32(nvs, PJ_NVS_TEXT_SIZE, &value) && value >= 2 && value <= 3) {
-        loaded.transcript_font_size = value;
-    }
+    int found = 0;
+    int found_any = 0;
+#define READ_LEGACY(key, field) do { \
+        err = nvs_read_optional_i32(nvs, (key), &value, &found); \
+        if (err != ESP_OK) { \
+            goto done; \
+        } \
+        if (found) { \
+            (field) = value; \
+            found_any = 1; \
+        } \
+    } while (0)
+    READ_LEGACY(PJ_NVS_VOLUME, loaded->volume);
+    READ_LEGACY(PJ_NVS_DARK_MODE, loaded->dark_mode);
+    READ_LEGACY(PJ_NVS_ALARM_ENABLED, loaded->alarm_enabled);
+    READ_LEGACY(PJ_NVS_ALARM_HOUR, loaded->alarm_hour);
+    READ_LEGACY(PJ_NVS_ALARM_MINUTE, loaded->alarm_minute);
+    READ_LEGACY(PJ_NVS_TIMER_SECONDS, loaded->timer_seconds);
+    READ_LEGACY(PJ_NVS_INTERVAL_SECONDS, loaded->interval_seconds);
+    int interval_loaded = found;
+    READ_LEGACY(PJ_NVS_CLOCK_24H, loaded->clock_24h);
+    READ_LEGACY(PJ_NVS_TEMP_F, loaded->temperature_fahrenheit);
+    READ_LEGACY(PJ_NVS_TEXT_SIZE, loaded->transcript_font_size);
     int settings_version = 0;
-    (void)nvs_read_i32(nvs, PJ_NVS_SETTINGS_VERSION, &settings_version);
+    READ_LEGACY(PJ_NVS_SETTINGS_VERSION, settings_version);
+#undef READ_LEGACY
     if (settings_version < PJ_SETTINGS_VERSION && interval_loaded &&
-        loaded.interval_seconds == 1500) {
-        loaded.interval_seconds = 90;
+        loaded->interval_seconds == 1500) {
+        loaded->interval_seconds = 90;
     }
+    if (!found_any) {
+        err = ESP_ERR_NVS_NOT_FOUND;
+    } else if (!pj_settings_valid(loaded)) {
+        err = ESP_ERR_INVALID_STATE;
+    }
+done:
     nvs_close(nvs);
+    return err;
+}
+
+static esp_err_t settings_load(void)
+{
+    pj_settings_store_init(&g_settings_store, NULL, settings_read_slot,
+                           settings_write_slot);
+    g_settings_store_ready = 0;
+    g_settings_io_error = ESP_OK;
+
+    pj_settings_t loaded;
+    pj_settings_load_result_t result = pj_settings_store_load(
+        &g_settings_store, &loaded);
+    if (result == PJ_SETTINGS_LOAD_ERROR) {
+        return g_settings_io_error == ESP_OK ? ESP_ERR_INVALID_CRC :
+                                               g_settings_io_error;
+    }
+    if (result == PJ_SETTINGS_LOAD_NOT_FOUND) {
+        esp_err_t legacy_err = settings_load_legacy(&loaded);
+        if (legacy_err == ESP_ERR_NVS_NOT_FOUND) {
+            pj_settings_defaults(&loaded);
+        } else if (legacy_err != ESP_OK) {
+            return legacy_err;
+        }
+        g_settings_store_ready = 1;
+        if (!pj_settings_store_save(&g_settings_store, &loaded)) {
+            ESP_LOGW(TAG, "Settings migration save failed: %s",
+                     esp_err_to_name(g_settings_io_error));
+        }
+    } else {
+        g_settings_store_ready = !g_settings_store.degraded;
+    }
+
     g_settings = loaded;
-    ESP_LOGI(TAG, "Settings loaded: volume=%d theme=%s", loaded.volume,
-             loaded.dark_mode ? "dark" : "light");
+    ESP_LOGI(TAG, "Settings loaded: volume=%d theme=%s generation=%" PRIu32,
+             loaded.volume, loaded.dark_mode ? "dark" : "light",
+             g_settings_store.generation);
+    return g_settings_store.degraded ?
+        (g_settings_io_error == ESP_OK ? ESP_FAIL : g_settings_io_error) :
+        ESP_OK;
 }
 
 static esp_err_t settings_save(const pj_settings_t *settings)
 {
-    nvs_handle_t nvs;
-    esp_err_t err = nvs_open(PJ_NVS_NAMESPACE, NVS_READWRITE, &nvs);
-    if (err != ESP_OK) {
-        return err;
+    if (!g_settings_store_ready) {
+        return ESP_ERR_INVALID_STATE;
     }
-#define SET_SETTING(key, value) do { \
-        if (err == ESP_OK) { \
-            err = nvs_set_i32(nvs, (key), (int32_t)(value)); \
-        } \
-    } while (0)
-    SET_SETTING(PJ_NVS_VOLUME, settings->volume);
-    SET_SETTING(PJ_NVS_DARK_MODE, settings->dark_mode);
-    SET_SETTING(PJ_NVS_ALARM_ENABLED, settings->alarm_enabled);
-    SET_SETTING(PJ_NVS_ALARM_HOUR, settings->alarm_hour);
-    SET_SETTING(PJ_NVS_ALARM_MINUTE, settings->alarm_minute);
-    SET_SETTING(PJ_NVS_TIMER_SECONDS, settings->timer_seconds);
-    SET_SETTING(PJ_NVS_INTERVAL_SECONDS, settings->interval_seconds);
-    SET_SETTING(PJ_NVS_CLOCK_24H, settings->clock_24h);
-    SET_SETTING(PJ_NVS_TEMP_F, settings->temperature_fahrenheit);
-    SET_SETTING(PJ_NVS_TEXT_SIZE, settings->transcript_font_size);
-    SET_SETTING(PJ_NVS_SETTINGS_VERSION, PJ_SETTINGS_VERSION);
-#undef SET_SETTING
-    if (err == ESP_OK) {
-        err = nvs_commit(nvs);
-    }
-    nvs_close(nvs);
-    return err;
+    g_settings_io_error = ESP_OK;
+    return pj_settings_store_save(&g_settings_store, settings) ? ESP_OK :
+        (g_settings_io_error == ESP_OK ? ESP_FAIL : g_settings_io_error);
 }
 
 static pj_time_controller_load_result_t time_controller_load_record(
@@ -4758,7 +4856,20 @@ void pj_board_init(const pj_board_profile_t *profile)
     if (g_settings_lock == NULL) {
         ESP_LOGW(TAG, "Settings mutex allocation failed");
     }
-    settings_load();
+    esp_err_t settings_err = ESP_FAIL;
+    for (int attempt = 0; attempt < 3 && settings_err != ESP_OK; attempt++) {
+        settings_err = settings_load();
+        if (settings_err != ESP_OK && attempt < 2) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+    }
+    if (settings_err != ESP_OK) {
+        (void)snprintf(g_status.last_error, sizeof(g_status.last_error),
+                       "settings load failed: %s",
+                       esp_err_to_name(settings_err));
+        ESP_LOGW(TAG, "%s; preserving in-memory defaults without writing NVS",
+                 g_status.last_error);
+    }
     g_home_layout_lock = xSemaphoreCreateMutex();
     if (g_home_layout_lock == NULL) {
         ESP_LOGW(TAG, "Home layout mutex allocation failed");

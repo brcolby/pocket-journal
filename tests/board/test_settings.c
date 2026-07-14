@@ -131,6 +131,15 @@ static void test_load_outcomes_and_selection(void)
     assert(pj_settings_store_load(&store, &output) == PJ_SETTINGS_LOAD_OK);
     assert(output.volume == 3);
     assert(store.active_slot == 0);
+    assert(store.degraded);
+    assert(!pj_settings_store_save(&store, &newer));
+
+    fixture.read_results[1] = PJ_SETTINGS_IO_OK;
+    fixture.slots[1][17] ^= 0x80;
+    assert(pj_settings_store_load(&store, &output) == PJ_SETTINGS_LOAD_OK);
+    assert(output.volume == 3);
+    assert(!store.degraded);
+    assert(pj_settings_store_save(&store, &newer));
 }
 
 static void test_generation_wrap_and_ambiguous_records(void)
@@ -155,6 +164,8 @@ static void test_generation_wrap_and_ambiguous_records(void)
     pj_settings_t unchanged = output;
     assert(pj_settings_store_load(&store, &output) == PJ_SETTINGS_LOAD_ERROR);
     assert(memcmp(&output, &unchanged, sizeof(output)) == 0);
+    assert(!store.has_record);
+    assert(store.active_slot == -1);
 }
 
 static void test_save_rotation_and_power_loss(void)
@@ -178,6 +189,10 @@ static void test_save_rotation_and_power_loss(void)
     pj_settings_t third = second;
     third.dark_mode = 1;
     fixture.fail_write = 1;
+    assert(!pj_settings_store_save(&store, &third));
+    assert(store.active_slot == 1);
+    assert(store.generation == 2);
+
     fixture.partial_write = 1;
     assert(!pj_settings_store_save(&store, &third));
     assert(store.active_slot == 1);

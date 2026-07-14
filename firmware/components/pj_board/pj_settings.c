@@ -191,10 +191,16 @@ pj_settings_load_result_t pj_settings_store_load(pj_settings_store_t *store,
         return PJ_SETTINGS_LOAD_ERROR;
     }
 
+    store->has_record = 0;
+    store->active_slot = -1;
+    store->generation = 0;
+    store->degraded = 0;
+
     pj_settings_t candidates[PJ_SETTINGS_SLOT_COUNT];
     uint32_t generations[PJ_SETTINGS_SLOT_COUNT] = {0};
     int valid[PJ_SETTINGS_SLOT_COUNT] = {0};
-    int saw_error = 0;
+    int saw_io_error = 0;
+    int saw_invalid = 0;
     int saw_not_found = 0;
 
     for (unsigned slot = 0; slot < PJ_SETTINGS_SLOT_COUNT; slot++) {
@@ -206,10 +212,13 @@ pj_settings_load_result_t pj_settings_store_load(pj_settings_store_t *store,
             saw_not_found = 1;
             continue;
         }
-        if (result != PJ_SETTINGS_IO_OK ||
-            !pj_settings_decode_record(record, record_size, &candidates[slot],
+        if (result != PJ_SETTINGS_IO_OK) {
+            saw_io_error = 1;
+            continue;
+        }
+        if (!pj_settings_decode_record(record, record_size, &candidates[slot],
                                        &generations[slot])) {
-            saw_error = 1;
+            saw_invalid = 1;
             continue;
         }
         valid[slot] = 1;
@@ -229,10 +238,7 @@ pj_settings_load_result_t pj_settings_store_load(pj_settings_store_t *store,
     }
 
     if (selected < 0) {
-        store->has_record = 0;
-        store->active_slot = -1;
-        store->generation = 0;
-        return saw_error ? PJ_SETTINGS_LOAD_ERROR :
+        return (saw_io_error || saw_invalid) ? PJ_SETTINGS_LOAD_ERROR :
                saw_not_found ? PJ_SETTINGS_LOAD_NOT_FOUND :
                PJ_SETTINGS_LOAD_ERROR;
     }
@@ -241,13 +247,14 @@ pj_settings_load_result_t pj_settings_store_load(pj_settings_store_t *store,
     store->has_record = 1;
     store->active_slot = selected;
     store->generation = generations[selected];
+    store->degraded = saw_io_error;
     return PJ_SETTINGS_LOAD_OK;
 }
 
 int pj_settings_store_save(pj_settings_store_t *store,
                            const pj_settings_t *settings)
 {
-    if (store == NULL || store->write_slot == NULL ||
+    if (store == NULL || store->write_slot == NULL || store->degraded ||
         !pj_settings_valid(settings)) {
         return 0;
     }

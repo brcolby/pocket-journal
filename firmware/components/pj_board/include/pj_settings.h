@@ -41,6 +41,7 @@ typedef struct {
     uint32_t generation;
     int active_slot;
     int has_record;
+    int degraded;
 } pj_settings_store_t;
 
 typedef enum {
