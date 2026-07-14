@@ -15,15 +15,14 @@ idf.py flash
 
 The initial firmware app compiles the shared UI core and starts placeholder service boundaries. Hardware drivers should be enabled only after board revision verification.
 
-Use `idf.py monitor` only when you explicitly need serial logs, and stop it
-with `Ctrl+]` before running any `pj` USB-C command. The monitor and partner
-CLI cannot share `/dev/cu.usbmodem*`.
+Use `idf.py monitor` only for an explicit serial-log session. Stop it with
+`Ctrl+]` as soon as that session is complete and before running any `pj` USB-C
+command; the monitor and partner CLI cannot share `/dev/cu.usbmodem*`.
 
 On the current board, BOOT/AUX is GPIO0 and is also the ESP32-S3 ROM download
 strap. If serial logs show `boot:0x0 (DOWNLOAD(USB/UART0))` and `waiting for
-download`, stop the monitor and reset or power-cycle the board with BOOT/AUX
-released. Do not hold BOOT/AUX during reset unless you intentionally want ROM
-download mode.
+download`, stop the monitor and recover with BOOT/AUX released. Hold BOOT/AUX
+during reset only when intentionally entering ROM download mode.
 
 ## Partner CLI
 
@@ -63,9 +62,16 @@ pj device sync-time
 Provisioning and USB maintenance commands auto-detect `/dev/cu.usbmodem1101` or the single attached USB serial port. Pass `--serial-port` only to override the detected port, or pass `--ble` to provision wirelessly.
 Stop `idf.py monitor` first, because the USB serial port cannot be shared.
 If the command times out even with no monitor running, rebuild/flash firmware with USB Serial/JTAG selected as the primary console input.
-If the board is in ROM download mode, release AUX/BOOT and run `pj device
-usb-recover`. It probes before resetting and reports whether the application,
-ROM downloader, or neither answered. Add `--probe-only` to avoid the reset.
+With AUX/BOOT released, run `pj device usb-recover`. It probes before resetting,
+then attempts a bounded esptool USB-JTAG watchdog reset followed by a short RTS
+fallback when needed. The command always reaps its esptool child and releases the
+serial port on completion, timeout, error, or interruption. Add `--probe-only` to
+inspect without resetting.
+
+If both the serial application protocol and USB-JTAG remain silent, software
+cannot recover the link. Physically re-enumerate the board with its dedicated
+reset control or by unplugging and reconnecting USB-C, keeping AUX/BOOT released
+for normal boot.
 
 ## Simulator
 

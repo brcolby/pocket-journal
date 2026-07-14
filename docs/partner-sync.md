@@ -67,16 +67,21 @@ Pass `--ble` to provision without a cable. BLE provisioning discovers a device a
 
 The status characteristic returns the device id, provisioning state, and current Wi-Fi state. After credentials are stored, firmware connects as a station, reconnects after disconnects, and advertises `_pocket-journal._tcp.local.` over mDNS.
 
-Only one process can own the USB serial port. Quit `idf.py monitor` with `Ctrl+]`
-before running the partner utility over USB-C. Partner commands request exclusive
-ownership, preset DTR/RTS before opening, and release the descriptor on success,
-timeout, error, or interruption. A timeout includes recovery guidance for a board
-left in ROM download mode. Run `pj device usb-recover` after closing the monitor to
-probe the application protocol, recognize available ROM download output, and issue
-a bounded RTS-only reset when needed. Use `--probe-only` to inspect without reset.
-The command closes the descriptor and returns DTR/RTS to idle on success, timeout,
-serial error, or Ctrl-C. If AUX/BOOT is physically held, release it before retrying;
-software cannot override the ESP32-S3 boot strap.
+Only one process can own the USB serial port. Start `idf.py monitor` only for an
+explicit log session, then quit it with `Ctrl+]` before running the partner utility
+over USB-C. Partner commands request exclusive ownership, preset DTR/RTS before
+opening, and release the descriptor on success, timeout, error, or interruption.
+
+After closing the monitor, `pj device usb-recover` probes the application protocol
+and recognizable ROM output. When reset is needed, it first runs a bounded esptool
+USB-JTAG watchdog reset and then uses a short RTS fallback if that fails. It always
+reaps the esptool child, closes the descriptor, and returns DTR/RTS to idle. Use
+`--probe-only` to inspect without resetting.
+
+If the serial protocol and USB-JTAG are both silent, physically re-enumerate the
+board with its dedicated reset control or by unplugging and reconnecting USB-C.
+Keep AUX/BOOT released for normal boot; hold it during reset only when intentionally
+entering ROM download mode.
 
 `pj device wifi-diagnostics` presents an allowlisted, credential-safe view of
 provisioning, connection, DHCP, disconnect, retry, and radio state. Older firmware

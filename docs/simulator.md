@@ -86,6 +86,6 @@ The inline bootstrap logger writes to the same endpoint before `src/main.js` loa
 - `record`: entering starts recording; AUX stops/saves it and returns home while processing continues asynchronously.
 - `listen` and `read`: show three dummy recordings per page ordered newest first; tap a note to enter detail or use the bottom arrows to move one full page.
 - AUX double-click jumps from any idle screen, including the resting screen, directly into recording. It is ignored while recording, playback, stopwatch, timer, or interval activity is in progress.
-- AUX single-click actions wait 350 ms so a second click can be recognized; release after holding for at least 500 ms to trigger a long press.
-- A 500 ms AUX long press is the sole Back action and backs out through the firmware parent state graph; child screens have no rendered or touch Back target.
+- AUX single-click actions wait 350 ms so a second click can be recognized. A long press fires once at the 500 ms threshold while AUX remains held; release is consumed and does not emit another action.
+- The AUX long press is the sole Back action and backs out through the firmware parent state graph; child screens have no rendered or touch Back target.
 - AUX short press follows the focused action on each screen; AUX double press cycles focus where a screen exposes multiple actions. Active media and time screens start, pause, or stop their current action without requiring touch.

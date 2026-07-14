@@ -42,7 +42,7 @@ hardware.
 
 | GPIO | Board signal | Project use and constraint |
 | ---: | --- | --- |
-| 0 | `BOOT0` / BOOT key | Active-low AUX input and ROM download strap. Runtime long press is 500 ms on release. Do not reset or power-cycle while holding it unless entering download mode. |
+| 0 | `BOOT0` / BOOT key | Active-low AUX input and ROM download strap. A runtime long press fires once at the 500 ms threshold while held; its later release is consumed. Do not reset or power-cycle while holding it unless entering download mode. |
 | 3 | LED | Onboard LED; also an ESP32-S3 JTAG-selection strapping pin, so avoid external drive during reset. |
 | 4 | `BAT_ADC` | ADC1 channel 3, through the board's 200 kOhm / 200 kOhm divider; battery voltage is approximately 2x ADC input voltage. |
 | 5 | `RTC_INT` | PCF85063ATL open-drain, active-low alarm interrupt and RTC-capable external wake input. |
@@ -76,6 +76,14 @@ are UART0. Espressif's
 documents GPIO0, 3, 45, and 46 as strapping pins; GPIO19/20 as USB Serial/JTAG;
 GPIO39-42 as JTAG; and GPIO43/44 as UART0. Treat their reset-time levels and
 alternate functions as part of the board contract.
+
+USB recovery first uses a bounded esptool USB-JTAG watchdog reset, then a short
+RTS fallback. Both paths release their resources. If the serial application
+protocol and USB-JTAG are both silent, use the board's dedicated reset control or
+unplug/replug USB-C to force re-enumeration. Keep BOOT/AUX released for normal boot;
+hold it during reset only to intentionally enter ROM download mode. Any serial
+monitor session must be explicitly started and stopped before another USB client
+uses the port.
 
 ## E-Paper Driver Constraints
 
