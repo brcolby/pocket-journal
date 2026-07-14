@@ -112,6 +112,7 @@ int pj_board_record_toggle(void);
 int pj_board_playback_set_active(int active, int note_index);
 int pj_board_playback_toggle(void);
 int pj_board_playback_toggle_index(int note_index);
+/* Starts or attaches to an async wipe. Returns its positive operation id or a negative error. */
 int pj_board_wipe_recordings(pj_ui_context_t *ui);
 int pj_board_storage_recover(void);
 int pj_board_http_start(void);

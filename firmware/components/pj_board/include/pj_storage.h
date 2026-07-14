@@ -52,7 +52,7 @@ pj_storage_health_t pj_storage_capacity_health(int mounted, int capacity_known,
                                                uint64_t reserve_bytes);
 int pj_storage_can_write(uint64_t free_bytes, uint64_t write_bytes, uint64_t reserve_bytes);
 pj_storage_recovery_action_t pj_storage_recovery_action(const char *filename, int target_exists);
-/* Snapshots at most max_entries non-hidden matches, closes the directory, then removes them. */
+/* Stops after max_entries plus one match, closes the directory, then removes snapshots. */
 pj_storage_delete_result_t pj_storage_delete_matching(const char *dir_path,
                                                        pj_storage_name_match_fn matches,
                                                        size_t max_entries);

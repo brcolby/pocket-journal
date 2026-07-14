@@ -10,6 +10,7 @@
 #include "pj_settings.h"
 #include "pj_static_art.h"
 #include "pj_storage.h"
+#include "pj_storage_coordinator.h"
 #include "pj_time_clock.h"
 #include "pj_time_controller.h"
 #include "pj_time_sync.h"
@@ -194,6 +195,9 @@
 #define PJ_NOTE_DIR "/sdcard/pj/notes"
 #define PJ_AUDIO_MAX_INDEXED_FILES 16
 #define PJ_SERIAL_COMMAND_TASK_STACK 4096
+#define PJ_STORAGE_WIPE_TASK_STACK 4096
+#define PJ_STORAGE_WIPE_BATCH_ENTRIES 64U
+#define PJ_STORAGE_WIPE_MAX_BATCHES 64U
 #define PJ_CONNECTIVITY_TASK_STACK 4096
 #define PJ_CONNECTIVITY_POLL_MS 250
 #define PJ_WIFI_RECONNECT_SETTLE_MS 250
@@ -262,6 +266,7 @@ static SemaphoreHandle_t g_audio_lock;
 static SemaphoreHandle_t g_settings_lock;
 static SemaphoreHandle_t g_static_art_lock;
 static SemaphoreHandle_t g_home_layout_lock;
+static SemaphoreHandle_t g_json_write_lock;
 static sdmmc_card_t *g_sd_card;
 static uint8_t g_epd_buffer[PJ_FRAMEBUFFER_BYTES];
 static pj_framebuffer_t g_epd_shadow_fb;
@@ -313,7 +318,11 @@ static TaskHandle_t g_record_task;
 static TaskHandle_t g_audio_process_task;
 static TaskHandle_t g_playback_task;
 static TaskHandle_t g_alert_audio_task;
+static TaskHandle_t g_storage_wipe_task;
 static int g_record_audio_owned;
+static int g_record_storage_owned;
+static int g_record_storage_processing;
+static int g_playback_storage_owned;
 static int g_alert_audio_output_owned;
 static char g_active_recording_path[128];
 static char g_active_playback_path[128];
@@ -327,7 +336,11 @@ static uint32_t g_record_sequence;
 static portMUX_TYPE g_time_lock = portMUX_INITIALIZER_UNLOCKED;
 static portMUX_TYPE g_audio_state_lock = portMUX_INITIALIZER_UNLOCKED;
 static portMUX_TYPE g_recording_lock = portMUX_INITIALIZER_UNLOCKED;
+static portMUX_TYPE g_storage_coordinator_lock = portMUX_INITIALIZER_UNLOCKED;
 static portMUX_TYPE g_aux_state_lock = portMUX_INITIALIZER_UNLOCKED;
+static pj_storage_coordinator_t g_storage_coordinator;
+static int g_cached_pending_sync;
+static int g_cached_transferred_sync;
 static pj_recording_t g_recording;
 static pj_time_clock_anchor_t g_time_clock_anchor;
 static pj_time_controller_t g_time_controller;
@@ -373,6 +386,118 @@ static esp_err_t board_event_queue_ensure(void);
 static void board_queue_event(const pj_board_event_t *event);
 
 static pj_alert_audio_t g_alert_audio;
+
+static int storage_shared_try_acquire(void)
+{
+    int acquired;
+    portENTER_CRITICAL(&g_storage_coordinator_lock);
+    acquired = pj_storage_shared_try_acquire(&g_storage_coordinator);
+    portEXIT_CRITICAL(&g_storage_coordinator_lock);
+    return acquired;
+}
+
+static void storage_shared_release(void)
+{
+    portENTER_CRITICAL(&g_storage_coordinator_lock);
+    pj_storage_shared_release(&g_storage_coordinator);
+    portEXIT_CRITICAL(&g_storage_coordinator_lock);
+}
+
+static int record_storage_try_acquire(void)
+{
+    int acquired = 0;
+    portENTER_CRITICAL(&g_storage_coordinator_lock);
+    if (!g_record_storage_owned && pj_storage_shared_try_acquire(&g_storage_coordinator)) {
+        g_record_storage_owned = 1;
+        g_record_storage_processing = 0;
+        acquired = 1;
+    }
+    portEXIT_CRITICAL(&g_storage_coordinator_lock);
+    return acquired;
+}
+
+static void record_storage_release(void)
+{
+    portENTER_CRITICAL(&g_storage_coordinator_lock);
+    if (g_record_storage_owned) {
+        g_record_storage_owned = 0;
+        g_record_storage_processing = 0;
+        pj_storage_shared_release(&g_storage_coordinator);
+    }
+    portEXIT_CRITICAL(&g_storage_coordinator_lock);
+}
+
+static int playback_storage_try_acquire(void)
+{
+    int acquired = 0;
+    portENTER_CRITICAL(&g_storage_coordinator_lock);
+    if (!g_playback_storage_owned && pj_storage_shared_try_acquire(&g_storage_coordinator)) {
+        g_playback_storage_owned = 1;
+        acquired = 1;
+    }
+    portEXIT_CRITICAL(&g_storage_coordinator_lock);
+    return acquired;
+}
+
+static void playback_storage_release(void)
+{
+    portENTER_CRITICAL(&g_storage_coordinator_lock);
+    if (g_playback_storage_owned) {
+        g_playback_storage_owned = 0;
+        pj_storage_shared_release(&g_storage_coordinator);
+    }
+    portEXIT_CRITICAL(&g_storage_coordinator_lock);
+}
+
+typedef struct {
+    pj_wipe_status_t current;
+    pj_wipe_status_t history[PJ_STORAGE_WIPE_HISTORY_CAPACITY];
+    size_t history_count;
+} storage_wipe_snapshot_t;
+
+static storage_wipe_snapshot_t storage_wipe_snapshot(void)
+{
+    storage_wipe_snapshot_t snapshot = {0};
+    portENTER_CRITICAL(&g_storage_coordinator_lock);
+    snapshot.current = pj_storage_wipe_status(&g_storage_coordinator);
+    snapshot.history_count = pj_storage_wipe_history(
+        &g_storage_coordinator, snapshot.history,
+        PJ_STORAGE_WIPE_HISTORY_CAPACITY);
+    portEXIT_CRITICAL(&g_storage_coordinator_lock);
+    return snapshot;
+}
+
+static int storage_sleep_try_begin(void)
+{
+    int acquired;
+    portENTER_CRITICAL(&g_storage_coordinator_lock);
+    acquired = pj_storage_sleep_try_begin(&g_storage_coordinator);
+    portEXIT_CRITICAL(&g_storage_coordinator_lock);
+    return acquired;
+}
+
+static void storage_sleep_finish(void)
+{
+    portENTER_CRITICAL(&g_storage_coordinator_lock);
+    pj_storage_sleep_finish(&g_storage_coordinator);
+    portEXIT_CRITICAL(&g_storage_coordinator_lock);
+}
+
+static void storage_sync_counts_cache(int pending, int transferred)
+{
+    portENTER_CRITICAL(&g_storage_coordinator_lock);
+    g_cached_pending_sync = pending;
+    g_cached_transferred_sync = transferred;
+    portEXIT_CRITICAL(&g_storage_coordinator_lock);
+}
+
+static void storage_sync_counts_snapshot(int *pending, int *transferred)
+{
+    portENTER_CRITICAL(&g_storage_coordinator_lock);
+    *pending = g_cached_pending_sync;
+    *transferred = g_cached_transferred_sync;
+    portEXIT_CRITICAL(&g_storage_coordinator_lock);
+}
 
 static void board_audio_state_set(int recording, int playback_active)
 {
@@ -1551,7 +1676,7 @@ static void static_art_slot_path(int slot, char *path, size_t path_size)
     (void)snprintf(path, path_size, "%s/static-art-%d.bin", g_status.storage_path, slot);
 }
 
-static int static_art_read_slot(int slot, pj_static_art_t *art)
+static int static_art_read_slot_unlocked(int slot, pj_static_art_t *art)
 {
     if (slot < 0 || slot >= PJ_STATIC_ART_SLOT_COUNT || art == NULL) {
         return 0;
@@ -1576,7 +1701,7 @@ static int static_art_read_slot(int slot, pj_static_art_t *art)
     return valid;
 }
 
-static void static_art_load(void)
+static void static_art_load_from_storage(void)
 {
     int preferred_slot = -1;
     nvs_handle_t nvs;
@@ -1598,7 +1723,7 @@ static void static_art_load(void)
         candidates[1] = 1;
     }
     for (int i = 0; i < PJ_STATIC_ART_SLOT_COUNT; i++) {
-        if (static_art_read_slot(candidates[i], &g_static_art)) {
+        if (static_art_read_slot_unlocked(candidates[i], &g_static_art)) {
             g_static_art_slot = candidates[i];
             g_static_art_valid = 1;
             ESP_LOGI(TAG, "Static art loaded from microSD slot %d", g_static_art_slot);
@@ -1610,7 +1735,16 @@ static void static_art_load(void)
     }
 }
 
-static esp_err_t static_art_save(const pj_static_art_t *art, int *saved_slot)
+static void static_art_load(void)
+{
+    if (!storage_shared_try_acquire()) {
+        return;
+    }
+    static_art_load_from_storage();
+    storage_shared_release();
+}
+
+static esp_err_t static_art_save_unlocked(const pj_static_art_t *art, int *saved_slot)
 {
     if (g_status.storage != PJ_BOARD_SERVICE_READY) {
         return ESP_ERR_INVALID_STATE;
@@ -1656,7 +1790,7 @@ static esp_err_t static_art_save(const pj_static_art_t *art, int *saved_slot)
         free(record);
         return ESP_ERR_NO_MEM;
     }
-    if (!static_art_read_slot(next_slot, verified) ||
+    if (!static_art_read_slot_unlocked(next_slot, verified) ||
         memcmp(verified->pixels, art->pixels, sizeof(verified->pixels)) != 0) {
         free(verified);
         free(record);
@@ -1677,6 +1811,16 @@ static esp_err_t static_art_save(const pj_static_art_t *art, int *saved_slot)
         *saved_slot = next_slot;
     }
     free(record);
+    return err;
+}
+
+static esp_err_t static_art_save(const pj_static_art_t *art, int *saved_slot)
+{
+    if (!storage_shared_try_acquire()) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    esp_err_t err = static_art_save_unlocked(art, saved_slot);
+    storage_shared_release();
     return err;
 }
 
@@ -2793,15 +2937,29 @@ static esp_err_t json_write_file_atomic(const char *path, const char *body, size
         snprintf(backup_path, sizeof(backup_path), "%s.bak", path) >= (int)sizeof(backup_path)) {
         return ESP_ERR_INVALID_ARG;
     }
+    if (!storage_shared_try_acquire()) {
+        return ESP_ERR_INVALID_STATE;
+    }
     if (g_status.storage != PJ_BOARD_SERVICE_READY) {
+        storage_shared_release();
         return ESP_ERR_INVALID_STATE;
     }
     if (!storage_preflight(body_size, "JSON update")) {
-        return g_status.storage_health == PJ_STORAGE_HEALTH_FULL ? ESP_ERR_NO_MEM : ESP_FAIL;
+        esp_err_t result = g_status.storage_health == PJ_STORAGE_HEALTH_FULL ?
+                           ESP_ERR_NO_MEM : ESP_FAIL;
+        storage_shared_release();
+        return result;
+    }
+    if (g_json_write_lock == NULL ||
+        xSemaphoreTake(g_json_write_lock, portMAX_DELAY) != pdTRUE) {
+        storage_shared_release();
+        return ESP_ERR_NO_MEM;
     }
     remove(temporary_path);
     FILE *file = fopen(temporary_path, "wb");
     if (file == NULL) {
+        xSemaphoreGive(g_json_write_lock);
+        storage_shared_release();
         return ESP_FAIL;
     }
     int written = fwrite(body, 1, body_size, file) == body_size;
@@ -2809,6 +2967,8 @@ static esp_err_t json_write_file_atomic(const char *path, const char *body, size
     int closed = fclose(file) == 0;
     if (!written || !flushed || !closed) {
         remove(temporary_path);
+        xSemaphoreGive(g_json_write_lock);
+        storage_shared_release();
         return ESP_FAIL;
     }
     struct stat existing;
@@ -2816,6 +2976,8 @@ static esp_err_t json_write_file_atomic(const char *path, const char *body, size
     remove(backup_path);
     if (had_existing && rename(path, backup_path) != 0) {
         remove(temporary_path);
+        xSemaphoreGive(g_json_write_lock);
+        storage_shared_release();
         return ESP_FAIL;
     }
     if (rename(temporary_path, path) != 0) {
@@ -2823,12 +2985,16 @@ static esp_err_t json_write_file_atomic(const char *path, const char *body, size
             (void)rename(backup_path, path);
         }
         remove(temporary_path);
+        xSemaphoreGive(g_json_write_lock);
+        storage_shared_release();
         return ESP_FAIL;
     }
     if (had_existing) {
         remove(backup_path);
     }
     (void)storage_refresh_capacity();
+    xSemaphoreGive(g_json_write_lock);
+    storage_shared_release();
     return ESP_OK;
 }
 
@@ -2971,7 +3137,7 @@ static int recording_publish_file(const char *temporary_path, const char *final_
     return 1;
 }
 
-static int probe_audio_entry(const char *filename, pj_audio_entry_t *entry)
+static int probe_audio_entry_unlocked(const char *filename, pj_audio_entry_t *entry)
 {
     char path[160];
     struct stat st;
@@ -3032,6 +3198,16 @@ static int probe_audio_entry(const char *filename, pj_audio_entry_t *entry)
     return 1;
 }
 
+static int probe_audio_entry(const char *filename, pj_audio_entry_t *entry)
+{
+    if (!storage_shared_try_acquire()) {
+        return 0;
+    }
+    int valid = probe_audio_entry_unlocked(filename, entry);
+    storage_shared_release();
+    return valid;
+}
+
 static int audio_entry_compare_newest_first(const void *left, const void *right)
 {
     const pj_audio_entry_t *a = (const pj_audio_entry_t *)left;
@@ -3044,8 +3220,12 @@ static int collect_audio_entries(pj_audio_entry_t *entries, int capacity)
     if (entries == NULL || capacity <= 0) {
         return 0;
     }
+    if (!storage_shared_try_acquire()) {
+        return -1;
+    }
     DIR *dir = opendir(PJ_AUDIO_DIR);
     if (dir == NULL) {
+        storage_shared_release();
         return 0;
     }
     int count = 0;
@@ -3060,18 +3240,29 @@ static int collect_audio_entries(pj_audio_entry_t *entries, int capacity)
     }
     closedir(dir);
     qsort(entries, (size_t)count, sizeof(entries[0]), audio_entry_compare_newest_first);
+    storage_shared_release();
     return count;
 }
 
 static void collect_sync_counts(int *pending, int *transferred)
 {
-    *pending = 0;
-    *transferred = 0;
+    storage_sync_counts_snapshot(pending, transferred);
+    if (!storage_shared_try_acquire()) {
+        return;
+    }
     pj_audio_entry_t *entries = calloc(PJ_AUDIO_MAX_INDEXED_FILES, sizeof(entries[0]));
     if (entries == NULL) {
+        storage_shared_release();
         return;
     }
     int count = collect_audio_entries(entries, PJ_AUDIO_MAX_INDEXED_FILES);
+    if (count < 0) {
+        free(entries);
+        storage_shared_release();
+        return;
+    }
+    *pending = 0;
+    *transferred = 0;
     for (int i = 0; i < count; i++) {
         if (entries[i].note.synced) {
             (*transferred)++;
@@ -3080,6 +3271,8 @@ static void collect_sync_counts(int *pending, int *transferred)
         }
     }
     free(entries);
+    storage_sync_counts_cache(*pending, *transferred);
+    storage_shared_release();
 }
 
 static void refresh_ui_sync_state(pj_ui_context_t *ui)
@@ -3090,28 +3283,114 @@ static void refresh_ui_sync_state(pj_ui_context_t *ui)
     pj_ui_set_sync_state(ui, pending, transferred, g_status.wifi == PJ_BOARD_SERVICE_READY);
 }
 
-static int delete_dir_entries(const char *dir_path, int (*matches)(const char *name),
-                              int *incomplete)
+static size_t delete_dir_entries(const char *dir_path, int (*matches)(const char *name),
+                                 int *incomplete)
 {
-    pj_storage_delete_result_t result =
-        pj_storage_delete_matching(dir_path, matches, 256U);
-    if (result.open_errno == ENOENT) {
-        return 0;
+    size_t deleted = 0U;
+    for (size_t batch = 0; batch < PJ_STORAGE_WIPE_MAX_BATCHES; batch++) {
+        pj_storage_delete_result_t result =
+            pj_storage_delete_matching(dir_path, matches, PJ_STORAGE_WIPE_BATCH_ENTRIES);
+        if (result.open_errno == ENOENT) {
+            return deleted;
+        }
+        deleted += result.deleted;
+        int failed = result.open_errno != 0 || result.scan_errno != 0 ||
+                     result.close_errno != 0 || result.allocation_errno != 0 ||
+                     result.remove_failures != 0U;
+        if (failed || result.truncated != 0U) {
+            ESP_LOGW(TAG,
+                     "Delete batch incomplete: dir=%s matched=%zu snapshotted=%zu deleted=%zu "
+                     "failures=%zu truncated=%zu open=%d scan=%d close=%d alloc=%d remove=%d",
+                     dir_path, result.matched, result.snapshotted, result.deleted,
+                     result.remove_failures, result.truncated, result.open_errno,
+                     result.scan_errno, result.close_errno, result.allocation_errno,
+                     result.first_remove_errno);
+        }
+        if (failed) {
+            *incomplete = 1;
+            return deleted;
+        }
+        if (result.truncated == 0U) {
+            return deleted;
+        }
+        vTaskDelay(1);
     }
-    int failed = result.open_errno != 0 || result.scan_errno != 0 ||
-                 result.close_errno != 0 || result.allocation_errno != 0 ||
-                 result.remove_failures != 0U || result.truncated != 0U;
-    if (failed) {
-        *incomplete = 1;
-        ESP_LOGW(TAG,
-                 "Delete incomplete: dir=%s matched=%zu snapshotted=%zu deleted=%zu "
-                 "failures=%zu truncated=%zu open=%d scan=%d close=%d alloc=%d remove=%d",
-                 dir_path, result.matched, result.snapshotted, result.deleted,
-                 result.remove_failures, result.truncated, result.open_errno,
-                 result.scan_errno, result.close_errno, result.allocation_errno,
-                 result.first_remove_errno);
+    ESP_LOGW(TAG, "Delete stopped at batch limit: dir=%s batches=%u", dir_path,
+             (unsigned)PJ_STORAGE_WIPE_MAX_BATCHES);
+    *incomplete = 1;
+    return deleted;
+}
+
+static void recording_wipe_worker(void *arg)
+{
+    (void)arg;
+    portENTER_CRITICAL(&g_storage_coordinator_lock);
+    pj_storage_wipe_mark_running(&g_storage_coordinator);
+    portEXIT_CRITICAL(&g_storage_coordinator_lock);
+
+    int incomplete = 0;
+    size_t audio_deleted = delete_dir_entries(PJ_AUDIO_DIR, is_audio_filename, &incomplete);
+    size_t transcripts_deleted =
+        delete_dir_entries(PJ_TRANSCRIPT_DIR, is_transcript_filename, &incomplete);
+    size_t notes_deleted = delete_dir_entries(PJ_NOTE_DIR, is_transcript_filename, &incomplete);
+
+    if (incomplete) {
+        (void)snprintf(g_status.last_error, sizeof(g_status.last_error),
+                       "recording wipe incomplete");
+    } else {
+        storage_sync_counts_cache(0, 0);
+        if (strcmp(g_status.last_error, "recording wipe incomplete") == 0) {
+            g_status.last_error[0] = '\0';
+        }
     }
-    return (int)result.deleted;
+    ESP_LOGI(TAG, "Wiped recordings: audio=%zu transcripts=%zu metadata=%zu complete=%d",
+             audio_deleted, transcripts_deleted, notes_deleted, !incomplete);
+
+    portENTER_CRITICAL(&g_storage_coordinator_lock);
+    pj_storage_wipe_finish(&g_storage_coordinator, audio_deleted, transcripts_deleted,
+                           notes_deleted,
+                           incomplete ? PJ_WIPE_CODE_INCOMPLETE : PJ_WIPE_CODE_NONE,
+                           incomplete);
+    g_storage_wipe_task = NULL;
+    portEXIT_CRITICAL(&g_storage_coordinator_lock);
+
+    g_ui_note_audio_count = 0;
+    g_ui_note_transcript_view = 0;
+    g_notes_update_pending = 1;
+    vTaskDelete(NULL);
+}
+
+static pj_wipe_start_result_t recording_wipe_start(const char *request_id,
+                                                    pj_wipe_status_t *status)
+{
+    pj_wipe_status_t local_status;
+    if (status == NULL) {
+        status = &local_status;
+    }
+    int audio_active = g_status.recording || g_record_task != NULL ||
+                       g_audio_process_task != NULL || g_status.playback_active ||
+                       g_playback_task != NULL;
+    portENTER_CRITICAL(&g_storage_coordinator_lock);
+    pj_wipe_start_result_t result = pj_storage_wipe_request(
+        &g_storage_coordinator, g_status.storage == PJ_BOARD_SERVICE_READY,
+        audio_active, request_id, status);
+    portEXIT_CRITICAL(&g_storage_coordinator_lock);
+    if (result != PJ_WIPE_START_STARTED) {
+        return result;
+    }
+
+    BaseType_t created = xTaskCreate(recording_wipe_worker, "pj-wipe",
+                                     PJ_STORAGE_WIPE_TASK_STACK, NULL, 2,
+                                     &g_storage_wipe_task);
+    if (created != pdPASS) {
+        portENTER_CRITICAL(&g_storage_coordinator_lock);
+        pj_storage_wipe_finish(&g_storage_coordinator, 0U, 0U, 0U,
+                               PJ_WIPE_CODE_TASK_START_FAILED, 1);
+        *status = pj_storage_wipe_status(&g_storage_coordinator);
+        portEXIT_CRITICAL(&g_storage_coordinator_lock);
+        return PJ_WIPE_START_TASK_FAILED;
+    }
+    return PJ_WIPE_START_STARTED;
 }
 
 static int recover_dir_artifacts(const char *dir_path)
@@ -3221,6 +3500,10 @@ static void refresh_ui_notes_from_sd(pj_ui_context_t *ui)
         return;
     }
     int count = collect_audio_entries(entries, PJ_AUDIO_MAX_INDEXED_FILES);
+    if (count < 0) {
+        free(entries);
+        return;
+    }
     pj_ui_state_t state = pj_ui_current_state(ui);
     if (state == PJ_UI_STATE_READ) {
         g_ui_note_transcript_view = 1;
@@ -4478,6 +4761,7 @@ static void audio_process_task(void *arg)
     recording_state_finish_processing(note_ready);
     recording_publish_completion();
     g_audio_process_task = NULL;
+    record_storage_release();
     vTaskDelete(NULL);
 }
 
@@ -4622,6 +4906,13 @@ static void record_task_exit(void)
     board_audio_state_set(0, -1);
     alert_audio_set_recording(0);
     g_audio_state_update_pending = 1;
+    int processing;
+    portENTER_CRITICAL(&g_storage_coordinator_lock);
+    processing = g_record_storage_processing;
+    portEXIT_CRITICAL(&g_storage_coordinator_lock);
+    if (!processing) {
+        record_storage_release();
+    }
     vTaskDelete(NULL);
 }
 
@@ -4631,6 +4922,7 @@ static void playback_task_exit(void)
     board_audio_state_set(-1, 0);
     alert_audio_notify();
     g_audio_state_update_pending = 1;
+    playback_storage_release();
     vTaskDelete(NULL);
 }
 
@@ -4804,11 +5096,17 @@ static void record_task(void *arg)
         process_args->raw_avg = raw_avg;
         process_args->raw_clipped = clipped_samples;
         process_args->input_channel = input_channel;
+        portENTER_CRITICAL(&g_storage_coordinator_lock);
+        g_record_storage_processing = 1;
+        portEXIT_CRITICAL(&g_storage_coordinator_lock);
         BaseType_t created = xTaskCreate(audio_process_task, "pj-audio-process",
                                         PJ_AUDIO_PROCESS_TASK_STACK, process_args, 1,
                                         &g_audio_process_task);
         if (created != pdPASS) {
             g_audio_process_task = NULL;
+            portENTER_CRITICAL(&g_storage_coordinator_lock);
+            g_record_storage_processing = 0;
+            portEXIT_CRITICAL(&g_storage_coordinator_lock);
             ESP_LOGW(TAG, "Audio processing task start failed; preserving raw recording");
             note_ready = recording_publish_file(temporary_path,
                                                 g_active_recording_path,
@@ -5402,7 +5700,12 @@ void pj_board_init(const pj_board_profile_t *profile)
     pj_home_layout_defaults(&g_home_layout);
 
 #ifdef ESP_PLATFORM
+    pj_storage_coordinator_init(&g_storage_coordinator);
     pj_recording_init(&g_recording);
+    g_json_write_lock = xSemaphoreCreateMutex();
+    if (g_json_write_lock == NULL) {
+        ESP_LOGW(TAG, "JSON write mutex allocation failed");
+    }
     esp_err_t err = nvs_flash_init();
     if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
@@ -5773,8 +6076,9 @@ void pj_board_refresh_status(pj_ui_context_t *ui)
         pj_time_controller_ready(&g_time_controller) && !controller_trusted) {
         board_time_mark_pending();
     }
-    if (g_status.storage_mounted) {
+    if (g_status.storage_mounted && storage_shared_try_acquire()) {
         (void)storage_refresh_capacity();
+        storage_shared_release();
     }
 #endif
     pj_board_status_t status = pj_board_status();
@@ -6077,6 +6381,10 @@ int pj_board_aux_released(void)
 void pj_board_enter_sleep(void)
 {
 #ifdef ESP_PLATFORM
+    if (!storage_sleep_try_begin()) {
+        ESP_LOGI(TAG, "Sleep deferred because storage work is active");
+        return;
+    }
     int rtc_schedule = rtc_wake_sync();
     uint64_t wake_delay_ms = UINT64_MAX;
     const pj_time_state_t *time_state =
@@ -6089,6 +6397,7 @@ void pj_board_enter_sleep(void)
     }
     if (wake_delay_ms == 0) {
         ESP_LOGI(TAG, "Sleep deferred because a time alert is due");
+        storage_sleep_finish();
         return;
     }
     if (wake_delay_ms != UINT64_MAX) {
@@ -6100,6 +6409,7 @@ void pj_board_enter_sleep(void)
         } else if (rtc_schedule <= 0) {
             ESP_LOGW(TAG, "Sleep deferred; no scheduled wake source: %s",
                      esp_err_to_name(err));
+            storage_sleep_finish();
             return;
         } else {
             ESP_LOGW(TAG, "Internal fallback wake unavailable: %s", esp_err_to_name(err));
@@ -6111,6 +6421,7 @@ void pj_board_enter_sleep(void)
     if (g_rtc_wake_plan.state == PJ_RTC_WAKE_ARMED &&
         gpio_get_level(RTC_INT_PIN) == 0) {
         ESP_LOGI(TAG, "Sleep deferred because RTC_INT is already active");
+        storage_sleep_finish();
         return;
     }
     if (g_display_ready) {
@@ -6129,6 +6440,7 @@ void pj_board_enter_sleep(void)
     if (sleep_err != ESP_OK) {
         gpio_set_level(EPD_PWR_PIN, 0);
         ESP_LOGW(TAG, "Light sleep rejected: %s", esp_err_to_name(sleep_err));
+        storage_sleep_finish();
         return;
     }
     uint32_t wake_causes = esp_sleep_get_wakeup_causes();
@@ -6173,6 +6485,7 @@ void pj_board_enter_sleep(void)
              source, rtc_flags,
              rtc_wake &&
              (rtc_flags & PJ_RTC_WAKE_CONTROL2_AF) == 0 ? " spurious" : "");
+    storage_sleep_finish();
 #endif
 }
 
@@ -6215,8 +6528,13 @@ int pj_board_record_set_active(int active)
         ESP_LOGW(TAG, "Record start ignored: previous recording still stopping");
         return 0;
     }
+    if (!record_storage_try_acquire()) {
+        ESP_LOGW(TAG, "Record start ignored: storage maintenance active");
+        return 0;
+    }
     if (!storage_preflight(PJ_STORAGE_RECORD_START_BYTES, "recording")) {
         ESP_LOGW(TAG, "Record start ignored: %s", g_status.last_error);
+        record_storage_release();
         return 0;
     }
     next_recording_path(g_active_recording_path, sizeof(g_active_recording_path));
@@ -6225,6 +6543,7 @@ int pj_board_record_set_active(int active)
         ESP_LOGE(TAG, "Record start failed: invalid lifecycle transition");
         (void)snprintf(g_status.last_error, sizeof(g_status.last_error),
                        "recording lifecycle was busy");
+        record_storage_release();
         return 0;
     }
     alert_audio_set_recording(1);
@@ -6238,6 +6557,7 @@ int pj_board_record_set_active(int active)
                        "recording task creation failed");
         recording_state_finish_capture(0);
         recording_publish_completion();
+        record_storage_release();
         ESP_LOGE(TAG, "Record start failed: task create failed");
         return 0;
     }
@@ -6292,12 +6612,17 @@ int pj_board_playback_set_active(int active, int note_index)
         ESP_LOGW(TAG, "Playback start ignored: previous playback still stopping");
         return 0;
     }
+    if (!playback_storage_try_acquire()) {
+        ESP_LOGW(TAG, "Playback start ignored: storage maintenance active");
+        return 0;
+    }
     if (note_index < 0) {
         note_index = 0;
     }
     char filename[96];
     if (!audio_filename_for_index(note_index, filename, sizeof(filename))) {
         ESP_LOGW(TAG, "Playback start ignored: WAV index %d unavailable", note_index);
+        playback_storage_release();
         return 0;
     }
     (void)snprintf(g_active_playback_path, sizeof(g_active_playback_path), PJ_AUDIO_DIR "/%s", filename);
@@ -6307,6 +6632,7 @@ int pj_board_playback_set_active(int active, int note_index)
     if (created != pdPASS) {
         board_audio_state_set(-1, 0);
         g_playback_task = NULL;
+        playback_storage_release();
         ESP_LOGE(TAG, "Playback start failed: task create failed");
         return 0;
     }
@@ -6326,34 +6652,22 @@ int pj_board_playback_toggle_index(int note_index)
 int pj_board_wipe_recordings(pj_ui_context_t *ui)
 {
 #ifdef ESP_PLATFORM
-    if (g_status.storage != PJ_BOARD_SERVICE_READY) {
-        ESP_LOGW(TAG, "Wipe recordings ignored: storage unavailable");
-        return -1;
+    (void)ui;
+    pj_wipe_status_t status;
+    pj_wipe_start_result_t result = recording_wipe_start(NULL, &status);
+    if (result == PJ_WIPE_START_STARTED || result == PJ_WIPE_START_ATTACHED) {
+        return (int)status.id;
     }
-    if (g_status.recording || g_record_task != NULL || g_audio_process_task != NULL ||
-        g_status.playback_active || g_playback_task != NULL) {
-        ESP_LOGW(TAG, "Wipe recordings ignored: audio task active");
+    if (result == PJ_WIPE_START_AUDIO_ACTIVE) {
         return -2;
     }
-    int incomplete = 0;
-    int audio_deleted = delete_dir_entries(PJ_AUDIO_DIR, is_audio_filename, &incomplete);
-    int transcripts_deleted = delete_dir_entries(PJ_TRANSCRIPT_DIR, is_transcript_filename,
-                                                  &incomplete);
-    int notes_deleted = delete_dir_entries(PJ_NOTE_DIR, is_transcript_filename, &incomplete);
-    g_ui_note_audio_count = 0;
-    g_ui_note_transcript_view = 0;
-    g_notes_update_pending = 1;
-    if (ui != NULL) {
-        refresh_ui_notes_from_sd(ui);
-    }
-    ESP_LOGI(TAG, "Wiped recordings: audio=%d transcripts=%d metadata=%d",
-             audio_deleted, transcripts_deleted, notes_deleted);
-    if (incomplete) {
-        (void)snprintf(g_status.last_error, sizeof(g_status.last_error),
-                       "recording wipe incomplete");
+    if (result == PJ_WIPE_START_STORAGE_BUSY) {
         return -3;
     }
-    return audio_deleted;
+    if (result == PJ_WIPE_START_TASK_FAILED) {
+        return -4;
+    }
+    return -1;
 #else
     char labels[PJ_UI_MAX_NOTES][PJ_UI_NOTE_LABEL_LEN] = {0};
     if (ui != NULL) {
@@ -6372,11 +6686,22 @@ int pj_board_storage_recover(void)
                        "storage recovery blocked while audio is active");
         return 0;
     }
+    portENTER_CRITICAL(&g_storage_coordinator_lock);
+    int maintenance_acquired = pj_storage_recovery_try_begin(&g_storage_coordinator);
+    portEXIT_CRITICAL(&g_storage_coordinator_lock);
+    if (!maintenance_acquired) {
+        (void)snprintf(g_status.last_error, sizeof(g_status.last_error),
+                       "storage recovery blocked by active storage work");
+        return 0;
+    }
     if (g_sd_card != NULL) {
         esp_err_t unmount_err = esp_vfs_fat_sdcard_unmount(g_status.storage_path, g_sd_card);
         if (unmount_err != ESP_OK) {
             (void)snprintf(g_status.last_error, sizeof(g_status.last_error),
                            "microSD unmount failed: %s", esp_err_to_name(unmount_err));
+            portENTER_CRITICAL(&g_storage_coordinator_lock);
+            pj_storage_recovery_finish(&g_storage_coordinator);
+            portEXIT_CRITICAL(&g_storage_coordinator_lock);
             return 0;
         }
         g_sd_card = NULL;
@@ -6390,6 +6715,9 @@ int pj_board_storage_recover(void)
         (void)snprintf(g_status.last_error, sizeof(g_status.last_error),
                        "microSD recovery failed: %s; check card and filesystem",
                        esp_err_to_name(err));
+        portENTER_CRITICAL(&g_storage_coordinator_lock);
+        pj_storage_recovery_finish(&g_storage_coordinator);
+        portEXIT_CRITICAL(&g_storage_coordinator_lock);
         return 0;
     }
     g_status.storage = PJ_BOARD_SERVICE_READY;
@@ -6397,7 +6725,7 @@ int pj_board_storage_recover(void)
     if (static_art_take(portMAX_DELAY)) {
         g_static_art_valid = 0;
         g_static_art_slot = -1;
-        static_art_load();
+        static_art_load_from_storage();
         static_art_give();
     }
     if (!g_audio_ready) {
@@ -6411,6 +6739,9 @@ int pj_board_storage_recover(void)
                            esp_err_to_name(audio_err));
         }
     }
+    portENTER_CRITICAL(&g_storage_coordinator_lock);
+    pj_storage_recovery_finish(&g_storage_coordinator);
+    portEXIT_CRITICAL(&g_storage_coordinator_lock);
     g_notes_update_pending = 1;
     return 1;
 #else
@@ -6432,6 +6763,18 @@ static esp_err_t send_json(httpd_req_t *req, const char *json)
 {
     httpd_resp_set_type(req, "application/json");
     return httpd_resp_sendstr(req, json);
+}
+
+static esp_err_t send_json_object(httpd_req_t *req, const cJSON *json)
+{
+    char *encoded = cJSON_PrintUnformatted(json);
+    if (encoded == NULL) {
+        httpd_resp_set_status(req, "503 Service Unavailable");
+        return send_json(req, "{\"error\":\"response encoding failed\"}");
+    }
+    esp_err_t result = send_json(req, encoded);
+    cJSON_free(encoded);
+    return result;
 }
 
 static esp_err_t require_auth(httpd_req_t *req)
@@ -6721,7 +7064,89 @@ static int connectivity_add_json(cJSON *json, const pj_board_status_t *status)
     return 1;
 }
 
-static void serial_print_status(void)
+static void wipe_status_fill_json(cJSON *wipe, const pj_wipe_status_t *status)
+{
+    cJSON_AddNumberToObject(wipe, "id", status->id);
+    cJSON_AddStringToObject(wipe, "state", pj_wipe_state_name(status->state));
+    cJSON_AddNumberToObject(wipe, "audio_deleted", (double)status->audio_deleted);
+    cJSON_AddNumberToObject(wipe, "transcripts_deleted", (double)status->transcripts_deleted);
+    cJSON_AddNumberToObject(wipe, "notes_deleted", (double)status->notes_deleted);
+    if (status->code == PJ_WIPE_CODE_NONE) {
+        cJSON_AddNullToObject(wipe, "code");
+    } else {
+        cJSON_AddStringToObject(wipe, "code", pj_wipe_code_name(status->code));
+    }
+    cJSON_AddBoolToObject(wipe, "retryable", status->retryable != 0);
+}
+
+static int wipe_status_add_json(cJSON *parent, const pj_wipe_status_t *status)
+{
+    cJSON *wipe = cJSON_AddObjectToObject(parent, "recording_wipe");
+    if (wipe == NULL) {
+        return 0;
+    }
+    wipe_status_fill_json(wipe, status);
+    return 1;
+}
+
+static int wipe_history_add_json(cJSON *parent,
+                                 const pj_wipe_status_t *statuses,
+                                 size_t count)
+{
+    cJSON *history = cJSON_AddArrayToObject(parent, "recording_wipe_recent");
+    if (history == NULL) {
+        return 0;
+    }
+    for (size_t i = 0; i < count; i++) {
+        cJSON *wipe = cJSON_CreateObject();
+        if (wipe == NULL) {
+            return 0;
+        }
+        wipe_status_fill_json(wipe, &statuses[i]);
+        cJSON_AddItemToArray(history, wipe);
+    }
+    return 1;
+}
+
+static int serial_request_matches(const char *line, const char *command,
+                                  const char **request_id)
+{
+    size_t command_length = strlen(command);
+    *request_id = NULL;
+    if (strcmp(line, command) == 0) {
+        return 1;
+    }
+    if (strncmp(line, command, command_length) != 0 ||
+        strncmp(line + command_length, " request_id=", 12) != 0) {
+        return 0;
+    }
+    const char *value = line + command_length + 12;
+    size_t length = strlen(value);
+    if (length == 0U || length > 32U) {
+        return 0;
+    }
+    for (size_t i = 0; i < length; i++) {
+        unsigned char ch = (unsigned char)value[i];
+        if (!isalnum(ch) && ch != '-' && ch != '_' && ch != '.') {
+            return 0;
+        }
+    }
+    *request_id = value;
+    return 1;
+}
+
+static void serial_print_json(const char *prefix, cJSON *json)
+{
+    char *encoded = cJSON_PrintUnformatted(json);
+    if (encoded == NULL) {
+        printf("PJ_ERR {\"error\":\"status encoding failed\"}\n");
+        return;
+    }
+    printf("%s %s\n", prefix, encoded);
+    cJSON_free(encoded);
+}
+
+static void serial_print_status(const char *request_id)
 {
     int pending_sync = 0;
     int transferred_sync = 0;
@@ -6731,6 +7156,10 @@ static void serial_print_status(void)
     if (json == NULL) {
         printf("PJ_ERR {\"error\":\"status allocation failed\"}\n");
         return;
+    }
+    cJSON_AddStringToObject(json, "command", "PJ_STATUS");
+    if (request_id != NULL) {
+        cJSON_AddStringToObject(json, "request_id", request_id);
     }
     cJSON_AddStringToObject(json, "device_id", status.device_id);
     cJSON_AddStringToObject(json, "firmware_version",
@@ -6744,19 +7173,60 @@ static void serial_print_status(void)
     cJSON_AddStringToObject(json, "ip", status.ip_addr);
     cJSON_AddNumberToObject(json, "pending_sync", pending_sync);
     cJSON_AddNumberToObject(json, "transferred_sync", transferred_sync);
-    if (!connectivity_add_json(json, &status)) {
+    storage_wipe_snapshot_t wipe = storage_wipe_snapshot();
+    if (!wipe_status_add_json(json, &wipe.current) ||
+        !wipe_history_add_json(json, wipe.history, wipe.history_count) ||
+        !connectivity_add_json(json, &status)) {
         cJSON_Delete(json);
         printf("PJ_ERR {\"error\":\"status allocation failed\"}\n");
         return;
     }
-    char *encoded = cJSON_PrintUnformatted(json);
+    serial_print_json("PJ_OK", json);
     cJSON_Delete(json);
-    if (encoded == NULL) {
-        printf("PJ_ERR {\"error\":\"status encoding failed\"}\n");
+}
+
+static void serial_print_wipe_start(pj_wipe_start_result_t result,
+                                    const pj_wipe_status_t *status,
+                                    const char *request_id)
+{
+    cJSON *json = cJSON_CreateObject();
+    if (json == NULL) {
+        printf("PJ_ERR {\"error\":\"wipe response allocation failed\"}\n");
         return;
     }
-    printf("PJ_OK %s\n", encoded);
-    cJSON_free(encoded);
+    cJSON_AddStringToObject(json, "command", "PJ_WIPE_RECORDINGS");
+    if (request_id != NULL) {
+        cJSON_AddStringToObject(json, "request_id", request_id);
+    }
+    const char *prefix = "PJ_ERR";
+    if (result == PJ_WIPE_START_STARTED || result == PJ_WIPE_START_ATTACHED) {
+        prefix = "PJ_OK";
+        cJSON_AddBoolToObject(json, "accepted", 1);
+        cJSON_AddBoolToObject(json, "attached", result == PJ_WIPE_START_ATTACHED);
+        (void)wipe_status_add_json(json, status);
+    } else {
+        const char *error = "storage unavailable";
+        const char *code = "storage_unavailable";
+        int retryable = 1;
+        if (result == PJ_WIPE_START_AUDIO_ACTIVE) {
+            error = "audio task active";
+            code = "audio_active";
+        } else if (result == PJ_WIPE_START_STORAGE_BUSY) {
+            error = "storage maintenance busy";
+            code = "storage_busy";
+        } else if (result == PJ_WIPE_START_TASK_FAILED) {
+            error = "recording wipe task start failed";
+            code = "wipe_task_start_failed";
+        }
+        cJSON_AddStringToObject(json, "error", error);
+        cJSON_AddStringToObject(json, "code", code);
+        cJSON_AddBoolToObject(json, "retryable", retryable);
+        if (status->id != 0U) {
+            (void)wipe_status_add_json(json, status);
+        }
+    }
+    serial_print_json(prefix, json);
+    cJSON_Delete(json);
 }
 
 static void serial_command_task(void *arg)
@@ -6800,23 +7270,16 @@ static void serial_command_task(void *arg)
         if (line[0] == '\0') {
             continue;
         }
-        if (strcmp(line, "PJ_STATUS") == 0) {
-            serial_print_status();
+        const char *request_id = NULL;
+        if (serial_request_matches(line, "PJ_STATUS", &request_id)) {
+            serial_print_status(request_id);
             fflush(stdout);
             continue;
         }
-        if (strcmp(line, "PJ_WIPE_RECORDINGS") == 0) {
-            int deleted = pj_board_wipe_recordings(NULL);
-            if (deleted >= 0) {
-                printf("PJ_OK {\"deleted\":%d}\n", deleted);
-            } else if (deleted == -2) {
-                printf("PJ_ERR {\"error\":\"audio task active\"}\n");
-            } else if (deleted == -3) {
-                printf("PJ_ERR {\"error\":\"recording wipe incomplete\","
-                       "\"code\":\"wipe_incomplete\",\"retryable\":true}\n");
-            } else {
-                printf("PJ_ERR {\"error\":\"storage unavailable\"}\n");
-            }
+        if (serial_request_matches(line, "PJ_WIPE_RECORDINGS", &request_id)) {
+            pj_wipe_status_t wipe_status = {0};
+            pj_wipe_start_result_t result = recording_wipe_start(request_id, &wipe_status);
+            serial_print_wipe_start(result, &wipe_status, request_id);
             fflush(stdout);
             continue;
         }
@@ -7059,8 +7522,9 @@ static esp_err_t status_handler(httpd_req_t *req)
     int pending_sync = 0;
     int transferred_sync = 0;
     pj_board_status_t status = pj_board_status();
-    if (g_status.storage_mounted) {
+    if (g_status.storage_mounted && storage_shared_try_acquire()) {
         (void)storage_refresh_capacity();
+        storage_shared_release();
     }
     if (g_status.storage == PJ_BOARD_SERVICE_READY) {
         collect_sync_counts(&pending_sync, &transferred_sync);
@@ -7104,7 +7568,10 @@ static esp_err_t status_handler(httpd_req_t *req)
     cJSON_AddNumberToObject(json, "pending_sync", pending_sync);
     cJSON_AddNumberToObject(json, "transferred_sync", transferred_sync);
     cJSON_AddStringToObject(json, "last_error", g_status.last_error);
-    if (!connectivity_add_json(json, &status)) {
+    storage_wipe_snapshot_t wipe = storage_wipe_snapshot();
+    if (!wipe_status_add_json(json, &wipe.current) ||
+        !wipe_history_add_json(json, wipe.history, wipe.history_count) ||
+        !connectivity_add_json(json, &status)) {
         cJSON_Delete(json);
         httpd_resp_set_status(req, "503 Service Unavailable");
         return send_json(req, "{\"error\":\"status allocation failed\"}");
@@ -7652,6 +8119,12 @@ static esp_err_t static_art_put_handler(httpd_req_t *req)
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "Static art save failed: %s", esp_err_to_name(err));
         if (err == ESP_ERR_INVALID_STATE) {
+            if (g_status.storage == PJ_BOARD_SERVICE_READY) {
+                httpd_resp_set_status(req, "409 Conflict");
+                return send_json(req,
+                                 "{\"error\":\"storage maintenance active\","
+                                 "\"code\":\"storage_busy\",\"retryable\":true}");
+            }
             httpd_resp_set_status(req, "503 Service Unavailable");
             return send_json(req, "{\"error\":\"storage unavailable; run storage recovery\"}");
         }
@@ -7665,7 +8138,7 @@ static esp_err_t static_art_put_handler(httpd_req_t *req)
     return send_json(req, "{\"updated\":true}");
 }
 
-static int audio_sha256_hex(const char *filename, char out[65])
+static int audio_sha256_hex_unlocked(const char *filename, char out[65])
 {
     char path[160];
     uint8_t buffer[1024];
@@ -7709,6 +8182,16 @@ static int audio_sha256_hex(const char *filename, char out[65])
     return valid;
 }
 
+static int audio_sha256_hex(const char *filename, char out[65])
+{
+    if (!storage_shared_try_acquire()) {
+        return 0;
+    }
+    int valid = audio_sha256_hex_unlocked(filename, out);
+    storage_shared_release();
+    return valid;
+}
+
 static esp_err_t audio_list_handler(httpd_req_t *req)
 {
     if (require_auth(req) != ESP_OK) {
@@ -7718,51 +8201,64 @@ static esp_err_t audio_list_handler(httpd_req_t *req)
         httpd_resp_set_status(req, "503 Service Unavailable");
         return send_json(req, "{\"error\":\"storage unavailable; run storage recovery\"}");
     }
-    httpd_resp_set_type(req, "application/json");
-    ESP_RETURN_ON_ERROR(httpd_resp_sendstr_chunk(req, "{\"audio\":["), TAG, "audio list send failed");
     pj_audio_entry_t *entries = calloc(PJ_AUDIO_MAX_INDEXED_FILES, sizeof(entries[0]));
-    int emitted = 0;
-    if (entries != NULL) {
-        int count = collect_audio_entries(entries, PJ_AUDIO_MAX_INDEXED_FILES);
-        for (int i = 0; i < count; i++) {
-            cJSON *item = cJSON_CreateObject();
-            if (item == NULL) {
-                continue;
-            }
-            cJSON_AddStringToObject(item, "audio_id", entries[i].filename);
-            cJSON_AddStringToObject(item, "filename", entries[i].filename);
-            cJSON_AddStringToObject(item, "label", entries[i].label);
-            cJSON_AddNumberToObject(item, "size", entries[i].size_bytes);
-            cJSON_AddNumberToObject(item, "data_bytes", entries[i].data_bytes);
-            char source_sha256[65];
-            if (audio_sha256_hex(entries[i].filename, source_sha256)) {
-                cJSON_AddStringToObject(item, "source_sha256", source_sha256);
-            } else {
-                cJSON_AddNullToObject(item, "source_sha256");
-            }
-            cJSON_AddStringToObject(item, "created_at", entries[i].note.created_at);
-            cJSON_AddNumberToObject(item, "duration_ms", entries[i].note.duration_ms);
-            cJSON_AddBoolToObject(item, "synced", entries[i].note.synced != 0);
-            cJSON_AddBoolToObject(item, "transcript_uploaded", entries[i].note.synced != 0);
-            cJSON_AddStringToObject(item, "transcript_path", entries[i].note.transcript_path);
-            char *encoded = cJSON_PrintUnformatted(item);
-            cJSON_Delete(item);
-            if (encoded == NULL) {
-                continue;
-            }
-            esp_err_t err = emitted ? httpd_resp_sendstr_chunk(req, ",") : ESP_OK;
-            if (err == ESP_OK) {
-                err = httpd_resp_sendstr_chunk(req, encoded);
-            }
-            cJSON_free(encoded);
-            if (err != ESP_OK) {
-                free(entries);
-                ESP_RETURN_ON_ERROR(err, TAG, "audio list item send failed");
-            }
-            emitted++;
-        }
-        free(entries);
+    if (entries == NULL) {
+        httpd_resp_set_status(req, "503 Service Unavailable");
+        return send_json(req, "{\"error\":\"audio list out of memory\"}");
     }
+    int count = collect_audio_entries(entries, PJ_AUDIO_MAX_INDEXED_FILES);
+    if (count < 0) {
+        free(entries);
+        httpd_resp_set_status(req, "409 Conflict");
+        return send_json(req,
+                         "{\"error\":\"storage maintenance active\","
+                         "\"code\":\"storage_busy\",\"retryable\":true}");
+    }
+    httpd_resp_set_type(req, "application/json");
+    esp_err_t start_err = httpd_resp_sendstr_chunk(req, "{\"audio\":[");
+    if (start_err != ESP_OK) {
+        free(entries);
+        return start_err;
+    }
+    int emitted = 0;
+    for (int i = 0; i < count; i++) {
+        cJSON *item = cJSON_CreateObject();
+        if (item == NULL) {
+            continue;
+        }
+        cJSON_AddStringToObject(item, "audio_id", entries[i].filename);
+        cJSON_AddStringToObject(item, "filename", entries[i].filename);
+        cJSON_AddStringToObject(item, "label", entries[i].label);
+        cJSON_AddNumberToObject(item, "size", entries[i].size_bytes);
+        cJSON_AddNumberToObject(item, "data_bytes", entries[i].data_bytes);
+        char source_sha256[65];
+        if (audio_sha256_hex(entries[i].filename, source_sha256)) {
+            cJSON_AddStringToObject(item, "source_sha256", source_sha256);
+        } else {
+            cJSON_AddNullToObject(item, "source_sha256");
+        }
+        cJSON_AddStringToObject(item, "created_at", entries[i].note.created_at);
+        cJSON_AddNumberToObject(item, "duration_ms", entries[i].note.duration_ms);
+        cJSON_AddBoolToObject(item, "synced", entries[i].note.synced != 0);
+        cJSON_AddBoolToObject(item, "transcript_uploaded", entries[i].note.synced != 0);
+        cJSON_AddStringToObject(item, "transcript_path", entries[i].note.transcript_path);
+        char *encoded = cJSON_PrintUnformatted(item);
+        cJSON_Delete(item);
+        if (encoded == NULL) {
+            continue;
+        }
+        esp_err_t err = emitted ? httpd_resp_sendstr_chunk(req, ",") : ESP_OK;
+        if (err == ESP_OK) {
+            err = httpd_resp_sendstr_chunk(req, encoded);
+        }
+        cJSON_free(encoded);
+        if (err != ESP_OK) {
+            free(entries);
+            ESP_RETURN_ON_ERROR(err, TAG, "audio list item send failed");
+        }
+        emitted++;
+    }
+    free(entries);
     ESP_RETURN_ON_ERROR(httpd_resp_sendstr_chunk(req, "]}"), TAG, "audio list end send failed");
     return httpd_resp_sendstr_chunk(req, NULL);
 }
@@ -7772,24 +8268,46 @@ static esp_err_t audio_delete_handler(httpd_req_t *req)
     if (require_auth(req) != ESP_OK) {
         return ESP_OK;
     }
-    int deleted = pj_board_wipe_recordings(NULL);
-    if (deleted == -2) {
-        httpd_resp_set_status(req, "409 Conflict");
-        return send_json(req, "{\"error\":\"audio task active\"}");
-    }
-    if (deleted == -3) {
-        httpd_resp_set_status(req, "500 Internal Server Error");
-        return send_json(req,
-                         "{\"error\":\"recording wipe incomplete\","
-                         "\"code\":\"wipe_incomplete\",\"retryable\":true}");
-    }
-    if (deleted < 0) {
+    pj_wipe_status_t status = {0};
+    pj_wipe_start_result_t start = recording_wipe_start(NULL, &status);
+    cJSON *json = cJSON_CreateObject();
+    if (json == NULL) {
         httpd_resp_set_status(req, "503 Service Unavailable");
-        return send_json(req, "{\"error\":\"storage unavailable\"}");
+        return send_json(req, "{\"error\":\"wipe response allocation failed\"}");
     }
-    char json[96];
-    (void)snprintf(json, sizeof(json), "{\"deleted\":%d}", deleted);
-    return send_json(req, json);
+    if (start == PJ_WIPE_START_STARTED || start == PJ_WIPE_START_ATTACHED) {
+        httpd_resp_set_status(req, "202 Accepted");
+        cJSON_AddBoolToObject(json, "accepted", 1);
+        cJSON_AddBoolToObject(json, "attached", start == PJ_WIPE_START_ATTACHED);
+        (void)wipe_status_add_json(json, &status);
+    } else {
+        const char *message = "storage unavailable";
+        const char *code = "storage_unavailable";
+        if (start == PJ_WIPE_START_AUDIO_ACTIVE) {
+            message = "audio task active";
+            code = "audio_active";
+            httpd_resp_set_status(req, "409 Conflict");
+        } else if (start == PJ_WIPE_START_STORAGE_BUSY) {
+            message = "storage busy";
+            code = "storage_busy";
+            httpd_resp_set_status(req, "409 Conflict");
+        } else {
+            httpd_resp_set_status(req, "503 Service Unavailable");
+            if (start == PJ_WIPE_START_TASK_FAILED) {
+                message = "recording wipe task start failed";
+                code = "wipe_task_start_failed";
+            }
+        }
+        cJSON_AddStringToObject(json, "error", message);
+        cJSON_AddStringToObject(json, "code", code);
+        cJSON_AddBoolToObject(json, "retryable", 1);
+        if (status.id != 0U) {
+            (void)wipe_status_add_json(json, &status);
+        }
+    }
+    esp_err_t result = send_json_object(req, json);
+    cJSON_Delete(json);
+    return result;
 }
 
 static esp_err_t audio_download_handler(httpd_req_t *req)
@@ -7808,8 +8326,15 @@ static esp_err_t audio_download_handler(httpd_req_t *req)
     }
     char path[160];
     (void)snprintf(path, sizeof(path), PJ_AUDIO_DIR "/%s", id + 1);
+    if (!storage_shared_try_acquire()) {
+        httpd_resp_set_status(req, "409 Conflict");
+        return send_json(req,
+                         "{\"error\":\"storage maintenance active\","
+                         "\"code\":\"storage_busy\",\"retryable\":true}");
+    }
     FILE *file = fopen(path, "rb");
     if (file == NULL) {
+        storage_shared_release();
         httpd_resp_set_status(req, "404 Not Found");
         return send_json(req, "{\"error\":\"audio not found\"}");
     }
@@ -7821,6 +8346,7 @@ static esp_err_t audio_download_handler(httpd_req_t *req)
             esp_err_t err = httpd_resp_send_chunk(req, chunk, read);
             if (err != ESP_OK) {
                 fclose(file);
+                storage_shared_release();
                 return err;
             }
         }
@@ -7829,6 +8355,7 @@ static esp_err_t audio_download_handler(httpd_req_t *req)
         }
     }
     fclose(file);
+    storage_shared_release();
     return httpd_resp_send_chunk(req, NULL, 0);
 }
 
@@ -7847,12 +8374,6 @@ static esp_err_t transcript_put_handler(httpd_req_t *req)
         httpd_resp_set_status(req, "400 Bad Request");
         drain_body(req);
         return send_json(req, "{\"error\":\"invalid transcript id\"}");
-    }
-    pj_audio_entry_t entry;
-    if (!probe_audio_entry(id + 1, &entry)) {
-        httpd_resp_set_status(req, "404 Not Found");
-        drain_body(req);
-        return send_json(req, "{\"error\":\"audio not found\"}");
     }
     if (req->content_len <= 0) {
         drain_body(req);
@@ -7885,19 +8406,36 @@ static esp_err_t transcript_put_handler(httpd_req_t *req)
         }
         return send_json(req, "{\"error\":\"transcript must be a JSON object with non-empty text\"}");
     }
+    if (!storage_shared_try_acquire()) {
+        free(body);
+        httpd_resp_set_status(req, "409 Conflict");
+        return send_json(req,
+                         "{\"error\":\"storage maintenance active\","
+                         "\"code\":\"storage_busy\",\"retryable\":true}");
+    }
+    pj_audio_entry_t entry;
+    if (!probe_audio_entry(id + 1, &entry)) {
+        storage_shared_release();
+        free(body);
+        httpd_resp_set_status(req, "404 Not Found");
+        return send_json(req, "{\"error\":\"audio not found\"}");
+    }
     char path[PJ_NOTE_TRANSCRIPT_PATH_LEN];
     transcript_path_for_audio(path, sizeof(path), id + 1);
     esp_err_t write_err = json_write_file_atomic(path, body, (size_t)req->content_len);
     free(body);
     if (write_err == ESP_ERR_NO_MEM && g_status.storage_health == PJ_STORAGE_HEALTH_FULL) {
+        storage_shared_release();
         httpd_resp_set_status(req, "507 Insufficient Storage");
         return send_json(req, "{\"error\":\"insufficient storage for transcript\"}");
     }
     if (write_err == ESP_ERR_INVALID_STATE) {
+        storage_shared_release();
         httpd_resp_set_status(req, "503 Service Unavailable");
         return send_json(req, "{\"error\":\"storage unavailable; run storage recovery\"}");
     }
     if (write_err != ESP_OK) {
+        storage_shared_release();
         ESP_LOGW(TAG, "Transcript store failed: %s", path);
         httpd_resp_set_status(req, "500 Internal Server Error");
         return send_json(req, "{\"error\":\"transcript store failed\"}");
@@ -7905,6 +8443,7 @@ static esp_err_t transcript_put_handler(httpd_req_t *req)
     if (!probe_audio_entry(id + 1, &entry)) {
         ESP_LOGW(TAG, "Transcript stored but note metadata refresh failed: %s", id + 1);
     }
+    storage_shared_release();
     g_notes_update_pending = 1;
     ESP_LOGI(TAG, "Transcript stored and note marked synced: %s", path);
     return send_json(req, "{\"uploaded\":true}");

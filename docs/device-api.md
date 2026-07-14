@@ -18,7 +18,25 @@ Every `/v1` route is protected. Missing, malformed, or invalid credentials recei
 GET /v1/status
 ```
 
-Returns device id, firmware version, board profile, Wi-Fi state, storage state, battery state if available, temperature, relative humidity, and pending sync counts. Environmental readings use `temperature_c` and `humidity_percent`; humidity is `null` until the sensor returns a CRC-valid sample. Unit conversion is a presentation preference and does not alter the canonical Celsius value.
+Returns device id, firmware version, board profile, Wi-Fi state, storage state, battery state if available, temperature, relative humidity, pending sync counts, and the latest recording-wipe operation. Environmental readings use `temperature_c` and `humidity_percent`; humidity is `null` until the sensor returns a CRC-valid sample. Unit conversion is a presentation preference and does not alter the canonical Celsius value.
+
+```json
+{
+  "pending_sync": 2,
+  "transferred_sync": 4,
+  "recording_wipe": {
+    "id": 17,
+    "state": "running",
+    "audio_deleted": 3,
+    "transcripts_deleted": 2,
+    "notes_deleted": 2,
+    "code": null,
+    "retryable": false
+  }
+}
+```
+
+Wipe states are `idle`, `queued`, `running`, `succeeded`, and `failed`. The idle operation has id `0`. `recording_wipe_recent` retains a bounded newest-first history of terminal operations so a client can still resolve its operation id if a later wipe starts before the next poll. During exclusive storage maintenance, status remains responsive and reports the last cached sync counts instead of walking the card.
 
 The time/temp screen can display battery percentage when firmware can read it from the board power-management path. Until hardware bring-up confirms that path, simulator and native tests use a dummy percentage.
 
@@ -108,7 +126,29 @@ GET /v1/audio/{audio_id}
 DELETE /v1/audio
 ```
 
-Lists, downloads, or wipes retained WAV recordings from the TF card. List items include `created_at`, `duration_ms`, `synced`, and `transcript_path`; legacy WAVs receive deterministic metadata derived from their filename and header. `DELETE /v1/audio` also removes transcript and note metadata JSON sidecars and returns the number of audio files deleted. It returns `409 Conflict` while recording or playback is active.
+Lists, downloads, or wipes retained WAV recordings from the TF card. List items include `created_at`, `duration_ms`, `synced`, and `transcript_path`; legacy WAVs receive deterministic metadata derived from their filename and header.
+
+`DELETE /v1/audio` starts an asynchronous, exclusive maintenance operation that removes audio, transcript, and note metadata files. It promptly returns `202 Accepted`; a duplicate start while the wipe is queued or running attaches to the same operation.
+
+```json
+{
+  "accepted": true,
+  "attached": false,
+  "recording_wipe": {
+    "id": 17,
+    "state": "queued",
+    "audio_deleted": 0,
+    "transcripts_deleted": 0,
+    "notes_deleted": 0,
+    "code": null,
+    "retryable": false
+  }
+}
+```
+
+Poll `GET /v1/status` until the matching operation id reaches `succeeded` or `failed`. A failed operation reports a stable code such as `wipe_incomplete` and a `retryable` boolean. Start requests return `409 Conflict` with a credential-safe `code` when audio or another storage user is active, and `503 Service Unavailable` when storage is unavailable or the worker cannot start.
+
+Recording, playback, directory enumeration, audio downloads, transcript/metadata updates, static-art SD access, storage recovery, and light-sleep admission participate in the same shared/exclusive coordinator. Home layout persistence is NVS-only and does not use the FAT volume. Light sleep is deferred while storage work is active. If a FAT/VFS call does not return, firmware does not delete or cancel the worker task: the worker remains quarantined as the exclusive storage owner, status continues from cached data, and new storage work plus recovery is rejected. Reset the device to recover from a permanently stuck driver call; recovery is allowed only after the worker reaches a terminal state.
 
 ```http
 PUT /v1/transcripts/{audio_id}
@@ -133,10 +173,10 @@ Reserved for partner-driven firmware updates after rollback and version checks a
 The firmware also accepts a small line protocol on the USB Serial/JTAG console for maintenance when Wi-Fi is unavailable. The firmware console must be configured with USB Serial/JTAG as the primary console input; a secondary USB log console is output-only for `stdin` consumers.
 
 ```text
-PJ_STATUS
+PJ_STATUS [request_id=ID]
 PJ_WIFI_HEX 4c61622057694669 70617373776f7264 746f6b656e
 PJ_TIME 2026 06 20 14 05
-PJ_WIPE_RECORDINGS
+PJ_WIPE_RECORDINGS [request_id=ID]
 PJ_AUDIO_TONE [0|1|-] [dout_gpio] [pa=0|1|-] [dout=gpio] [pwr=0|1|-] [gpio44=0x00..0xff] [gp45=0x00..0xff]
 PJ_MIC_CHECK [duration_ms] [ms=1..10000] [gain_db=0..42]
 ```
@@ -146,6 +186,8 @@ PJ_MIC_CHECK [duration_ms] [ms=1..10000] [gain_db=0..42]
 `PJ_MIC_CHECK` samples the ES8311 microphone path without creating a note file and returns input statistics: `peak`, `avg_abs`, `clipped`, `near_zero`, `read_errors`, and `silent`. The production recording gain is `42 dB`; use lower diagnostic overrides only when measuring input headroom.
 
 Responses start with `PJ_OK` or `PJ_ERR` followed by a compact JSON object. Normal ESP-IDF logs may appear on the same serial stream, so clients should scan for those prefixes.
+
+`PJ_STATUS` and `PJ_WIPE_RECORDINGS` accept an optional 1-32 character request id containing letters, digits, `.`, `_`, or `-`. Tagged responses include both `command` and `request_id`; clients must reject a response when either differs from the request. The partner CLI retries a lost wipe-start acknowledgment with the same request id, allowing firmware to return the associated operation even after a fast wipe has completed. It uses a fresh request id and a newly opened, bounded-lifetime serial descriptor for every status poll. A CLI timeout identifies the still-running operation id so a later status check can determine the outcome.
 
 ## Calendar Event Shape
 

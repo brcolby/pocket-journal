@@ -127,7 +127,6 @@ pj_storage_delete_result_t pj_storage_delete_matching(const char *dir_path,
     }
 
     const size_t dir_len = strlen(dir_path);
-    int snapshot_stopped = 0;
     struct dirent *entry;
     for (;;) {
         errno = 0;
@@ -142,25 +141,23 @@ pj_storage_delete_result_t pj_storage_delete_matching(const char *dir_path,
             continue;
         }
         result.matched++;
-        if (snapshot_stopped || result.snapshotted >= max_entries) {
+        if (result.snapshotted >= max_entries) {
             result.truncated++;
-            continue;
+            break;
         }
 
         const size_t name_len = strlen(entry->d_name);
         if (name_len > SIZE_MAX - 2U || dir_len > SIZE_MAX - name_len - 2U) {
             result.allocation_errno = EOVERFLOW;
             result.truncated++;
-            snapshot_stopped = 1;
-            continue;
+            break;
         }
         const size_t path_size = dir_len + 1U + name_len + 1U;
         char *path = malloc(path_size);
         if (path == NULL) {
             result.allocation_errno = ENOMEM;
             result.truncated++;
-            snapshot_stopped = 1;
-            continue;
+            break;
         }
         memcpy(path, dir_path, dir_len);
         path[dir_len] = '/';

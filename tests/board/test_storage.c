@@ -107,6 +107,21 @@ static void test_delete_matching_empty(void)
     assert(rmdir(dir) == 0);
 }
 
+static void test_delete_matching_missing_and_invalid_inputs(void)
+{
+    pj_storage_delete_result_t result =
+        pj_storage_delete_matching("/tmp/pj-storage-does-not-exist", matches_wav, 8U);
+    assert(result.open_errno == ENOENT);
+    assert(result.deleted == 0U);
+
+    result = pj_storage_delete_matching(NULL, matches_wav, 8U);
+    assert(result.open_errno == EINVAL);
+    result = pj_storage_delete_matching("", matches_wav, 8U);
+    assert(result.open_errno == EINVAL);
+    result = pj_storage_delete_matching("/tmp", NULL, 8U);
+    assert(result.open_errno == EINVAL);
+}
+
 static void test_delete_matching_filters_and_deletes_multiple(void)
 {
     char dir[TEST_PATH_BYTES];
@@ -303,6 +318,7 @@ static void test_wav_header_encoding(void)
 int main(void)
 {
     test_delete_matching_empty();
+    test_delete_matching_missing_and_invalid_inputs();
     test_delete_matching_filters_and_deletes_multiple();
     test_delete_matching_reports_truncation();
     test_delete_matching_reports_remove_failure_once();

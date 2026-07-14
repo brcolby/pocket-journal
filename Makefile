@@ -16,6 +16,7 @@ SETTINGS_TEST_BIN := build/test_settings
 STATIC_ART_TEST_BIN := build/test_static_art
 HOME_LAYOUT_TEST_BIN := build/test_home_layout
 STORAGE_TEST_BIN := build/test_storage
+STORAGE_COORDINATOR_TEST_BIN := build/test_storage_coordinator
 TIME_CLOCK_TEST_BIN := build/test_time_clock
 RTC_WAKE_TEST_BIN := build/test_rtc_wake
 TIME_CONTROLLER_TEST_BIN := build/test_time_controller
@@ -131,6 +132,12 @@ test-input:
 		tests/board/test_storage.c \
 		-o $(STORAGE_TEST_BIN)
 	$(STORAGE_TEST_BIN)
+	$(CC) $(CFLAGS) \
+		-Ifirmware/components/pj_board/include \
+		firmware/components/pj_board/pj_storage_coordinator.c \
+		tests/board/test_storage_coordinator.c \
+		-o $(STORAGE_COORDINATOR_TEST_BIN)
+	$(STORAGE_COORDINATOR_TEST_BIN)
 	$(CC) $(CFLAGS) \
 		-Ifirmware/components/pj_board/include \
 		-Ifirmware/components/pj_ui/include \

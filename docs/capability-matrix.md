@@ -25,7 +25,7 @@ in command output or errors.
 | Download audio | `pj recordings download [--device ID] --audio-id ID [--output-dir DIR]` | No | `GET /v1/audio/{id}` | Bearer token | v0 audio endpoint | Writes only the selected local file | Safe to retry; replaces the same local filename |
 | Sync audio and transcripts | `pj sync [--device ID] [--backend hf\|fake]` | No | Audio GET plus transcript PUT | Bearer token | v0 audio and transcript endpoints; selected transcription backend installed | Yes | Safe after interruption; cached audio/transcripts are reused and firmware skips uploaded notes |
 | Upload transcript | Performed by `pj sync` | No | `PUT /v1/transcripts/{id}` | Bearer token | v0 transcript endpoint and an existing recording | Yes | Safe to retry for the same recording |
-| Delete recordings | `pj recordings wipe [--device ID] --yes` | `PJ_WIPE_RECORDINGS` | `DELETE /v1/audio` | Physical USB access or bearer token | v0 wipe command/endpoint | Yes, destructive | Requires `--yes`; retry leaves the device empty |
+| Delete recordings | `pj recordings wipe [--device ID] --yes` | Tagged `PJ_WIPE_RECORDINGS` start plus `PJ_STATUS` polls | `DELETE /v1/audio` plus `GET /v1/status` polls | Physical USB access or bearer token | Async wipe operation status | Yes, destructive | Requires `--yes`; concurrent starts attach to one operation; terminal counts and retryability are reported |
 | Speaker diagnostic | `pj device tone ...` | `PJ_AUDIO_TONE` | No | Physical USB access | v0 diagnostic command | Temporarily changes diagnostic routing | Safe to repeat; firmware restores temporary overrides |
 | Microphone diagnostic | `pj device mic-check ...` | `PJ_MIC_CHECK` | No | Physical USB access | v0 diagnostic command | No retained recording | Safe to repeat |
 | OTA firmware update | None | Not implemented | Reserved `POST /v1/ota`; not production-ready | Not applicable | Rollback and version verification are required first | Yes | Undefined; CLI intentionally refuses by having no command |
@@ -52,6 +52,13 @@ short RTS fallback if necessary. Timeout and interruption paths terminate, wait
 for, and if necessary kill and reap the esptool child before releasing the port.
 If neither serial nor USB-JTAG answers, use a dedicated reset or unplug/replug the
 board with AUX/BOOT released; hold AUX/BOOT only to enter ROM download mode.
+
+Recording wipes use a bounded serial exchange for the start and each status poll;
+no descriptor is held for the lifetime of the device operation. Start retries reuse
+one request id so a lost acknowledgment attaches to the same operation, including
+after terminal completion. Polls use fresh request ids and accept only responses
+whose command tag, request id, and operation id match. A timeout reports the
+operation id and does not imply that the device worker was cancelled.
 
 The shared operation session reports transport as `"usb"` or `"lan"`, preflights
 mutations, honors a firmware `capabilities` advertisement when present, and rejects

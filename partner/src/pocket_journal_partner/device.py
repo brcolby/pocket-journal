@@ -8,6 +8,7 @@ from urllib import error, parse, request
 import glob
 import json
 import os
+import secrets
 import subprocess
 import sys
 import time
@@ -18,10 +19,45 @@ class DeviceError(RuntimeError):
 
 
 class DeviceHTTPError(DeviceError):
-    def __init__(self, message: str, status_code: int, retryable: bool) -> None:
+    def __init__(
+        self,
+        message: str,
+        status_code: int,
+        retryable: bool,
+        *,
+        code: str | None = None,
+        device_error: str | None = None,
+        operation: dict[str, Any] | None = None,
+    ) -> None:
         super().__init__(message)
         self.status_code = status_code
         self.retryable = retryable
+        self.code = code
+        self.device_error = device_error
+        self.operation = operation
+
+
+class DeviceOperationError(DeviceError):
+    def __init__(
+        self,
+        message: str,
+        operation_id: int,
+        *,
+        code: str | None,
+        retryable: bool,
+    ) -> None:
+        super().__init__(message)
+        self.operation_id = operation_id
+        self.code = code
+        self.retryable = retryable
+
+
+class DeviceOperationTimeout(DeviceOperationError):
+    pass
+
+
+class DeviceRequestTimeout(DeviceError):
+    pass
 
 
 class SerialPortNotFound(DeviceError):
@@ -46,6 +82,76 @@ _USB_ROM_DOWNLOAD_MARKERS = (
     "(download(usb/uart0))",
     "boot:0x0",
 )
+
+_WIPE_STATES = {"idle", "queued", "running", "succeeded", "failed"}
+
+
+def _safe_code(value: Any) -> str | None:
+    if not isinstance(value, str) or not 1 <= len(value) <= 64:
+        return None
+    if any(not (ch.islower() or ch.isdigit() or ch in "._-") for ch in value):
+        return None
+    return value
+
+
+def _safe_device_error(value: Any) -> str | None:
+    if not isinstance(value, str) or not 1 <= len(value) <= 160:
+        return None
+    if any(ord(ch) < 0x20 or ord(ch) > 0x7E or ch in {'"', "'", "\\"} for ch in value):
+        return None
+    lowered = value.lower()
+    if any(term in lowered for term in ("authorization", "bearer", "credential", "password", "secret", "ssid", "token")):
+        return None
+    return value
+
+
+def _decode_recording_wipe(source: Any) -> dict[str, Any] | None:
+    if not isinstance(source, dict):
+        return None
+    operation_id = source.get("id")
+    state = source.get("state")
+    if isinstance(operation_id, bool) or not isinstance(operation_id, int) or operation_id <= 0:
+        return None
+    if state not in _WIPE_STATES:
+        return None
+    operation: dict[str, Any] = {"id": operation_id, "state": state}
+    for field in ("audio_deleted", "transcripts_deleted", "notes_deleted"):
+        value = source.get(field, 0)
+        operation[field] = value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else 0
+    operation["code"] = _safe_code(source.get("code"))
+    operation["retryable"] = source.get("retryable") is True
+    return operation
+
+
+def _recording_wipe_operation(
+    payload: Any,
+    operation_id: int | None = None,
+) -> dict[str, Any] | None:
+    if not isinstance(payload, dict):
+        return None
+    sources = [payload.get("recording_wipe")]
+    if operation_id is not None and isinstance(payload.get("recording_wipe_recent"), list):
+        sources.extend(payload["recording_wipe_recent"])
+    for source in sources:
+        operation = _decode_recording_wipe(source)
+        if operation is not None and (operation_id is None or operation["id"] == operation_id):
+            return operation
+    return None
+
+
+def _recording_wipe_result(operation: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "operation_id": operation["id"],
+        "state": operation["state"],
+        "deleted": operation["audio_deleted"],
+        "audio_deleted": operation["audio_deleted"],
+        "transcripts_deleted": operation["transcripts_deleted"],
+        "notes_deleted": operation["notes_deleted"],
+    }
+
+
+def _new_request_id() -> str:
+    return secrets.token_hex(8)
 
 
 def _looks_like_usb_serial_port(device: str) -> bool:
@@ -98,7 +204,14 @@ class DeviceClient:
     def _url(self, path: str) -> str:
         return parse.urljoin(self.base_url + "/", path.lstrip("/"))
 
-    def _request(self, method: str, path: str, body: Any | None = None) -> Any:
+    def _request(
+        self,
+        method: str,
+        path: str,
+        body: Any | None = None,
+        *,
+        timeout: float | None = None,
+    ) -> Any:
         data = None
         headers = {"Authorization": f"Bearer {self.token}"}
         if body is not None:
@@ -111,8 +224,9 @@ class DeviceClient:
             ).encode("utf-8")
             headers["Content-Type"] = "application/json"
         req = request.Request(self._url(path), data=data, method=method, headers=headers)
+        request_timeout = self.timeout if timeout is None else timeout
         try:
-            with request.urlopen(req, timeout=self.timeout) as response:
+            with request.urlopen(req, timeout=request_timeout) as response:
                 payload = response.read()
                 if not payload:
                     return None
@@ -124,6 +238,24 @@ class DeviceClient:
                         raise DeviceError(f"{method} {path} failed: device returned invalid JSON") from exc
                 return payload
         except error.HTTPError as exc:
+            code = None
+            device_error = None
+            operation = None
+            response_retryable = None
+            try:
+                if exc.fp is None:
+                    raise AttributeError("HTTP error has no response body")
+                raw_error = exc.read(4097)
+                if len(raw_error) <= 4096:
+                    parsed_error = json.loads(raw_error.decode("utf-8"))
+                    if isinstance(parsed_error, dict):
+                        code = _safe_code(parsed_error.get("code"))
+                        device_error = _safe_device_error(parsed_error.get("error"))
+                        operation = _recording_wipe_operation(parsed_error)
+                        if isinstance(parsed_error.get("retryable"), bool):
+                            response_retryable = parsed_error["retryable"]
+            except (AttributeError, KeyError, OSError, ValueError, UnicodeDecodeError, json.JSONDecodeError):
+                pass
             if exc.code == 401:
                 detail = "authentication failed; verify the paired device token"
             elif exc.code == 404:
@@ -132,9 +264,18 @@ class DeviceClient:
                 detail = "device is busy; stop recording or playback and retry"
             else:
                 detail = f"HTTP {exc.code}"
+            if device_error is not None:
+                detail = f"{detail}; device reported: {device_error}"
             retryable = exc.code in {408, 409, 425, 429} or 500 <= exc.code < 600
+            if response_retryable is not None:
+                retryable = response_retryable
             raise DeviceHTTPError(
-                f"{method} {path} failed: {detail}", exc.code, retryable
+                f"{method} {path} failed: {detail}",
+                exc.code,
+                retryable,
+                code=code,
+                device_error=device_error,
+                operation=operation,
             ) from exc
         except error.URLError as exc:
             raise DeviceError(f"{method} {path} failed: {exc.reason}") from exc
@@ -184,7 +325,45 @@ class DeviceClient:
             raise DeviceError("GET /v1/audio failed: device returned invalid recording metadata") from exc
 
     def wipe_recordings(self) -> dict[str, Any] | None:
-        return self._request("DELETE", "/v1/audio")
+        deadline = time.monotonic() + self.timeout
+        response = self._request("DELETE", "/v1/audio")
+        operation = _recording_wipe_operation(response)
+        if operation is None:
+            if isinstance(response, dict) and isinstance(response.get("deleted"), int):
+                return response
+            raise DeviceError("DELETE /v1/audio failed: device returned an invalid wipe operation")
+
+        while True:
+            if operation["state"] == "succeeded":
+                return _recording_wipe_result(operation)
+            if operation["state"] == "failed":
+                code = operation["code"]
+                suffix = f" ({code})" if code is not None else ""
+                raise DeviceOperationError(
+                    f"recording wipe operation {operation['id']} failed{suffix}",
+                    operation["id"],
+                    code=code,
+                    retryable=operation["retryable"],
+                )
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise DeviceOperationTimeout(
+                    f"recording wipe operation {operation['id']} timed out; it may still be running",
+                    operation["id"],
+                    code="operation_timeout",
+                    retryable=True,
+                )
+            status = self._request(
+                "GET",
+                "/v1/status",
+                timeout=min(1.0, remaining),
+            )
+            current = _recording_wipe_operation(status, operation["id"])
+            if current is not None:
+                operation = current
+            remaining = deadline - time.monotonic()
+            if remaining > 0 and operation["state"] not in {"succeeded", "failed"}:
+                time.sleep(min(0.1, remaining))
 
     def download_audio(self, item: AudioItem, target_dir: Path) -> Path:
         target_dir.mkdir(parents=True, exist_ok=True)
@@ -252,39 +431,71 @@ class SerialDeviceClient:
                 except (serial_module.SerialException, OSError):
                     pass
 
-    def _request(self, command: str) -> dict[str, Any]:
+    def _request(
+        self,
+        command: str,
+        *,
+        timeout: float | None = None,
+        request_id: str | None = None,
+    ) -> dict[str, Any]:
         try:
             import serial  # type: ignore
         except ImportError as exc:
             raise DeviceError("USB support requires pyserial; reinstall the partner CLI") from exc
 
+        request_timeout = self.timeout if timeout is None else timeout
+        expected_command = command.split(" ", 1)[0]
+        wire_command = command if request_id is None else f"{command} request_id={request_id}"
         try:
             with self._connection(serial) as connection:
                 time.sleep(0.1)
                 connection.reset_input_buffer()
-                connection.write(f"{command}\n".encode("ascii"))
+                connection.write(f"{wire_command}\n".encode("ascii"))
                 connection.flush()
-                deadline = time.monotonic() + self.timeout
+                deadline = time.monotonic() + request_timeout
                 while time.monotonic() < deadline:
                     raw = connection.readline()
                     if not raw:
                         continue
                     line = raw.decode("utf-8", errors="replace").strip()
-                    if line.startswith("PJ_OK "):
-                        try:
-                            return json.loads(line[6:])
-                        except json.JSONDecodeError as exc:
-                            raise DeviceError("USB command failed: device returned invalid JSON") from exc
-                    if line.startswith("PJ_ERR "):
-                        try:
-                            payload = json.loads(line[7:])
-                            message = payload.get("error", line[7:])
-                        except json.JSONDecodeError:
-                            message = line[7:]
-                        raise DeviceError(f"USB command failed: {message}")
+                    ok = line.startswith("PJ_OK ")
+                    failed = line.startswith("PJ_ERR ")
+                    if not ok and not failed:
+                        continue
+                    encoded = line[6:] if ok else line[7:]
+                    try:
+                        payload = json.loads(encoded)
+                    except json.JSONDecodeError as exc:
+                        raise DeviceError("USB command failed: device returned invalid JSON") from exc
+                    if not isinstance(payload, dict):
+                        raise DeviceError("USB command failed: device returned invalid JSON")
+                    response_command = payload.get("command")
+                    if request_id is not None:
+                        if response_command != expected_command or payload.get("request_id") != request_id:
+                            continue
+                    elif response_command is not None and response_command != expected_command:
+                        continue
+                    if ok:
+                        return payload
+
+                    operation = _recording_wipe_operation(payload)
+                    code = _safe_code(payload.get("code"))
+                    retryable = payload.get("retryable") is True
+                    if operation is not None:
+                        code = operation["code"] or code
+                        retryable = operation["retryable"]
+                        suffix = f" ({code})" if code is not None else ""
+                        raise DeviceOperationError(
+                            f"USB recording wipe operation {operation['id']} failed{suffix}",
+                            operation["id"],
+                            code=code,
+                            retryable=retryable,
+                        )
+                    suffix = f" ({code})" if code is not None else ""
+                    raise DeviceError(f"USB command failed: device rejected {expected_command}{suffix}")
         except (serial.SerialException, OSError) as exc:
             raise DeviceError(f"USB serial connection failed on {self.port}: {exc}") from exc
-        raise DeviceError(
+        raise DeviceRequestTimeout(
             f"USB command timed out on {self.port}; the port was released. Close any serial monitor and verify "
             "the firmware console uses USB Serial/JTAG. If the board says 'waiting for download', reset or "
             "power-cycle it with AUX/BOOT released"
@@ -299,7 +510,60 @@ class SerialDeviceClient:
         return self._request(f"PJ_TIME {year} {month} {day} {hour} {minute}")
 
     def wipe_recordings(self) -> dict[str, Any]:
-        return self._request("PJ_WIPE_RECORDINGS")
+        deadline = time.monotonic() + self.timeout
+        start_request_id = _new_request_id()
+        while True:
+            remaining = max(0.0, deadline - time.monotonic())
+            try:
+                response = self._request(
+                    "PJ_WIPE_RECORDINGS",
+                    timeout=min(0.5, remaining),
+                    request_id=start_request_id,
+                )
+                break
+            except DeviceRequestTimeout:
+                if time.monotonic() >= deadline:
+                    raise
+        operation = _recording_wipe_operation(response)
+        if operation is None:
+            if isinstance(response.get("deleted"), int):
+                return response
+            raise DeviceError("USB command failed: device returned an invalid wipe operation")
+
+        while True:
+            if operation["state"] == "succeeded":
+                return _recording_wipe_result(operation)
+            if operation["state"] == "failed":
+                code = operation["code"]
+                suffix = f" ({code})" if code is not None else ""
+                raise DeviceOperationError(
+                    f"USB recording wipe operation {operation['id']} failed{suffix}",
+                    operation["id"],
+                    code=code,
+                    retryable=operation["retryable"],
+                )
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise DeviceOperationTimeout(
+                    f"USB recording wipe operation {operation['id']} timed out; it may still be running",
+                    operation["id"],
+                    code="operation_timeout",
+                    retryable=True,
+                )
+            try:
+                status = self._request(
+                    "PJ_STATUS",
+                    timeout=min(0.75, remaining),
+                    request_id=_new_request_id(),
+                )
+            except DeviceRequestTimeout:
+                continue
+            current = _recording_wipe_operation(status, operation["id"])
+            if current is not None:
+                operation = current
+            remaining = deadline - time.monotonic()
+            if remaining > 0 and operation["state"] not in {"succeeded", "failed"}:
+                time.sleep(min(0.1, remaining))
 
     def audio_tone(
         self,

@@ -4,7 +4,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from contextlib import redirect_stderr
 from contextlib import redirect_stdout
-from io import StringIO
+from io import BytesIO, StringIO
 import json
 import stat
 from urllib import error
@@ -13,7 +13,15 @@ import unittest
 
 from pocket_journal_partner import cli
 from pocket_journal_partner.config import DeviceProfile, PartnerConfig
-from pocket_journal_partner.device import AudioItem, DeviceClient, DeviceError, DeviceHTTPError, SerialDeviceClient, resolve_serial_port
+from pocket_journal_partner.device import (
+    AudioItem,
+    DeviceClient,
+    DeviceError,
+    DeviceHTTPError,
+    DeviceOperationError,
+    SerialDeviceClient,
+    resolve_serial_port,
+)
 
 
 class ConfigTests(unittest.TestCase):
@@ -135,6 +143,27 @@ class ConfigTests(unittest.TestCase):
                 self.assertEqual(raised.exception.status_code, code)
                 self.assertEqual(raised.exception.retryable, retryable)
 
+    def test_http_errors_preserve_only_validated_device_details(self) -> None:
+        client = DeviceClient("http://device.local", "token")
+        body = BytesIO(b'{"error":"recording wipe incomplete","code":"wipe_incomplete","retryable":true}')
+        failure = error.HTTPError(client._url("/v1/audio"), 500, "error", {}, body)
+        with patch("pocket_journal_partner.device.request.urlopen", side_effect=failure):
+            with self.assertRaises(DeviceHTTPError) as raised:
+                client.wipe_recordings()
+        self.assertEqual(raised.exception.code, "wipe_incomplete")
+        self.assertEqual(raised.exception.device_error, "recording wipe incomplete")
+        self.assertIn("recording wipe incomplete", str(raised.exception))
+        failure.close()
+
+        sensitive = BytesIO(b'{"error":"password is super-secret-token","code":"storage_busy"}')
+        failure = error.HTTPError(client._url("/v1/audio"), 409, "error", {}, sensitive)
+        with patch("pocket_journal_partner.device.request.urlopen", side_effect=failure):
+            with self.assertRaises(DeviceHTTPError) as raised:
+                client.wipe_recordings()
+        self.assertIsNone(raised.exception.device_error)
+        self.assertNotIn("super-secret-token", str(raised.exception))
+        failure.close()
+
     def test_provision_output_does_not_expose_generated_token_or_password(self) -> None:
         with TemporaryDirectory() as tmp:
             stdout = StringIO()
@@ -243,6 +272,84 @@ class ConfigTests(unittest.TestCase):
 
         self.assertEqual(calls[0], ("GET", "/v1/audio", None))
         self.assertEqual(calls[1], ("DELETE", "/v1/audio", None))
+
+    def test_http_wipe_polls_matching_operation_to_completion(self) -> None:
+        calls = []
+        responses = iter([
+            {
+                "accepted": True,
+                "recording_wipe": {
+                    "id": 17,
+                    "state": "queued",
+                    "audio_deleted": 0,
+                    "transcripts_deleted": 0,
+                    "notes_deleted": 0,
+                    "code": None,
+                    "retryable": False,
+                },
+            },
+            {
+                "recording_wipe": {
+                    "id": 99,
+                    "state": "running",
+                    "audio_deleted": 99,
+                    "transcripts_deleted": 0,
+                    "notes_deleted": 0,
+                    "code": None,
+                    "retryable": False,
+                },
+                "recording_wipe_recent": [{
+                    "id": 17,
+                    "state": "succeeded",
+                    "audio_deleted": 3,
+                    "transcripts_deleted": 2,
+                    "notes_deleted": 1,
+                    "code": None,
+                    "retryable": False,
+                }],
+            },
+        ])
+        client = DeviceClient("http://device.local", "token", timeout=1)
+
+        def fake_request(method, path, body=None, **kwargs):
+            calls.append((method, path, body, kwargs))
+            return next(responses)
+
+        client._request = fake_request  # type: ignore[method-assign]
+        with patch("pocket_journal_partner.device.time.sleep"):
+            result = client.wipe_recordings()
+
+        self.assertEqual(result, {
+            "operation_id": 17,
+            "state": "succeeded",
+            "deleted": 3,
+            "audio_deleted": 3,
+            "transcripts_deleted": 2,
+            "notes_deleted": 1,
+        })
+        self.assertEqual([call[:2] for call in calls], [
+            ("DELETE", "/v1/audio"),
+            ("GET", "/v1/status"),
+        ])
+
+    def test_http_wipe_failure_exposes_operation_code(self) -> None:
+        client = DeviceClient("http://device.local", "token")
+        client._request = lambda method, path, body=None: {  # type: ignore[method-assign]
+            "recording_wipe": {
+                "id": 18,
+                "state": "failed",
+                "audio_deleted": 1,
+                "transcripts_deleted": 0,
+                "notes_deleted": 0,
+                "code": "wipe_incomplete",
+                "retryable": True,
+            }
+        }
+        with self.assertRaises(DeviceOperationError) as raised:
+            client.wipe_recordings()
+        self.assertEqual(raised.exception.operation_id, 18)
+        self.assertEqual(raised.exception.code, "wipe_incomplete")
+        self.assertTrue(raised.exception.retryable)
 
     def test_audio_source_digest_is_optional_for_older_or_failed_device_hashing(self) -> None:
         client = DeviceClient("http://127.0.0.1", "token")
