@@ -9,7 +9,7 @@ The current visual treatment is accepted as the initial-release baseline.
 Future visual refinement is non-blocking unless hardware testing finds a
 legibility, navigation, clipping, refresh, or other usability defect.
 
-Last synchronized with `bd human list`: 2026-07-13 (16 beads).
+Last synchronized with `bd human list`: 2026-07-14 (5 beads).
 
 ## Batch Validation Strategy
 
@@ -31,84 +31,110 @@ results, and the few logs or artifacts worth preserving. Safety, destructive
 hardware choices, and hard blockers are the only reasons to request an
 out-of-cycle test.
 
-## Ready To Validate
+## Verified Hardware Evidence
 
-### Controls and display
+Do not repeat these checks on an unchanged build.
 
-- [ ] **E-paper and touch baseline** (`pocket-journal-jjt`)
-  - Exercise primary screens, touch targets, rapid navigation, wake, and repeated partial refreshes.
-  - Record stale pixels, clipping, missed touches, ghosting, and approximate refresh latency.
-- [ ] **Clock, unit, and reading-size persistence** (`pocket-journal-aw7`)
-  - Toggle 12/24-hour mode directly from the Settings row; verify the change appears immediately and there is no nested Display screen.
-  - Confirm Settings rows are Volume, Light/Dark, and 12/24-hour mode.
-  - Verify Celsius/Fahrenheit and transcript font-size preferences still round-trip through the settings API and persist without requiring compact-device navigation rows.
-  - In 12-hour mode, confirm the main clock has no AM/PM suffix; verify the Alarm screen still disambiguates AM from PM.
-  - Reboot and sleep/wake, then confirm all three preferences persist.
-  - Compare displayed temperature and humidity with a nearby reference; report whether the values are plausible and stable. When the humidity sensor is unavailable, the clock must show `--%` and `/v1/status` must return `null`, never a plausible placeholder value.
-- [ ] **Home layout persistence** (`pocket-journal-bmz`)
-  - Change the layout, reboot and sleep/wake, and confirm order and navigation persist.
-- [ ] **Static art persistence** (`pocket-journal-lhl`)
-  - PUT/GET art repeatedly, reboot and sleep/wake, and verify exact physical pixels.
-  - Check missing/corrupt slot and interrupted-write fallback retains last-known-good art.
-
-### Recording, playback, and audio
-
-- [ ] **Settings and volume persistence** (`pocket-journal-wsl`)
-  - Change volume and representative settings, reboot and sleep/wake, then verify persistence and real output changes.
-
-### Time, sleep, and wake
-
-- [ ] **RTC alert wake** (`pocket-journal-54s`)
-  - Arm a short timer, enter static/sleep, and confirm GPIO5 RTC wake presents it exactly once.
-  - While armed, confirm BOOT still wakes independently; try an early BOOT wake and re-sleep.
-  - Capture logs for RTC flags and verify there is no repeated wake loop.
-
-### Connectivity, API, and storage
-
-- [ ] **LAN bearer authentication** (`pocket-journal-3ie`)
-  - Confirm valid token access after reboot; missing, malformed, and wrong tokens consistently return 401.
-  - Check device logs and responses for leaked token or Wi-Fi credentials.
-- [ ] **SD-card recovery** (`pocket-journal-pc3`)
-  - With backed-up test media, exercise missing/remounted, low/full, corrupt-file, removal, and controlled power-interruption cases.
-  - Verify prior valid notes remain readable and partial/corrupt objects are rejected or recovered safely.
+- Default USB-C provisioning completed on firmware `7e6ce1e-dirty` and returned
+  the expected device identity with `provisioned=true` (`pocket-journal-iig`,
+  closed). A later Wi-Fi association failure does not reopen provisioning.
+- A partner command without `--device` selected the attached USB device
+  successfully (`pocket-journal-b96`, closed).
+- The app reached normal SPI flash boot, initialized the display, touch, RTC,
+  environmental sensor, SD card, and audio codec, and accepted USB commands.
+- Saved Wi-Fi credentials loaded and the station repeatedly reached
+  authentication and association, but it never obtained an IP address
+  (`pocket-journal-d3d`, `pocket-journal-1qk`).
+- Explicit partner time sync worked. Automatic time establishment after flash
+  and provisioning did not (`pocket-journal-223`, `pocket-journal-2f2`).
+- Core display and navigation were usable across enough screens to reveal dark
+  focused buttons, excess full refreshes, and gray or displaced pixels around a
+  minute update (`pocket-journal-jjt`, `pocket-journal-1dx`,
+  `pocket-journal-zi6`).
+- Record opened, but elapsed time stayed at zero and no completed note appeared
+  (`pocket-journal-sm1`).
+- Four invalid or interrupted WAV files were rejected without breaking note
+  enumeration (`pocket-journal-pc3`). Corrupt-file rejection is verified; the
+  remaining storage failure matrix is not.
+- Timer and interval alert output was not audible even though logs showed the
+  output path starting and finishing at maximum configured volume
+  (`pocket-journal-oi9`).
+- AUX Back waited for release, holding AUX through a transition could wedge the
+  UI, interval round one changed screen and duration, and dynamic time screens
+  used disruptive full refreshes (`pocket-journal-61u`, `pocket-journal-8q5`,
+  `pocket-journal-zi6`).
 
 ## In Current Agent Batch
 
-Do not retest these on the current firmware. They return to `Ready To Validate`
-only after their focused blockers pass automated checks and are included in the
-next identified firmware build.
+Do not retest these on the current firmware. They enter the next consolidated
+checklist only after their focused blockers pass automated checks and are
+included in the next identified firmware build.
 
-- **Controls and navigation** (`pocket-journal-2ji`, `pocket-journal-d8j`): blocked by `pocket-journal-61u`, `pocket-journal-1dx`, and `pocket-journal-sm1`.
-- **Editorial UI and refresh behavior** (`pocket-journal-nz5`, `pocket-journal-e43`): blocked by `pocket-journal-1dx`, `pocket-journal-cf4`, and `pocket-journal-zi6`.
-- **Recording and board-state truth** (`pocket-journal-te0`): blocked by `pocket-journal-sm1`.
-- **Time workflow and alert audio** (`pocket-journal-xl8`, `pocket-journal-oi9`): interval behavior is blocked by `pocket-journal-8q5`; alert audio remains under software diagnosis.
-- **Connectivity and automatic time** (`pocket-journal-d3d`): blocked by `pocket-journal-1qk` and `pocket-journal-223`.
+- **Controls and navigation:** `pocket-journal-61u` fires AUX Back at the
+  threshold and hardens held-button transitions; `pocket-journal-1dx` replaces
+  inverted focus with a local indicator and chevrons; `pocket-journal-cf4`
+  corrects Timer geometry and focus timeout.
+- **Dynamic time UI:** `pocket-journal-zi6` bounds dirty regions and refresh
+  cadence; `pocket-journal-8q5` stabilizes interval rounds and durations.
+- **Recording:** `pocket-journal-sm1` connects elapsed time to captured bytes and
+  publishes exactly one validated note after asynchronous finalization.
+- **Alert audio:** `pocket-journal-oi9` now requires one approximately one-second
+  chime per new alert ID, never indefinite repetition, and still needs audible
+  codec/PA diagnosis.
+- **USB reliability:** `pocket-journal-rgo` is completing ROM-mode detection and
+  repeated command/flash lifecycle handling. A monitor continuing to run until
+  explicitly quit is expected behavior; unintended reset or port retention is
+  the defect.
+- **Connectivity and time:** `pocket-journal-1qk` adds firmware Wi-Fi phase and
+  disconnect diagnostics; `pocket-journal-223` owns automatic USB host-time
+  anchoring; `pocket-journal-d3d` owns successful IP, reconnect, mDNS, and sync
+  truth. Background SNTP remains `pocket-journal-2f2` after connectivity works.
 
-## Decisions Needed Before More Implementation
+## Human Decisions And Physical Work
 
 - [ ] **Secure BLE possession UX** (`pocket-journal-db1`)
   - Choose authenticated numeric comparison on the display with AUX confirmation, or a unique per-device proof-of-possession secret.
   - Define lost-partner recovery, bond/secret replacement, provisioning timeout, and factory clearing behavior.
-- [ ] **Timezone provisioning UX** (`pocket-journal-2f2`)
-  - Choose partner-confirmed host timezone during provisioning/settings, or manual timezone selection.
-  - The chosen format must support daylight-saving rules; a fixed UTC offset is insufficient.
 - [ ] **Portal authentication/session UX** (`pocket-journal-kky`)
   - Approve or revise short-lived memory-only browser sessions, same-origin security, conflict revisions, and the initial capability inventory.
 - [ ] **Power-mode intent** (`pocket-journal-ap4`)
   - Decide whether PWR means UI suspend, connected standby, disconnected light sleep, deep sleep, or hardware off after observing current hardware behavior.
-
-## Blocked Until Prerequisites
-
 - [ ] **Correct enclosure acoustics** (`pocket-journal-cpk`)
   - Uncover and correctly orient the microphone path; verify the speaker opening and eliminate enclosure buzz or obstruction.
   - Capture comparable before/after recordings using identical distance, voice, environment, and firmware settings.
-- [ ] **Detailed microphone/speaker tuning** (`pocket-journal-im4`)
-  - Start only after the corrected enclosure is installed. Run the documented controlled gain/corpus/listening/transcription evaluation.
-- [ ] **Playback volume mapping** (`pocket-journal-qza`)
-  - Start after the corrected enclosure and recording pipeline are available; play a known note at several volume levels and confirm a useful progression without an unexpectedly loud jump.
-- [ ] **OTA activation and rollback** (`pocket-journal-i4s.2`)
-  - Start after software bead `pocket-journal-i4s.1` completes.
-  - Validate signed upload, reboot/reconnect/health confirmation, interrupted upload safety, forced rollback, reset/power interruption, and factory-to-first-OTA behavior.
+
+## Blocked Future Batch
+
+These checks stay out of `bd human list` until every named agent prerequisite is
+complete. Restore the `human` labels only when one exact firmware build is ready.
+
+- **Controls, display, and recording:** `pocket-journal-2ji`,
+  `pocket-journal-d8j`, `pocket-journal-nz5`, `pocket-journal-e43`,
+  `pocket-journal-te0`, and `pocket-journal-jjt` wait on the current input,
+  refresh, Timer, interval, and recording fixes. The next batch should cover
+  physical legibility, touch edges, held AUX, playback and recording Back,
+  three-note paging, repeated partial refresh, ghosting, and sleep/wake recovery.
+- **Settings, LAN APIs, and storage:** `pocket-journal-wsl`,
+  `pocket-journal-aw7`, `pocket-journal-3ie`, `pocket-journal-bmz`,
+  `pocket-journal-lhl`, and `pocket-journal-pc3` wait on working
+  `pocket-journal-d3d` connectivity. Storage removal, remount, full-card, and
+  power-loss tests also wait on `pocket-journal-sm1`.
+- **Time and RTC wake:** `pocket-journal-xl8` waits on interval, Back, and alert
+  fixes. Include `pocket-journal-54s` in the next batch: arm a short timer, enter
+  static or sleep, verify one GPIO5 RTC wake and one presentation, exercise an
+  early BOOT wake and re-sleep, and capture RTC flags with no wake loop.
+- **Audio tuning:** `pocket-journal-qza` and `pocket-journal-im4` wait on both
+  the corrected enclosure (`pocket-journal-cpk`) and working recording pipeline
+  (`pocket-journal-sm1`). Then test known speech at several volume and gain
+  levels without an unexpected jump, crackle, clipping, or enclosure buzz.
+- **Transcription:** `pocket-journal-zon` waits on one valid new recording and
+  working LAN connectivity. Do not claim transcription validation from the
+  current batch.
+- **OTA:** `pocket-journal-i4s.2` waits on software child
+  `pocket-journal-i4s.1` and target LAN authentication `pocket-journal-3ie`.
+  Then validate signed upload, reboot/reconnect/health confirmation,
+  interrupted-upload safety, forced rollback, reset/power interruption, and
+  factory-to-first-OTA behavior.
 
 ## Reporting Results
 
