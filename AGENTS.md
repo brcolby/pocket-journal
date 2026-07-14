@@ -81,6 +81,16 @@ section in status reports and handoffs.
   bead is created, materially updated, validated, or closed. The document is a
   concise operator checklist; Beads remains the source of truth for status,
   acceptance criteria, implementation notes, and evidence.
+- Prefer low-frequency, large-batch human validation. Accumulate a coherent set
+  of agent-complete changes, run all available automated and simulator checks,
+  and prepare one identified firmware build plus one consolidated hardware
+  checklist before requesting another human test round. Do not interrupt the
+  human for isolated checks unless a safety concern, destructive decision, or
+  hard implementation blocker cannot be resolved without immediate evidence.
+- Treat human notes as mildly lossy evidence. Map observations to the behavior
+  they necessarily exercised, close criteria that were clearly demonstrated,
+  and preserve ambiguity as a focused follow-up rather than requiring the human
+  to repeat an unchanged broad checklist.
 
 <!-- BEGIN BEADS INTEGRATION v:1 profile:minimal hash:970c3bf2 -->
 ## Beads Issue Tracker

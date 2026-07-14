@@ -9,7 +9,27 @@ The current visual treatment is accepted as the initial-release baseline.
 Future visual refinement is non-blocking unless hardware testing finds a
 legibility, navigation, clipping, refresh, or other usability defect.
 
-Last synchronized with `bd human list`: 2026-07-14 (26 beads).
+Last synchronized with `bd human list`: 2026-07-13 (25 beads).
+
+## Batch Validation Strategy
+
+Human testing is intentionally low frequency and broad. Agents should finish a
+coherent implementation batch, run all available unit, integration, simulator,
+image, and firmware-build checks, and then nominate one exact firmware commit
+for a consolidated hardware pass. Do not repeat a failed hardware check on an
+unchanged build.
+
+Human notes are treated as mildly lossy evidence: an observation can validate
+behavior that necessarily had to work to reach the reported state, even when
+the full original checklist was not followed. Each batch result is mapped back
+to Beads; demonstrated criteria close, concrete failures become focused bugs,
+and genuinely untested hardware risks remain here for a later batch.
+
+The next prompt for human testing should contain a short ordered path through
+all newly ready checks, the exact firmware version, prerequisites, expected
+results, and the few logs or artifacts worth preserving. Safety, destructive
+hardware choices, and hard blockers are the only reasons to request an
+out-of-cycle test.
 
 ## Ready To Validate
 
@@ -90,9 +110,6 @@ Last synchronized with `bd human list`: 2026-07-14 (26 beads).
   - Provision with the default USB-C flow, reboot, and confirm saved Wi-Fi reconnect and `_pocket-journal._tcp` discovery.
   - Separately validate optional `--ble` provisioning; BLE security approval remains tracked in `pocket-journal-db1`.
   - Disconnect/reconnect the network and confirm status plus pending/uploaded sync counts remain accurate.
-- [ ] **Default USB provisioning command robustness** (`pocket-journal-iig`)
-  - Rerun `pj provision --ssid <network> --password <password>` with the current partner CLI and confirm the command is accepted over USB-C without the `expected PJ_WIFI_HEX...` parser error.
-  - After the next firmware flash, repeat provisioning with the same partner CLI to confirm fragmented USB serial input is handled on-device.
 - [ ] **LAN bearer authentication** (`pocket-journal-3ie`)
   - Confirm valid token access after reboot; missing, malformed, and wrong tokens consistently return 401.
   - Check device logs and responses for leaked token or Wi-Fi credentials.
