@@ -4,6 +4,7 @@
 #include <stdint.h>
 
 #define PJ_WIFI_DHCP_TIMEOUT_MS 30000u
+#define PJ_WIFI_CONNECT_TIMEOUT_MS 15000u
 #define PJ_WIFI_RETRY_MAX_MS 60000u
 
 typedef enum {
@@ -16,6 +17,7 @@ typedef enum {
     PJ_WIFI_PHASE_DHCP,
     PJ_WIFI_PHASE_DHCP_FAILED,
     PJ_WIFI_PHASE_CONNECTED,
+    PJ_WIFI_PHASE_CONNECT_TIMEOUT,
     PJ_WIFI_PHASE_FAILED,
 } pj_wifi_phase_t;
 
@@ -59,6 +61,7 @@ typedef struct {
     uint32_t retry_count;
     uint32_t backoff_ms;
     uint64_t next_retry_ms;
+    uint64_t connect_deadline_ms;
     uint64_t dhcp_deadline_ms;
     uint64_t last_success_monotonic_ms;
     int64_t last_success_utc_s;

@@ -52,6 +52,7 @@ void pj_wifi_state_set_provisioned(pj_wifi_state_t *state, int provisioned,
     state->provisioned = provisioned != 0;
     state->has_ip = 0;
     state->dhcp_state = PJ_WIFI_DHCP_UNKNOWN;
+    state->connect_deadline_ms = 0;
     state->dhcp_deadline_ms = 0;
     state->retry_count = 0;
     state->backoff_ms = 0;
@@ -81,6 +82,7 @@ void pj_wifi_state_on_driver_started(pj_wifi_state_t *state,
     state->phase = PJ_WIFI_PHASE_DISCONNECTED;
     state->retry_state = PJ_WIFI_RETRY_BACKOFF;
     state->backoff_ms = 0;
+    state->connect_deadline_ms = 0;
     state->next_retry_ms = now_ms;
 }
 
@@ -93,6 +95,7 @@ void pj_wifi_state_on_associated(pj_wifi_state_t *state, uint64_t now_ms)
     state->dhcp_state = PJ_WIFI_DHCP_REQUESTING;
     state->retry_state = PJ_WIFI_RETRY_IDLE;
     state->backoff_ms = 0;
+    state->connect_deadline_ms = 0;
     state->next_retry_ms = 0;
     state->dhcp_deadline_ms = deadline_after(now_ms, PJ_WIFI_DHCP_TIMEOUT_MS);
     state->ap_visible = 1;
@@ -113,6 +116,7 @@ void pj_wifi_state_on_got_ip(pj_wifi_state_t *state, uint64_t now_ms,
     state->channel = channel > UINT8_MAX ? UINT8_MAX : (uint8_t)channel;
     state->retry_count = 0;
     state->backoff_ms = 0;
+    state->connect_deadline_ms = 0;
     state->next_retry_ms = 0;
     state->dhcp_deadline_ms = 0;
     state->last_success_monotonic_ms = now_ms;
@@ -124,6 +128,7 @@ void pj_wifi_state_on_lost_ip(pj_wifi_state_t *state, uint64_t now_ms)
         return;
     }
     state->has_ip = 0;
+    state->connect_deadline_ms = 0;
     state->phase = PJ_WIFI_PHASE_DHCP_FAILED;
     state->dhcp_state = PJ_WIFI_DHCP_TIMEOUT;
     state->dhcp_deadline_ms = 0;
@@ -175,6 +180,7 @@ void pj_wifi_state_on_disconnected(pj_wifi_state_t *state, unsigned reason,
     }
     state->has_ip = 0;
     state->dhcp_state = PJ_WIFI_DHCP_UNKNOWN;
+    state->connect_deadline_ms = 0;
     state->dhcp_deadline_ms = 0;
     state->last_disconnect_reason = reason > UINT16_MAX ? UINT16_MAX : (uint16_t)reason;
     switch (pj_wifi_disconnect_classify(reason)) {
@@ -208,6 +214,7 @@ void pj_wifi_state_on_connect_request_failed(pj_wifi_state_t *state,
     state->has_ip = 0;
     state->phase = PJ_WIFI_PHASE_FAILED;
     state->dhcp_state = PJ_WIFI_DHCP_UNKNOWN;
+    state->connect_deadline_ms = 0;
     state->ap_visible = -1;
     schedule_retry(state, now_ms);
 }
@@ -225,6 +232,17 @@ pj_wifi_action_t pj_wifi_state_tick(pj_wifi_state_t *state, uint64_t now_ms)
     if (state == NULL || !state->provisioned) {
         return PJ_WIFI_ACTION_NONE;
     }
+    if (state->phase == PJ_WIFI_PHASE_CONNECTING &&
+        state->retry_state == PJ_WIFI_RETRY_RETRYING &&
+        state->connect_deadline_ms != 0 &&
+        now_ms >= state->connect_deadline_ms) {
+        state->has_ip = 0;
+        state->phase = PJ_WIFI_PHASE_CONNECT_TIMEOUT;
+        state->dhcp_state = PJ_WIFI_DHCP_UNKNOWN;
+        state->connect_deadline_ms = 0;
+        state->ap_visible = -1;
+        schedule_retry(state, now_ms);
+    }
     if (state->phase == PJ_WIFI_PHASE_DHCP && state->dhcp_deadline_ms != 0 &&
         now_ms >= state->dhcp_deadline_ms) {
         state->has_ip = 0;
@@ -237,12 +255,16 @@ pj_wifi_action_t pj_wifi_state_tick(pj_wifi_state_t *state, uint64_t now_ms)
         now_ms < state->next_retry_ms) {
         return PJ_WIFI_ACTION_NONE;
     }
-    pj_wifi_action_t action = state->phase == PJ_WIFI_PHASE_DHCP_FAILED
+    pj_wifi_action_t action =
+        (state->phase == PJ_WIFI_PHASE_DHCP_FAILED ||
+         state->phase == PJ_WIFI_PHASE_CONNECT_TIMEOUT)
         ? PJ_WIFI_ACTION_RECONNECT : PJ_WIFI_ACTION_CONNECT;
     state->phase = PJ_WIFI_PHASE_CONNECTING;
     state->dhcp_state = PJ_WIFI_DHCP_UNKNOWN;
     state->retry_state = PJ_WIFI_RETRY_RETRYING;
     state->next_retry_ms = 0;
+    state->connect_deadline_ms = deadline_after(
+        now_ms, PJ_WIFI_CONNECT_TIMEOUT_MS);
     return action;
 }
 
@@ -258,6 +280,7 @@ const char *pj_wifi_phase_name(pj_wifi_phase_t phase)
     case PJ_WIFI_PHASE_DHCP: return "dhcp";
     case PJ_WIFI_PHASE_DHCP_FAILED: return "dhcp_failed";
     case PJ_WIFI_PHASE_CONNECTED: return "connected";
+    case PJ_WIFI_PHASE_CONNECT_TIMEOUT: return "connect_timeout";
     case PJ_WIFI_PHASE_FAILED: return "failed";
     default: return "failed";
     }
