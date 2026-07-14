@@ -20,6 +20,14 @@ class DeviceHTTPError(DeviceError):
         self.retryable = retryable
 
 
+class SerialPortNotFound(DeviceError):
+    pass
+
+
+class SerialPortAmbiguous(DeviceError):
+    pass
+
+
 DEFAULT_SERIAL_PORT = "/dev/cu.usbmodem1101"
 SERIAL_PORT_PATTERNS = (
     "/dev/cu.usbmodem*",
@@ -205,44 +213,66 @@ class SerialDeviceClient:
         except ImportError as exc:
             raise DeviceError("USB support requires pyserial; reinstall the partner CLI") from exc
 
+        connection = None
         try:
-            with serial.Serial(
-                self.port,
-                self.baudrate,
+            # Configure the control lines before opening the descriptor. Opening
+            # with a port argument lets pyserial apply its default DTR/RTS state
+            # first, which can reset an ESP32-S3 or select its ROM downloader.
+            connection = serial.Serial(
+                port=None,
+                baudrate=self.baudrate,
                 timeout=0.2,
                 write_timeout=2.0,
                 dsrdtr=False,
                 rtscts=False,
-            ) as connection:
-                connection.dtr = False
-                connection.rts = False
-                time.sleep(0.1)
-                connection.reset_input_buffer()
-                connection.write(f"{command}\n".encode("ascii"))
-                connection.flush()
-                deadline = time.monotonic() + self.timeout
-                while time.monotonic() < deadline:
-                    raw = connection.readline()
-                    if not raw:
-                        continue
-                    line = raw.decode("utf-8", errors="replace").strip()
-                    if line.startswith("PJ_OK "):
-                        try:
-                            return json.loads(line[6:])
-                        except json.JSONDecodeError as exc:
-                            raise DeviceError("USB command failed: device returned invalid JSON") from exc
-                    if line.startswith("PJ_ERR "):
-                        try:
-                            payload = json.loads(line[7:])
-                            message = payload.get("error", line[7:])
-                        except json.JSONDecodeError:
-                            message = line[7:]
-                        raise DeviceError(f"USB command failed: {message}")
+                exclusive=True,
+            )
+            connection.port = self.port
+            connection.dtr = False
+            connection.rts = False
+            connection.open()
+            connection.dtr = False
+            connection.rts = False
+            time.sleep(0.1)
+            connection.reset_input_buffer()
+            connection.write(f"{command}\n".encode("ascii"))
+            connection.flush()
+            deadline = time.monotonic() + self.timeout
+            while time.monotonic() < deadline:
+                raw = connection.readline()
+                if not raw:
+                    continue
+                line = raw.decode("utf-8", errors="replace").strip()
+                if line.startswith("PJ_OK "):
+                    try:
+                        return json.loads(line[6:])
+                    except json.JSONDecodeError as exc:
+                        raise DeviceError("USB command failed: device returned invalid JSON") from exc
+                if line.startswith("PJ_ERR "):
+                    try:
+                        payload = json.loads(line[7:])
+                        message = payload.get("error", line[7:])
+                    except json.JSONDecodeError:
+                        message = line[7:]
+                    raise DeviceError(f"USB command failed: {message}")
         except serial.SerialException as exc:
             raise DeviceError(f"USB serial connection failed on {self.port}: {exc}") from exc
+        finally:
+            if connection is not None:
+                try:
+                    connection.dtr = False
+                    connection.rts = False
+                except (serial.SerialException, OSError):
+                    pass
+                try:
+                    if connection.is_open:
+                        connection.close()
+                except (serial.SerialException, OSError):
+                    pass
         raise DeviceError(
-            f"USB command timed out on {self.port}; close any serial monitor and verify the firmware console is "
-            "configured for USB Serial/JTAG input"
+            f"USB command timed out on {self.port}; the port was released. Close any serial monitor and verify "
+            "the firmware console uses USB Serial/JTAG. If the board says 'waiting for download', reset or "
+            "power-cycle it with AUX/BOOT released"
         )
 
     def status(self) -> dict[str, Any]:
@@ -342,8 +372,10 @@ def resolve_serial_port(port: str | None = None) -> str:
     if len(ports) == 1:
         return ports[0]
     if not ports:
-        raise DeviceError(f"no USB serial port found; pass --serial-port (default is {DEFAULT_SERIAL_PORT})")
-    raise DeviceError("multiple USB serial ports found; pass --serial-port: " + ", ".join(ports))
+        raise SerialPortNotFound(
+            f"no USB serial port found; pass --serial-port (default is {DEFAULT_SERIAL_PORT})"
+        )
+    raise SerialPortAmbiguous("multiple USB serial ports found; pass --serial-port: " + ", ".join(ports))
 
 
 def discover_mdns() -> list[dict[str, str]]:

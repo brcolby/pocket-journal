@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from pathlib import Path
+from typing import Any
 import argparse
 import asyncio
 import json
@@ -11,7 +12,15 @@ import sys
 from .ble import provision_wifi
 from .calendar import calendar_payload_for_day
 from .config import DeviceProfile, load_config, save_config
-from .device import DeviceClient, DeviceError, SerialDeviceClient, discover_mdns, resolve_serial_port
+from .device import (
+    DeviceClient,
+    DeviceError,
+    SerialDeviceClient,
+    SerialPortNotFound,
+    discover_mdns,
+    resolve_serial_port,
+)
+from .diagnostics import credential_safe_status, wifi_diagnostics
 from .home_design import normalize_home_design
 from .operations import DeviceSession
 from .ota import inspect_firmware_image, ota_preflight, ota_status, stream_firmware_image, wait_for_ota_result
@@ -21,10 +30,45 @@ from .transcription import FakeTranscriptionBackend, backend_from_name
 
 
 USB_PROVISIONING_TOKEN_BYTES = 16
+CALENDAR_REMOVAL_VERSION = "0.2.0"
 
 
 def _print_json(payload) -> None:
     print(json.dumps(payload, indent=2, sort_keys=True))
+
+
+def _sync_time_from_host(
+    client: DeviceClient | SerialDeviceClient,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    local_now = now or datetime.now().astimezone()
+    if local_now.tzinfo is None:
+        raise DeviceError("host time must include a UTC offset")
+    local_now = local_now.replace(second=0, microsecond=0)
+    expected = {
+        "hour": local_now.hour,
+        "minute": local_now.minute,
+        "year": local_now.year,
+        "month": local_now.month,
+        "day": local_now.day,
+    }
+    response = client.put_time(
+        expected["hour"],
+        expected["minute"],
+        expected["month"],
+        expected["day"],
+        expected["year"],
+    )
+    if not isinstance(response, dict) or any(response.get(key) != value for key, value in expected.items()):
+        raise DeviceError("device time sync could not be validated; run 'pj device sync-time' to retry")
+    offset = local_now.utcoffset()
+    return {
+        "state": "synced",
+        "source": "host",
+        "host_utc": local_now.astimezone(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "utc_offset_minutes": int(offset.total_seconds() // 60) if offset is not None else 0,
+        "device_local_time": expected,
+    }
 
 
 def cmd_provision(args: argparse.Namespace) -> int:
@@ -35,12 +79,17 @@ def cmd_provision(args: argparse.Namespace) -> int:
     if args.mock and not args.ble:
         raise DeviceError("--mock requires --ble")
 
+    serial_client: SerialDeviceClient | None = None
     if not args.ble:
         # Hex encoding doubles this value on the legacy serial protocol. 128 bits
         # keeps ordinary provisioning commands below small USB console boundaries.
         token = secrets.token_urlsafe(USB_PROVISIONING_TOKEN_BYTES)
-        client = SerialDeviceClient(resolve_serial_port(args.serial_port), baudrate=args.serial_baud, timeout=args.timeout)
-        response = client.provision_wifi(args.ssid, args.password, token)
+        serial_client = SerialDeviceClient(
+            resolve_serial_port(args.serial_port),
+            baudrate=args.serial_baud,
+            timeout=args.timeout,
+        )
+        response = serial_client.provision_wifi(args.ssid, args.password, token)
         device_id = str(response.get("device_id") or "pj-usb")
         profile = DeviceProfile(
             device_id=device_id,
@@ -63,11 +112,26 @@ def cmd_provision(args: argparse.Namespace) -> int:
     config = load_config(data_dir)
     config.devices[profile.device_id] = profile
     save_config(config, data_dir)
+
+    if serial_client is None:
+        time_sync: dict[str, Any] = {
+            "state": "deferred",
+            "reason": "BLE provisioning does not expose a time-write operation; connect over USB-C or LAN",
+        }
+    else:
+        try:
+            time_sync = _sync_time_from_host(serial_client)
+        except DeviceError as exc:
+            # Provisioning has already rotated the bearer token. Preserve the
+            # paired profile and report time failure independently so it can be
+            # retried without re-entering credentials.
+            time_sync = {"state": "failed", "error": str(exc)}
     _print_json({
         "device_id": profile.device_id,
         "ble_name": profile.ble_name,
         "base_url": profile.base_url,
         "provisioned": True,
+        "time_sync": time_sync,
     })
     return 0
 
@@ -78,28 +142,121 @@ def cmd_discover(args: argparse.Namespace) -> int:
     return 0
 
 
+def _discovered_lan_devices() -> list[dict[str, str]]:
+    return discover_mdns()
+
+
 def _client_from_args(args: argparse.Namespace) -> tuple[str, DeviceClient]:
     data_dir = Path(args.data_dir) if getattr(args, "data_dir", None) else None
-    profile = load_config(data_dir).devices.get(args.device)
-    base_url = args.base_url or (profile.base_url if profile else "")
-    if not base_url:
-        raise SystemExit("device base URL is required; pass --base-url or store it in config")
-    token = getattr(args, "token", None) or (profile.token if profile else "")
-    if not token:
-        raise SystemExit("device bearer token is required; pass --token or provision the device")
-    return args.device, DeviceClient(base_url, token)
+    config = load_config(data_dir)
+    requested_id = getattr(args, "device", None)
+    base_url_override = getattr(args, "base_url", None) or ""
+    token_override = getattr(args, "token", None) or ""
+
+    if requested_id:
+        profile = config.devices.get(requested_id)
+        base_url = base_url_override or (profile.base_url if profile else "")
+        if not base_url:
+            matches = [
+                device for device in _discovered_lan_devices()
+                if device.get("device_id") == requested_id and device.get("base_url")
+            ]
+            if len(matches) == 1:
+                base_url = matches[0]["base_url"]
+            elif len(matches) > 1:
+                raise DeviceError(
+                    f"multiple LAN endpoints found for {requested_id}; pass --base-url"
+                )
+        token = token_override or (profile.token if profile else "")
+        if not base_url:
+            raise DeviceError(
+                f"no LAN endpoint found for {requested_id}; connect it to Wi-Fi or pass --base-url"
+            )
+        if not token:
+            raise DeviceError(
+                f"no bearer token stored for {requested_id}; provision it or pass --token"
+            )
+        return requested_id, DeviceClient(base_url, token)
+
+    profiles = list(config.devices.values())
+    if base_url_override:
+        matching_profiles = [
+            profile for profile in profiles
+            if profile.base_url.rstrip("/") == base_url_override.rstrip("/")
+        ]
+        profile = matching_profiles[0] if len(matching_profiles) == 1 else None
+        if profile is None and len(profiles) == 1:
+            profile = profiles[0]
+        token = token_override or (profile.token if profile else "")
+        if not token:
+            raise DeviceError("a bearer token is required with --base-url; pass --token or provision the device")
+        return profile.device_id if profile else "explicit", DeviceClient(base_url_override, token)
+
+    complete_profiles = [profile for profile in profiles if profile.base_url and profile.token]
+    if len(complete_profiles) == 1:
+        profile = complete_profiles[0]
+        return profile.device_id, DeviceClient(profile.base_url, token_override or profile.token)
+
+    discovered = _discovered_lan_devices()
+    candidates: dict[str, tuple[str, str]] = {}
+    for device in discovered:
+        device_id = device.get("device_id", "")
+        base_url = device.get("base_url", "")
+        profile = config.devices.get(device_id)
+        token = token_override or (profile.token if profile else "")
+        if device_id and base_url and token:
+            candidates[device_id] = (base_url, token)
+
+    if len(candidates) == 1:
+        device_id, (base_url, token) = next(iter(sorted(candidates.items())))
+        return device_id, DeviceClient(base_url, token)
+    if len(candidates) > 1:
+        raise DeviceError(
+            "multiple paired Pocket Journals are reachable; pass --device: "
+            + ", ".join(sorted(candidates))
+        )
+
+    discovered_ids = sorted({device.get("device_id", "") for device in discovered if device.get("device_id")})
+    if len(discovered_ids) == 1:
+        raise DeviceError(
+            f"found {discovered_ids[0]} on LAN but no bearer token is available; provision it or pass --token"
+        )
+    if len(discovered_ids) > 1:
+        raise DeviceError(
+            "multiple Pocket Journals found on LAN; pass --device: " + ", ".join(discovered_ids)
+        )
+    if len(complete_profiles) > 1:
+        raise DeviceError(
+            "multiple paired Pocket Journals are configured; pass --device: "
+            + ", ".join(sorted(profile.device_id for profile in complete_profiles))
+        )
+    if len(profiles) == 1:
+        raise DeviceError(
+            f"paired device {profiles[0].device_id} is not discoverable on LAN; connect it to Wi-Fi or pass --base-url"
+        )
+    raise DeviceError("no paired or discoverable Pocket Journal found; provision a device or pass --base-url and --token")
 
 
 def _control_client_from_args(args: argparse.Namespace):
     serial_port = getattr(args, "serial_port", None)
-    if serial_port or not getattr(args, "device", None):
+    if serial_port:
         resolved_port = resolve_serial_port(serial_port)
-        return getattr(args, "device", None) or "usb", SerialDeviceClient(
+        return "usb", SerialDeviceClient(
             resolved_port,
             baudrate=getattr(args, "serial_baud", 115200),
             timeout=getattr(args, "timeout", 6.0),
         )
-    return _client_from_args(args)
+    if any(getattr(args, name, None) for name in ("device", "base_url", "token")):
+        return _client_from_args(args)
+    try:
+        resolved_port = resolve_serial_port()
+    except SerialPortNotFound:
+        return _client_from_args(args)
+    return "usb", SerialDeviceClient(
+        resolved_port,
+        baudrate=getattr(args, "serial_baud", 115200),
+        timeout=getattr(args, "timeout", 6.0),
+    )
 
 
 def _session_from_args(args: argparse.Namespace) -> DeviceSession:
@@ -142,6 +299,10 @@ def cmd_sync(args: argparse.Namespace) -> int:
 
 
 def cmd_calendar_sync(args: argparse.Namespace) -> int:
+    print(
+        f"pj: warning: 'calendar' commands are deprecated and will be removed in {CALENDAR_REMOVAL_VERSION}",
+        file=sys.stderr,
+    )
     if args.fixture:
         events = json.loads(Path(args.fixture).read_text(encoding="utf-8"))
     else:
@@ -225,21 +386,19 @@ def cmd_settings_set(args: argparse.Namespace) -> int:
 def cmd_device_sync_time(args: argparse.Namespace) -> int:
     session = _session_from_args(args)
     session.require("time.write")
-    now = datetime.now().astimezone()
-    response = session.client.put_time(now.hour, now.minute, now.month, now.day, now.year)
-    _print_json(session.envelope(response or {
-            "hour": now.hour,
-            "minute": now.minute,
-            "year": now.year,
-            "month": now.month,
-            "day": now.day,
-        }))
+    _print_json(session.envelope(_sync_time_from_host(session.client)))
     return 0
 
 
 def cmd_device_status(args: argparse.Namespace) -> int:
     session = _session_from_args(args)
-    _print_json(session.envelope(session.status()))
+    _print_json(session.envelope(credential_safe_status(session.status())))
+    return 0
+
+
+def cmd_device_wifi_diagnostics(args: argparse.Namespace) -> int:
+    session = _session_from_args(args)
+    _print_json(session.envelope(wifi_diagnostics(session.status())))
     return 0
 
 
@@ -475,7 +634,11 @@ def cmd_static_art_set(args: argparse.Namespace) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="pj")
-    sub = parser.add_subparsers(dest="command", required=True)
+    sub = parser.add_subparsers(
+        dest="command",
+        required=True,
+        metavar="{provision,discover,device,firmware,sync,settings,recordings,home,static-art}",
+    )
 
     provision = sub.add_parser("provision", help="provision Wi-Fi over USB-C (default) or BLE")
     provision.add_argument("--ssid", required=True)
@@ -505,6 +668,18 @@ def build_parser() -> argparse.ArgumentParser:
     device_status.add_argument("--serial-baud", type=int, default=115200)
     device_status.add_argument("--timeout", type=float, default=6.0)
     device_status.set_defaults(func=cmd_device_status)
+    device_wifi = device_sub.add_parser(
+        "wifi-diagnostics",
+        help="explain Wi-Fi connection state without exposing credentials",
+    )
+    device_wifi.add_argument("--device", help="paired device id for Wi-Fi HTTP; optional for USB-C")
+    device_wifi.add_argument("--base-url")
+    device_wifi.add_argument("--token", help="override the stored LAN bearer token")
+    device_wifi.add_argument("--data-dir")
+    device_wifi.add_argument("--serial-port", help="USB-C serial port; auto-detected when omitted")
+    device_wifi.add_argument("--serial-baud", type=int, default=115200)
+    device_wifi.add_argument("--timeout", type=float, default=6.0)
+    device_wifi.set_defaults(func=cmd_device_wifi_diagnostics)
     device_sync_time = device_sub.add_parser("sync-time", help="set device time from this computer")
     device_sync_time.add_argument("--device", help="paired device id for Wi-Fi HTTP; optional for USB-C")
     device_sync_time.add_argument("--base-url")
@@ -537,13 +712,13 @@ def build_parser() -> argparse.ArgumentParser:
     firmware = sub.add_parser("firmware", help="firmware update commands")
     firmware_sub = firmware.add_subparsers(dest="firmware_command", required=True)
     firmware_status = firmware_sub.add_parser("status", help="read OTA status over LAN/Wi-Fi")
-    firmware_status.add_argument("--device", required=True)
+    firmware_status.add_argument("--device", help="paired device id; auto-selected when unambiguous")
     firmware_status.add_argument("--base-url")
     firmware_status.add_argument("--token", help="override the stored LAN bearer token")
     firmware_status.add_argument("--data-dir")
     firmware_status.set_defaults(func=cmd_firmware_status)
     firmware_update = firmware_sub.add_parser("update", help="upload and activate a firmware image")
-    firmware_update.add_argument("--device", required=True)
+    firmware_update.add_argument("--device", help="paired device id; auto-selected when unambiguous")
     firmware_update.add_argument("--base-url")
     firmware_update.add_argument("--token", help="override the stored LAN bearer token")
     firmware_update.add_argument("--data-dir")
@@ -553,7 +728,7 @@ def build_parser() -> argparse.ArgumentParser:
     firmware_update.set_defaults(func=cmd_firmware_update)
 
     sync = sub.add_parser("sync", help="download audio, transcribe, and upload transcripts")
-    sync.add_argument("--device", required=True)
+    sync.add_argument("--device", help="paired device id; auto-selected when unambiguous")
     sync.add_argument("--base-url")
     sync.add_argument("--token", help="override the stored LAN bearer token")
     sync.add_argument("--backend", choices=["fake", "hf"], default="hf")
@@ -561,10 +736,11 @@ def build_parser() -> argparse.ArgumentParser:
     sync.add_argument("--data-dir")
     sync.set_defaults(func=cmd_sync)
 
-    calendar = sub.add_parser("calendar", help="calendar commands")
+    # Kept parseable for one compatibility window, but omitted from primary help.
+    calendar = sub.add_parser("calendar")
     calendar_sub = calendar.add_subparsers(dest="calendar_command", required=True)
     calendar_sync = calendar_sub.add_parser("sync", help="sync today's calendar")
-    calendar_sync.add_argument("--device", required=True)
+    calendar_sync.add_argument("--device", help="paired device id; auto-selected when unambiguous")
     calendar_sync.add_argument("--base-url")
     calendar_sync.add_argument("--token", help="override the stored LAN bearer token")
     calendar_sync.add_argument("--data-dir")
@@ -574,13 +750,13 @@ def build_parser() -> argparse.ArgumentParser:
     settings = sub.add_parser("settings", help="device settings")
     settings_sub = settings.add_subparsers(dest="settings_command", required=True)
     settings_get = settings_sub.add_parser("get")
-    settings_get.add_argument("--device", required=True)
+    settings_get.add_argument("--device", help="paired device id; auto-selected when unambiguous")
     settings_get.add_argument("--base-url")
     settings_get.add_argument("--token", help="override the stored LAN bearer token")
     settings_get.add_argument("--data-dir")
     settings_get.set_defaults(func=cmd_settings_get)
     settings_set = settings_sub.add_parser("set")
-    settings_set.add_argument("--device", required=True)
+    settings_set.add_argument("--device", help="paired device id; auto-selected when unambiguous")
     settings_set.add_argument("--base-url")
     settings_set.add_argument("--token", help="override the stored LAN bearer token")
     settings_set.add_argument("--data-dir")
@@ -590,13 +766,13 @@ def build_parser() -> argparse.ArgumentParser:
     recordings = sub.add_parser("recordings", help="recording maintenance commands")
     recordings_sub = recordings.add_subparsers(dest="recordings_command", required=True)
     recordings_list = recordings_sub.add_parser("list", help="list retained recordings over LAN/Wi-Fi")
-    recordings_list.add_argument("--device", required=True)
+    recordings_list.add_argument("--device", help="paired device id; auto-selected when unambiguous")
     recordings_list.add_argument("--base-url")
     recordings_list.add_argument("--token", help="override the stored LAN bearer token")
     recordings_list.add_argument("--data-dir")
     recordings_list.set_defaults(func=cmd_recordings_list)
     recordings_download = recordings_sub.add_parser("download", help="download one recording over LAN/Wi-Fi")
-    recordings_download.add_argument("--device", required=True)
+    recordings_download.add_argument("--device", help="paired device id; auto-selected when unambiguous")
     recordings_download.add_argument("--base-url")
     recordings_download.add_argument("--token", help="override the stored LAN bearer token")
     recordings_download.add_argument("--data-dir")
@@ -617,13 +793,13 @@ def build_parser() -> argparse.ArgumentParser:
     home = sub.add_parser("home", help="custom home screen design")
     home_sub = home.add_subparsers(dest="home_command", required=True)
     home_get = home_sub.add_parser("get")
-    home_get.add_argument("--device", required=True)
+    home_get.add_argument("--device", help="paired device id; auto-selected when unambiguous")
     home_get.add_argument("--base-url")
     home_get.add_argument("--token", help="override the stored LAN bearer token")
     home_get.add_argument("--data-dir")
     home_get.set_defaults(func=cmd_home_get)
     home_set = home_sub.add_parser("set")
-    home_set.add_argument("--device", required=True)
+    home_set.add_argument("--device", help="paired device id; auto-selected when unambiguous")
     home_set.add_argument("--base-url")
     home_set.add_argument("--token", help="override the stored LAN bearer token")
     home_set.add_argument("--data-dir")
@@ -633,13 +809,13 @@ def build_parser() -> argparse.ArgumentParser:
     static_art = sub.add_parser("static-art", help="custom resting-screen bitmap art")
     static_art_sub = static_art.add_subparsers(dest="static_art_command", required=True)
     static_art_get = static_art_sub.add_parser("get")
-    static_art_get.add_argument("--device", required=True)
+    static_art_get.add_argument("--device", help="paired device id; auto-selected when unambiguous")
     static_art_get.add_argument("--base-url")
     static_art_get.add_argument("--token", help="override the stored LAN bearer token")
     static_art_get.add_argument("--data-dir")
     static_art_get.set_defaults(func=cmd_static_art_get)
     static_art_set = static_art_sub.add_parser("set")
-    static_art_set.add_argument("--device", required=True)
+    static_art_set.add_argument("--device", help="paired device id; auto-selected when unambiguous")
     static_art_set.add_argument("--base-url")
     static_art_set.add_argument("--token", help="override the stored LAN bearer token")
     static_art_set.add_argument("--data-dir")
