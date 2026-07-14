@@ -101,12 +101,12 @@ included in the next identified firmware build.
 
 - **USB and storage:** `pocket-journal-6ot` has an asynchronous, correlated,
   exclusive wipe worker. Firmware now gates the dual-core worker until the
-  operation-ID response has physically drained, and the partner uses one
-  descriptor with bounded same-ID retries. Both fixes are in `558770f`. Target
-  validation received operation ID `1`, then timed out before a terminal result;
-  an immediate status succeeded without a replug but reported fresh idle state
-  with no operation history. Firmware and partner audits are tracing reboot or
-  operation-state loss. `pocket-journal-rgo` remains blocked on that result.
+  operation-ID response has physically drained. Partner commit `2d40a42` then
+  kept one descriptor open through terminal polling; target operation `1`
+  succeeded and deleted seven audio plus seven note records. A fresh status
+  connection remained responsive without a replug but showed idle state and no
+  history, proving serial close/open resets the device. POSIX control-line
+  lifecycle work remains in `pocket-journal-rgo` and still blocks `6ot` closure.
 - **Connectivity:** `pocket-journal-r7s` adds a 15-second connect-attempt
   watchdog so a missing ESP-IDF terminal event becomes `connect_timeout` with
   increasing retry count and bounded backoff. `pocket-journal-d3d` still needs
@@ -155,9 +155,9 @@ When nominated, perform one ordered pass rather than isolated retests:
   indefinitely at `connecting` and retry count zero (`pocket-journal-r7s`,
   `pocket-journal-d3d`).
 - [ ] Recording wipe returns an operation ID, status remains responsive during
-  and after it, and a passive USB probe succeeds without reset or replug. Do not
-  repeat this check until the operation-`1` disappearance on `558770f` has a new
-  focused fix (`pocket-journal-6ot`, `pocket-journal-rgo`).
+  and after it, and a passive USB probe succeeds without reset or replug. The
+  same-session wipe already succeeds; do not repeat it until serial close/open
+  reset has a focused lifecycle fix (`pocket-journal-6ot`, `pocket-journal-rgo`).
 - [ ] AUX hold acts once at 500 ms, permits navigation while recording
   finalizes, and produces no second action on release
   (`pocket-journal-61u`, `pocket-journal-sm1`).
