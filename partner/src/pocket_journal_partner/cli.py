@@ -31,6 +31,8 @@ from .transcription import FakeTranscriptionBackend, backend_from_name
 
 USB_PROVISIONING_TOKEN_BYTES = 16
 CALENDAR_REMOVAL_VERSION = "0.2.0"
+TIME_SYNC_PRECISION_SECONDS = 60
+TIME_SYNC_RETRY_COMMAND = "pj device sync-time"
 
 
 def _print_json(payload) -> None:
@@ -42,9 +44,13 @@ def _sync_time_from_host(
     now: datetime | None = None,
 ) -> dict[str, Any]:
     local_now = now or datetime.now().astimezone()
-    if local_now.tzinfo is None:
-        raise DeviceError("host time must include a UTC offset")
     local_now = local_now.replace(second=0, microsecond=0)
+    offset = local_now.utcoffset() if local_now.tzinfo is not None else None
+    if offset is None:
+        raise DeviceError("host time must include a UTC offset")
+    offset_seconds = offset.total_seconds()
+    if offset_seconds % 60 != 0:
+        raise DeviceError("host UTC offset must resolve to whole minutes")
     expected = {
         "hour": local_now.hour,
         "minute": local_now.minute,
@@ -60,13 +66,15 @@ def _sync_time_from_host(
         expected["year"],
     )
     if not isinstance(response, dict) or any(response.get(key) != value for key, value in expected.items()):
-        raise DeviceError("device time sync could not be validated; run 'pj device sync-time' to retry")
-    offset = local_now.utcoffset()
+        raise DeviceError(f"device time sync could not be validated; run '{TIME_SYNC_RETRY_COMMAND}' to retry")
     return {
         "state": "synced",
         "source": "host",
+        "validated": True,
+        "precision_seconds": TIME_SYNC_PRECISION_SECONDS,
+        "host_local": local_now.isoformat(),
         "host_utc": local_now.astimezone(timezone.utc).isoformat().replace("+00:00", "Z"),
-        "utc_offset_minutes": int(offset.total_seconds() // 60) if offset is not None else 0,
+        "utc_offset_minutes": int(offset_seconds // 60),
         "device_local_time": expected,
     }
 
@@ -117,6 +125,8 @@ def cmd_provision(args: argparse.Namespace) -> int:
         time_sync: dict[str, Any] = {
             "state": "deferred",
             "reason": "BLE provisioning does not expose a time-write operation; connect over USB-C or LAN",
+            "retryable": True,
+            "retry_command": TIME_SYNC_RETRY_COMMAND,
         }
     else:
         try:
@@ -125,7 +135,12 @@ def cmd_provision(args: argparse.Namespace) -> int:
             # Provisioning has already rotated the bearer token. Preserve the
             # paired profile and report time failure independently so it can be
             # retried without re-entering credentials.
-            time_sync = {"state": "failed", "error": str(exc)}
+            time_sync = {
+                "state": "failed",
+                "error": str(exc),
+                "retryable": True,
+                "retry_command": TIME_SYNC_RETRY_COMMAND,
+            }
     _print_json({
         "device_id": profile.device_id,
         "ble_name": profile.ble_name,

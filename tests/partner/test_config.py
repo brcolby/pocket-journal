@@ -449,6 +449,28 @@ class ConfigTests(unittest.TestCase):
             "PJ_WIFI_HEX 4c61622057694669 7040207373 746f6b656e5f31",
         ])
 
+    def test_serial_time_command_serializes_the_complete_local_anchor(self) -> None:
+        calls = []
+        client = SerialDeviceClient("/dev/null")
+        client._request = lambda command: calls.append(command) or {  # type: ignore[method-assign]
+            "hour": 8,
+            "minute": 42,
+            "year": 2026,
+            "month": 7,
+            "day": 14,
+        }
+
+        response = client.put_time(8, 42, 7, 14, 2026)
+
+        self.assertEqual(response["minute"], 42)
+        self.assertEqual(calls, ["PJ_TIME 2026 7 14 8 42"])
+
+    def test_serial_time_command_requires_a_year(self) -> None:
+        client = SerialDeviceClient("/dev/null")
+
+        with self.assertRaisesRegex(DeviceError, "requires a year"):
+            client.put_time(8, 42, 7, 14)
+
     def test_serial_audio_tone_command(self) -> None:
         calls = []
         client = SerialDeviceClient("/dev/null")

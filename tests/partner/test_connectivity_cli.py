@@ -15,6 +15,7 @@ from pocket_journal_partner.config import DeviceProfile, PartnerConfig
 from pocket_journal_partner.device import (
     DeviceClient,
     DeviceError,
+    DeviceRequestTimeout,
     SerialDeviceClient,
     SerialPortAmbiguous,
     SerialPortNotFound,
@@ -144,8 +145,24 @@ class AutomaticTimeSyncTests(unittest.TestCase):
 
         client.put_time.assert_called_once_with(8, 42, 7, 14, 2026)
         self.assertEqual(result["state"], "synced")
+        self.assertTrue(result["validated"])
+        self.assertEqual(result["precision_seconds"], 60)
+        self.assertEqual(result["host_local"], "2026-07-14T08:42:00-07:00")
         self.assertEqual(result["host_utc"], "2026-07-14T15:42:00Z")
         self.assertEqual(result["utc_offset_minutes"], -420)
+
+    def test_sync_rejects_ambiguous_or_subminute_host_offsets(self) -> None:
+        client = Mock(spec=SerialDeviceClient)
+
+        with self.assertRaisesRegex(DeviceError, "must include a UTC offset"):
+            cli._sync_time_from_host(client, datetime(2026, 7, 14, 8, 42))
+        with self.assertRaisesRegex(DeviceError, "whole minutes"):
+            cli._sync_time_from_host(
+                client,
+                datetime(2026, 7, 14, 8, 42, tzinfo=timezone(timedelta(seconds=30))),
+            )
+
+        client.put_time.assert_not_called()
 
     def test_sync_rejects_an_unvalidated_device_response(self) -> None:
         local = datetime(2026, 7, 14, 8, 42, tzinfo=timezone.utc)
@@ -154,6 +171,29 @@ class AutomaticTimeSyncTests(unittest.TestCase):
 
         with self.assertRaisesRegex(DeviceError, "could not be validated"):
             cli._sync_time_from_host(client, local)
+
+    def test_sync_reanchors_stale_and_already_valid_clocks_without_a_preflight_read(self) -> None:
+        local = datetime(2026, 7, 14, 8, 42, tzinfo=timezone.utc)
+        for reported_time in (
+            {"hour": 1, "minute": 2, "year": 2024, "month": 1, "day": 1},
+            {"hour": 8, "minute": 42, "year": 2026, "month": 7, "day": 14},
+        ):
+            with self.subTest(reported_time=reported_time):
+                client = Mock(spec=DeviceClient)
+                client.get_time.return_value = reported_time
+                client.put_time.return_value = {
+                    "hour": 8,
+                    "minute": 42,
+                    "year": 2026,
+                    "month": 7,
+                    "day": 14,
+                }
+
+                result = cli._sync_time_from_host(client, local)
+
+                self.assertEqual(result["state"], "synced")
+                client.get_time.assert_not_called()
+                client.put_time.assert_called_once_with(8, 42, 7, 14, 2026)
 
     def test_usb_provisioning_syncs_time_automatically(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -179,26 +219,61 @@ class AutomaticTimeSyncTests(unittest.TestCase):
         serial.put_time.assert_called_once()
         self.assertEqual(json.loads(stdout.getvalue())["time_sync"]["state"], "synced")
 
-    def test_time_failure_preserves_provisioned_profile_for_retry(self) -> None:
+    def test_time_timeout_preserves_token_and_is_structurally_retryable(self) -> None:
         with TemporaryDirectory() as tmp:
             serial = Mock(spec=SerialDeviceClient)
             serial.provision_wifi.return_value = {"device_id": "pj-usb"}
-            serial.put_time.side_effect = DeviceError("time transport unavailable")
+            serial.put_time.side_effect = DeviceRequestTimeout("time transport unavailable")
             stdout = StringIO()
             with patch("pocket_journal_partner.cli.resolve_serial_port", return_value="/dev/cu.test"):
                 with patch("pocket_journal_partner.cli.SerialDeviceClient", return_value=serial):
-                    with redirect_stdout(stdout):
-                        exit_code = cli.main([
-                            "provision", "--ssid", "Lab", "--password", "test-password",
-                            "--data-dir", tmp,
-                        ])
+                    with patch("pocket_journal_partner.cli.secrets.token_urlsafe", return_value="stable-token"):
+                        with redirect_stdout(stdout):
+                            exit_code = cli.main([
+                                "provision", "--ssid", "Lab", "--password", "test-password",
+                                "--data-dir", tmp,
+                            ])
             stored = json.loads((Path(tmp) / "config.json").read_text(encoding="utf-8"))
 
         self.assertEqual(exit_code, 0)
         self.assertIn("pj-usb", stored["devices"])
+        self.assertEqual(stored["devices"]["pj-usb"]["token"], "stable-token")
+        serial.provision_wifi.assert_called_once_with("Lab", "test-password", "stable-token")
         result = json.loads(stdout.getvalue())
         self.assertEqual(result["time_sync"]["state"], "failed")
+        self.assertTrue(result["time_sync"]["retryable"])
+        self.assertEqual(result["time_sync"]["retry_command"], "pj device sync-time")
         self.assertNotIn("test-password", stdout.getvalue())
+
+    def test_failed_provisioning_time_write_retries_without_rotating_profile(self) -> None:
+        serial = Mock(spec=SerialDeviceClient)
+        serial.provision_wifi.return_value = {"device_id": "pj-usb"}
+        serial.put_time.side_effect = [
+            DeviceRequestTimeout("first write timed out"),
+            {"hour": 8, "minute": 42, "year": 2026, "month": 7, "day": 14},
+        ]
+
+        with TemporaryDirectory() as tmp:
+            stdout = StringIO()
+            with patch("pocket_journal_partner.cli.resolve_serial_port", return_value="/dev/cu.test"):
+                with patch("pocket_journal_partner.cli.SerialDeviceClient", return_value=serial):
+                    with patch("pocket_journal_partner.cli.secrets.token_urlsafe", return_value="stable-token"):
+                        with redirect_stdout(stdout):
+                            self.assertEqual(cli.main([
+                                "provision", "--ssid", "Lab", "--password", "test-password",
+                                "--data-dir", tmp,
+                            ]), 0)
+            before_retry = (Path(tmp) / "config.json").read_bytes()
+            retry = cli._sync_time_from_host(
+                serial,
+                datetime(2026, 7, 14, 8, 42, tzinfo=timezone(timedelta(hours=-7))),
+            )
+            after_retry = (Path(tmp) / "config.json").read_bytes()
+
+        self.assertEqual(retry["state"], "synced")
+        self.assertEqual(before_retry, after_retry)
+        serial.provision_wifi.assert_called_once()
+        self.assertEqual(serial.put_time.call_count, 2)
 
 
 class CalendarDeprecationTests(unittest.TestCase):
