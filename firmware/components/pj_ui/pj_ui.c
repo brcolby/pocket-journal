@@ -1067,6 +1067,18 @@ void pj_ui_set_static_art(pj_ui_context_t *ctx, const uint8_t *pixels, size_t pi
     }
 }
 
+void pj_ui_clear_static_art(pj_ui_context_t *ctx)
+{
+    if (ctx == NULL || !ctx->static_art_valid) {
+        return;
+    }
+    memset(ctx->static_art, 0, sizeof(ctx->static_art));
+    ctx->static_art_valid = 0;
+    if (ctx->state == PJ_UI_STATE_STATIC) {
+        mark_full(ctx);
+    }
+}
+
 void pj_ui_set_time(pj_ui_context_t *ctx, int hour, int minute, int year, int month, int day)
 {
     if (ctx->hour == hour && ctx->minute == minute && ctx->year == year && ctx->month == month && ctx->day == day) {

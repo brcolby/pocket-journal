@@ -1,9 +1,32 @@
 #include "pj_static_art.h"
+#include "pj_static_art_ui.h"
 #include "pj_default_static_art.h"
 
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>
+
+static int published_set_count;
+static int published_clear_count;
+static pj_ui_context_t *published_ui;
+static uint8_t published_pixels[PJ_STATIC_ART_BYTES];
+
+void pj_ui_set_static_art(pj_ui_context_t *ui, const uint8_t *pixels, size_t pixel_bytes)
+{
+    assert(ui != NULL);
+    assert(pixels != NULL);
+    assert(pixel_bytes == sizeof(published_pixels));
+    published_ui = ui;
+    memcpy(published_pixels, pixels, sizeof(published_pixels));
+    published_set_count++;
+}
+
+void pj_ui_clear_static_art(pj_ui_context_t *ui)
+{
+    assert(ui != NULL);
+    published_ui = ui;
+    published_clear_count++;
+}
 
 static void fill_rows(char storage[PJ_STATIC_ART_HEIGHT][PJ_STATIC_ART_WIDTH + 1],
                       const char *rows[PJ_STATIC_ART_HEIGHT])
@@ -100,12 +123,36 @@ static void test_compiled_default_uses_static_art_record_format(void)
     assert(memcmp(art.pixels, decoded.pixels, sizeof(art.pixels)) == 0);
 }
 
+static void test_board_art_publication_sets_or_clears_ui(void)
+{
+    pj_ui_context_t ui = {0};
+    pj_static_art_t art = {0};
+    art.pixels[0] = 0xa5;
+    art.pixels[PJ_STATIC_ART_BYTES - 1] = 0x80;
+
+    pj_static_art_publish_to_ui(&ui, &art);
+    assert(published_set_count == 1);
+    assert(published_clear_count == 0);
+    assert(published_ui == &ui);
+    assert(memcmp(published_pixels, art.pixels, sizeof(art.pixels)) == 0);
+
+    pj_static_art_publish_to_ui(&ui, NULL);
+    assert(published_set_count == 1);
+    assert(published_clear_count == 1);
+    assert(published_ui == &ui);
+
+    pj_static_art_publish_to_ui(NULL, &art);
+    assert(published_set_count == 1);
+    assert(published_clear_count == 1);
+}
+
 int main(void)
 {
     test_valid_rows_and_pixel_mapping();
     test_validation_errors();
     test_record_round_trip_and_corruption();
     test_compiled_default_uses_static_art_record_format();
+    test_board_art_publication_sets_or_clears_ui();
     puts("static art tests passed");
     return 0;
 }

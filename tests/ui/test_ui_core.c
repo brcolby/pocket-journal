@@ -1622,6 +1622,9 @@ static void test_static_art_render_and_fallback(void)
     pixels[first >> 3u] |= (uint8_t)(1u << (first & 7u));
     pixels[second >> 3u] |= (uint8_t)(1u << (second & 7u));
     pj_ui_mark_displayed(&ui);
+    pj_ui_clear_static_art(&ui);
+    assert(ui.static_art_valid == 0);
+    assert(pj_ui_is_dirty(&ui) == 0);
     pj_ui_set_static_art(&ui, pixels, sizeof(pixels));
     assert(ui.static_art_valid == 1);
     assert(pj_ui_is_dirty(&ui) == 1);
@@ -1633,10 +1636,31 @@ static void test_static_art_render_and_fallback(void)
     assert(pj_framebuffer_get(&custom, 199, 199) == 1);
     assert(pj_framebuffer_get(&custom, 100, 100) == 0);
 
+    pj_ui_mark_displayed(&ui);
+    pj_ui_set_static_art(&ui, pixels, sizeof(pixels));
+    assert(pj_ui_is_dirty(&ui) == 0);
+
     ui.dark_mode = 1;
     pj_ui_request_full_refresh(&ui);
     pj_ui_render(&ui, &custom);
     assert(count_black_pixels(&custom) == 2);
+
+    ui.dark_mode = 0;
+    pj_ui_mark_displayed(&ui);
+    pj_ui_clear_static_art(&ui);
+    assert(ui.static_art_valid == 0);
+    assert(pj_ui_is_dirty(&ui) == 1);
+    assert(ui.dirty.partial == 0);
+    assert(memcmp(ui.static_art, (uint8_t[PJ_FRAMEBUFFER_BYTES]){0},
+                  sizeof(ui.static_art)) == 0);
+    pj_ui_render(&ui, &fallback);
+    assert(memcmp(fallback.pixels, pj_default_static_art, sizeof(fallback.pixels)) == 0);
+
+    pj_ui_mark_displayed(&ui);
+    pj_ui_clear_static_art(&ui);
+    assert(ui.static_art_valid == 0);
+    assert(pj_ui_is_dirty(&ui) == 0);
+    pj_ui_clear_static_art(NULL);
 }
 
 static void test_long_note_label_stays_inside_editorial_row(void)

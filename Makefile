@@ -115,6 +115,7 @@ test-input:
 		-Ifirmware/components/pj_board/include \
 		-Ifirmware/components/pj_ui/include \
 		firmware/components/pj_board/pj_static_art.c \
+		firmware/components/pj_board/pj_static_art_ui.c \
 		firmware/components/pj_ui/pj_default_static_art.c \
 		tests/board/test_static_art.c \
 		-o $(STATIC_ART_TEST_BIN)

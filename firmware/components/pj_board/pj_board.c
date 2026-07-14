@@ -9,6 +9,7 @@
 #include "pj_rtc_wake.h"
 #include "pj_settings.h"
 #include "pj_static_art.h"
+#include "pj_static_art_ui.h"
 #include "pj_storage.h"
 #include "pj_storage_coordinator.h"
 #include "pj_time_clock.h"
@@ -1699,6 +1700,13 @@ static int static_art_read_slot_unlocked(int slot, pj_static_art_t *art)
                 pj_static_art_decode_record(record, got, art);
     free(record);
     return valid;
+}
+
+static void static_art_reset_unlocked(void)
+{
+    memset(&g_static_art, 0, sizeof(g_static_art));
+    g_static_art_valid = 0;
+    g_static_art_slot = -1;
 }
 
 static void static_art_load_from_storage(void)
@@ -6027,9 +6035,7 @@ void pj_board_refresh_static_art(pj_ui_context_t *ui)
     if (ui == NULL || !static_art_take(portMAX_DELAY)) {
         return;
     }
-    if (g_static_art_valid) {
-        pj_ui_set_static_art(ui, g_static_art.pixels, sizeof(g_static_art.pixels));
-    }
+    pj_static_art_publish_to_ui(ui, g_static_art_valid ? &g_static_art : NULL);
     static_art_give();
 }
 
@@ -6039,9 +6045,7 @@ int pj_board_consume_static_art_update(pj_ui_context_t *ui)
         return 0;
     }
     g_static_art_update_pending = 0;
-    if (g_static_art_valid) {
-        pj_ui_set_static_art(ui, g_static_art.pixels, sizeof(g_static_art.pixels));
-    }
+    pj_static_art_publish_to_ui(ui, g_static_art_valid ? &g_static_art : NULL);
     static_art_give();
     return 1;
 }
@@ -6716,16 +6720,20 @@ int pj_board_storage_recover(void)
         (void)snprintf(g_status.last_error, sizeof(g_status.last_error),
                        "microSD recovery failed: %s; check card and filesystem",
                        esp_err_to_name(err));
+        if (static_art_take(portMAX_DELAY)) {
+            static_art_reset_unlocked();
+            static_art_give();
+        }
         portENTER_CRITICAL(&g_storage_coordinator_lock);
         pj_storage_recovery_finish(&g_storage_coordinator);
         portEXIT_CRITICAL(&g_storage_coordinator_lock);
+        g_static_art_update_pending = 1;
         return 0;
     }
     g_status.storage = PJ_BOARD_SERVICE_READY;
     g_status.last_error[0] = '\0';
     if (static_art_take(portMAX_DELAY)) {
-        g_static_art_valid = 0;
-        g_static_art_slot = -1;
+        static_art_reset_unlocked();
         static_art_load_from_storage();
         static_art_give();
     }
@@ -6743,6 +6751,7 @@ int pj_board_storage_recover(void)
     portENTER_CRITICAL(&g_storage_coordinator_lock);
     pj_storage_recovery_finish(&g_storage_coordinator);
     portEXIT_CRITICAL(&g_storage_coordinator_lock);
+    g_static_art_update_pending = 1;
     g_notes_update_pending = 1;
     return 1;
 #else
