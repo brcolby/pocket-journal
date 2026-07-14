@@ -120,3 +120,9 @@ pj_aux_gesture_t pj_aux_input_update(pj_aux_input_t *input, int raw_level, uint3
     gesture = poll_long_press(input, now_ms);
     return gesture != PJ_AUX_GESTURE_NONE ? gesture : poll_pending_short(input, now_ms);
 }
+
+int pj_aux_input_is_released(const pj_aux_input_t *input)
+{
+    return input != NULL && input->raw_level != 0 &&
+        input->stable_level != 0 && !input->pressed;
+}

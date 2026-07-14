@@ -81,14 +81,38 @@ static void test_initial_and_resumed_hold_fire_once(void)
 {
     pj_aux_input_t input;
     pj_aux_input_init(&input, 0, 100);
+    assert(!pj_aux_input_is_released(&input));
     assert(pj_aux_input_update(&input, 0, 599) == PJ_AUX_GESTURE_NONE);
     assert(pj_aux_input_update(&input, 0, 600) == PJ_AUX_GESTURE_LONG);
     assert(pj_aux_input_update(&input, 0, 900) == PJ_AUX_GESTURE_NONE);
+    assert(!pj_aux_input_is_released(&input));
     assert(settle_level(&input, 1, 950) == PJ_AUX_GESTURE_NONE);
+    assert(pj_aux_input_is_released(&input));
 
     pj_aux_input_resume_pressed(&input, 2000);
+    assert(!pj_aux_input_is_released(&input));
     assert(pj_aux_input_update(&input, 0, 2500) == PJ_AUX_GESTURE_LONG);
     assert(settle_level(&input, 1, 2600) == PJ_AUX_GESTURE_NONE);
+    assert(pj_aux_input_is_released(&input));
+}
+
+static void test_release_predicate_waits_for_debounced_high(void)
+{
+    pj_aux_input_t input;
+    pj_aux_input_init(&input, 1, 100);
+    assert(pj_aux_input_is_released(&input));
+
+    assert(pj_aux_input_update(&input, 0, 200) == PJ_AUX_GESTURE_NONE);
+    assert(!pj_aux_input_is_released(&input));
+    assert(pj_aux_input_update(&input, 0, 200 + PJ_AUX_DEBOUNCE_MS) ==
+           PJ_AUX_GESTURE_NONE);
+    assert(!pj_aux_input_is_released(&input));
+
+    assert(pj_aux_input_update(&input, 1, 300) == PJ_AUX_GESTURE_NONE);
+    assert(!pj_aux_input_is_released(&input));
+    assert(pj_aux_input_update(&input, 1, 300 + PJ_AUX_DEBOUNCE_MS) ==
+           PJ_AUX_GESTURE_NONE);
+    assert(pj_aux_input_is_released(&input));
 }
 
 static void test_contact_bounce_does_not_drop_click(void)
@@ -138,6 +162,7 @@ int main(void)
     test_late_second_click_preserves_both_singles();
     test_long_press_is_not_a_double_click();
     test_initial_and_resumed_hold_fire_once();
+    test_release_predicate_waits_for_debounced_high();
     test_contact_bounce_does_not_drop_click();
     test_wake_press_survives_release_before_poll();
     test_millisecond_counter_wrap();

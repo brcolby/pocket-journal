@@ -105,6 +105,7 @@ int pj_board_apply_time_actions(pj_ui_context_t *ui);
 int pj_board_update_time_state(pj_ui_context_t *ui);
 int pj_board_display_framebuffer(const pj_framebuffer_t *fb, const pj_ui_dirty_region_t *dirty);
 int pj_board_poll_event(pj_board_event_t *event);
+int pj_board_aux_released(void);
 void pj_board_enter_sleep(void);
 int pj_board_record_set_active(int active);
 int pj_board_record_toggle(void);

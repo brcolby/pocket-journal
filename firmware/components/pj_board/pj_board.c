@@ -181,7 +181,9 @@
 #define PJ_AUDIO_TONE_DEFAULT_INT -1
 #define PJ_TOUCH_EVENT_GUARD_MS 150
 #define PJ_TOUCH_POLL_MS 10
+#define PJ_AUX_POLL_MS 10
 #define PJ_TOUCH_EVENT_QUEUE_DEPTH 8
+#define PJ_AUX_EVENT_QUEUE_DEPTH 4
 #define PJ_TOUCH_STABLE_SAMPLES 2
 #define PJ_TOUCH_MOVE_TOLERANCE 18
 #define PJ_HTTP_MAX_URI_HANDLERS 16
@@ -250,6 +252,7 @@ static gpio_num_t g_i2s_dout_pin = I2S_DOUT_PIN;
 static adc_oneshot_unit_handle_t g_adc1_handle;
 static adc_cali_handle_t g_adc_cali_handle;
 static QueueHandle_t g_board_event_queue;
+static QueueHandle_t g_aux_event_queue;
 static SemaphoreHandle_t g_i2c_lock;
 static SemaphoreHandle_t g_rtc_sequence_lock;
 static SemaphoreHandle_t g_audio_lock;
@@ -287,6 +290,8 @@ static char g_ble_password[PJ_WIFI_PASSWORD_MAX_LEN + 1];
 static char g_ble_token[sizeof(g_status.token)];
 static char g_ble_state[24] = "idle";
 static pj_aux_input_t g_aux_input;
+static int g_aux_task_started;
+static int g_aux_released = 1;
 static int g_touch_task_started;
 static int g_serial_command_task_started;
 static int g_touch_pressed;
@@ -319,6 +324,7 @@ static uint32_t g_record_sequence;
 static portMUX_TYPE g_time_lock = portMUX_INITIALIZER_UNLOCKED;
 static portMUX_TYPE g_audio_state_lock = portMUX_INITIALIZER_UNLOCKED;
 static portMUX_TYPE g_recording_lock = portMUX_INITIALIZER_UNLOCKED;
+static portMUX_TYPE g_aux_state_lock = portMUX_INITIALIZER_UNLOCKED;
 static pj_recording_t g_recording;
 static pj_time_clock_anchor_t g_time_clock_anchor;
 static pj_time_controller_t g_time_controller;
@@ -358,6 +364,9 @@ static void alert_audio_project(const pj_time_alert_t *alert,
                                 pj_time_conflict_action_t action);
 static void alert_audio_set_recording(int recording);
 static void alert_audio_set_volume(int codec_volume);
+static esp_err_t aux_task_start(void);
+static esp_err_t board_event_queue_ensure(void);
+static void board_queue_event(const pj_board_event_t *event);
 
 static pj_alert_audio_t g_alert_audio;
 
@@ -3325,8 +3334,10 @@ static void button_init(void)
         .intr_type = GPIO_INTR_DISABLE,
     };
     ESP_ERROR_CHECK_WITHOUT_ABORT(gpio_config(&button_conf));
-    uint32_t now_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
-    pj_aux_input_init(&g_aux_input, gpio_get_level(BOOT_BUTTON_PIN), now_ms);
+    esp_err_t aux_err = aux_task_start();
+    if (aux_err != ESP_OK) {
+        ESP_LOGW(TAG, "AUX poll task failed to start: %s", esp_err_to_name(aux_err));
+    }
 }
 
 static int touch_read(uint16_t *x, uint16_t *y)
@@ -3415,7 +3426,16 @@ static int touch_poll_filtered_event(pj_board_event_t *event, TickType_t now)
     return 0;
 }
 
-static void touch_queue_event(const pj_board_event_t *event)
+static esp_err_t board_event_queue_ensure(void)
+{
+    if (g_board_event_queue != NULL) {
+        return ESP_OK;
+    }
+    g_board_event_queue = xQueueCreate(PJ_TOUCH_EVENT_QUEUE_DEPTH, sizeof(pj_board_event_t));
+    return g_board_event_queue != NULL ? ESP_OK : ESP_ERR_NO_MEM;
+}
+
+static void board_queue_event(const pj_board_event_t *event)
 {
     if (g_board_event_queue == NULL) {
         return;
@@ -3425,6 +3445,88 @@ static void touch_queue_event(const pj_board_event_t *event)
         (void)xQueueReceive(g_board_event_queue, &dropped, 0);
         (void)xQueueSend(g_board_event_queue, event, 0);
     }
+}
+
+static void aux_released_set(int released)
+{
+    portENTER_CRITICAL(&g_aux_state_lock);
+    g_aux_released = released != 0;
+    portEXIT_CRITICAL(&g_aux_state_lock);
+}
+
+static void aux_queue_event(const pj_board_event_t *event)
+{
+    if (g_aux_event_queue == NULL || event == NULL) {
+        return;
+    }
+    if (event->type == PJ_BOARD_EVENT_AUX_LONG) {
+        if (xQueueSendToFront(g_aux_event_queue, event, 0) == pdTRUE) {
+            return;
+        }
+        pj_board_event_t dropped;
+        if (xQueueReceive(g_aux_event_queue, &dropped, 0) != pdTRUE ||
+            xQueueSendToFront(g_aux_event_queue, event, 0) != pdTRUE) {
+            ESP_LOGE(TAG, "AUX long gesture could not replace a queued event");
+        } else {
+            ESP_LOGW(TAG, "AUX event queue full; long gesture replaced gesture=%d",
+                     dropped.type);
+        }
+        return;
+    }
+
+    if (xQueueSend(g_aux_event_queue, event, 0) != pdTRUE) {
+        ESP_LOGW(TAG, "AUX event queue full; dropped gesture=%d", event->type);
+    }
+}
+
+static void aux_poll_task(void *arg)
+{
+    (void)arg;
+    while (1) {
+        int level = gpio_get_level(BOOT_BUTTON_PIN);
+        uint32_t now_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
+        pj_aux_gesture_t gesture = pj_aux_input_update(&g_aux_input, level, now_ms);
+        aux_released_set(pj_aux_input_is_released(&g_aux_input));
+
+        pj_board_event_t event = {
+            .type = gesture == PJ_AUX_GESTURE_SHORT ? PJ_BOARD_EVENT_AUX_SHORT :
+                    gesture == PJ_AUX_GESTURE_LONG ? PJ_BOARD_EVENT_AUX_LONG :
+                    gesture == PJ_AUX_GESTURE_DOUBLE ? PJ_BOARD_EVENT_AUX_DOUBLE :
+                    PJ_BOARD_EVENT_NONE,
+            .x = 0,
+            .y = 0,
+        };
+        if (event.type != PJ_BOARD_EVENT_NONE) {
+            ESP_LOGI(TAG, "AUX %s", event.type == PJ_BOARD_EVENT_AUX_SHORT ? "short" :
+                     event.type == PJ_BOARD_EVENT_AUX_LONG ? "long" : "double");
+            aux_queue_event(&event);
+        }
+        vTaskDelay(pdMS_TO_TICKS(PJ_AUX_POLL_MS));
+    }
+}
+
+static esp_err_t aux_task_start(void)
+{
+    if (g_aux_task_started) {
+        return ESP_OK;
+    }
+    if (g_aux_event_queue == NULL) {
+        g_aux_event_queue = xQueueCreate(PJ_AUX_EVENT_QUEUE_DEPTH,
+                                         sizeof(pj_board_event_t));
+        if (g_aux_event_queue == NULL) {
+            return ESP_ERR_NO_MEM;
+        }
+    }
+    int level = gpio_get_level(BOOT_BUTTON_PIN);
+    uint32_t now_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
+    pj_aux_input_init(&g_aux_input, level, now_ms);
+    aux_released_set(pj_aux_input_is_released(&g_aux_input));
+    if (xTaskCreate(aux_poll_task, "pj-aux", 3072, NULL, 7, NULL) != pdPASS) {
+        return ESP_ERR_NO_MEM;
+    }
+    g_aux_task_started = 1;
+    ESP_LOGI(TAG, "AUX polling at %dms", PJ_AUX_POLL_MS);
+    return ESP_OK;
 }
 
 static void touch_poll_task(void *arg)
@@ -3437,7 +3539,7 @@ static void touch_poll_task(void *arg)
             .y = 0,
         };
         if (touch_poll_filtered_event(&event, xTaskGetTickCount())) {
-            touch_queue_event(&event);
+            board_queue_event(&event);
         }
         vTaskDelay(pdMS_TO_TICKS(PJ_TOUCH_POLL_MS));
     }
@@ -3448,12 +3550,8 @@ static esp_err_t touch_task_start(void)
     if (!g_touch_ready || g_touch_task_started) {
         return ESP_OK;
     }
-    if (g_board_event_queue == NULL) {
-        g_board_event_queue = xQueueCreate(PJ_TOUCH_EVENT_QUEUE_DEPTH, sizeof(pj_board_event_t));
-        if (g_board_event_queue == NULL) {
-            return ESP_ERR_NO_MEM;
-        }
-    }
+    ESP_RETURN_ON_ERROR(board_event_queue_ensure(), TAG,
+                        "board event queue allocation failed");
     BaseType_t created = xTaskCreate(touch_poll_task, "pj-touch", 3072, NULL, 6, NULL);
     if (created != pdPASS) {
         return ESP_ERR_NO_MEM;
@@ -5863,35 +5961,33 @@ int pj_board_poll_event(pj_board_event_t *event)
     event->x = 0;
     event->y = 0;
 #ifdef ESP_PLATFORM
-    int level = gpio_get_level(BOOT_BUTTON_PIN);
-    TickType_t now = xTaskGetTickCount();
-    uint32_t now_ms = (uint32_t)(now * portTICK_PERIOD_MS);
-    pj_aux_gesture_t gesture = pj_aux_input_update(&g_aux_input, level, now_ms);
-    switch (gesture) {
-    case PJ_AUX_GESTURE_SHORT:
-        event->type = PJ_BOARD_EVENT_AUX_SHORT;
-        break;
-    case PJ_AUX_GESTURE_LONG:
-        event->type = PJ_BOARD_EVENT_AUX_LONG;
-        break;
-    case PJ_AUX_GESTURE_DOUBLE:
-        event->type = PJ_BOARD_EVENT_AUX_DOUBLE;
-        break;
-    case PJ_AUX_GESTURE_NONE:
-    default:
-        break;
+    if (!g_aux_task_started) {
+        esp_err_t aux_err = aux_task_start();
+        if (aux_err != ESP_OK) {
+            ESP_LOGW(TAG, "AUX poll task retry failed: %s", esp_err_to_name(aux_err));
+        }
     }
-    if (event->type != PJ_BOARD_EVENT_NONE) {
-        ESP_LOGI(TAG, "AUX %s", event->type == PJ_BOARD_EVENT_AUX_SHORT ? "short" :
-                 event->type == PJ_BOARD_EVENT_AUX_LONG ? "long" : "double");
+    if (g_aux_event_queue != NULL && xQueueReceive(g_aux_event_queue, event, 0) == pdTRUE) {
         return 1;
     }
-
     if (g_board_event_queue != NULL && xQueueReceive(g_board_event_queue, event, 0) == pdTRUE) {
         return 1;
     }
 #endif
     return 0;
+}
+
+int pj_board_aux_released(void)
+{
+#ifdef ESP_PLATFORM
+    int released;
+    portENTER_CRITICAL(&g_aux_state_lock);
+    released = g_aux_released;
+    portEXIT_CRITICAL(&g_aux_state_lock);
+    return released;
+#else
+    return 1;
+#endif
 }
 
 void pj_board_enter_sleep(void)
@@ -5986,12 +6082,6 @@ void pj_board_enter_sleep(void)
         } else {
             (void)pj_time_controller_update(&g_time_controller, &result);
         }
-    }
-    uint32_t wake_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
-    if (gpio_get_level(BOOT_BUTTON_PIN) == 0) {
-        pj_aux_input_resume_pressed(&g_aux_input, wake_ms);
-    } else {
-        pj_aux_input_init(&g_aux_input, 1, wake_ms);
     }
     gpio_set_level(EPD_PWR_PIN, 0);
     const char *source = rtc_wake ? "RTC_INT" : timer_wake ? "timer" : "GPIO";
