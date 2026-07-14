@@ -30,8 +30,9 @@ static size_t pattern_tones(pj_alert_audio_kind_t kind, pj_alert_tone_t tones[2]
         return 1;
     }
     if (kind == PJ_ALERT_AUDIO_TIMER) {
-        tones[0] = (pj_alert_tone_t) {.start = 0, .length = 1600, .frequency = 660};
-        return 1;
+        tones[0] = (pj_alert_tone_t) {.start = 0, .length = 2400, .frequency = 660};
+        tones[1] = (pj_alert_tone_t) {.start = 3200, .length = 2400, .frequency = 880};
+        return 2;
     }
     tones[0] = (pj_alert_tone_t) {.start = 0, .length = 1200, .frequency = 1047};
     tones[1] = (pj_alert_tone_t) {.start = 2400, .length = 1200, .frequency = 1047};
@@ -207,7 +208,9 @@ pj_alert_audio_result_t pj_alert_audio_defer(pj_alert_audio_t *audio,
     if (audio == NULL || alert_id == 0) {
         return PJ_ALERT_AUDIO_ERR_ARGUMENT;
     }
-    if (audio->alert_id != alert_id || audio->state == PJ_ALERT_AUDIO_DEFERRED) {
+    if (audio->alert_id != alert_id ||
+        audio->state == PJ_ALERT_AUDIO_DEFERRED ||
+        audio->state == PJ_ALERT_AUDIO_COMPLETE) {
         return PJ_ALERT_AUDIO_NO_CHANGE;
     }
     audio->cancellation_generation++;
@@ -261,7 +264,7 @@ pj_alert_audio_result_t pj_alert_audio_set_recording(pj_alert_audio_t *audio,
         return PJ_ALERT_AUDIO_NO_CHANGE;
     }
     audio->recording = value;
-    if (audio->alert_id == 0) {
+    if (audio->alert_id == 0 || audio->state == PJ_ALERT_AUDIO_COMPLETE) {
         return PJ_ALERT_AUDIO_OK;
     }
     return value ? pj_alert_audio_defer(audio, audio->alert_id)
@@ -284,7 +287,8 @@ pj_alert_audio_result_t pj_alert_audio_pump(
     }
     if (audio->state == PJ_ALERT_AUDIO_IDLE ||
         audio->state == PJ_ALERT_AUDIO_DEFERRED ||
-        audio->state == PJ_ALERT_AUDIO_SILENT) {
+        audio->state == PJ_ALERT_AUDIO_SILENT ||
+        audio->state == PJ_ALERT_AUDIO_COMPLETE) {
         return PJ_ALERT_AUDIO_NO_CHANGE;
     }
 
@@ -301,28 +305,7 @@ pj_alert_audio_result_t pj_alert_audio_pump(
             break;
         }
     }
-    if (silent) {
-        pj_alert_audio_result_t cleanup = finish_stream(audio);
-        if (cleanup != PJ_ALERT_AUDIO_OK) {
-            return cleanup;
-        }
-        if (audio->cancellation_generation != generation ||
-            audio->alert_id != alert_id ||
-            audio->state != PJ_ALERT_AUDIO_PLAYING) {
-            return PJ_ALERT_AUDIO_CANCELLED;
-        }
-        audio->frame_cursor =
-            (audio->frame_cursor + PJ_ALERT_AUDIO_BLOCK_FRAMES) %
-            PJ_ALERT_AUDIO_PATTERN_FRAMES;
-        if (audio->frame_cursor == 0) {
-            audio->start_volume = audio->configured_volume;
-            if (audio->start_volume == 0) {
-                audio->state = PJ_ALERT_AUDIO_SILENT;
-            }
-        }
-        return PJ_ALERT_AUDIO_SILENT_BLOCK;
-    }
-    if (!audio->prepared) {
+    if (!silent && !audio->prepared) {
         if (!audio->io.prepare(audio->io.context, PJ_ALERT_AUDIO_SAMPLE_RATE,
                                PJ_ALERT_AUDIO_CHANNELS, audio->start_volume)) {
             audio->cleanup_pending = 1;
@@ -342,8 +325,8 @@ pj_alert_audio_result_t pj_alert_audio_pump(
         pj_alert_audio_result_t result = finish_stream(audio);
         return result == PJ_ALERT_AUDIO_OK ? PJ_ALERT_AUDIO_CANCELLED : result;
     }
-    if (!audio->io.write(audio->io.context, scratch,
-                         PJ_ALERT_AUDIO_BLOCK_FRAMES)) {
+    if (audio->prepared && !audio->io.write(audio->io.context, scratch,
+                                            PJ_ALERT_AUDIO_BLOCK_FRAMES)) {
         audio->cleanup_pending = 1;
         (void)finish_stream(audio);
         return PJ_ALERT_AUDIO_ERR_WRITE;
@@ -353,18 +336,14 @@ pj_alert_audio_result_t pj_alert_audio_pump(
         pj_alert_audio_result_t result = finish_stream(audio);
         return result == PJ_ALERT_AUDIO_OK ? PJ_ALERT_AUDIO_CANCELLED : result;
     }
-    audio->frame_cursor =
-        (audio->frame_cursor + PJ_ALERT_AUDIO_BLOCK_FRAMES) %
-        PJ_ALERT_AUDIO_PATTERN_FRAMES;
-    if (audio->frame_cursor == 0) {
+    audio->frame_cursor += PJ_ALERT_AUDIO_BLOCK_FRAMES;
+    if (audio->frame_cursor >= PJ_ALERT_AUDIO_DURATION_FRAMES) {
+        audio->frame_cursor = PJ_ALERT_AUDIO_DURATION_FRAMES;
+        audio->state = PJ_ALERT_AUDIO_COMPLETE;
         pj_alert_audio_result_t result = finish_stream(audio);
-        audio->start_volume = audio->configured_volume;
-        if (audio->start_volume == 0) {
-            audio->state = PJ_ALERT_AUDIO_SILENT;
-        }
         if (result != PJ_ALERT_AUDIO_OK) {
             return result;
         }
     }
-    return PJ_ALERT_AUDIO_BLOCK_WRITTEN;
+    return silent ? PJ_ALERT_AUDIO_SILENT_BLOCK : PJ_ALERT_AUDIO_BLOCK_WRITTEN;
 }
