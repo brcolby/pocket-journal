@@ -122,6 +122,7 @@ test-input:
 		-o $(HOME_LAYOUT_TEST_BIN)
 	$(HOME_LAYOUT_TEST_BIN)
 	$(CC) $(CFLAGS) \
+		-D_POSIX_C_SOURCE=200809L \
 		-Ifirmware/components/pj_board/include \
 		firmware/components/pj_board/pj_storage.c \
 		tests/board/test_storage.c \

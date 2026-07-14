@@ -1,5 +1,9 @@
 #include "pj_storage.h"
 
+#include <dirent.h>
+#include <errno.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 static int has_suffix(const char *value, const char *suffix)
@@ -90,6 +94,102 @@ pj_storage_recovery_action_t pj_storage_recovery_action(const char *filename, in
         return target_exists ? PJ_STORAGE_RECOVERY_DELETE_BACKUP : PJ_STORAGE_RECOVERY_RESTORE_BACKUP;
     }
     return PJ_STORAGE_RECOVERY_IGNORE;
+}
+
+pj_storage_delete_result_t pj_storage_delete_matching(const char *dir_path,
+                                                       pj_storage_name_match_fn matches,
+                                                       size_t max_entries)
+{
+    pj_storage_delete_result_t result = {0};
+    char **paths = NULL;
+
+    if (dir_path == NULL || dir_path[0] == '\0' || matches == NULL) {
+        result.open_errno = EINVAL;
+        return result;
+    }
+    if (max_entries > SIZE_MAX / sizeof(paths[0])) {
+        result.allocation_errno = ENOMEM;
+        return result;
+    }
+    if (max_entries > 0U) {
+        paths = calloc(max_entries, sizeof(paths[0]));
+        if (paths == NULL) {
+            result.allocation_errno = ENOMEM;
+            return result;
+        }
+    }
+
+    DIR *dir = opendir(dir_path);
+    if (dir == NULL) {
+        result.open_errno = errno != 0 ? errno : EIO;
+        free(paths);
+        return result;
+    }
+
+    const size_t dir_len = strlen(dir_path);
+    int snapshot_stopped = 0;
+    struct dirent *entry;
+    for (;;) {
+        errno = 0;
+        entry = readdir(dir);
+        if (entry == NULL) {
+            if (errno != 0) {
+                result.scan_errno = errno;
+            }
+            break;
+        }
+        if (entry->d_name[0] == '.' || !matches(entry->d_name)) {
+            continue;
+        }
+        result.matched++;
+        if (snapshot_stopped || result.snapshotted >= max_entries) {
+            result.truncated++;
+            continue;
+        }
+
+        const size_t name_len = strlen(entry->d_name);
+        if (name_len > SIZE_MAX - 2U || dir_len > SIZE_MAX - name_len - 2U) {
+            result.allocation_errno = EOVERFLOW;
+            result.truncated++;
+            snapshot_stopped = 1;
+            continue;
+        }
+        const size_t path_size = dir_len + 1U + name_len + 1U;
+        char *path = malloc(path_size);
+        if (path == NULL) {
+            result.allocation_errno = ENOMEM;
+            result.truncated++;
+            snapshot_stopped = 1;
+            continue;
+        }
+        memcpy(path, dir_path, dir_len);
+        path[dir_len] = '/';
+        memcpy(path + dir_len + 1U, entry->d_name, name_len + 1U);
+        paths[result.snapshotted++] = path;
+    }
+    errno = 0;
+    if (closedir(dir) != 0) {
+        result.close_errno = errno != 0 ? errno : EIO;
+    }
+
+    if (result.close_errno == 0) {
+        for (size_t i = 0; i < result.snapshotted; i++) {
+            errno = 0;
+            if (remove(paths[i]) == 0) {
+                result.deleted++;
+                continue;
+            }
+            result.remove_failures++;
+            if (result.first_remove_errno == 0) {
+                result.first_remove_errno = errno != 0 ? errno : EIO;
+            }
+        }
+    }
+    for (size_t i = 0; i < result.snapshotted; i++) {
+        free(paths[i]);
+    }
+    free(paths);
+    return result;
 }
 
 int pj_storage_wav_encode_header(uint8_t *header, size_t header_size,

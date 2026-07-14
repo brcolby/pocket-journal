@@ -29,6 +29,21 @@ typedef struct {
     uint16_t bits_per_sample;
 } pj_storage_wav_info_t;
 
+typedef int (*pj_storage_name_match_fn)(const char *name);
+
+typedef struct {
+    size_t matched;
+    size_t snapshotted;
+    size_t deleted;
+    size_t remove_failures;
+    size_t truncated;
+    int open_errno;
+    int scan_errno;
+    int close_errno;
+    int allocation_errno;
+    int first_remove_errno;
+} pj_storage_delete_result_t;
+
 #define PJ_STORAGE_WAV_HEADER_BYTES 44U
 
 const char *pj_storage_health_name(pj_storage_health_t health);
@@ -37,6 +52,10 @@ pj_storage_health_t pj_storage_capacity_health(int mounted, int capacity_known,
                                                uint64_t reserve_bytes);
 int pj_storage_can_write(uint64_t free_bytes, uint64_t write_bytes, uint64_t reserve_bytes);
 pj_storage_recovery_action_t pj_storage_recovery_action(const char *filename, int target_exists);
+/* Snapshots at most max_entries non-hidden matches, closes the directory, then removes them. */
+pj_storage_delete_result_t pj_storage_delete_matching(const char *dir_path,
+                                                       pj_storage_name_match_fn matches,
+                                                       size_t max_entries);
 int pj_storage_wav_encode_header(uint8_t *header, size_t header_size,
                                  uint32_t data_bytes, uint32_t sample_rate,
                                  uint16_t channels, uint16_t bits_per_sample);
