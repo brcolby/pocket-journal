@@ -227,6 +227,20 @@ static int active_alert_present(const pj_ui_context_t *ctx)
     return ctx != NULL && ctx->active_alert.id != 0;
 }
 
+static int alert_is_modal_for_state(pj_ui_state_t state,
+                                    const pj_time_alert_t *alert)
+{
+    return alert != NULL && alert->id != 0 &&
+        !(state == PJ_UI_STATE_INTERVAL &&
+          alert->source == PJ_TIME_ALERT_INTERVAL);
+}
+
+static int modal_alert_present(const pj_ui_context_t *ctx)
+{
+    return ctx != NULL &&
+        alert_is_modal_for_state(ctx->state, &ctx->active_alert);
+}
+
 static void fb_clear(pj_framebuffer_t *fb)
 {
     memset(fb->pixels, 0, sizeof(fb->pixels));
@@ -1161,8 +1175,16 @@ void pj_ui_set_time_projection(pj_ui_context_t *ctx, const pj_ui_time_projection
     int next_interval_seconds = countdown_seconds_from_ms(projection->interval_remaining_ms);
     int next_interval_round = projection->interval_phase > INT_MAX ?
         INT_MAX : (int)projection->interval_phase;
-    int alert_changed = !alerts_equal(&ctx->active_alert, &projection->active_alert) ||
-        ctx->alert_audio_deferred != (projection->alert_audio_deferred != 0) ||
+    int previous_alert_modal =
+        alert_is_modal_for_state(ctx->state, &ctx->active_alert);
+    int next_alert_modal =
+        alert_is_modal_for_state(ctx->state, &projection->active_alert);
+    int alert_content_changed =
+        !alerts_equal(&ctx->active_alert, &projection->active_alert) ||
+        ctx->alert_audio_deferred != (projection->alert_audio_deferred != 0);
+    int modal_alert_changed = previous_alert_modal != next_alert_modal ||
+        (previous_alert_modal && next_alert_modal && alert_content_changed);
+    int recovery_changed =
         ctx->recovery_time_uncertain != (projection->recovery_time_uncertain != 0);
     int alarm_changed = ctx->alarm_on != (projection->alarm_enabled != 0) ||
         ctx->alarm_hour != projection->alarm_hour ||
@@ -1197,7 +1219,7 @@ void pj_ui_set_time_projection(pj_ui_context_t *ctx, const pj_ui_time_projection
     ctx->alert_audio_deferred = projection->alert_audio_deferred != 0;
     ctx->recovery_time_uncertain = projection->recovery_time_uncertain != 0;
 
-    if (alert_changed) {
+    if (modal_alert_changed || recovery_changed) {
         mark_full(ctx);
     } else if (ctx->state == PJ_UI_STATE_ALARM && alarm_changed) {
         mark_partial(ctx, 0, 0, PJ_DISPLAY_WIDTH, 140);
@@ -1411,7 +1433,7 @@ static int reset_time_page_and_return(pj_ui_context_t *ctx)
 
 int pj_ui_handle_aux_long(pj_ui_context_t *ctx)
 {
-    if (active_alert_present(ctx)) {
+    if (modal_alert_present(ctx)) {
         if (ctx->time_command.type != PJ_UI_TIME_COMMAND_NONE) {
             return 0;
         }
@@ -1455,7 +1477,7 @@ int pj_ui_handle_aux_long(pj_ui_context_t *ctx)
 
 int pj_ui_handle_aux_short(pj_ui_context_t *ctx)
 {
-    if (active_alert_present(ctx)) {
+    if (modal_alert_present(ctx)) {
         if (ctx->time_command.type != PJ_UI_TIME_COMMAND_NONE) {
             return 0;
         }
@@ -1627,7 +1649,7 @@ int pj_ui_handle_aux_short(pj_ui_context_t *ctx)
 
 int pj_ui_handle_aux_double(pj_ui_context_t *ctx)
 {
-    if (active_alert_present(ctx)) {
+    if (modal_alert_present(ctx)) {
         if (ctx->active_alert.source != PJ_TIME_ALERT_ALARM ||
             ctx->time_command.type != PJ_UI_TIME_COMMAND_NONE) {
             return 0;
@@ -1735,7 +1757,7 @@ int pj_ui_handle_touch(pj_ui_context_t *ctx, int x, int y, pj_touch_kind_t kind)
 {
     pj_ui_state_t next = ctx->state;
 
-    if (active_alert_present(ctx)) {
+    if (modal_alert_present(ctx)) {
         if (kind != PJ_TOUCH_TAP || y < 140 || ctx->time_command.type != PJ_UI_TIME_COMMAND_NONE) {
             return 0;
         }
@@ -2084,7 +2106,7 @@ static void render_scene(const pj_ui_context_t *ctx, pj_framebuffer_t *fb)
     char text[24];
     fb_clear(fb);
 
-    if (active_alert_present(ctx)) {
+    if (modal_alert_present(ctx)) {
         draw_alert_overlay(ctx, fb);
     } else {
         switch (ctx->state) {
@@ -2191,7 +2213,7 @@ static void render_scene(const pj_ui_context_t *ctx, pj_framebuffer_t *fb)
         }
     }
 
-    if (!active_alert_present(ctx) && ctx->recovery_time_uncertain &&
+    if (!modal_alert_present(ctx) && ctx->recovery_time_uncertain &&
         ctx->state >= PJ_UI_STATE_ALARM && ctx->state <= PJ_UI_STATE_INTERVAL) {
         draw_text(fb, 150, 8, "TIME?", 1);
     }

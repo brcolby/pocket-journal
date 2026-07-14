@@ -210,6 +210,30 @@ static void test_interval_catchup_and_stopwatch(void)
     assert(pj_time_stopwatch_elapsed(&state) == 35000);
 }
 
+static void test_interval_replaces_undismissed_alert_each_round(void)
+{
+    pj_time_clock_t clock = clock_at(40, 0, 0, 40, 100);
+    pj_time_state_t state;
+    pj_time_state_defaults(&state, &clock);
+    assert(pj_time_interval_start(&state, 1000, 1000, &clock));
+
+    clock.monotonic_ms = 1000;
+    assert(pj_time_advance(&state, &clock));
+    assert(state.interval_phase == 1 && state.interval.remaining_ms == 1000);
+    assert(state.active_alert.source == PJ_TIME_ALERT_INTERVAL);
+    assert(state.active_alert.occurrence == 1);
+    uint64_t first_id = state.active_alert.id;
+
+    clock.monotonic_ms = 2000;
+    assert(pj_time_advance(&state, &clock));
+    assert(state.interval_phase == 2 && state.interval.remaining_ms == 1000);
+    assert(state.active_alert.source == PJ_TIME_ALERT_INTERVAL);
+    assert(state.active_alert.occurrence == 2);
+    assert(state.active_alert.id != 0 && state.active_alert.id != first_id);
+    assert(state.pending_count == 0);
+    assert(pj_time_state_valid(&state));
+}
+
 static void test_interval_resume_preserves_phase_and_remaining(void)
 {
     pj_time_clock_t start = clock_at(30, 0, 0, 30, 100);
@@ -402,6 +426,7 @@ int main(void)
     test_snooze_exact_reboot_deadline_is_recovered();
     test_timer_uses_monotonic_and_reboot_policy();
     test_interval_catchup_and_stopwatch();
+    test_interval_replaces_undismissed_alert_each_round();
     test_interval_resume_preserves_phase_and_remaining();
     test_simultaneous_priority_and_conflicts();
     test_pause_at_expiry_and_canonical_validation();

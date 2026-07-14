@@ -264,6 +264,17 @@ static void remove_source_alerts(pj_time_state_t *state, uint8_t source)
     }
 }
 
+static int replace_source_alert(pj_time_state_t *state, uint8_t source,
+                                uint8_t reason, uint64_t occurrence,
+                                uint32_t skipped, int recovered)
+{
+    if (state->next_alert_id == UINT64_MAX) {
+        return 0;
+    }
+    remove_source_alerts(state, source);
+    return enqueue_alert(state, source, reason, occurrence, skipped, recovered);
+}
+
 int pj_time_alarm_configure(pj_time_state_t *state, int enabled, int hour, int minute,
                             const pj_time_clock_t *clock)
 {
@@ -529,11 +540,12 @@ static int advance_interval(pj_time_state_t *state, const pj_time_clock_t *clock
     state->interval.remaining_ms = duration - overrun;
     state->interval.running = 1;
     countdown_anchor(&state->interval, clock);
-    return enqueue_alert(state, PJ_TIME_ALERT_INTERVAL, PJ_TIME_ALERT_EXPIRED,
-                         state->interval_phase,
-                         crossed - 1u > UINT32_MAX ? UINT32_MAX : (uint32_t)(crossed - 1u),
-                         boot_before != clock->boot_id || crossed > 1 ||
-                         uncertain_before != state->recovery_time_uncertain);
+    return replace_source_alert(
+        state, PJ_TIME_ALERT_INTERVAL, PJ_TIME_ALERT_EXPIRED,
+        state->interval_phase,
+        crossed - 1u > UINT32_MAX ? UINT32_MAX : (uint32_t)(crossed - 1u),
+        boot_before != clock->boot_id || crossed > 1 ||
+        uncertain_before != state->recovery_time_uncertain);
 }
 
 int pj_time_advance(pj_time_state_t *state, const pj_time_clock_t *clock)

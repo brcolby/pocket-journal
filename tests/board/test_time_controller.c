@@ -772,6 +772,46 @@ static void test_media_playback_recording_and_queued_transitions(void)
     assert(result.media_action == PJ_TIME_PRESENT);
 }
 
+static void test_interval_projects_each_round_and_reset_clears_alert(void)
+{
+    fixture_t fixture;
+    fixture_defaults(&fixture);
+    pj_time_controller_t controller = init_default(&fixture);
+    assert(apply(&controller, &fixture,
+                 PJ_TIME_CONTROLLER_COMMAND_INTERVAL_START, 1000, 1000)
+               .command_applied);
+
+    clear_observations(&fixture);
+    fixture.clock.monotonic_ms += 1000;
+    fixture.clock.wall_utc_ms += 1000;
+    pj_time_controller_result_t result;
+    assert(pj_time_controller_update(&controller, &result));
+    assert(result.media_projected && fixture.media_calls == 1);
+    assert(fixture.media_has_alert);
+    assert(fixture.media_alert.source == PJ_TIME_ALERT_INTERVAL);
+    assert(controller.state.interval_phase == 1);
+    uint64_t first_id = fixture.media_alert.id;
+
+    clear_observations(&fixture);
+    fixture.clock.monotonic_ms += 1000;
+    fixture.clock.wall_utc_ms += 1000;
+    assert(pj_time_controller_update(&controller, &result));
+    assert(result.media_projected && fixture.media_calls == 1);
+    assert(fixture.media_has_alert);
+    assert(fixture.media_alert.source == PJ_TIME_ALERT_INTERVAL);
+    assert(fixture.media_alert.id != 0 && fixture.media_alert.id != first_id);
+    assert(controller.state.interval_phase == 2);
+    assert(controller.state.pending_count == 0);
+
+    clear_observations(&fixture);
+    result = apply(&controller, &fixture,
+                   PJ_TIME_CONTROLLER_COMMAND_INTERVAL_RESET, 0, 0);
+    assert(result.command_applied && result.media_projected);
+    assert(!fixture.media_has_alert);
+    assert(controller.state.active_alert.source == PJ_TIME_ALERT_NONE);
+    assert(!controller.state.interval.running && controller.state.interval_phase == 0);
+}
+
 static void test_monotonic_rollback_resets_cadence_baselines(void)
 {
     fixture_t fixture;
@@ -1126,6 +1166,7 @@ int main(void)
     test_time_changes_and_recovery_acknowledge();
     test_wake_arm_disarm_and_error_retry();
     test_media_playback_recording_and_queued_transitions();
+    test_interval_projects_each_round_and_reset_clears_alert();
     test_monotonic_rollback_resets_cadence_baselines();
     test_settings_failure_is_conservative_and_recovers();
     test_operational_diagnostic_precedence();

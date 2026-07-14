@@ -898,6 +898,55 @@ static void test_time_projection_and_alert_repaint(void)
     assert(pj_ui_is_dirty(&ui) == 1 && ui.dirty.partial == 0);
 }
 
+static void test_interval_alert_stays_inline_and_aux_long_resets(void)
+{
+    pj_ui_context_t with_alert;
+    pj_ui_context_t without_alert;
+    pj_framebuffer_t with_alert_fb;
+    pj_framebuffer_t without_alert_fb;
+    pj_ui_time_command_t command;
+    pj_ui_init(&with_alert);
+    pj_ui_init(&without_alert);
+    with_alert.state = PJ_UI_STATE_INTERVAL;
+    without_alert.state = PJ_UI_STATE_INTERVAL;
+    pj_ui_mark_displayed(&with_alert);
+    pj_ui_mark_displayed(&without_alert);
+
+    pj_ui_time_projection_t projection =
+        time_projection_with_alert(71, PJ_TIME_ALERT_INTERVAL);
+    pj_ui_time_projection_t quiet_projection = projection;
+    memset(&quiet_projection.active_alert, 0, sizeof(quiet_projection.active_alert));
+    pj_ui_set_time_projection(&with_alert, &projection);
+    pj_ui_set_time_projection(&without_alert, &quiet_projection);
+    assert(with_alert.state == PJ_UI_STATE_INTERVAL);
+    assert(with_alert.active_alert.id == 71);
+    assert(with_alert.interval_running == 1 && with_alert.interval_round == 3);
+    assert(with_alert.dirty.partial == 1);
+    assert(with_alert.dirty.width * with_alert.dirty.height <
+           PJ_DISPLAY_WIDTH * PJ_DISPLAY_HEIGHT);
+
+    memset(&with_alert_fb, 0, sizeof(with_alert_fb));
+    memset(&without_alert_fb, 0, sizeof(without_alert_fb));
+    pj_ui_render(&with_alert, &with_alert_fb);
+    pj_ui_render(&without_alert, &without_alert_fb);
+    assert(memcmp(&with_alert_fb, &without_alert_fb, sizeof(with_alert_fb)) == 0);
+
+    pj_ui_mark_displayed(&with_alert);
+    projection.active_alert.id = 72;
+    projection.active_alert.occurrence = 8;
+    projection.interval_phase = 4;
+    projection.interval_remaining_ms = 45000;
+    pj_ui_set_time_projection(&with_alert, &projection);
+    assert(with_alert.active_alert.id == 72 && with_alert.interval_round == 4);
+    assert(with_alert.interval_seconds == 45);
+    assert(with_alert.dirty.partial == 1);
+
+    assert(pj_ui_handle_aux_long(&with_alert) == 1);
+    assert(with_alert.state == PJ_UI_STATE_TIME);
+    assert(pj_ui_consume_time_command(&with_alert, &command) == 1);
+    assert(command.type == PJ_UI_TIME_COMMAND_INTERVAL_RESET);
+}
+
 static pj_ui_time_projection_t projection_from_ui(const pj_ui_context_t *ui)
 {
     return (pj_ui_time_projection_t) {
@@ -1668,6 +1717,7 @@ int main(void)
     test_interval_repeats_one_stable_duration_across_rounds();
     test_timer_geometry_and_adjustment_focus_timeout();
     test_time_projection_and_alert_repaint();
+    test_interval_alert_stays_inline_and_aux_long_resets();
     test_time_projection_refreshes_changed_controls();
     test_active_alert_is_controllable_from_aux();
     test_sleep_preserves_durable_time_activity();
