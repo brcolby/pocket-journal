@@ -70,8 +70,10 @@ Do not repeat these checks on an unchanged build.
   `interval_active_after=false`, `persisted=true`, and `silenced=true`.
   Partner `cbe3342` then prevented pyserial's normal POSIX open from changing
   DTR/RTS or applying hangup-on-close. Repeated status sessions, an empty wipe,
-  and a separate post-wipe status all preserved boot ID `585729899` while
-  uptime advanced beyond 306 seconds. Wipe operation `1` remained in terminal
+  and a separate post-wipe status all preserved boot ID `585729899`. A final
+  interval reset after 626 seconds reported `interval_active_before=false`,
+  proving the interval stayed stopped for more than six default periods. Wipe
+  operation `1` remained in terminal
   history and no process owned the USB descriptor afterward
   (`pocket-journal-6ot`, `pocket-journal-rgo`, closed).
 - Saved Wi-Fi credentials loaded and the station repeatedly reached
@@ -139,8 +141,8 @@ art-fidelity, or image-analysis acceptance evidence recorded in Beads.
 
 **Nominated firmware: `8b97009`.** It passed the complete native, partner, and
 simulator test suite plus an ESP-IDF 6.0.1 build, was flashed with hash
-verification and no monitor, retained a durably stopped interval beyond three
-default interval periods, and was left with no USB descriptor owner. Partner
+verification and no monitor, retained a durably stopped interval beyond ten
+minutes, and was left with no USB descriptor owner. Partner
 `cbe3342` passed 173 tests and preserved the same target boot across repeated
 USB commands. Use this exact firmware and partner revision for the next
 consolidated pass.
