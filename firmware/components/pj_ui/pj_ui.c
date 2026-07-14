@@ -222,23 +222,15 @@ static void set_state(pj_ui_context_t *ctx, pj_ui_state_t state)
     }
 }
 
-static int active_alert_present(const pj_ui_context_t *ctx)
-{
-    return ctx != NULL && ctx->active_alert.id != 0;
-}
-
-static int alert_is_modal_for_state(pj_ui_state_t state,
-                                    const pj_time_alert_t *alert)
+static int alert_is_modal(const pj_time_alert_t *alert)
 {
     return alert != NULL && alert->id != 0 &&
-        !(state == PJ_UI_STATE_INTERVAL &&
-          alert->source == PJ_TIME_ALERT_INTERVAL);
+        alert->source != PJ_TIME_ALERT_INTERVAL;
 }
 
 static int modal_alert_present(const pj_ui_context_t *ctx)
 {
-    return ctx != NULL &&
-        alert_is_modal_for_state(ctx->state, &ctx->active_alert);
+    return ctx != NULL && alert_is_modal(&ctx->active_alert);
 }
 
 static void fb_clear(pj_framebuffer_t *fb)
@@ -988,7 +980,7 @@ void pj_ui_wake(pj_ui_context_t *ctx)
 
 void pj_ui_sleep(pj_ui_context_t *ctx)
 {
-    if (active_alert_present(ctx)) {
+    if (modal_alert_present(ctx)) {
         return;
     }
     ctx->record_state = PJ_RECORD_IDLE;
@@ -1175,10 +1167,8 @@ void pj_ui_set_time_projection(pj_ui_context_t *ctx, const pj_ui_time_projection
     int next_interval_seconds = countdown_seconds_from_ms(projection->interval_remaining_ms);
     int next_interval_round = projection->interval_phase > INT_MAX ?
         INT_MAX : (int)projection->interval_phase;
-    int previous_alert_modal =
-        alert_is_modal_for_state(ctx->state, &ctx->active_alert);
-    int next_alert_modal =
-        alert_is_modal_for_state(ctx->state, &projection->active_alert);
+    int previous_alert_modal = alert_is_modal(&ctx->active_alert);
+    int next_alert_modal = alert_is_modal(&projection->active_alert);
     int alert_content_changed =
         !alerts_equal(&ctx->active_alert, &projection->active_alert) ||
         ctx->alert_audio_deferred != (projection->alert_audio_deferred != 0);

@@ -163,6 +163,19 @@ void pj_alert_audio_set_volume(pj_alert_audio_t *audio, uint8_t volume)
     }
 }
 
+int pj_alert_audio_settled(const pj_alert_audio_t *audio, uint64_t *alert_id,
+                           pj_alert_audio_kind_t *kind)
+{
+    if (audio == NULL || alert_id == NULL || kind == NULL || audio->alert_id == 0 ||
+        (audio->state != PJ_ALERT_AUDIO_COMPLETE &&
+         audio->state != PJ_ALERT_AUDIO_SILENT)) {
+        return 0;
+    }
+    *alert_id = audio->alert_id;
+    *kind = audio->kind;
+    return 1;
+}
+
 pj_alert_audio_result_t pj_alert_audio_present(pj_alert_audio_t *audio,
                                                uint64_t alert_id,
                                                pj_alert_audio_kind_t kind,

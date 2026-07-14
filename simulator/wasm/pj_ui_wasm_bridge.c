@@ -102,13 +102,20 @@ void pj_sim_set_audio_state(int recording, int playback_active)
 }
 
 EMSCRIPTEN_KEEPALIVE
-void pj_sim_set_alert(int source)
+void pj_sim_set_alert_detail(int source, int alert_id, int recovered)
 {
     pj_ui_time_projection_t projection;
     memset(&projection, 0, sizeof(projection));
-    projection.active_alert.id = source > 0 ? 42u : 0u;
+    projection.active_alert.id = source > 0 && alert_id > 0 ? (uint64_t)alert_id : 0u;
     projection.active_alert.source = source;
+    projection.active_alert.recovered = recovered != 0;
     pj_ui_set_time_projection(&g_ctx, &projection);
+}
+
+EMSCRIPTEN_KEEPALIVE
+void pj_sim_set_alert(int source)
+{
+    pj_sim_set_alert_detail(source, 42, 0);
 }
 
 EMSCRIPTEN_KEEPALIVE

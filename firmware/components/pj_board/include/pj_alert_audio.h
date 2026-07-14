@@ -64,6 +64,10 @@ void pj_alert_audio_init(pj_alert_audio_t *audio, const pj_alert_audio_io_t *io,
                          uint8_t volume);
 void pj_alert_audio_set_volume(pj_alert_audio_t *audio, uint8_t volume);
 
+/* Reports an alert whose one-shot has completed or requires no audible work. */
+int pj_alert_audio_settled(const pj_alert_audio_t *audio, uint64_t *alert_id,
+                           pj_alert_audio_kind_t *kind);
+
 /* Present replaces any active ID. Re-presenting the same ID and kind is a no-op. */
 pj_alert_audio_result_t pj_alert_audio_present(pj_alert_audio_t *audio,
                                                uint64_t alert_id,

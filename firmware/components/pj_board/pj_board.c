@@ -168,6 +168,7 @@
 #define PJ_AUDIO_PROCESS_TASK_STACK 6144
 #define PJ_AUDIO_PLAYBACK_TASK_STACK 6144
 #define PJ_ALERT_AUDIO_TASK_STACK 4096
+#define PJ_ALERT_AUDIO_FAILURE_ACK_THRESHOLD 3
 #define PJ_AUDIO_IO_BUFFER_BYTES 1024
 #define PJ_AUDIO_MAX_CONSECUTIVE_READ_ERRORS 10
 #define AUDIO_PA_ACTIVE_LEVEL 1
@@ -347,6 +348,7 @@ typedef struct {
 
 static portMUX_TYPE g_alert_audio_intent_lock = portMUX_INITIALIZER_UNLOCKED;
 static alert_audio_intent_t g_alert_audio_intent;
+static uint64_t g_interval_alert_ack_pending;
 
 static esp_err_t rtc_write_status_time(void);
 static uint64_t board_monotonic_ms(void);
@@ -784,6 +786,24 @@ static alert_audio_intent_t alert_audio_intent_snapshot(void)
     return intent;
 }
 
+static void alert_audio_publish_interval_ack(uint64_t alert_id)
+{
+    portENTER_CRITICAL(&g_alert_audio_intent_lock);
+    g_interval_alert_ack_pending = alert_id;
+    portEXIT_CRITICAL(&g_alert_audio_intent_lock);
+    g_audio_state_update_pending = 1;
+}
+
+static uint64_t alert_audio_take_interval_ack(void)
+{
+    uint64_t alert_id;
+    portENTER_CRITICAL(&g_alert_audio_intent_lock);
+    alert_id = g_interval_alert_ack_pending;
+    g_interval_alert_ack_pending = 0;
+    portEXIT_CRITICAL(&g_alert_audio_intent_lock);
+    return alert_id;
+}
+
 static void alert_audio_apply_intent(const alert_audio_intent_t *intent)
 {
     pj_alert_audio_set_volume(&g_alert_audio, intent->volume);
@@ -811,10 +831,39 @@ static void alert_audio_task(void *arg)
 {
     (void)arg;
     int16_t scratch[PJ_ALERT_AUDIO_BLOCK_SAMPLES];
+    uint64_t reported_interval_id = 0;
+    uint64_t failure_alert_id = 0;
+    unsigned consecutive_failures = 0;
     while (1) {
         alert_audio_intent_t intent = alert_audio_intent_snapshot();
         alert_audio_apply_intent(&intent);
         pj_alert_audio_result_t result = pj_alert_audio_pump(&g_alert_audio, scratch);
+        if (g_alert_audio.alert_id != failure_alert_id) {
+            failure_alert_id = g_alert_audio.alert_id;
+            consecutive_failures = 0;
+        }
+        if (result < 0) {
+            if (consecutive_failures < PJ_ALERT_AUDIO_FAILURE_ACK_THRESHOLD) {
+                consecutive_failures++;
+            }
+        } else {
+            consecutive_failures = 0;
+        }
+        uint64_t settled_id = 0;
+        pj_alert_audio_kind_t settled_kind = 0;
+        int settled = pj_alert_audio_settled(
+            &g_alert_audio, &settled_id, &settled_kind);
+        int interval_failed = consecutive_failures >=
+            PJ_ALERT_AUDIO_FAILURE_ACK_THRESHOLD &&
+            g_alert_audio.alert_id != 0 &&
+            g_alert_audio.kind == PJ_ALERT_AUDIO_INTERVAL;
+        if (((settled && settled_kind == PJ_ALERT_AUDIO_INTERVAL) ||
+             interval_failed) &&
+            (settled ? settled_id : g_alert_audio.alert_id) != reported_interval_id) {
+            settled_id = settled ? settled_id : g_alert_audio.alert_id;
+            alert_audio_publish_interval_ack(settled_id);
+            reported_interval_id = settled_id;
+        }
         int active = g_alert_audio.state == PJ_ALERT_AUDIO_PLAYING ||
                      g_alert_audio.cleanup_pending;
         if (result < 0) {
@@ -853,7 +902,12 @@ static esp_err_t alert_audio_start(void)
 
 static int alert_audio_desired(void)
 {
-    return alert_audio_intent_snapshot().alert_id != 0;
+    int desired;
+    portENTER_CRITICAL(&g_alert_audio_intent_lock);
+    desired = g_alert_audio_intent.alert_id != 0 &&
+        g_alert_audio_intent.alert_id != g_interval_alert_ack_pending;
+    portEXIT_CRITICAL(&g_alert_audio_intent_lock);
+    return desired;
 }
 
 static void alert_audio_set_volume(int codec_volume)
@@ -4229,6 +4283,24 @@ static int time_state_project(pj_ui_context_t *ui)
     return 1;
 }
 
+static int time_state_apply_interval_audio_ack(void)
+{
+    uint64_t alert_id = alert_audio_take_interval_ack();
+    const pj_time_state_t *state = pj_time_controller_state(&g_time_controller);
+    if (alert_id == 0 || state == NULL ||
+        state->active_alert.id != alert_id ||
+        state->active_alert.source != PJ_TIME_ALERT_INTERVAL) {
+        return 0;
+    }
+    pj_time_controller_command_t command = {
+        .type = PJ_TIME_CONTROLLER_COMMAND_ALERT_DISMISS,
+        .alert_id = alert_id,
+    };
+    pj_time_controller_result_t result;
+    (void)pj_time_controller_apply(&g_time_controller, &command, &result);
+    return result.command_applied;
+}
+
 static int wav_write_header(FILE *file, uint32_t data_bytes, uint16_t channels, uint32_t sample_rate)
 {
     uint8_t header[PJ_STORAGE_WAV_HEADER_BYTES];
@@ -5733,6 +5805,9 @@ int pj_board_consume_audio_update(pj_ui_context_t *ui)
     }
     g_audio_state_update_pending = 0;
     pj_ui_set_audio_state(ui, g_status.recording, g_status.playback_active);
+    if (time_state_apply_interval_audio_ack()) {
+        (void)time_state_project(ui);
+    }
     return 1;
 #else
     (void)ui;
@@ -5798,6 +5873,7 @@ void pj_board_refresh_time_state(pj_ui_context_t *ui)
     }
     pj_time_controller_result_t result;
     (void)pj_time_controller_update(&g_time_controller, &result);
+    (void)time_state_apply_interval_audio_ack();
     (void)time_state_project(ui);
 #else
     (void)ui;
@@ -5879,6 +5955,7 @@ int pj_board_update_time_state(pj_ui_context_t *ui)
     }
     pj_time_controller_result_t result;
     (void)pj_time_controller_update(&g_time_controller, &result);
+    (void)time_state_apply_interval_audio_ack();
     (void)time_state_project(ui);
     return pj_ui_is_dirty(ui);
 #else

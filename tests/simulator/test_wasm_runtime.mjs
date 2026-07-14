@@ -31,6 +31,13 @@ function assertRendered(expectedState) {
   assert.ok(framebuffer.some((byte) => byte !== 0), `${expectedState} framebuffer is blank`);
 }
 
+function framebufferSnapshot() {
+  api.pj_sim_render();
+  const start = api.pj_sim_framebuffer();
+  const end = start + api.pj_sim_framebuffer_bytes();
+  return new Uint8Array(api.memory.buffer.slice(start, end));
+}
+
 api.pj_sim_init();
 assert.equal(api.pj_sim_display_width(), 200);
 assert.equal(api.pj_sim_display_height(), 200);
@@ -135,6 +142,18 @@ api.pj_sim_set_status(84, 22, 45);
 api.pj_sim_set_time(21, 41, 2026, 6, 6);
 api.pj_sim_set_preferences(0, 1, 3);
 assertRendered("time_temp");
+
+api.pj_sim_reset();
+api.pj_sim_wake();
+const timeTempWithoutIntervalAlert = framebufferSnapshot();
+api.pj_sim_set_alert_detail(3, 101, 1);
+assert.deepEqual(framebufferSnapshot(), timeTempWithoutIntervalAlert,
+  "a recovered interval occurrence must not replace the current screen");
+api.pj_sim_set_alert_detail(3, 102, 1);
+assert.deepEqual(framebufferSnapshot(), timeTempWithoutIntervalAlert,
+  "later interval occurrences must remain nonmodal");
+assert.equal(api.pj_sim_aux_short(), 1);
+assertRendered("home");
 
 api.pj_sim_reset();
 api.pj_sim_wake();

@@ -397,22 +397,49 @@ static void test_repeated_operation_stays_bounded(void)
     setup(&audio, &mock, 100);
     assert(pj_alert_audio_present(&audio, 61, PJ_ALERT_AUDIO_INTERVAL, 0) ==
            PJ_ALERT_AUDIO_OK);
+    uint64_t settled_id = 0;
+    pj_alert_audio_kind_t settled_kind = 0;
+    assert(!pj_alert_audio_settled(&audio, &settled_id, &settled_kind));
     for (int block = 0; block < 100; ++block) {
         pj_alert_audio_result_t result = pj_alert_audio_pump(&audio, scratch);
         assert(result == PJ_ALERT_AUDIO_BLOCK_WRITTEN ||
                result == PJ_ALERT_AUDIO_SILENT_BLOCK);
         assert(audio.frame_cursor <= PJ_ALERT_AUDIO_DURATION_FRAMES);
+        if (block < 99) {
+            assert(!pj_alert_audio_settled(&audio, &settled_id, &settled_kind));
+        }
     }
     assert(audio.state == PJ_ALERT_AUDIO_COMPLETE);
+    assert(pj_alert_audio_settled(&audio, &settled_id, &settled_kind));
+    assert(settled_id == 61 && settled_kind == PJ_ALERT_AUDIO_INTERVAL);
     for (int block = 0; block < 10000; ++block) {
         assert(pj_alert_audio_pump(&audio, scratch) ==
                PJ_ALERT_AUDIO_NO_CHANGE);
     }
     assert(mock.prepare_calls == 1 && mock.write_calls == 100);
     assert(mock.finish_calls == 1);
-    assert(pj_alert_audio_stop(&audio, 61) == PJ_ALERT_AUDIO_OK);
-    assert(mock.finish_calls == 1);
+
+    assert(pj_alert_audio_transition(&audio, 61, 62, PJ_ALERT_AUDIO_INTERVAL, 0) ==
+           PJ_ALERT_AUDIO_OK);
+    assert(!pj_alert_audio_settled(&audio, &settled_id, &settled_kind));
+    for (int block = 0; block < 100; ++block) {
+        pj_alert_audio_result_t result = pj_alert_audio_pump(&audio, scratch);
+        assert(result == PJ_ALERT_AUDIO_BLOCK_WRITTEN ||
+               result == PJ_ALERT_AUDIO_SILENT_BLOCK);
+    }
+    assert(pj_alert_audio_settled(&audio, &settled_id, &settled_kind));
+    assert(settled_id == 62 && settled_kind == PJ_ALERT_AUDIO_INTERVAL);
+    assert(mock.prepare_calls == 2 && mock.write_calls == 200 && mock.finish_calls == 2);
+
+    assert(pj_alert_audio_stop(&audio, 62) == PJ_ALERT_AUDIO_OK);
+    assert(mock.finish_calls == 2);
     assert(pj_alert_audio_pump(&audio, scratch) == PJ_ALERT_AUDIO_NO_CHANGE);
+
+    pj_alert_audio_set_volume(&audio, 0);
+    assert(pj_alert_audio_present(&audio, 63, PJ_ALERT_AUDIO_INTERVAL, 0) ==
+           PJ_ALERT_AUDIO_OK);
+    assert(pj_alert_audio_settled(&audio, &settled_id, &settled_kind));
+    assert(settled_id == 63 && settled_kind == PJ_ALERT_AUDIO_INTERVAL);
 
     pj_alert_audio_t invalid;
     pj_alert_audio_init(&invalid, NULL, 50);

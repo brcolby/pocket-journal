@@ -914,6 +914,7 @@ static void test_interval_alert_stays_inline_and_aux_long_resets(void)
 
     pj_ui_time_projection_t projection =
         time_projection_with_alert(71, PJ_TIME_ALERT_INTERVAL);
+    projection.active_alert.recovered = 1;
     pj_ui_time_projection_t quiet_projection = projection;
     memset(&quiet_projection.active_alert, 0, sizeof(quiet_projection.active_alert));
     pj_ui_set_time_projection(&with_alert, &projection);
@@ -945,6 +946,66 @@ static void test_interval_alert_stays_inline_and_aux_long_resets(void)
     assert(with_alert.state == PJ_UI_STATE_TIME);
     assert(pj_ui_consume_time_command(&with_alert, &command) == 1);
     assert(command.type == PJ_UI_TIME_COMMAND_INTERVAL_RESET);
+}
+
+static void test_recovered_interval_alert_is_nonmodal_on_every_screen(void)
+{
+    const pj_ui_state_t states[] = {
+        PJ_UI_STATE_STATIC,
+        PJ_UI_STATE_TIME_TEMP,
+        PJ_UI_STATE_HOME,
+        PJ_UI_STATE_SETTINGS,
+        PJ_UI_STATE_TIMER,
+    };
+
+    for (size_t index = 0; index < sizeof(states) / sizeof(states[0]); ++index) {
+        pj_ui_context_t with_alert;
+        pj_ui_context_t without_alert;
+        pj_framebuffer_t with_alert_fb;
+        pj_framebuffer_t without_alert_fb;
+        pj_ui_init(&with_alert);
+        pj_ui_init(&without_alert);
+        with_alert.state = states[index];
+        without_alert.state = states[index];
+
+        pj_ui_time_projection_t projection =
+            time_projection_with_alert(81, PJ_TIME_ALERT_INTERVAL);
+        projection.active_alert.recovered = 1;
+        pj_ui_time_projection_t quiet_projection = projection;
+        memset(&quiet_projection.active_alert, 0, sizeof(quiet_projection.active_alert));
+        pj_ui_set_time_projection(&with_alert, &projection);
+        pj_ui_set_time_projection(&without_alert, &quiet_projection);
+        pj_ui_mark_displayed(&with_alert);
+        pj_ui_mark_displayed(&without_alert);
+
+        pj_ui_render(&with_alert, &with_alert_fb);
+        pj_ui_render(&without_alert, &without_alert_fb);
+        assert(memcmp(&with_alert_fb, &without_alert_fb,
+                      sizeof(with_alert_fb)) == 0);
+
+        projection.active_alert.id = 82;
+        projection.active_alert.occurrence++;
+        pj_ui_set_time_projection(&with_alert, &projection);
+        assert(with_alert.active_alert.id == 82);
+        assert(pj_ui_is_dirty(&with_alert) == 0);
+
+        int alert_handled = pj_ui_handle_aux_short(&with_alert);
+        int quiet_handled = pj_ui_handle_aux_short(&without_alert);
+        assert(alert_handled == quiet_handled);
+        assert(with_alert.state == without_alert.state);
+        assert(with_alert.focus_index == without_alert.focus_index);
+    }
+
+    pj_ui_context_t sleeping;
+    pj_ui_init(&sleeping);
+    sleeping.state = PJ_UI_STATE_HOME;
+    pj_ui_time_projection_t recovered =
+        time_projection_with_alert(83, PJ_TIME_ALERT_INTERVAL);
+    recovered.active_alert.recovered = 1;
+    pj_ui_set_time_projection(&sleeping, &recovered);
+    pj_ui_sleep(&sleeping);
+    assert(sleeping.state == PJ_UI_STATE_STATIC);
+    assert(sleeping.interval_running == 1);
 }
 
 static pj_ui_time_projection_t projection_from_ui(const pj_ui_context_t *ui)
@@ -1206,15 +1267,6 @@ static void test_alert_overlay_commands_keep_model_authoritative(void)
     assert(ui.active_alert.id == 61);
     assert(pj_ui_consume_time_command(&ui, &command) == 1);
     assert(command.type == PJ_UI_TIME_COMMAND_ALARM_SNOOZE && command.alert_id == 61);
-
-    projection = time_projection_with_alert(62, PJ_TIME_ALERT_INTERVAL);
-    pj_ui_set_time_projection(&ui, &projection);
-    assert(pj_ui_handle_touch(&ui, 150, 166, PJ_TOUCH_TAP) == 0);
-    assert(pj_ui_consume_time_command(&ui, &command) == 0);
-    assert(pj_ui_handle_touch(&ui, 40, 166, PJ_TOUCH_TAP) == 1);
-    assert(pj_ui_consume_time_command(&ui, &command) == 1);
-    assert(command.type == PJ_UI_TIME_COMMAND_ALERT_DISMISS && command.alert_id == 62);
-    assert(pj_ui_current_state(&ui) == PJ_UI_STATE_SETTINGS);
 }
 
 static void test_sync_state_is_board_driven(void)
@@ -1718,6 +1770,7 @@ int main(void)
     test_timer_geometry_and_adjustment_focus_timeout();
     test_time_projection_and_alert_repaint();
     test_interval_alert_stays_inline_and_aux_long_resets();
+    test_recovered_interval_alert_is_nonmodal_on_every_screen();
     test_time_projection_refreshes_changed_controls();
     test_active_alert_is_controllable_from_aux();
     test_sleep_preserves_durable_time_activity();
