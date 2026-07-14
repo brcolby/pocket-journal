@@ -9,7 +9,7 @@ The current visual treatment is accepted as the initial-release baseline.
 Future visual refinement is non-blocking unless hardware testing finds a
 legibility, navigation, clipping, refresh, or other usability defect.
 
-Last synchronized with `bd human list`: 2026-07-14 (5 beads).
+Last synchronized with `bd human list`: 2026-07-14 (15 beads).
 
 ## Batch Validation Strategy
 
@@ -42,6 +42,29 @@ Do not repeat these checks on an unchanged build.
   successfully (`pocket-journal-b96`, closed).
 - The app reached normal SPI flash boot, initialized the display, touch, RTC,
   environmental sensor, SD card, and audio codec, and accepted USB commands.
+- Firmware `06a2a4f` required one physical USB replug after the previously
+  wedged image, then flashed successfully without a monitor. USB status and
+  explicit host-time sync both completed and released the descriptor.
+- On that same `06a2a4f` boot, recording wipe exceeded the eight-second host
+  timeout. The host descriptor closed, but the next passive application/ROM
+  probe was unresponsive even though no host process owned the port
+  (`pocket-journal-6ot`, `pocket-journal-rgo`).
+- Firmware `f3318d2` flashed successfully without a monitor and reported its
+  exact running version over USB. A new bounded USB maintenance command then
+  stopped the unattended interval and returned `silenced=true`, `reset=true`,
+  `persisted=true`, and `state_changed=true`; status still reported audio and
+  storage ready, and no host process or descriptor remained
+  (`pocket-journal-ti0`, closed). Follow-up audit found that this response did
+  not distinguish interval state from unrelated controller changes and could
+  report persistence without an NVS write, so `pocket-journal-3i4` was reopened.
+- Exact firmware `558770f` replaced `f3318d2` without a monitor. Its durable
+  reset force-writes NVS, drops stale queued interval commands, checks active
+  and pending interval state, and waits for audio-worker cleanup. Both the
+  initial command and an idempotent retry returned
+  `interval_active_after=false`, `persisted=true`, and `silenced=true`. After a
+  bounded RTS reboot, status reported exact version `558770f` with audio and
+  storage ready, and another reset returned
+  `interval_active_before=false` and `interval_active_after=false`.
 - Saved Wi-Fi credentials loaded and the station repeatedly reached
   authentication and association, but it never obtained an IP address
   (`pocket-journal-d3d`, `pocket-journal-1qk`).
@@ -56,39 +79,108 @@ Do not repeat these checks on an unchanged build.
 - Four invalid or interrupted WAV files were rejected without breaking note
   enumeration (`pocket-journal-pc3`). Corrupt-file rejection is verified; the
   remaining storage failure matrix is not.
-- Timer and interval alert output was not audible even though logs showed the
-  output path starting and finishing at maximum configured volume
-  (`pocket-journal-oi9`).
+- An early build produced no audible timer or interval alert even though logs
+  showed the output path running. A later persisted interval produced clearly
+  audible periodic one-shot chimes at nonzero volume. Nonzero audibility is
+  established; volume-zero silence, sound quality, and PA idle still need one
+  intentional check (`pocket-journal-oi9`).
 - AUX Back waited for release, holding AUX through a transition could wedge the
   UI, interval round one changed screen and duration, and dynamic time screens
   used disruptive full refreshes (`pocket-journal-61u`, `pocket-journal-8q5`,
   `pocket-journal-zi6`).
+- A later interval failure rendered a large square Stop symbol with
+  `INTERVAL` and `RECOVERED` away from the Interval page. Treat this as exact
+  evidence for the durable-alert/modal regression in `pocket-journal-8q5`, not
+  as a general display corruption report.
 
-## In Current Agent Batch
+## Agent Batch In Progress
 
 Do not retest these on the current firmware. They enter the next consolidated
 checklist only after their focused blockers pass automated checks and are
 included in the next identified firmware build.
 
-- **Controls and navigation:** `pocket-journal-61u` fires AUX Back at the
-  threshold and hardens held-button transitions; `pocket-journal-1dx` replaces
-  inverted focus with a local indicator and chevrons; `pocket-journal-cf4`
-  corrects Timer geometry and focus timeout.
+- **USB and storage:** `pocket-journal-6ot` has an asynchronous, correlated,
+  exclusive wipe worker. Firmware now gates the dual-core worker until the
+  operation-ID response has physically drained, and the partner uses one
+  descriptor with bounded same-ID retries. Both fixes are in `558770f`. Target
+  validation received operation ID `1`, then timed out before a terminal result;
+  an immediate status succeeded without a replug but reported fresh idle state
+  with no operation history. Firmware and partner audits are tracing reboot or
+  operation-state loss. `pocket-journal-rgo` remains blocked on that result.
+- **Connectivity:** `pocket-journal-r7s` adds a 15-second connect-attempt
+  watchdog so a missing ESP-IDF terminal event becomes `connect_timeout` with
+  increasing retry count and bounded backoff. `pocket-journal-d3d` still needs
+  an IP, reconnect, mDNS, and truthful sync-state evidence on the next build.
 - **Dynamic time UI:** `pocket-journal-zi6` bounds dirty regions and refresh
-  cadence; `pocket-journal-8q5` stabilizes interval rounds and durations.
-- **Recording:** `pocket-journal-sm1` connects elapsed time to captured bytes and
-  publishes exactly one validated note after asynchronous finalization.
-- **Alert audio:** `pocket-journal-oi9` now requires one approximately one-second
-  chime per new alert ID, never indefinite repetition, and still needs audible
-  codec/PA diagnosis.
-- **USB reliability:** `pocket-journal-rgo` is completing ROM-mode detection and
-  repeated command/flash lifecycle handling. A monitor continuing to run until
-  explicitly quit is expected behavior; unintended reset or port retention is
-  the defect.
-- **Connectivity and time:** `pocket-journal-1qk` adds firmware Wi-Fi phase and
-  disconnect diagnostics; `pocket-journal-223` owns automatic USB host-time
-  anchoring; `pocket-journal-d3d` owns successful IP, reconnect, mDNS, and sync
-  truth. Background SNTP remains `pocket-journal-2f2` after connectivity works.
+  cadence. `pocket-journal-8q5` makes every interval alert nonmodal and clears
+  only the exact alert after its one-shot audio settles, so restored and live
+  rounds cannot render the Stop / Interval / Recovered takeover.
+- **Controls and navigation:** `pocket-journal-61u` fires AUX Back at the
+  500 ms threshold independently of display refresh and consumes release.
+- **Recording:** `pocket-journal-sm1` derives elapsed time only from committed
+  PCM, permits navigation during background finalization, blocks record
+  re-entry until idle, and preserves one pending completion event.
+- **Alert audio:** `pocket-journal-oi9` produces one approximately one-second
+  chime per new alert ID. Target nonzero audibility is now confirmed; only
+  volume-zero, sound-quality, and PA-idle judgment remains.
+- **Automatic time:** `pocket-journal-223` validates minute-precision host
+  local/UTC anchors during USB provisioning and emits a structured retry
+  command without reprovisioning or rotating the saved token. Background SNTP
+  remains `pocket-journal-2f2` after connectivity works.
+
+Software-only closures in this batch do not need hardware repetition:
+`pocket-journal-1dx`, `pocket-journal-cf4`, `pocket-journal-1qk`,
+`pocket-journal-3yp`, `pocket-journal-5pt`, `pocket-journal-de3`, and
+`pocket-journal-ti0` have their simulator, protocol, target-status,
+art-fidelity, or image-analysis acceptance evidence recorded in Beads.
+
+## Next Consolidated Hardware Batch
+
+**Nominated firmware: `558770f`.** It passed the complete native, partner, and
+simulator test suite plus an ESP-IDF 6.0.1 build, was flashed with hash
+verification and no monitor, survived a bounded reboot with the interval still
+inactive, and was left with no USB descriptor owner. Use only this exact build
+for the next consolidated pass.
+
+When nominated, perform one ordered pass rather than isolated retests:
+
+- [ ] Leave the device unattended for at least ten minutes before intentionally
+  starting an interval. Confirm there is no spontaneous chime and no Stop /
+  Interval / Recovered takeover (`pocket-journal-3i4`).
+- [ ] Default USB provisioning reports `time_sync.state=synced`,
+  `validated=true`, and updates the RTC/display without a separate time command
+  (`pocket-journal-223`).
+- [ ] Wi-Fi diagnostics obtain an IP or progress within 15 seconds to
+  `connect_timeout` with retry count greater than zero; they never remain
+  indefinitely at `connecting` and retry count zero (`pocket-journal-r7s`,
+  `pocket-journal-d3d`).
+- [ ] Recording wipe returns an operation ID, status remains responsive during
+  and after it, and a passive USB probe succeeds without reset or replug. Do not
+  repeat this check until the operation-`1` disappearance on `558770f` has a new
+  focused fix (`pocket-journal-6ot`, `pocket-journal-rgo`).
+- [ ] AUX hold acts once at 500 ms, permits navigation while recording
+  finalizes, and produces no second action on release
+  (`pocket-journal-61u`, `pocket-journal-sm1`).
+- [ ] Primary screens preserve the accepted full-bleed geometry, uppercase
+  chrome, contiguous controls, thick shared boundaries, chevron paging, and
+  legible unclipped text on physical e-paper (`pocket-journal-nz5`).
+- [ ] Clock, stopwatch, timer, and interval update at no more than 1 Hz without
+  disruptive full flashes, gray/displaced pixels, or accumulating ghosting
+  (`pocket-journal-zi6`).
+- [ ] An intentionally started interval stays inline through rounds 0, 1, and
+  2 with stable duration and one chime per round; no Stop / Interval / Recovered
+  overlay appears. End it with AUX before leaving the device unattended
+  (`pocket-journal-8q5`).
+- [ ] A recording of at least five seconds advances from captured audio, AUX
+  returns immediately, exactly one playable note appears after background
+  finalization, and an interrupted capture exposes no corrupt note
+  (`pocket-journal-sm1`).
+- [ ] At nonzero volume, one timer or interval expiry produces one bounded
+  acceptable chime and returns the PA to idle; volume zero is silent
+  (`pocket-journal-oi9`).
+- [ ] A short timer wakes from static/sleep once through RTC GPIO5, while BOOT
+  still wakes independently and an early BOOT wake can re-enter sleep without
+  a loop (`pocket-journal-54s`).
 
 ## Human Decisions And Physical Work
 
