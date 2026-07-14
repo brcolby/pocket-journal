@@ -5,6 +5,7 @@
 #include "pj_auth.h"
 #include "pj_home_layout.h"
 #include "pj_note_model.h"
+#include "pj_recording.h"
 #include "pj_rtc_wake.h"
 #include "pj_settings.h"
 #include "pj_static_art.h"
@@ -301,6 +302,8 @@ static int g_wifi_credentials_stored;
 static uint32_t g_record_sequence;
 static portMUX_TYPE g_time_lock = portMUX_INITIALIZER_UNLOCKED;
 static portMUX_TYPE g_audio_state_lock = portMUX_INITIALIZER_UNLOCKED;
+static portMUX_TYPE g_recording_lock = portMUX_INITIALIZER_UNLOCKED;
+static pj_recording_t g_recording;
 static pj_time_clock_anchor_t g_time_clock_anchor;
 static pj_time_controller_t g_time_controller;
 static pj_time_controller_diagnostic_t g_time_last_diagnostic;
@@ -348,6 +351,66 @@ static void board_audio_state_set(int recording, int playback_active)
         g_status.playback_active = playback_active;
     }
     portEXIT_CRITICAL(&g_audio_state_lock);
+}
+
+static int recording_state_start(void)
+{
+    int started;
+    portENTER_CRITICAL(&g_recording_lock);
+    started = pj_recording_start(&g_recording, PJ_AUDIO_SAMPLE_RATE,
+                                 PJ_AUDIO_CHANNELS, PJ_AUDIO_BITS_PER_SAMPLE);
+    g_status.recording_elapsed_ms = pj_recording_elapsed_ms(&g_recording);
+    portEXIT_CRITICAL(&g_recording_lock);
+    return started;
+}
+
+static int recording_state_commit(size_t bytes)
+{
+    int committed;
+    portENTER_CRITICAL(&g_recording_lock);
+    committed = pj_recording_commit(&g_recording, bytes);
+    g_status.recording_elapsed_ms = pj_recording_elapsed_ms(&g_recording);
+    portEXIT_CRITICAL(&g_recording_lock);
+    return committed;
+}
+
+static void recording_state_request_stop(void)
+{
+    portENTER_CRITICAL(&g_recording_lock);
+    (void)pj_recording_request_stop(&g_recording);
+    portEXIT_CRITICAL(&g_recording_lock);
+}
+
+static void recording_state_finish_capture(int succeeded)
+{
+    portENTER_CRITICAL(&g_recording_lock);
+    (void)pj_recording_finish_capture(&g_recording, succeeded);
+    portEXIT_CRITICAL(&g_recording_lock);
+}
+
+static void recording_state_finish_processing(int succeeded)
+{
+    portENTER_CRITICAL(&g_recording_lock);
+    (void)pj_recording_finish_processing(&g_recording, succeeded);
+    portEXIT_CRITICAL(&g_recording_lock);
+}
+
+static void recording_publish_completion(void)
+{
+    int succeeded = 0;
+    int completed;
+    portENTER_CRITICAL(&g_recording_lock);
+    completed = pj_recording_take_completion(&g_recording, &succeeded);
+    portEXIT_CRITICAL(&g_recording_lock);
+    if (!completed) {
+        return;
+    }
+    if (succeeded) {
+        g_notes_update_pending = 1;
+    } else if (g_status.last_error[0] == '\0') {
+        (void)snprintf(g_status.last_error, sizeof(g_status.last_error),
+                       "recording failed before a valid note was published");
+    }
 }
 
 static pj_time_activity_t board_time_activity(void)
@@ -2526,6 +2589,51 @@ static void write_recording_metadata(const char *final_path, uint32_t data_bytes
     }
 }
 
+static int recording_file_valid(const char *path, uint32_t expected_data_bytes)
+{
+    struct stat st;
+    uint8_t header[44];
+    if (path == NULL || stat(path, &st) != 0 || st.st_size < (off_t)sizeof(header)) {
+        return 0;
+    }
+    FILE *file = fopen(path, "rb");
+    if (file == NULL) {
+        return 0;
+    }
+    size_t read = fread(header, 1, sizeof(header), file);
+    int close_ok = fclose(file) == 0;
+    pj_storage_wav_info_t wav;
+    return close_ok && read == sizeof(header) &&
+           pj_storage_wav_validate(header, sizeof(header), (uint64_t)st.st_size,
+                                   PJ_AUDIO_SAMPLE_RATE, PJ_AUDIO_BITS_PER_SAMPLE,
+                                   &wav) &&
+           wav.channels == PJ_AUDIO_CHANNELS &&
+           wav.data_bytes == expected_data_bytes;
+}
+
+static int recording_publish_file(const char *temporary_path, const char *final_path,
+                                  uint32_t data_bytes)
+{
+    if (!recording_file_valid(temporary_path, data_bytes)) {
+        ESP_LOGE(TAG, "Recording rejected before publish: %s", temporary_path);
+        remove(temporary_path);
+        return 0;
+    }
+    if (rename(temporary_path, final_path) != 0) {
+        ESP_LOGE(TAG, "Recording publish rename failed: %s -> %s errno=%d",
+                 temporary_path, final_path, errno);
+        remove(temporary_path);
+        return 0;
+    }
+    if (!recording_file_valid(final_path, data_bytes)) {
+        ESP_LOGE(TAG, "Recording rejected after publish: %s", final_path);
+        remove(final_path);
+        return 0;
+    }
+    write_recording_metadata(final_path, data_bytes);
+    return 1;
+}
+
 static int probe_audio_entry(const char *filename, pj_audio_entry_t *entry)
 {
     char path[160];
@@ -3752,37 +3860,14 @@ static int time_state_project(pj_ui_context_t *ui)
     return 1;
 }
 
-static void wav_put_le16(uint8_t *data, uint16_t value)
-{
-    data[0] = (uint8_t)(value & 0xFF);
-    data[1] = (uint8_t)(value >> 8);
-}
-
-static void wav_put_le32(uint8_t *data, uint32_t value)
-{
-    data[0] = (uint8_t)(value & 0xFF);
-    data[1] = (uint8_t)((value >> 8) & 0xFF);
-    data[2] = (uint8_t)((value >> 16) & 0xFF);
-    data[3] = (uint8_t)((value >> 24) & 0xFF);
-}
-
 static int wav_write_header(FILE *file, uint32_t data_bytes, uint16_t channels, uint32_t sample_rate)
 {
-    uint8_t header[44] = {
-        'R', 'I', 'F', 'F', 0, 0, 0, 0, 'W', 'A', 'V', 'E', 'f', 'm', 't', ' ',
-        16, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 16, 0,
-        'd', 'a', 't', 'a', 0, 0, 0, 0
-    };
-    uint16_t bits = PJ_AUDIO_BITS_PER_SAMPLE;
-    uint16_t block_align = (uint16_t)(channels * (bits / 8));
-    uint32_t byte_rate = sample_rate * block_align;
-    wav_put_le32(&header[4], 36u + data_bytes);
-    wav_put_le16(&header[22], channels);
-    wav_put_le32(&header[24], sample_rate);
-    wav_put_le32(&header[28], byte_rate);
-    wav_put_le16(&header[32], block_align);
-    wav_put_le16(&header[34], bits);
-    wav_put_le32(&header[40], data_bytes);
+    uint8_t header[PJ_STORAGE_WAV_HEADER_BYTES];
+    if (!pj_storage_wav_encode_header(header, sizeof(header), data_bytes,
+                                      sample_rate, channels,
+                                      PJ_AUDIO_BITS_PER_SAMPLE)) {
+        return 0;
+    }
     long pos = ftell(file);
     if (pos < 0 || fseek(file, 0, SEEK_SET) != 0) {
         return 0;
@@ -3914,14 +3999,13 @@ static int audio_process_recording(audio_process_args_t *args)
     int flush_ok = fflush(file) == 0 && fsync(fileno(file)) == 0;
     int close_ok = fclose(file) == 0;
     int ready = filter_ok && normalize_ok && flush_ok && close_ok &&
-                rename(args->temporary_path, args->final_path) == 0;
+                recording_publish_file(args->temporary_path, args->final_path,
+                                       args->data_bytes);
     if (!ready) {
         ESP_LOGE(TAG, "Audio processing failed: %s", args->temporary_path);
         remove(args->temporary_path);
         return 0;
     }
-
-    write_recording_metadata(args->final_path, args->data_bytes);
 
     ESP_LOGI(TAG, "Audio processing complete: %s input_channel=%d raw_peak=%u raw_avg_abs=%u raw_clipped=%u "
              "filtered_peak=%u robust_peak=%u filtered_avg_abs=%u filtered_clipped=%u "
@@ -3939,9 +4023,12 @@ static void audio_process_task(void *arg)
     audio_process_args_t *args = arg;
     int note_ready = audio_process_recording(args);
     free(args);
-    if (note_ready) {
-        g_notes_update_pending = 1;
+    if (!note_ready) {
+        (void)snprintf(g_status.last_error, sizeof(g_status.last_error),
+                       "recording post-processing or publication failed");
     }
+    recording_state_finish_processing(note_ready);
+    recording_publish_completion();
     g_audio_process_task = NULL;
     vTaskDelete(NULL);
 }
@@ -4076,15 +4163,13 @@ static esp_err_t audio_init(void)
     return ESP_OK;
 }
 
-static void record_task_exit(int note_ready)
+static void record_task_exit(void)
 {
     if (g_record_audio_owned) {
         g_record_audio_owned = 0;
         xSemaphoreGive(g_audio_lock);
     }
-    if (note_ready) {
-        g_notes_update_pending = 1;
-    }
+    recording_publish_completion();
     g_record_task = NULL;
     board_audio_state_set(0, -1);
     alert_audio_set_recording(0);
@@ -4106,7 +4191,10 @@ static void record_task(void *arg)
     (void)arg;
     if (g_audio_lock == NULL || xSemaphoreTake(g_audio_lock, portMAX_DELAY) != pdTRUE) {
         ESP_LOGE(TAG, "Recording could not acquire audio ownership");
-        record_task_exit(0);
+        (void)snprintf(g_status.last_error, sizeof(g_status.last_error),
+                       "recording could not acquire audio ownership");
+        recording_state_finish_capture(0);
+        record_task_exit();
         return;
     }
     g_record_audio_owned = 1;
@@ -4128,7 +4216,10 @@ static void record_task(void *arg)
         ESP_LOGE(TAG, "Recording buffer allocation failed");
         free(stereo);
         free(mono);
-        record_task_exit(0);
+        (void)snprintf(g_status.last_error, sizeof(g_status.last_error),
+                       "recording buffer allocation failed");
+        recording_state_finish_capture(0);
+        record_task_exit();
         return;
     }
     FILE *file = fopen(temporary_path, "wb+");
@@ -4136,7 +4227,10 @@ static void record_task(void *arg)
         ESP_LOGE(TAG, "Recording open failed: %s", temporary_path);
         free(stereo);
         free(mono);
-        record_task_exit(0);
+        (void)snprintf(g_status.last_error, sizeof(g_status.last_error),
+                       "recording file open failed");
+        recording_state_finish_capture(0);
+        record_task_exit();
         return;
     }
     if (!wav_write_header(file, 0, PJ_AUDIO_CHANNELS, PJ_AUDIO_SAMPLE_RATE)) {
@@ -4145,7 +4239,10 @@ static void record_task(void *arg)
         remove(temporary_path);
         free(stereo);
         free(mono);
-        record_task_exit(0);
+        (void)snprintf(g_status.last_error, sizeof(g_status.last_error),
+                       "recording WAV header creation failed");
+        recording_state_finish_capture(0);
+        record_task_exit();
         return;
     }
     int gain_ret = esp_codec_dev_set_in_gain(g_audio_record_codec, PJ_AUDIO_MIC_GAIN_DB);
@@ -4155,7 +4252,10 @@ static void record_task(void *arg)
         remove(temporary_path);
         free(stereo);
         free(mono);
-        record_task_exit(0);
+        (void)snprintf(g_status.last_error, sizeof(g_status.last_error),
+                       "recording input gain setup failed");
+        recording_state_finish_capture(0);
+        record_task_exit();
         return;
     }
     int capture_failed = 0;
@@ -4205,7 +4305,14 @@ static void record_task(void *arg)
             next_capacity_check += PJ_STORAGE_CAPACITY_CHECK_BYTES;
         }
         size_t written = fwrite(mono, sizeof(int16_t), frames, file);
-        data_bytes += (uint32_t)(written * sizeof(int16_t));
+        size_t written_bytes = written * sizeof(int16_t);
+        data_bytes += (uint32_t)written_bytes;
+        if (written_bytes > 0 && !recording_state_commit(written_bytes)) {
+            ESP_LOGE(TAG, "Recording progress rejected invalid PCM write size=%u",
+                     (unsigned)written_bytes);
+            capture_failed = 1;
+            break;
+        }
         if (written != frames) {
             ESP_LOGE(TAG, "Recording write failed: expected=%u samples wrote=%u",
                      (unsigned)frames, (unsigned)written);
@@ -4220,12 +4327,15 @@ static void record_task(void *arg)
     int flush_ok = fflush(file) == 0 && fsync(fileno(file)) == 0;
     int close_ok = fclose(file) == 0;
     int finalized = header_ok && flush_ok && close_ok && !capture_failed && data_bytes > 0;
+    recording_state_finish_capture(finalized);
     free(stereo);
     free(mono);
     if (!finalized) {
         ESP_LOGE(TAG, "Recording finalization failed or produced no audio: %s", temporary_path);
+        (void)snprintf(g_status.last_error, sizeof(g_status.last_error),
+                       "recording capture or WAV finalization failed");
         remove(temporary_path);
-        record_task_exit(0);
+        record_task_exit();
         return;
     }
 
@@ -4252,20 +4362,24 @@ static void record_task(void *arg)
         if (created != pdPASS) {
             g_audio_process_task = NULL;
             ESP_LOGW(TAG, "Audio processing task start failed; preserving raw recording");
-            note_ready = rename(temporary_path, g_active_recording_path) == 0;
-            if (note_ready) {
-                write_recording_metadata(g_active_recording_path, data_bytes);
-            }
+            note_ready = recording_publish_file(temporary_path,
+                                                g_active_recording_path,
+                                                data_bytes);
+            recording_state_finish_processing(note_ready);
             free(process_args);
         }
     } else {
         ESP_LOGW(TAG, "Audio processing task allocation failed; preserving raw recording");
-        note_ready = rename(temporary_path, g_active_recording_path) == 0;
-        if (note_ready) {
-            write_recording_metadata(g_active_recording_path, data_bytes);
-        }
+        note_ready = recording_publish_file(temporary_path,
+                                            g_active_recording_path,
+                                            data_bytes);
+        recording_state_finish_processing(note_ready);
     }
-    record_task_exit(note_ready);
+    if (g_audio_process_task == NULL && !note_ready) {
+        (void)snprintf(g_status.last_error, sizeof(g_status.last_error),
+                       "recording post-processing or publication failed");
+    }
+    record_task_exit();
 }
 
 static int wav_read_header(FILE *file, uint16_t *channels, uint32_t *sample_rate, uint16_t *bits, uint32_t *data_bytes)
@@ -4840,6 +4954,7 @@ void pj_board_init(const pj_board_profile_t *profile)
     pj_home_layout_defaults(&g_home_layout);
 
 #ifdef ESP_PLATFORM
+    pj_recording_init(&g_recording);
     esp_err_t err = nvs_flash_init();
     if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
@@ -5018,6 +5133,9 @@ pj_board_status_t pj_board_status(void)
 {
 #ifdef ESP_PLATFORM
     pj_board_status_t status = g_status;
+    portENTER_CRITICAL(&g_recording_lock);
+    status.recording_elapsed_ms = pj_recording_elapsed_ms(&g_recording);
+    portEXIT_CRITICAL(&g_recording_lock);
     board_time_snapshot_t time = board_time_snapshot();
     status.hour = time.hour;
     status.minute = time.minute;
@@ -5621,6 +5739,7 @@ int pj_board_record_set_active(int active)
             return 1;
         }
         g_record_stop_requested = 1;
+        recording_state_request_stop();
         ESP_LOGI(TAG, "Recording stop requested");
 #else
         g_status.recording = 0;
@@ -5655,6 +5774,12 @@ int pj_board_record_set_active(int active)
     }
     next_recording_path(g_active_recording_path, sizeof(g_active_recording_path));
     g_record_stop_requested = 0;
+    if (!recording_state_start()) {
+        ESP_LOGE(TAG, "Record start failed: invalid lifecycle transition");
+        (void)snprintf(g_status.last_error, sizeof(g_status.last_error),
+                       "recording lifecycle was busy");
+        return 0;
+    }
     alert_audio_set_recording(1);
     board_audio_state_set(1, -1);
     BaseType_t created = xTaskCreate(record_task, "pj-record", PJ_AUDIO_RECORD_TASK_STACK, NULL, 5, &g_record_task);
@@ -5662,6 +5787,10 @@ int pj_board_record_set_active(int active)
         board_audio_state_set(0, -1);
         alert_audio_set_recording(0);
         g_record_task = NULL;
+        (void)snprintf(g_status.last_error, sizeof(g_status.last_error),
+                       "recording task creation failed");
+        recording_state_finish_capture(0);
+        recording_publish_completion();
         ESP_LOGE(TAG, "Record start failed: task create failed");
         return 0;
     }

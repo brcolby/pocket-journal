@@ -64,6 +64,7 @@ typedef struct {
     pj_storage_health_t storage_health;
     unsigned storage_recovery_count;
     int recording;
+    uint64_t recording_elapsed_ms;
     int playback_active;
     int hour;
     int minute;

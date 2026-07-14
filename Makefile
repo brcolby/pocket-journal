@@ -9,6 +9,7 @@ TIME_MODEL_TEST_BIN := build/test_time_model
 AUX_INPUT_TEST_BIN := build/test_aux_input
 AUDIO_LEVEL_TEST_BIN := build/test_audio_level
 ALERT_AUDIO_TEST_BIN := build/test_alert_audio
+RECORDING_TEST_BIN := build/test_recording
 NOTE_MODEL_TEST_BIN := build/test_note_model
 AUTH_TEST_BIN := build/test_auth
 SETTINGS_TEST_BIN := build/test_settings
@@ -82,6 +83,12 @@ test-input:
 		tests/board/test_alert_audio.c \
 		-o $(ALERT_AUDIO_TEST_BIN)
 	$(ALERT_AUDIO_TEST_BIN)
+	$(CC) $(CFLAGS) \
+		-Ifirmware/components/pj_board/include \
+		firmware/components/pj_board/pj_recording.c \
+		tests/board/test_recording.c \
+		-o $(RECORDING_TEST_BIN)
+	$(RECORDING_TEST_BIN)
 	$(CC) $(CFLAGS) \
 		-Ifirmware/components/pj_board/include \
 		firmware/components/pj_board/pj_note_model.c \

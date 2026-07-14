@@ -29,12 +29,17 @@ typedef struct {
     uint16_t bits_per_sample;
 } pj_storage_wav_info_t;
 
+#define PJ_STORAGE_WAV_HEADER_BYTES 44U
+
 const char *pj_storage_health_name(pj_storage_health_t health);
 pj_storage_health_t pj_storage_capacity_health(int mounted, int capacity_known,
                                                uint64_t total_bytes, uint64_t free_bytes,
                                                uint64_t reserve_bytes);
 int pj_storage_can_write(uint64_t free_bytes, uint64_t write_bytes, uint64_t reserve_bytes);
 pj_storage_recovery_action_t pj_storage_recovery_action(const char *filename, int target_exists);
+int pj_storage_wav_encode_header(uint8_t *header, size_t header_size,
+                                 uint32_t data_bytes, uint32_t sample_rate,
+                                 uint16_t channels, uint16_t bits_per_sample);
 int pj_storage_wav_validate(const uint8_t *header, size_t header_size, uint64_t file_size,
                             uint32_t expected_sample_rate, uint16_t expected_bits,
                             pj_storage_wav_info_t *info);

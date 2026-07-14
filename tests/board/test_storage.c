@@ -20,19 +20,7 @@ static void put_le32(uint8_t *data, uint32_t value)
 
 static void valid_header(uint8_t header[44], uint32_t data_bytes)
 {
-    memset(header, 0, 44);
-    memcpy(header, "RIFF", 4);
-    put_le32(&header[4], 36U + data_bytes);
-    memcpy(&header[8], "WAVEfmt ", 8);
-    put_le32(&header[16], 16);
-    put_le16(&header[20], 1);
-    put_le16(&header[22], 1);
-    put_le32(&header[24], 16000);
-    put_le32(&header[28], 32000);
-    put_le16(&header[32], 2);
-    put_le16(&header[34], 16);
-    memcpy(&header[36], "data", 4);
-    put_le32(&header[40], data_bytes);
+    assert(pj_storage_wav_encode_header(header, 44, data_bytes, 16000, 1, 16));
 }
 
 static void test_capacity_policy(void)
@@ -103,11 +91,27 @@ static void test_wav_validation(void)
     assert(!pj_storage_wav_validate(header, sizeof(header), 32044, 16000, 16, &info));
 }
 
+static void test_wav_header_encoding(void)
+{
+    uint8_t header[PJ_STORAGE_WAV_HEADER_BYTES];
+    pj_storage_wav_info_t info;
+    assert(pj_storage_wav_encode_header(header, sizeof(header), 64000, 16000, 2, 16));
+    assert(pj_storage_wav_validate(header, sizeof(header), 64044, 16000, 16, &info));
+    assert(info.data_bytes == 64000 && info.channels == 2);
+    assert(!pj_storage_wav_encode_header(NULL, sizeof(header), 32000, 16000, 1, 16));
+    assert(!pj_storage_wav_encode_header(header, sizeof(header) - 1, 32000, 16000, 1, 16));
+    assert(!pj_storage_wav_encode_header(header, sizeof(header), 32001, 16000, 1, 16));
+    assert(!pj_storage_wav_encode_header(header, sizeof(header), 32000, 0, 1, 16));
+    assert(!pj_storage_wav_encode_header(header, sizeof(header), 32000, 16000, 3, 16));
+    assert(!pj_storage_wav_encode_header(header, sizeof(header), UINT32_MAX, 16000, 1, 16));
+}
+
 int main(void)
 {
     test_capacity_policy();
     test_recovery_policy();
     test_wav_validation();
+    test_wav_header_encoding();
     puts("storage tests passed");
     return 0;
 }
