@@ -124,6 +124,42 @@ class WifiDiagnosticsTests(unittest.TestCase):
         self.assertEqual(payload["transport"], "usb")
         self.assertEqual(payload["result"]["phase"], "connected")
 
+    def test_general_status_omits_verbose_nested_connectivity_details(self) -> None:
+        raw_status = {
+            "device_id": "pj-test",
+            "wifi_provisioned": True,
+            "wifi": "ready",
+            "ip": "192.0.2.8",
+            "time_set": True,
+            "wifi_diagnostics": {
+                "phase": "connected",
+                "retry_count": 7,
+            },
+            "time_sync": {
+                "state": "synced",
+                "server": "pool.ntp.org",
+                "attempt_count": 4,
+            },
+        }
+        client = SerialDeviceClient("/dev/cu.test")
+        client.status = lambda: raw_status  # type: ignore[method-assign]
+        stdout = StringIO()
+
+        with patch(
+            "pocket_journal_partner.cli._session_from_args",
+            return_value=DeviceSession("pj-test", client),
+        ):
+            with redirect_stdout(stdout):
+                exit_code = cli.main(["device", "status"])
+
+        self.assertEqual(exit_code, 0)
+        result = json.loads(stdout.getvalue())["result"]
+        self.assertEqual(result["wifi"], "ready")
+        self.assertTrue(result["time_set"])
+        self.assertNotIn("wifi_diagnostics", result)
+        self.assertNotIn("time_sync", result)
+        self.assertIn("wifi_diagnostics", raw_status)
+
 
 if __name__ == "__main__":
     unittest.main()

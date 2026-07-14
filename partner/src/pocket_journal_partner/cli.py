@@ -392,7 +392,11 @@ def cmd_device_sync_time(args: argparse.Namespace) -> int:
 
 def cmd_device_status(args: argparse.Namespace) -> int:
     session = _session_from_args(args)
-    _print_json(session.envelope(credential_safe_status(session.status())))
+    status = credential_safe_status(session.status())
+    if isinstance(status, dict):
+        status.pop("wifi_diagnostics", None)
+        status.pop("time_sync", None)
+    _print_json(session.envelope(status))
     return 0
 
 
