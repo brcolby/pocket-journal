@@ -10,6 +10,7 @@ import unittest
 
 from pocket_journal_partner.device import (
     DeviceError,
+    DeviceOperationError,
     DeviceOperationTimeout,
     DeviceRequestTimeout,
     SerialDeviceClient,
@@ -112,6 +113,19 @@ class ResponseAfterWriteConnection(FakeConnection):
         written = super().write(payload)
         if len(self.writes) == self.write_number:
             self.lines.append(self.response)
+        return written
+
+
+class ResponsesAfterWriteConnection(FakeConnection):
+    def __init__(self, responses: dict[int, bytes]) -> None:
+        super().__init__()
+        self.responses = responses
+
+    def write(self, payload: bytes) -> int:
+        written = super().write(payload)
+        response = self.responses.get(len(self.writes))
+        if response is not None:
+            self.lines.append(response)
         return written
 
 
@@ -225,51 +239,52 @@ class SerialLifecycleTests(unittest.TestCase):
         self.assertEqual(connection.close_count, 1)
         self.assertFalse(connection.is_open)
 
-    def test_wipe_rejects_stale_frames_and_closes_each_poll_descriptor(self) -> None:
-        start = FakeConnection([
+    def test_wipe_rejects_stale_frames_on_one_lifecycle_descriptor(self) -> None:
+        connection = FakeConnection([
             b'PJ_OK {"command":"PJ_WIPE_RECORDINGS","request_id":"start",'
             b'"accepted":true,"recording_wipe":{"id":7,"state":"queued",'
             b'"audio_deleted":0,"transcripts_deleted":0,"notes_deleted":0,'
             b'"code":null,"retryable":false}}\n',
-        ])
-        first_poll = FakeConnection([
             b'PJ_OK {"command":"PJ_WIPE_RECORDINGS","request_id":"poll-1",'
             b'"recording_wipe":{"id":7,"state":"succeeded","audio_deleted":91}}\n',
             b'PJ_OK {"command":"PJ_STATUS","request_id":"wrong",'
             b'"recording_wipe":{"id":7,"state":"succeeded","audio_deleted":92}}\n',
             b'PJ_OK {"command":"PJ_STATUS","request_id":"poll-1",'
             b'"recording_wipe":{"id":7,"state":"running","audio_deleted":1}}\n',
-        ])
-        second_poll = FakeConnection([
             b'PJ_OK {"command":"PJ_STATUS","request_id":"poll-2",'
+            b'"recording_wipe":{"id":7,"state":"succeeded","audio_deleted":93}}\n',
+            b'PJ_OK {"command":"PJ_STATUS","request_id":"poll-1",'
             b'"recording_wipe":{"id":7,"state":"succeeded","audio_deleted":3,'
             b'"transcripts_deleted":2,"notes_deleted":1,"code":null,'
             b'"retryable":false}}\n',
         ])
-        serial_module = QueuedSerialModule([start, first_poll, second_poll])
+        serial_module = QueuedSerialModule([connection])
 
         with patch.dict(sys.modules, {"serial": serial_module}):
             with patch("pocket_journal_partner.device.time.sleep"):
                 with patch(
                     "pocket_journal_partner.device._new_request_id",
-                    side_effect=["start", "poll-1", "poll-2"],
+                    side_effect=["start", "poll-1"],
                 ):
                     result = SerialDeviceClient("/dev/cu.test", timeout=1).wipe_recordings()
 
         self.assertEqual(result["operation_id"], 7)
         self.assertEqual(result["deleted"], 3)
-        self.assertEqual(start.writes, [b"PJ_WIPE_RECORDINGS request_id=start\n"])
-        self.assertEqual(first_poll.writes, [b"PJ_STATUS request_id=poll-1\n"])
-        self.assertEqual(second_poll.writes, [b"PJ_STATUS request_id=poll-2\n"])
-        self.assertTrue(all(connection.close_count == 1 for connection in (start, first_poll, second_poll)))
+        self.assertEqual(connection.writes, [
+            b"PJ_WIPE_RECORDINGS request_id=start\n",
+            b"PJ_STATUS request_id=poll-1\n",
+            b"PJ_STATUS request_id=poll-1\n",
+        ])
+        self.assertEqual(connection.open_count, 1)
+        self.assertEqual(connection.close_count, 1)
+        self.assertFalse(connection.input_reset)
 
-    def test_wipe_timeout_reports_operation_id_and_releases_poll_descriptor(self) -> None:
-        start = FakeConnection([
+    def test_wipe_timeout_reports_operation_id_and_releases_lifecycle_descriptor(self) -> None:
+        connection = FakeConnection([
             b'PJ_OK {"command":"PJ_WIPE_RECORDINGS","request_id":"start",'
             b'"recording_wipe":{"id":41,"state":"running","audio_deleted":0}}\n',
         ])
-        poll = FakeConnection()
-        serial_module = QueuedSerialModule([start, poll])
+        serial_module = QueuedSerialModule([connection])
 
         with patch.dict(sys.modules, {"serial": serial_module}):
             with patch("pocket_journal_partner.device.time.sleep"):
@@ -282,8 +297,9 @@ class SerialLifecycleTests(unittest.TestCase):
 
         self.assertEqual(raised.exception.operation_id, 41)
         self.assertIn("operation 41", str(raised.exception))
-        self.assertEqual(start.close_count, 1)
-        self.assertEqual(poll.close_count, 1)
+        self.assertEqual(connection.open_count, 1)
+        self.assertEqual(connection.close_count, 1)
+        self.assertFalse(connection.is_open)
 
     def test_wipe_delayed_start_response_uses_one_descriptor_without_retransmit(self) -> None:
         start = FakeConnection([
@@ -308,17 +324,18 @@ class SerialLifecycleTests(unittest.TestCase):
         self.assertEqual(len(serial_module.constructor_kwargs), 1)
 
     def test_wipe_lost_start_ack_retransmits_same_request_on_one_descriptor(self) -> None:
-        start = ResponseAfterWriteConnection(
-            2,
-            b'PJ_OK {"command":"PJ_WIPE_RECORDINGS","request_id":"start",'
-            b'"attached":true,"recording_wipe":{"id":52,"state":"running"}}\n',
-        )
-        poll = FakeConnection([
-            b'PJ_OK {"command":"PJ_STATUS","request_id":"poll",'
-            b'"recording_wipe":{"id":52,"state":"succeeded","audio_deleted":2, '
-            b'"transcripts_deleted":1,"notes_deleted":1}}\n',
-        ])
-        serial_module = QueuedSerialModule([start, poll])
+        connection = ResponsesAfterWriteConnection({
+            2: (
+                b'PJ_OK {"command":"PJ_WIPE_RECORDINGS","request_id":"start",'
+                b'"attached":true,"recording_wipe":{"id":52,"state":"running"}}\n'
+            ),
+            4: (
+                b'PJ_OK {"command":"PJ_STATUS","request_id":"poll",'
+                b'"recording_wipe":{"id":52,"state":"succeeded","audio_deleted":2, '
+                b'"transcripts_deleted":1,"notes_deleted":1}}\n'
+            ),
+        })
+        serial_module = QueuedSerialModule([connection])
 
         with patch.dict(sys.modules, {"serial": serial_module}):
             with patch("pocket_journal_partner.device.time.sleep"):
@@ -330,12 +347,69 @@ class SerialLifecycleTests(unittest.TestCase):
                         result = SerialDeviceClient("/dev/cu.test", timeout=10).wipe_recordings()
 
         self.assertEqual(result["operation_id"], 52)
-        self.assertEqual(start.writes, 2 * [b"PJ_WIPE_RECORDINGS request_id=start\n"])
-        self.assertEqual(poll.writes, [b"PJ_STATUS request_id=poll\n"])
-        self.assertTrue(all(connection.open_count == 1 for connection in (start, poll)))
-        self.assertTrue(all(connection.close_count == 1 for connection in (start, poll)))
-        self.assertTrue(all(not connection.is_open for connection in (start, poll)))
-        self.assertEqual(len(serial_module.constructor_kwargs), 2)
+        self.assertEqual(connection.writes[:2], 2 * [b"PJ_WIPE_RECORDINGS request_id=start\n"])
+        self.assertEqual(connection.writes[2:], 2 * [b"PJ_STATUS request_id=poll\n"])
+        self.assertEqual(connection.open_count, 1)
+        self.assertEqual(connection.close_count, 1)
+        self.assertFalse(connection.is_open)
+        self.assertEqual(len(serial_module.constructor_kwargs), 1)
+
+    def test_wipe_reports_accepted_operation_disappearing_from_status(self) -> None:
+        connection = FakeConnection([
+            b'PJ_OK {"command":"PJ_WIPE_RECORDINGS","request_id":"start",'
+            b'"recording_wipe":{"id":61,"state":"running"}}\n',
+            b'PJ_OK {"command":"PJ_STATUS","request_id":"poll",'
+            b'"recording_wipe":{"id":0,"state":"idle"},"recording_wipe_recent":[]}\n',
+        ])
+        serial_module = QueuedSerialModule([connection])
+
+        with patch.dict(sys.modules, {"serial": serial_module}):
+            with patch("pocket_journal_partner.device.time.sleep"):
+                with patch(
+                    "pocket_journal_partner.device._new_request_id",
+                    side_effect=["start", "poll"],
+                ):
+                    with self.assertRaises(DeviceOperationError) as raised:
+                        SerialDeviceClient("/dev/cu.test", timeout=1).wipe_recordings()
+
+        self.assertEqual(raised.exception.operation_id, 61)
+        self.assertEqual(raised.exception.code, "operation_state_lost")
+        self.assertFalse(raised.exception.retryable)
+        self.assertIn("current idle id 0", str(raised.exception))
+        self.assertIn("outcome is unknown", str(raised.exception))
+        self.assertEqual(connection.open_count, 1)
+        self.assertEqual(connection.close_count, 1)
+        self.assertEqual(connection.writes, [
+            b"PJ_WIPE_RECORDINGS request_id=start\n",
+            b"PJ_STATUS request_id=poll\n",
+        ])
+
+    def test_wipe_preserves_and_reports_reset_evidence_after_start(self) -> None:
+        connection = FakeConnection([
+            b'PJ_OK {"command":"PJ_WIPE_RECORDINGS","request_id":"start",'
+            b'"recording_wipe":{"id":62,"state":"running"}}\n',
+            b"ESP-ROM:esp32s3-20210327\n",
+            b"rst:0x15 (USB_UART_CHIP_RESET),boot:0x8 (SPI_FAST_FLASH_BOOT)\n",
+        ])
+        serial_module = QueuedSerialModule([connection])
+
+        with patch.dict(sys.modules, {"serial": serial_module}):
+            with patch("pocket_journal_partner.device.time.sleep"):
+                with patch("pocket_journal_partner.device.time.monotonic", new=SteppingClock()):
+                    with patch(
+                        "pocket_journal_partner.device._new_request_id",
+                        side_effect=["start", "poll"],
+                    ):
+                        with self.assertRaises(DeviceOperationError) as raised:
+                            SerialDeviceClient("/dev/cu.test", timeout=10).wipe_recordings()
+
+        self.assertEqual(raised.exception.operation_id, 62)
+        self.assertEqual(raised.exception.code, "device_reset")
+        self.assertFalse(raised.exception.retryable)
+        self.assertIn("reset", str(raised.exception))
+        self.assertFalse(connection.input_reset)
+        self.assertEqual(connection.open_count, 1)
+        self.assertEqual(connection.close_count, 1)
 
     def test_wipe_start_total_timeout_bounds_writes_and_releases_one_descriptor(self) -> None:
         start = FakeConnection()

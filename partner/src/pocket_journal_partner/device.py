@@ -87,6 +87,24 @@ _USB_ROM_DOWNLOAD_MARKERS = (
 _WIPE_STATES = {"idle", "queued", "running", "succeeded", "failed"}
 _WIPE_START_RETRY_INTERVAL_SECONDS = 1.5
 _WIPE_START_MAX_ATTEMPTS = 3
+_USB_RESET_MARKERS = ("esp-rom:", "rst:0x")
+
+
+@dataclass
+class _SerialEvidence:
+    device_reset: bool = False
+    rom_download: bool = False
+
+    def observe(self, raw: bytes) -> None:
+        line = raw.decode("utf-8", errors="replace").strip().lower()
+        if any(marker in line for marker in _USB_ROM_DOWNLOAD_MARKERS):
+            self.rom_download = True
+        if any(marker in line for marker in _USB_RESET_MARKERS):
+            self.device_reset = True
+
+    def clear(self) -> None:
+        self.device_reset = False
+        self.rom_download = False
 
 
 def _serial_response(
@@ -467,6 +485,89 @@ class SerialDeviceClient:
                 except (serial_module.SerialException, OSError):
                     pass
 
+    def _request_on_connection(
+        self,
+        connection: Any,
+        command: str,
+        *,
+        deadline: float,
+        request_id: str | None = None,
+        retry_interval: float | None = None,
+        max_attempts: int = 1,
+        evidence: _SerialEvidence | None = None,
+    ) -> dict[str, Any] | None:
+        expected_command = command.split(" ", 1)[0]
+        wire_command = command if request_id is None else f"{command} request_id={request_id}"
+        wire_payload = f"{wire_command}\n".encode("ascii")
+        attempts = 0
+        next_retry_at: float | None = None
+        if time.monotonic() < deadline:
+            connection.write(wire_payload)
+            connection.flush()
+            attempts = 1
+            if retry_interval is not None:
+                next_retry_at = time.monotonic() + retry_interval
+
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            connection.timeout = min(0.2, remaining)
+            raw = connection.readline()
+            if raw and evidence is not None:
+                evidence.observe(raw)
+            decoded = _serial_response(raw, expected_command, request_id) if raw else None
+            if decoded is not None:
+                ok, payload = decoded
+                if ok:
+                    return payload
+
+                operation = _recording_wipe_operation(payload)
+                code = _safe_code(payload.get("code"))
+                retryable = payload.get("retryable") is True
+                if operation is not None:
+                    code = operation["code"] or code
+                    retryable = operation["retryable"]
+                    suffix = f" ({code})" if code is not None else ""
+                    raise DeviceOperationError(
+                        f"USB recording wipe operation {operation['id']} failed{suffix}",
+                        operation["id"],
+                        code=code,
+                        retryable=retryable,
+                    )
+                suffix = f" ({code})" if code is not None else ""
+                raise DeviceError(f"USB command failed: device rejected {expected_command}{suffix}")
+
+            now = time.monotonic()
+            if (
+                next_retry_at is not None
+                and attempts < max_attempts
+                and now >= next_retry_at
+                and now < deadline
+            ):
+                connection.write(wire_payload)
+                connection.flush()
+                attempts += 1
+                assert retry_interval is not None
+                next_retry_at = now + retry_interval
+
+    def _request_timeout(self, evidence: _SerialEvidence) -> DeviceRequestTimeout:
+        if evidence.rom_download:
+            return DeviceRequestTimeout(
+                f"USB command timed out on {self.port}; the port was released after the device reported "
+                "that it entered the ROM downloader. Reset or power-cycle it with AUX/BOOT released"
+            )
+        if evidence.device_reset:
+            return DeviceRequestTimeout(
+                f"USB command timed out on {self.port}; the port was released after reset evidence was "
+                "observed. Wait for the application to boot, then retry once"
+            )
+        return DeviceRequestTimeout(
+            f"USB command timed out on {self.port}; the port was released. Close any serial monitor and verify "
+            "the firmware console uses USB Serial/JTAG. If the board says 'waiting for download', reset or "
+            "power-cycle it with AUX/BOOT released"
+        )
+
     def _request(
         self,
         command: str,
@@ -495,70 +596,27 @@ class SerialDeviceClient:
             request_id is None or retry_interval is None or retry_interval <= 0
         ):
             raise ValueError("serial retries require a request ID and positive retry interval")
-        expected_command = command.split(" ", 1)[0]
-        wire_command = command if request_id is None else f"{command} request_id={request_id}"
+        evidence = _SerialEvidence()
         try:
             with self._connection(serial, read_timeout=min(0.2, request_timeout)) as connection:
                 remaining = deadline - time.monotonic()
                 if remaining > 0:
                     time.sleep(min(0.1, remaining))
                 connection.reset_input_buffer()
-                wire_payload = f"{wire_command}\n".encode("ascii")
-                attempts = 0
-                next_retry_at: float | None = None
-                if time.monotonic() < deadline:
-                    connection.write(wire_payload)
-                    connection.flush()
-                    attempts = 1
-                    if retry_interval is not None:
-                        next_retry_at = time.monotonic() + retry_interval
-                while True:
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        break
-                    connection.timeout = min(0.2, remaining)
-                    raw = connection.readline()
-                    decoded = _serial_response(raw, expected_command, request_id) if raw else None
-                    if decoded is not None:
-                        ok, payload = decoded
-                        if ok:
-                            return payload
-
-                        operation = _recording_wipe_operation(payload)
-                        code = _safe_code(payload.get("code"))
-                        retryable = payload.get("retryable") is True
-                        if operation is not None:
-                            code = operation["code"] or code
-                            retryable = operation["retryable"]
-                            suffix = f" ({code})" if code is not None else ""
-                            raise DeviceOperationError(
-                                f"USB recording wipe operation {operation['id']} failed{suffix}",
-                                operation["id"],
-                                code=code,
-                                retryable=retryable,
-                            )
-                        suffix = f" ({code})" if code is not None else ""
-                        raise DeviceError(f"USB command failed: device rejected {expected_command}{suffix}")
-
-                    now = time.monotonic()
-                    if (
-                        next_retry_at is not None
-                        and attempts < max_attempts
-                        and now >= next_retry_at
-                        and now < deadline
-                    ):
-                        connection.write(wire_payload)
-                        connection.flush()
-                        attempts += 1
-                        assert retry_interval is not None
-                        next_retry_at = now + retry_interval
+                response = self._request_on_connection(
+                    connection,
+                    command,
+                    deadline=deadline,
+                    request_id=request_id,
+                    retry_interval=retry_interval,
+                    max_attempts=max_attempts,
+                    evidence=evidence,
+                )
+                if response is not None:
+                    return response
         except (serial.SerialException, OSError) as exc:
             raise DeviceError(f"USB serial connection failed on {self.port}: {exc}") from exc
-        raise DeviceRequestTimeout(
-            f"USB command timed out on {self.port}; the port was released. Close any serial monitor and verify "
-            "the firmware console uses USB Serial/JTAG. If the board says 'waiting for download', reset or "
-            "power-cycle it with AUX/BOOT released"
-        )
+        raise self._request_timeout(evidence)
 
     def status(self) -> dict[str, Any]:
         return self._request("PJ_STATUS")
@@ -577,56 +635,141 @@ class SerialDeviceClient:
             raise DeviceError("USB time sync requires a year")
         return self._request(f"PJ_TIME {year} {month} {day} {hour} {minute}")
 
+    def _wipe_operation_lost(
+        self,
+        operation_id: int,
+        status: dict[str, Any],
+    ) -> DeviceOperationError:
+        current = status.get("recording_wipe")
+        current_description = "missing"
+        if isinstance(current, dict):
+            current_id = current.get("id")
+            current_state = current.get("state")
+            if isinstance(current_id, int) and not isinstance(current_id, bool):
+                current_description = f"{current_state or 'unknown'} id {current_id}"
+        recent = status.get("recording_wipe_recent")
+        retained = len(recent) if isinstance(recent, list) else 0
+        return DeviceOperationError(
+            f"USB recording wipe operation {operation_id} disappeared from device status "
+            f"(current {current_description}, {retained} retained result(s)); the device may have reset or "
+            "lost operation state. The outcome is unknown and the destructive command was not retried",
+            operation_id,
+            code="operation_state_lost",
+            retryable=False,
+        )
+
+    def _wipe_runtime_evidence(
+        self,
+        operation_id: int,
+        evidence: _SerialEvidence,
+    ) -> DeviceOperationError | None:
+        if evidence.rom_download:
+            return DeviceOperationError(
+                f"USB recording wipe operation {operation_id} lost its application connection when the device "
+                "entered the ROM downloader; the outcome is unknown and the destructive command was not retried",
+                operation_id,
+                code="rom_download",
+                retryable=False,
+            )
+        if evidence.device_reset:
+            return DeviceOperationError(
+                f"USB recording wipe operation {operation_id} observed a device reset before a terminal result; "
+                "the outcome is unknown and the destructive command was not retried",
+                operation_id,
+                code="device_reset",
+                retryable=False,
+            )
+        return None
+
     def wipe_recordings(self) -> dict[str, Any]:
+        try:
+            import serial  # type: ignore
+        except ImportError as exc:
+            raise DeviceError("USB support requires pyserial; reinstall the partner CLI") from exc
+
         deadline = time.monotonic() + self.timeout
         start_request_id = _new_request_id()
-        response = self._request(
-            "PJ_WIPE_RECORDINGS",
-            deadline=deadline,
-            request_id=start_request_id,
-            retry_interval=_WIPE_START_RETRY_INTERVAL_SECONDS,
-            max_attempts=_WIPE_START_MAX_ATTEMPTS,
-        )
-        operation = _recording_wipe_operation(response)
-        if operation is None:
-            if isinstance(response.get("deleted"), int):
-                return response
-            raise DeviceError("USB command failed: device returned an invalid wipe operation")
+        evidence = _SerialEvidence()
+        operation_id: int | None = None
+        try:
+            with self._connection(serial, read_timeout=min(0.2, self.timeout)) as connection:
+                remaining = deadline - time.monotonic()
+                if remaining > 0:
+                    time.sleep(min(0.1, remaining))
+                # Every command is request-tagged, so stale frames can be rejected
+                # without discarding reset or ROM evidence from the shared stream.
+                response = self._request_on_connection(
+                    connection,
+                    "PJ_WIPE_RECORDINGS",
+                    deadline=deadline,
+                    request_id=start_request_id,
+                    retry_interval=_WIPE_START_RETRY_INTERVAL_SECONDS,
+                    max_attempts=_WIPE_START_MAX_ATTEMPTS,
+                    evidence=evidence,
+                )
+                if response is None:
+                    raise self._request_timeout(evidence)
+                operation = _recording_wipe_operation(response)
+                if operation is None:
+                    if isinstance(response.get("deleted"), int):
+                        return response
+                    raise DeviceError("USB command failed: device returned an invalid wipe operation")
 
-        while True:
-            if operation["state"] == "succeeded":
-                return _recording_wipe_result(operation)
-            if operation["state"] == "failed":
-                code = operation["code"]
-                suffix = f" ({code})" if code is not None else ""
+                operation_id = operation["id"]
+                evidence.clear()
+                poll_request_id = _new_request_id()
+                while True:
+                    if operation["state"] == "succeeded":
+                        return _recording_wipe_result(operation)
+                    if operation["state"] == "failed":
+                        code = operation["code"]
+                        suffix = f" ({code})" if code is not None else ""
+                        raise DeviceOperationError(
+                            f"USB recording wipe operation {operation_id} failed{suffix}",
+                            operation_id,
+                            code=code,
+                            retryable=operation["retryable"],
+                        )
+                    runtime_error = self._wipe_runtime_evidence(operation_id, evidence)
+                    if runtime_error is not None:
+                        raise runtime_error
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise DeviceOperationTimeout(
+                            f"USB recording wipe operation {operation_id} timed out; it may still be running",
+                            operation_id,
+                            code="operation_timeout",
+                            retryable=True,
+                        )
+                    status = self._request_on_connection(
+                        connection,
+                        "PJ_STATUS",
+                        deadline=min(deadline, time.monotonic() + min(0.75, remaining)),
+                        request_id=poll_request_id,
+                        evidence=evidence,
+                    )
+                    runtime_error = self._wipe_runtime_evidence(operation_id, evidence)
+                    if runtime_error is not None:
+                        raise runtime_error
+                    if status is None:
+                        continue
+                    current = _recording_wipe_operation(status, operation_id)
+                    if current is None:
+                        raise self._wipe_operation_lost(operation_id, status)
+                    operation = current
+                    remaining = deadline - time.monotonic()
+                    if remaining > 0 and operation["state"] not in {"succeeded", "failed"}:
+                        time.sleep(min(0.1, remaining))
+        except (serial.SerialException, OSError) as exc:
+            if operation_id is not None:
                 raise DeviceOperationError(
-                    f"USB recording wipe operation {operation['id']} failed{suffix}",
-                    operation["id"],
-                    code=code,
-                    retryable=operation["retryable"],
-                )
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise DeviceOperationTimeout(
-                    f"USB recording wipe operation {operation['id']} timed out; it may still be running",
-                    operation["id"],
-                    code="operation_timeout",
-                    retryable=True,
-                )
-            try:
-                status = self._request(
-                    "PJ_STATUS",
-                    timeout=min(0.75, remaining),
-                    request_id=_new_request_id(),
-                )
-            except DeviceRequestTimeout:
-                continue
-            current = _recording_wipe_operation(status, operation["id"])
-            if current is not None:
-                operation = current
-            remaining = deadline - time.monotonic()
-            if remaining > 0 and operation["state"] not in {"succeeded", "failed"}:
-                time.sleep(min(0.1, remaining))
+                    f"USB recording wipe operation {operation_id} lost its serial connection before a terminal "
+                    "result; the outcome is unknown and the destructive command was not retried",
+                    operation_id,
+                    code="transport_lost",
+                    retryable=False,
+                ) from exc
+            raise DeviceError(f"USB serial connection failed on {self.port}: {exc}") from exc
 
     def audio_tone(
         self,
