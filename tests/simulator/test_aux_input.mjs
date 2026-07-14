@@ -4,6 +4,7 @@ import {
   AUX_DOUBLE_CLICK_MS,
   AUX_LONG_PRESS_MS,
   createAuxClickDetector,
+  createAuxPressDetector,
 } from "../../simulator/src/aux_input.js";
 
 assert.equal(AUX_LONG_PRESS_MS, 500);
@@ -70,5 +71,45 @@ detector.click("late second");
 assert.deepEqual(events.at(-1), ["short", "late first"]);
 advanceTo(clock + AUX_DOUBLE_CLICK_MS + 1);
 assert.deepEqual(events.at(-1), ["short", "late second"]);
+
+const presses = [];
+const pressDetector = createAuxPressDetector({
+  onShort: (label) => presses.push(["short", label]),
+  onLong: (label) => presses.push(["long", label]),
+  now: () => clock,
+  setTimer,
+  clearTimer,
+});
+
+clock = 7000;
+assert.equal(pressDetector.press("held"), true);
+advanceTo(clock + AUX_LONG_PRESS_MS - 1);
+assert.deepEqual(presses, []);
+advanceTo(clock + 1);
+assert.deepEqual(presses, [["long", "held long"]]);
+assert.equal(pressDetector.release("held"), true);
+assert.equal(presses.length, 1, "release after threshold must be consumed");
+
+clock = 8000;
+assert.equal(pressDetector.press("tap"), true);
+advanceTo(clock + AUX_LONG_PRESS_MS - 1);
+assert.equal(pressDetector.release("tap"), true);
+assert.deepEqual(presses.at(-1), ["short", "tap"]);
+
+// If the event loop delays the threshold timer, release still classifies by elapsed time.
+clock = 9000;
+assert.equal(pressDetector.press("late timer"), true);
+clock += AUX_LONG_PRESS_MS;
+assert.equal(pressDetector.release("late timer"), true);
+assert.deepEqual(presses.at(-1), ["long", "late timer long"]);
+const pressCount = presses.length;
+advanceTo(clock + 1000);
+assert.equal(presses.length, pressCount);
+
+clock = 11000;
+pressDetector.press("cancelled hold");
+pressDetector.cancel();
+advanceTo(clock + AUX_LONG_PRESS_MS);
+assert.equal(presses.some(([, label]) => label === "cancelled hold long"), false);
 
 console.log("simulator aux input tests passed");

@@ -39,3 +39,69 @@ export function createAuxClickDetector({ onShort, onDouble, now, setTimer, clear
 
   return { cancel, click };
 }
+
+export function createAuxPressDetector({ onShort, onLong, now, setTimer, clearTimer }) {
+  let timer = null;
+  let pressedAt = 0;
+  let pressedLabel = "";
+  let pressed = false;
+  let longEmitted = false;
+
+  function clearLongTimer() {
+    if (timer !== null) {
+      clearTimer(timer);
+      timer = null;
+    }
+  }
+
+  function emitLong(label) {
+    if (!pressed || longEmitted) {
+      return false;
+    }
+    clearLongTimer();
+    longEmitted = true;
+    onLong(`${label} long`);
+    return true;
+  }
+
+  function press(label) {
+    if (pressed) {
+      return false;
+    }
+    pressed = true;
+    longEmitted = false;
+    pressedAt = now();
+    pressedLabel = label;
+    timer = setTimer(() => emitLong(pressedLabel), AUX_LONG_PRESS_MS);
+    return true;
+  }
+
+  function release(label = pressedLabel) {
+    if (!pressed) {
+      return false;
+    }
+    if (!longEmitted && now() - pressedAt >= AUX_LONG_PRESS_MS) {
+      emitLong(label);
+    }
+    clearLongTimer();
+    const wasLong = longEmitted;
+    pressed = false;
+    longEmitted = false;
+    pressedAt = 0;
+    pressedLabel = "";
+    if (!wasLong) {
+      onShort(label);
+    }
+    return true;
+  }
+
+  function cancel() {
+    clearLongTimer();
+    pressed = false;
+    longEmitted = false;
+    pressedAt = 0;
+    pressedLabel = "";
+  }
+
+  return { cancel, press, release };
+}

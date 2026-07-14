@@ -24,6 +24,7 @@ typedef struct {
     int raw_level;
     int stable_level;
     int pressed;
+    int long_emitted;
     int pending_short;
     int second_press;
 } pj_aux_input_t;

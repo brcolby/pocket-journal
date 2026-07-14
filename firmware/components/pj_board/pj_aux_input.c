@@ -9,6 +9,10 @@ void pj_aux_input_init(pj_aux_input_t *input, int initial_level, uint32_t now_ms
         input->raw_level = initial_level;
         input->stable_level = initial_level;
         input->raw_changed_ms = now_ms;
+        if (initial_level == 0) {
+            input->pressed = 1;
+            input->press_started_ms = now_ms;
+        }
     }
 }
 
@@ -38,7 +42,8 @@ static pj_aux_gesture_t handle_press(pj_aux_input_t *input, uint32_t now_ms)
     }
 
     input->pressed = 1;
-    input->press_started_ms = now_ms;
+    input->long_emitted = 0;
+    input->press_started_ms = input->raw_changed_ms;
     return expired;
 }
 
@@ -49,11 +54,9 @@ static pj_aux_gesture_t handle_release(pj_aux_input_t *input, uint32_t now_ms)
     }
 
     input->pressed = 0;
-    uint32_t held_ms = (uint32_t)(now_ms - input->press_started_ms);
-    if (held_ms >= PJ_AUX_LONG_PRESS_MS) {
-        input->pending_short = 0;
-        input->second_press = 0;
-        return PJ_AUX_GESTURE_LONG;
+    if (input->long_emitted) {
+        input->long_emitted = 0;
+        return PJ_AUX_GESTURE_NONE;
     }
     if (input->second_press) {
         input->pending_short = 0;
@@ -64,6 +67,19 @@ static pj_aux_gesture_t handle_release(pj_aux_input_t *input, uint32_t now_ms)
     input->pending_short = 1;
     input->first_release_ms = now_ms;
     return PJ_AUX_GESTURE_NONE;
+}
+
+static pj_aux_gesture_t poll_long_press(pj_aux_input_t *input, uint32_t now_ms)
+{
+    if (!input->pressed || input->long_emitted ||
+        (uint32_t)(now_ms - input->press_started_ms) < PJ_AUX_LONG_PRESS_MS) {
+        return PJ_AUX_GESTURE_NONE;
+    }
+
+    input->long_emitted = 1;
+    input->pending_short = 0;
+    input->second_press = 0;
+    return PJ_AUX_GESTURE_LONG;
 }
 
 static pj_aux_gesture_t poll_pending_short(pj_aux_input_t *input, uint32_t now_ms)
@@ -98,5 +114,9 @@ pj_aux_gesture_t pj_aux_input_update(pj_aux_input_t *input, int raw_level, uint3
         gesture = input->stable_level == 0 ? handle_press(input, now_ms) : handle_release(input, now_ms);
     }
 
+    if (gesture != PJ_AUX_GESTURE_NONE) {
+        return gesture;
+    }
+    gesture = poll_long_press(input, now_ms);
     return gesture != PJ_AUX_GESTURE_NONE ? gesture : poll_pending_short(input, now_ms);
 }

@@ -2,6 +2,7 @@ import {
   AUX_DOUBLE_CLICK_MS,
   AUX_LONG_PRESS_MS,
   createAuxClickDetector,
+  createAuxPressDetector,
 } from "./aux_input.js";
 
 const canvas = document.querySelector("#display");
@@ -31,7 +32,6 @@ const PLAYBACK_STOPPING = 2;
 let wasmModule = null;
 let api = null;
 let framebufferImage = ctx.createImageData(DISPLAY_WIDTH, DISPLAY_HEIGHT);
-let auxPressStartedAt = 0;
 let auxPressPointerId = null;
 const visited = [];
 const debugLog = loadDebugLog();
@@ -354,6 +354,17 @@ const auxClickDetector = createAuxClickDetector({
   clearTimer: (timer) => clearTimeout(timer),
 });
 
+const auxPressDetector = createAuxPressDetector({
+  onShort: scheduleAuxShort,
+  onLong: (label) => {
+    cancelPendingAuxShort();
+    handleAuxLong(label);
+  },
+  now: () => performance.now(),
+  setTimer: (callback, delay) => setTimeout(callback, delay),
+  clearTimer: (timer) => clearTimeout(timer),
+});
+
 function cancelPendingAuxShort() {
   auxClickDetector.cancel();
 }
@@ -364,6 +375,7 @@ function scheduleAuxShort(label) {
 
 function resetSimulator() {
   cancelPendingAuxShort();
+  auxPressDetector.cancel();
   dispatchFirmware("reset", () => {
     api.reset();
     seedDynamicContent();
@@ -417,14 +429,13 @@ function attachAuxButton(button, label) {
     if (auxPressPointerId !== null) {
       return;
     }
-    auxPressStartedAt = performance.now();
     auxPressPointerId = event.pointerId;
+    auxPressDetector.press(label);
     button.setPointerCapture?.(event.pointerId);
     traceDebug("event.aux.pointerdown", {
       source: label,
       pointerId: event.pointerId,
       pointerType: event.pointerType,
-      startedAt: auxPressStartedAt,
     });
   });
 
@@ -432,22 +443,15 @@ function attachAuxButton(button, label) {
     if (auxPressPointerId === null || event.pointerId !== auxPressPointerId) {
       return;
     }
-    const heldMs = performance.now() - auxPressStartedAt;
-    auxPressStartedAt = 0;
     auxPressPointerId = null;
-    traceDebug("event.aux.pointerup", { source: label, heldMs });
-    if (heldMs >= LONG_PRESS_MS) {
-      cancelPendingAuxShort();
-      handleAuxLong(`${label} long`);
-    } else {
-      scheduleAuxShort(label);
-    }
+    traceDebug("event.aux.pointerup", { source: label });
+    auxPressDetector.release(label);
   });
 
   button.addEventListener("pointercancel", (event) => {
     traceDebug("event.aux.pointercancel", { source: label, pointerId: event.pointerId });
-    auxPressStartedAt = 0;
     auxPressPointerId = null;
+    auxPressDetector.cancel();
   });
 
   button.addEventListener("keydown", (event) => {
