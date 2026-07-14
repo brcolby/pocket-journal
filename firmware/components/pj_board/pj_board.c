@@ -3,6 +3,7 @@
 #include "pj_audio_level.h"
 #include "pj_aux_input.h"
 #include "pj_auth.h"
+#include "pj_display_refresh.h"
 #include "pj_home_layout.h"
 #include "pj_note_model.h"
 #include "pj_recording.h"
@@ -277,6 +278,7 @@ static pj_framebuffer_t g_epd_shadow_fb;
 static int g_display_ready;
 static int g_epd_shadow_valid;
 static int g_epd_partial_ready;
+static pj_display_refresh_policy_t g_epd_refresh_policy;
 static int g_i2c_ready;
 static int g_touch_ready;
 static int g_rtc_ready;
@@ -2727,6 +2729,8 @@ static esp_err_t display_init(void)
 {
     g_epd_shadow_valid = 0;
     g_epd_partial_ready = 0;
+    pj_display_refresh_policy_init(&g_epd_refresh_policy,
+                                   PJ_DISPLAY_REFRESH_DEFAULT_PARTIAL_LIMIT);
 
     gpio_config_t output_conf = {
         .pin_bit_mask = (1ULL << EPD_RST_PIN) | (1ULL << EPD_DC_PIN) | (1ULL << EPD_CS_PIN),
@@ -6504,19 +6508,29 @@ int pj_board_update_time_state(pj_ui_context_t *ui)
 int pj_board_display_framebuffer(const pj_framebuffer_t *fb, const pj_ui_dirty_region_t *dirty)
 {
 #ifdef ESP_PLATFORM
-    if (!g_display_ready || g_epd_spi == NULL) {
+    if (fb == NULL || !g_display_ready || g_epd_spi == NULL) {
         if (!g_display_warning_logged) {
             ESP_LOGW(TAG, "Display refresh skipped: display not initialized");
             g_display_warning_logged = 1;
         }
         return 0;
     }
-    if (dirty != NULL && dirty->partial && dirty->width > 0 && dirty->height > 0 && g_epd_shadow_valid) {
+    int64_t refresh_started_us = esp_timer_get_time();
+    pj_display_refresh_plan_t plan = pj_display_refresh_plan(
+        &g_epd_refresh_policy, fb, &g_epd_shadow_fb, g_epd_shadow_valid, dirty);
+    if (plan.kind == PJ_DISPLAY_REFRESH_NOOP) {
+        pj_display_refresh_record(&g_epd_refresh_policy, &plan, 1, 0, 0);
+        ESP_LOGI(TAG, "Display refresh no-op requests=%" PRIu64 " noops=%" PRIu64,
+                 g_epd_refresh_policy.metrics.requests,
+                 g_epd_refresh_policy.metrics.noops);
+        return 1;
+    }
+    if (plan.kind == PJ_DISPLAY_REFRESH_PARTIAL) {
         int x0 = 0;
         int y0 = 0;
         int x1 = 0;
         int y1 = 0;
-        int byte_len = framebuffer_region_to_epd(fb, dirty, &x0, &y0, &x1, &y1);
+        int byte_len = framebuffer_region_to_epd(fb, &plan.region, &x0, &y0, &x1, &y1);
         if (byte_len > 0) {
             uint16_t mem_y_start = (uint16_t)(PJ_DISPLAY_HEIGHT - 1 - y0);
             uint16_t mem_y_end = (uint16_t)(PJ_DISPLAY_HEIGHT - 1 - y1);
@@ -6536,11 +6550,20 @@ int pj_board_display_framebuffer(const pj_framebuffer_t *fb, const pj_ui_dirty_r
             ESP_ERROR_CHECK_WITHOUT_ABORT(epd_send_command(0x24));
             ESP_ERROR_CHECK_WITHOUT_ABORT(epd_write_bytes(g_epd_buffer, byte_len));
             epd_turn_on_display_part();
-            g_epd_shadow_fb = *fb;
+            pj_display_refresh_apply_shadow(&g_epd_shadow_fb, fb, &plan);
+            uint32_t latency_us = (uint32_t)(esp_timer_get_time() - refresh_started_us);
+            pj_display_refresh_record(&g_epd_refresh_policy, &plan, 1, latency_us, 0);
+            ESP_LOGI(TAG, "Display metrics full=%" PRIu64 " partial=%" PRIu64
+                     " noop=%" PRIu64 " changed=%" PRIu32 " latency_us=%" PRIu32,
+                     g_epd_refresh_policy.metrics.applied_full,
+                     g_epd_refresh_policy.metrics.applied_partial,
+                     g_epd_refresh_policy.metrics.noops,
+                     plan.changed_pixels, latency_us);
             return 1;
         }
     }
-    ESP_LOGI(TAG, "Display full refresh");
+    ESP_LOGI(TAG, "Display full refresh%s",
+             plan.promoted_to_full ? " (partial cadence)" : "");
     g_epd_partial_ready = 0;
     epd_set_lut(WF_FULL_1IN54);
     ESP_ERROR_CHECK_WITHOUT_ABORT(epd_send_command(0x11));
@@ -6556,8 +6579,16 @@ int pj_board_display_framebuffer(const pj_framebuffer_t *fb, const pj_ui_dirty_r
     ESP_ERROR_CHECK_WITHOUT_ABORT(epd_send_command(0x26));
     ESP_ERROR_CHECK_WITHOUT_ABORT(epd_write_bytes(g_epd_buffer, PJ_FRAMEBUFFER_BYTES));
     epd_turn_on_display();
-    g_epd_shadow_fb = *fb;
+    pj_display_refresh_apply_shadow(&g_epd_shadow_fb, fb, &plan);
     g_epd_shadow_valid = 1;
+    uint32_t latency_us = (uint32_t)(esp_timer_get_time() - refresh_started_us);
+    pj_display_refresh_record(&g_epd_refresh_policy, &plan, 1, latency_us, 0);
+    ESP_LOGI(TAG, "Display metrics full=%" PRIu64 " partial=%" PRIu64
+             " noop=%" PRIu64 " changed=%" PRIu32 " latency_us=%" PRIu32,
+             g_epd_refresh_policy.metrics.applied_full,
+             g_epd_refresh_policy.metrics.applied_partial,
+             g_epd_refresh_policy.metrics.noops,
+             plan.changed_pixels, latency_us);
     return 1;
 #else
     (void)fb;

@@ -98,10 +98,8 @@ Important constraints from the panel datasheet:
 - Write data is captured on the rising clock edge. CS must be low for a
   transfer, D/C must be low for commands and high for data, and CS must return
   high between transfers.
-- The specified maximum write clock is **20 MHz** at 25 C. The current firmware
-  configures 40 MHz. That is outside the panel specification even if a sample
-  unit appears to work; reduce it to 20 MHz or below before treating display
-  behavior as production-stable.
+- The specified maximum write clock is **20 MHz** at 25 C. Firmware caps the
+  display bus at 20 MHz; do not raise that limit based on a single working unit.
 - BUSY high means the controller is executing a waveform or another internal
   operation. Do not issue another command until BUSY goes low. Use BUSY rather
   than a fixed refresh delay, and make a timeout an explicit driver error.
@@ -109,6 +107,16 @@ Important constraints from the panel datasheet:
   dependent. No authoritative maximum partial-refresh count was found. Keep a
   periodic full-refresh policy configurable and establish its cadence from
   ghosting tests on the shipping enclosure and temperature range.
+- The refresh planner clips dirty regions to the panel, byte-aligns partial X
+  bounds, tightens transfers to pixels that differ from the last confirmed
+  driver shadow, and suppresses byte-identical partial updates. It promotes the
+  30th successful partial update to a full refresh until hardware testing
+  establishes a board-profile cadence. The driver logs cumulative full,
+  partial, and no-op counts plus changed pixels and total update latency.
+- A partial update copies only its confirmed transfer region into the panel
+  shadow. Pixels outside the invalidated region remain unchanged in the shadow,
+  so an incomplete dirty-region declaration cannot hide a later required
+  update.
 - A display update is not complete until BUSY deasserts. Do not cut `EPD3V3`,
   reset the controller, or start another update during master activation.
 - Command `0x10` with data `0x01` enters panel deep sleep. BUSY then remains
