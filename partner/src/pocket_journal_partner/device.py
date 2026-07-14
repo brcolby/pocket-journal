@@ -451,7 +451,13 @@ class SerialDeviceClient:
         self.timeout = timeout
 
     @contextmanager
-    def _connection(self, serial_module: Any, *, read_timeout: float = 0.2) -> Iterator[Any]:
+    def _connection(
+        self,
+        serial_module: Any,
+        *,
+        read_timeout: float = 0.2,
+        idle_on_close: bool = False,
+    ) -> Iterator[Any]:
         connection = None
         try:
             # Configure the control lines before opening the descriptor. Opening
@@ -471,14 +477,15 @@ class SerialDeviceClient:
             connection.port = self.port
             _idle_serial_control_lines(connection)
             connection.open()
-            _idle_serial_control_lines(connection)
+            _disable_hangup_on_close(connection)
             yield connection
         finally:
             if connection is not None:
-                try:
-                    _idle_serial_control_lines(connection)
-                except (serial_module.SerialException, OSError):
-                    pass
+                if idle_on_close:
+                    try:
+                        _idle_serial_control_lines(connection)
+                    except (serial_module.SerialException, OSError):
+                        pass
                 try:
                     if connection.is_open:
                         connection.close()
@@ -978,7 +985,11 @@ class SerialDeviceClient:
     def _hard_reset_usb_serial_jtag(self, serial_module: Any) -> str:
         reset_asserted = False
         try:
-            with self._connection(serial_module, read_timeout=0.1) as connection:
+            with self._connection(
+                serial_module,
+                read_timeout=0.1,
+                idle_on_close=True,
+            ) as connection:
                 # ESP32-S3 passes uses_usb_otg=False for USB-Serial/JTAG, so its
                 # esptool hard reset is a short RTS pulse with DTR left idle.
                 connection.dtr = False
@@ -998,6 +1009,32 @@ class SerialDeviceClient:
 def _idle_serial_control_lines(connection: Any) -> None:
     connection.dtr = False
     connection.rts = False
+
+
+def _disable_hangup_on_close(connection: Any) -> bool:
+    if os.name == "nt":
+        return False
+    fd = getattr(connection, "fd", None)
+    if not isinstance(fd, int):
+        return False
+    try:
+        import termios
+    except ImportError:
+        return False
+    hupcl = getattr(termios, "HUPCL", None)
+    if not isinstance(hupcl, int):
+        return False
+    try:
+        attributes = termios.tcgetattr(fd)
+        cflag = attributes[2]
+        if not isinstance(cflag, int):
+            raise TypeError("termios cflag is not an integer")
+        if cflag & hupcl:
+            attributes[2] = cflag & ~hupcl
+            termios.tcsetattr(fd, termios.TCSANOW, attributes)
+    except (AttributeError, IndexError, OSError, TypeError) as exc:
+        raise DeviceError("USB serial could not disable POSIX hangup-on-close") from exc
+    return True
 
 
 def _stop_child_process(process: Any) -> None:

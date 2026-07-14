@@ -77,6 +77,23 @@ class FakeSerialModule:
         return self.connection
 
 
+class FakeTermiosModule:
+    HUPCL = 0x4000
+    TCSANOW = 0
+
+    def __init__(self) -> None:
+        self.attributes = [1, 2, self.HUPCL | 0x20, 4, 5, 6, [7]]
+        self.events: list[tuple[str, int, object]] = []
+
+    def tcgetattr(self, fd: int):
+        self.events.append(("get", fd, None))
+        return list(self.attributes)
+
+    def tcsetattr(self, fd: int, when: int, attributes) -> None:
+        self.attributes = list(attributes)
+        self.events.append(("set", fd, when))
+
+
 class QueuedSerialModule:
     SerialException = FakeSerialException
 
@@ -199,6 +216,31 @@ class SerialLifecycleTests(unittest.TestCase):
         self.assertFalse(connection.is_open)
         self.assertTrue(connection.input_reset)
         self.assertEqual(connection.writes, [b"PJ_STATUS\n"])
+
+    def test_posix_connection_clears_hupcl_without_redundant_line_writes(self) -> None:
+        connection = TracedConnection([b'PJ_OK {"device_id":"pj-test"}\n'])
+        connection.fd = 73
+        serial_module = FakeSerialModule(connection)
+        termios_module = FakeTermiosModule()
+
+        with patch.dict(sys.modules, {"serial": serial_module, "termios": termios_module}):
+            with patch("pocket_journal_partner.device.time.sleep"):
+                result = SerialDeviceClient("/dev/cu.test", timeout=1).status()
+
+        self.assertEqual(result, {"device_id": "pj-test"})
+        self.assertEqual(termios_module.events, [
+            ("get", 73, None),
+            ("set", 73, termios_module.TCSANOW),
+        ])
+        self.assertEqual(termios_module.attributes[2] & termios_module.HUPCL, 0)
+        self.assertEqual(termios_module.attributes[2] & 0x20, 0x20)
+        self.assertEqual(connection.control_line_events, [
+            ("dtr", False),
+            ("rts", False),
+        ])
+        self.assertEqual(connection.open_count, 1)
+        self.assertEqual(connection.close_count, 1)
+        self.assertEqual(connection.closed_control_lines, (False, False))
 
     def test_interval_reset_is_tagged_confirmed_and_releases_descriptor(self) -> None:
         connection = FakeConnection([
@@ -684,9 +726,14 @@ class SerialLifecycleTests(unittest.TestCase):
 
     @unittest.skipIf(os.name == "nt", "pseudo-terminals are POSIX-only")
     def test_application_probe_over_pty_releases_the_descriptor(self) -> None:
+        import termios
+
         master_fd, slave_fd = os.openpty()
         slave_name = os.ttyname(slave_fd)
         tty.setraw(slave_fd)
+        attributes = termios.tcgetattr(slave_fd)
+        attributes[2] |= termios.HUPCL
+        termios.tcsetattr(slave_fd, termios.TCSANOW, attributes)
         peer_result: list[bytes] = []
 
         def peer() -> None:
@@ -706,6 +753,7 @@ class SerialLifecycleTests(unittest.TestCase):
             self.assertEqual(result["final_state"], "application")
             self.assertEqual(result["status"]["device_id"], "pj-pty")
             self.assertEqual(peer_result, [b"PJ_STATUS\n"])
+            self.assertEqual(termios.tcgetattr(slave_fd)[2] & termios.HUPCL, 0)
 
             import serial  # type: ignore
 
