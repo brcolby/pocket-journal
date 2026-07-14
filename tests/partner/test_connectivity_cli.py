@@ -232,5 +232,35 @@ class CalendarDeprecationTests(unittest.TestCase):
         self.assertEqual(json.loads(stdout.getvalue())["result"]["uploaded"], 0)
 
 
+class UsbRecoveryCliTests(unittest.TestCase):
+    def test_recovery_autodetects_usb_and_emits_a_credential_safe_report(self) -> None:
+        client = Mock(spec=SerialDeviceClient)
+        client.recover_usb.return_value = {
+            "port": "/dev/cu.test",
+            "initial_state": "rom_download",
+            "recovery_attempted": True,
+            "recovered": True,
+            "final_state": "application",
+            "status": {"device_id": "pj-test", "token": "private-token"},
+            "action": "normal application boot restored",
+        }
+        stdout = StringIO()
+
+        with patch("pocket_journal_partner.cli.resolve_serial_port", return_value="/dev/cu.test") as resolve:
+            with patch("pocket_journal_partner.cli.SerialDeviceClient", return_value=client) as serial_client:
+                with redirect_stdout(stdout):
+                    exit_code = cli.main(["device", "usb-recover", "--timeout", "4"])
+
+        self.assertEqual(exit_code, 0)
+        resolve.assert_called_once_with(None)
+        serial_client.assert_called_once_with("/dev/cu.test", baudrate=115200, timeout=4.0)
+        client.recover_usb.assert_called_once_with(probe_only=False)
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(payload["transport"], "usb")
+        self.assertEqual(payload["result"]["final_state"], "application")
+        self.assertEqual(payload["result"]["status"]["token"], "[redacted]")
+        self.assertNotIn("private-token", stdout.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()

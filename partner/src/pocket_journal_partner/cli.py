@@ -402,6 +402,14 @@ def cmd_device_wifi_diagnostics(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_device_usb_recover(args: argparse.Namespace) -> int:
+    port = resolve_serial_port(args.serial_port)
+    client = SerialDeviceClient(port, baudrate=args.serial_baud, timeout=args.timeout)
+    result = credential_safe_status(client.recover_usb(probe_only=args.probe_only))
+    _print_json({"device_id": "usb", "transport": "usb", "result": result})
+    return 0 if result.get("final_state") == "application" else 1
+
+
 def cmd_firmware_status(args: argparse.Namespace) -> int:
     session = _lan_session_from_args(args)
     session.require("ota.read")
@@ -708,6 +716,27 @@ def build_parser() -> argparse.ArgumentParser:
     device_mic_check.add_argument("--duration-ms", type=int, default=1500)
     device_mic_check.add_argument("--gain-db", type=int, help="temporarily set ES8311 input gain for this check, 0..42 dB")
     device_mic_check.set_defaults(func=cmd_device_mic_check)
+    device_usb_recover = device_sub.add_parser(
+        "usb-recover",
+        help="diagnose USB-C state and safely reset an ESP32-S3 out of ROM download mode",
+    )
+    device_usb_recover.add_argument(
+        "--serial-port",
+        help="USB-C serial port, such as /dev/cu.usbmodem1101; auto-detected when omitted",
+    )
+    device_usb_recover.add_argument("--serial-baud", type=int, default=115200)
+    device_usb_recover.add_argument(
+        "--timeout",
+        type=float,
+        default=8.0,
+        help="maximum probe/reconnect wait in seconds",
+    )
+    device_usb_recover.add_argument(
+        "--probe-only",
+        action="store_true",
+        help="report application, ROM, or unresponsive state without resetting",
+    )
+    device_usb_recover.set_defaults(func=cmd_device_usb_recover)
 
     firmware = sub.add_parser("firmware", help="firmware update commands")
     firmware_sub = firmware.add_subparsers(dest="firmware_command", required=True)

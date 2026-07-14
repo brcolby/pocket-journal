@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 from urllib import error, parse, request
 import glob
 import json
@@ -36,6 +37,12 @@ SERIAL_PORT_PATTERNS = (
     "/dev/ttyACM*",
     "/dev/cu.SLAB_USBtoUART*",
     "/dev/cu.wchusbserial*",
+)
+
+_USB_ROM_DOWNLOAD_MARKERS = (
+    "waiting for download",
+    "(download(usb/uart0))",
+    "boot:0x0",
 )
 
 
@@ -208,12 +215,8 @@ class SerialDeviceClient:
         self.baudrate = baudrate
         self.timeout = timeout
 
-    def _request(self, command: str) -> dict[str, Any]:
-        try:
-            import serial  # type: ignore
-        except ImportError as exc:
-            raise DeviceError("USB support requires pyserial; reinstall the partner CLI") from exc
-
+    @contextmanager
+    def _connection(self, serial_module: Any, *, read_timeout: float = 0.2) -> Iterator[Any]:
         connection = None
         try:
             # Configure the control lines before opening the descriptor. Opening
@@ -222,58 +225,63 @@ class SerialDeviceClient:
             serial_options: dict[str, Any] = {
                 "port": None,
                 "baudrate": self.baudrate,
-                "timeout": 0.2,
+                "timeout": read_timeout,
                 "write_timeout": 2.0,
                 "dsrdtr": False,
                 "rtscts": False,
             }
             if os.name != "nt":
                 serial_options["exclusive"] = True
-            connection = serial.Serial(
-                **serial_options,
-            )
+            connection = serial_module.Serial(**serial_options)
             connection.port = self.port
-            connection.dtr = False
-            connection.rts = False
+            _idle_serial_control_lines(connection)
             connection.open()
-            connection.dtr = False
-            connection.rts = False
-            time.sleep(0.1)
-            connection.reset_input_buffer()
-            connection.write(f"{command}\n".encode("ascii"))
-            connection.flush()
-            deadline = time.monotonic() + self.timeout
-            while time.monotonic() < deadline:
-                raw = connection.readline()
-                if not raw:
-                    continue
-                line = raw.decode("utf-8", errors="replace").strip()
-                if line.startswith("PJ_OK "):
-                    try:
-                        return json.loads(line[6:])
-                    except json.JSONDecodeError as exc:
-                        raise DeviceError("USB command failed: device returned invalid JSON") from exc
-                if line.startswith("PJ_ERR "):
-                    try:
-                        payload = json.loads(line[7:])
-                        message = payload.get("error", line[7:])
-                    except json.JSONDecodeError:
-                        message = line[7:]
-                    raise DeviceError(f"USB command failed: {message}")
-        except serial.SerialException as exc:
-            raise DeviceError(f"USB serial connection failed on {self.port}: {exc}") from exc
+            _idle_serial_control_lines(connection)
+            yield connection
         finally:
             if connection is not None:
                 try:
-                    connection.dtr = False
-                    connection.rts = False
-                except (serial.SerialException, OSError):
+                    _idle_serial_control_lines(connection)
+                except (serial_module.SerialException, OSError):
                     pass
                 try:
                     if connection.is_open:
                         connection.close()
-                except (serial.SerialException, OSError):
+                except (serial_module.SerialException, OSError):
                     pass
+
+    def _request(self, command: str) -> dict[str, Any]:
+        try:
+            import serial  # type: ignore
+        except ImportError as exc:
+            raise DeviceError("USB support requires pyserial; reinstall the partner CLI") from exc
+
+        try:
+            with self._connection(serial) as connection:
+                time.sleep(0.1)
+                connection.reset_input_buffer()
+                connection.write(f"{command}\n".encode("ascii"))
+                connection.flush()
+                deadline = time.monotonic() + self.timeout
+                while time.monotonic() < deadline:
+                    raw = connection.readline()
+                    if not raw:
+                        continue
+                    line = raw.decode("utf-8", errors="replace").strip()
+                    if line.startswith("PJ_OK "):
+                        try:
+                            return json.loads(line[6:])
+                        except json.JSONDecodeError as exc:
+                            raise DeviceError("USB command failed: device returned invalid JSON") from exc
+                    if line.startswith("PJ_ERR "):
+                        try:
+                            payload = json.loads(line[7:])
+                            message = payload.get("error", line[7:])
+                        except json.JSONDecodeError:
+                            message = line[7:]
+                        raise DeviceError(f"USB command failed: {message}")
+        except (serial.SerialException, OSError) as exc:
+            raise DeviceError(f"USB serial connection failed on {self.port}: {exc}") from exc
         raise DeviceError(
             f"USB command timed out on {self.port}; the port was released. Close any serial monitor and verify "
             "the firmware console uses USB Serial/JTAG. If the board says 'waiting for download', reset or "
@@ -341,6 +349,136 @@ class SerialDeviceClient:
         password_hex = password.encode("utf-8").hex()
         token_hex = token.encode("utf-8").hex()
         return self._request(f"PJ_WIFI_HEX {ssid_hex} {password_hex} {token_hex}")
+
+    def recover_usb(self, *, probe_only: bool = False) -> dict[str, Any]:
+        """Probe and, when necessary, reset an ESP32-S3 USB Serial/JTAG link."""
+        if self.timeout <= 0:
+            raise DeviceError("USB recovery timeout must be greater than zero")
+        try:
+            import serial  # type: ignore
+        except ImportError as exc:
+            raise DeviceError("USB support requires pyserial; reinstall the partner CLI") from exc
+
+        started = time.monotonic()
+        deadline = started + self.timeout
+        initial_deadline = min(deadline, started + min(1.0, max(0.2, self.timeout / 3)))
+        try:
+            initial = self._probe_usb_state(serial, initial_deadline)
+        except (serial.SerialException, OSError) as exc:
+            raise DeviceError(
+                f"USB recovery could not open {self.port}: {exc}. Close any serial monitor and retry"
+            ) from exc
+
+        report: dict[str, Any] = {
+            "port": self.port,
+            "initial_state": initial["state"],
+            "initial_evidence": initial["evidence"],
+            "recovery_attempted": False,
+            "recovered": False,
+        }
+        if initial.get("status") is not None:
+            report["status"] = initial["status"]
+        if initial["state"] == "application":
+            report.update({
+                "final_state": "application",
+                "action": "none; Pocket Journal firmware answered PJ_STATUS",
+            })
+            return report
+        if probe_only:
+            report.update({
+                "final_state": initial["state"],
+                "action": _usb_recovery_action(initial["state"], attempted=False),
+            })
+            return report
+
+        report["recovery_attempted"] = True
+        report["reset_result"] = self._reset_usb_serial_jtag(serial)
+
+        final: dict[str, Any] = {
+            "state": "port_unavailable",
+            "evidence": "serial_port_did_not_reopen",
+        }
+        while time.monotonic() < deadline:
+            attempt_deadline = min(deadline, time.monotonic() + 0.75)
+            try:
+                final = self._probe_usb_state(serial, attempt_deadline)
+            except (serial.SerialException, OSError):
+                time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
+                continue
+            if final["state"] == "application":
+                break
+            if final["state"] == "rom_download":
+                break
+            time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
+
+        report.update({
+            "final_state": final["state"],
+            "final_evidence": final["evidence"],
+            "recovered": final["state"] == "application",
+            "action": _usb_recovery_action(final["state"], attempted=True),
+        })
+        if final.get("status") is not None:
+            report["status"] = final["status"]
+        return report
+
+    def _probe_usb_state(self, serial_module: Any, deadline: float) -> dict[str, Any]:
+        with self._connection(serial_module, read_timeout=0.1) as connection:
+            connection.write(b"PJ_STATUS\n")
+            connection.flush()
+            while time.monotonic() < deadline:
+                raw = connection.readline()
+                if not raw:
+                    continue
+                line = raw.decode("utf-8", errors="replace").strip()
+                lowered = line.lower()
+                if line.startswith("PJ_OK "):
+                    try:
+                        status = json.loads(line[6:])
+                    except json.JSONDecodeError:
+                        return {"state": "application", "evidence": "PJ_OK_INVALID_JSON"}
+                    return {"state": "application", "evidence": "PJ_OK", "status": status}
+                if line.startswith("PJ_ERR "):
+                    return {"state": "application", "evidence": "PJ_ERR"}
+                if any(marker in lowered for marker in _USB_ROM_DOWNLOAD_MARKERS):
+                    return {"state": "rom_download", "evidence": "rom_boot_log"}
+        return {"state": "unresponsive", "evidence": "no_protocol_or_rom_response"}
+
+    def _reset_usb_serial_jtag(self, serial_module: Any) -> str:
+        reset_asserted = False
+        try:
+            with self._connection(serial_module, read_timeout=0.1) as connection:
+                # This mirrors esptool's HardReset(uses_usb=True): DTR remains
+                # idle while RTS resets the chip, then both lines are released.
+                connection.dtr = False
+                connection.rts = True
+                reset_asserted = True
+                time.sleep(0.2)
+                connection.rts = False
+                connection.dtr = False
+                time.sleep(0.2)
+        except (serial_module.SerialException, OSError) as exc:
+            if not reset_asserted:
+                raise DeviceError(f"USB recovery could not start reset on {self.port}: {exc}") from exc
+            return "device_reenumerated_during_reset"
+        return "rts_pulse_completed"
+
+
+def _idle_serial_control_lines(connection: Any) -> None:
+    connection.dtr = False
+    connection.rts = False
+
+
+def _usb_recovery_action(state: str, *, attempted: bool) -> str:
+    if state == "application":
+        return "normal application boot restored; retry the original USB-C command"
+    if state == "rom_download":
+        prefix = "reset completed but " if attempted else ""
+        return prefix + "ROM download mode is active; release AUX/BOOT, then retry recovery or power-cycle"
+    if state == "port_unavailable":
+        return "USB serial did not return before timeout; release AUX/BOOT and power-cycle, then rerun recovery"
+    if attempted:
+        return "reset completed but firmware did not answer; verify the flashed image and USB Serial/JTAG console"
+    return "firmware did not answer; rerun without --probe-only to attempt a bounded reset"
 
 
 def discover_serial_ports() -> list[str]:

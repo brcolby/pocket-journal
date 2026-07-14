@@ -12,6 +12,7 @@ in command output or errors.
 | Device discovery | `pj discover` | No | Yes, mDNS | None for discovery; API remains authenticated | `_pocket-journal._tcp` advertisement | No | Safe to repeat |
 | Device status | `pj device status [--device ID]` | `PJ_STATUS` | `GET /v1/status` | Physical USB access or bearer token | v0 status command/endpoint | No | Safe to repeat |
 | Wi-Fi diagnostics | `pj device wifi-diagnostics [--device ID]` | Normalizes `PJ_STATUS` | Normalizes `GET /v1/status` | Physical USB access or bearer token | Structured fields are used when firmware advertises them; older status is classified conservatively | No | Safe to repeat; output is credential-safe |
+| USB recovery | `pj device usb-recover [--probe-only]` | Probes `PJ_STATUS`, recognizes ESP32-S3 ROM boot output, and uses an explicit RTS reset when needed | No | Physical USB access | ESP32-S3 USB Serial/JTAG | Resets the device only when the application does not answer | Bounded; always releases the port and leaves DTR/RTS idle |
 | Wi-Fi provisioning | `pj provision ... [--ble \| --serial-port PORT]` | `PJ_WIFI_HEX` (default) | No; BLE is an optional provisioning transport | Physical USB access or encrypted paired BLE; generates a new bearer token | v0 USB command or Pocket Journal BLE GATT service | Yes | Repeating intentionally replaces credentials and token |
 | Time sync | `pj device sync-time [--device ID]` | `PJ_TIME` | `PUT /v1/time` | Physical USB access or bearer token | v0 time command/endpoint | Yes | Safe to repeat; USB provisioning performs it automatically and validates the echoed civil time against a host UTC anchor |
 | Read settings | `pj settings get [--device ID]` | No | `GET /v1/settings` | Bearer token | v0 settings endpoint | No | Safe to repeat |
@@ -43,8 +44,10 @@ process arguments.
 
 USB serial commands request exclusive ownership, set DTR and RTS while the port is
 still closed, and release the descriptor in every success, timeout, error, and
-interrupt path. The partner never intentionally toggles those lines into an ESP32
-download/reset sequence.
+interrupt path. Ordinary commands never intentionally toggle those lines into an
+ESP32 download/reset sequence. The explicit `pj device usb-recover` command first
+probes for a firmware response or recognizable ROM boot log; only an unresponsive
+or ROM-mode device receives the ESP32-S3 USB Serial/JTAG RTS hard-reset sequence.
 
 The shared operation session reports transport as `"usb"` or `"lan"`, preflights
 mutations, honors a firmware `capabilities` advertisement when present, and rejects
@@ -86,6 +89,7 @@ bodies in errors, preventing device-provided content from leaking secrets.
 pj discover
 pj device status
 pj device wifi-diagnostics
+pj device usb-recover
 pj device sync-time
 pj settings set volume=8 theme=dark
 pj recordings list

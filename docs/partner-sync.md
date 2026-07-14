@@ -16,6 +16,7 @@ pj settings set alarm_enabled=true alarm_hour=7 alarm_minute=30
 pj settings set clock_24h=false temperature_unit=f transcript_font_size=3
 pj device status
 pj device wifi-diagnostics
+pj device usb-recover
 pj device sync-time
 pj device tone
 pj device tone --pa-level 1
@@ -70,7 +71,12 @@ Only one process can own the USB serial port. Quit `idf.py monitor` with `Ctrl+]
 before running the partner utility over USB-C. Partner commands request exclusive
 ownership, preset DTR/RTS before opening, and release the descriptor on success,
 timeout, error, or interruption. A timeout includes recovery guidance for a board
-left in ROM download mode.
+left in ROM download mode. Run `pj device usb-recover` after closing the monitor to
+probe the application protocol, recognize available ROM download output, and issue
+a bounded RTS-only reset when needed. Use `--probe-only` to inspect without reset.
+The command closes the descriptor and returns DTR/RTS to idle on success, timeout,
+serial error, or Ctrl-C. If AUX/BOOT is physically held, release it before retrying;
+software cannot override the ESP32-S3 boot strap.
 
 `pj device wifi-diagnostics` presents an allowlisted, credential-safe view of
 provisioning, connection, DHCP, disconnect, retry, and radio state. Older firmware

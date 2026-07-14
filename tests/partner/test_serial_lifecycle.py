@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 from unittest.mock import patch
+import os
 import sys
+import threading
+import tty
 import unittest
 
 from pocket_journal_partner.device import DeviceError, SerialDeviceClient
@@ -62,6 +65,32 @@ class FakeSerialModule:
     def Serial(self, **kwargs):  # noqa: N802 - mirrors pyserial
         self.constructor_kwargs = kwargs
         return self.connection
+
+
+class QueuedSerialModule:
+    SerialException = FakeSerialException
+
+    def __init__(self, connections: list[FakeConnection]) -> None:
+        self.connections = list(connections)
+        self.constructor_kwargs: list[dict[str, object]] = []
+
+    def Serial(self, **kwargs):  # noqa: N802 - mirrors pyserial
+        self.constructor_kwargs.append(kwargs)
+        if not self.connections:
+            raise AssertionError("unexpected serial connection")
+        return self.connections.pop(0)
+
+
+class TracedConnection(FakeConnection):
+    def __init__(self, lines: list[bytes | BaseException] | None = None) -> None:
+        self.control_line_events: list[tuple[str, bool | None]] = []
+        super().__init__(lines)
+        self.control_line_events.clear()
+
+    def __setattr__(self, name: str, value) -> None:
+        if name in {"dtr", "rts"} and "control_line_events" in self.__dict__:
+            self.control_line_events.append((name, value))
+        super().__setattr__(name, value)
 
 
 class SerialLifecycleTests(unittest.TestCase):
@@ -145,6 +174,117 @@ class SerialLifecycleTests(unittest.TestCase):
 
         self.assertEqual(connection.close_count, 1)
         self.assertFalse(connection.is_open)
+
+    def test_recovery_recognizes_a_healthy_application_without_resetting(self) -> None:
+        connection = TracedConnection([b'PJ_OK {"device_id":"pj-test","token":"secret"}\n'])
+        serial_module = QueuedSerialModule([connection])
+
+        with patch.dict(sys.modules, {"serial": serial_module}):
+            result = SerialDeviceClient("/dev/cu.test", timeout=1).recover_usb()
+
+        self.assertEqual(result["initial_state"], "application")
+        self.assertEqual(result["final_state"], "application")
+        self.assertFalse(result["recovery_attempted"])
+        self.assertFalse(result["recovered"])
+        self.assertEqual(result["status"]["device_id"], "pj-test")
+        self.assertEqual(connection.writes, [b"PJ_STATUS\n"])
+        self.assertEqual(connection.close_count, 1)
+        self.assertEqual(connection.closed_control_lines, (False, False))
+
+    def test_recovery_resets_rom_download_mode_and_reprobes_application(self) -> None:
+        initial = TracedConnection([
+            b"rst:0x15 (USB_UART_CHIP_RESET),boot:0x0 (DOWNLOAD(USB/UART0))\n",
+        ])
+        reset = TracedConnection()
+        final = TracedConnection([b'PJ_OK {"device_id":"pj-test","firmware_version":"v1"}\n'])
+        serial_module = QueuedSerialModule([initial, reset, final])
+
+        with patch.dict(sys.modules, {"serial": serial_module}):
+            with patch("pocket_journal_partner.device.time.sleep"):
+                result = SerialDeviceClient("/dev/cu.test", timeout=2).recover_usb()
+
+        self.assertEqual(result["initial_state"], "rom_download")
+        self.assertTrue(result["recovery_attempted"])
+        self.assertTrue(result["recovered"])
+        self.assertEqual(result["final_state"], "application")
+        self.assertEqual(result["reset_result"], "rts_pulse_completed")
+        self.assertIn(("rts", True), reset.control_line_events)
+        self.assertEqual(reset.closed_control_lines, (False, False))
+        self.assertTrue(all(connection.close_count == 1 for connection in (initial, reset, final)))
+
+    def test_probe_only_reports_rom_without_toggling_reset(self) -> None:
+        connection = TracedConnection([b"waiting for download\n"])
+        serial_module = QueuedSerialModule([connection])
+
+        with patch.dict(sys.modules, {"serial": serial_module}):
+            result = SerialDeviceClient("/dev/cu.test", timeout=1).recover_usb(probe_only=True)
+
+        self.assertEqual(result["final_state"], "rom_download")
+        self.assertFalse(result["recovery_attempted"])
+        self.assertNotIn(("rts", True), connection.control_line_events)
+        self.assertIn("release AUX/BOOT", result["action"])
+        self.assertEqual(connection.close_count, 1)
+
+    def test_probe_timeout_is_bounded_and_releases_the_descriptor(self) -> None:
+        connection = TracedConnection()
+        serial_module = QueuedSerialModule([connection])
+
+        with patch.dict(sys.modules, {"serial": serial_module}):
+            result = SerialDeviceClient("/dev/cu.test", timeout=0.01).recover_usb(probe_only=True)
+
+        self.assertEqual(result["final_state"], "unresponsive")
+        self.assertIn("rerun without --probe-only", result["action"])
+        self.assertEqual(connection.close_count, 1)
+        self.assertFalse(connection.is_open)
+        self.assertEqual(connection.closed_control_lines, (False, False))
+
+    def test_recovery_interrupt_releases_every_open_descriptor(self) -> None:
+        initial = TracedConnection([b"waiting for download\n"])
+        reset = TracedConnection()
+        final = TracedConnection([KeyboardInterrupt()])
+        serial_module = QueuedSerialModule([initial, reset, final])
+
+        with patch.dict(sys.modules, {"serial": serial_module}):
+            with patch("pocket_journal_partner.device.time.sleep"):
+                with self.assertRaises(KeyboardInterrupt):
+                    SerialDeviceClient("/dev/cu.test", timeout=2).recover_usb()
+
+        self.assertTrue(all(connection.close_count == 1 for connection in (initial, reset, final)))
+        self.assertTrue(all(not connection.is_open for connection in (initial, reset, final)))
+        self.assertTrue(all(connection.closed_control_lines == (False, False) for connection in (initial, reset, final)))
+
+    @unittest.skipIf(os.name == "nt", "pseudo-terminals are POSIX-only")
+    def test_application_probe_over_pty_releases_the_descriptor(self) -> None:
+        master_fd, slave_fd = os.openpty()
+        slave_name = os.ttyname(slave_fd)
+        tty.setraw(slave_fd)
+        peer_result: list[bytes] = []
+
+        def peer() -> None:
+            request = os.read(master_fd, 128)
+            peer_result.append(request)
+            os.write(master_fd, b'PJ_OK {"device_id":"pj-pty"}\n')
+
+        thread = threading.Thread(target=peer, daemon=True)
+        thread.start()
+        try:
+            # PTYs do not implement modem-line ioctls. The mock tests above cover
+            # DTR/RTS; this exercises the real pyserial read/write/close lifecycle.
+            with patch("pocket_journal_partner.device._idle_serial_control_lines"):
+                result = SerialDeviceClient(slave_name, timeout=1).recover_usb(probe_only=True)
+            thread.join(timeout=1)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(result["final_state"], "application")
+            self.assertEqual(result["status"]["device_id"], "pj-pty")
+            self.assertEqual(peer_result, [b"PJ_STATUS\n"])
+
+            import serial  # type: ignore
+
+            reopened = serial.Serial(slave_name, timeout=0, exclusive=True)
+            reopened.close()
+        finally:
+            os.close(slave_fd)
+            os.close(master_fd)
 
 
 if __name__ == "__main__":

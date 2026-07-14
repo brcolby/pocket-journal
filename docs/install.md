@@ -63,6 +63,9 @@ pj device sync-time
 Provisioning and USB maintenance commands auto-detect `/dev/cu.usbmodem1101` or the single attached USB serial port. Pass `--serial-port` only to override the detected port, or pass `--ble` to provision wirelessly.
 Stop `idf.py monitor` first, because the USB serial port cannot be shared.
 If the command times out even with no monitor running, rebuild/flash firmware with USB Serial/JTAG selected as the primary console input.
+If the board is in ROM download mode, release AUX/BOOT and run `pj device
+usb-recover`. It probes before resetting and reports whether the application,
+ROM downloader, or neither answered. Add `--probe-only` to avoid the reset.
 
 ## Simulator
 
