@@ -37,6 +37,7 @@
 #include "esp_adc/adc_cali.h"
 #include "esp_adc/adc_cali_scheme.h"
 #include "esp_adc/adc_oneshot.h"
+#include "esp_app_desc.h"
 #include "esp_err.h"
 #include "esp_event.h"
 #include "esp_codec_dev.h"
@@ -3075,36 +3076,28 @@ static void refresh_ui_sync_state(pj_ui_context_t *ui)
     pj_ui_set_sync_state(ui, pending, transferred, g_status.wifi == PJ_BOARD_SERVICE_READY);
 }
 
-static int delete_dir_entries(const char *dir_path, int (*matches)(const char *name))
+static int delete_dir_entries(const char *dir_path, int (*matches)(const char *name),
+                              int *incomplete)
 {
-    DIR *dir = opendir(dir_path);
-    if (dir == NULL) {
+    pj_storage_delete_result_t result =
+        pj_storage_delete_matching(dir_path, matches, 256U);
+    if (result.open_errno == ENOENT) {
         return 0;
     }
-    int deleted = 0;
-    struct dirent *entry;
-    while ((entry = readdir(dir)) != NULL) {
-        if (entry->d_name[0] == '.' || !matches(entry->d_name)) {
-            continue;
-        }
-        char path[384];
-        size_t dir_len = strlen(dir_path);
-        size_t name_len = strlen(entry->d_name);
-        if (dir_len + 1 + name_len + 1 > sizeof(path)) {
-            ESP_LOGW(TAG, "Delete path too long: %s/%s", dir_path, entry->d_name);
-            continue;
-        }
-        memcpy(path, dir_path, dir_len);
-        path[dir_len] = '/';
-        memcpy(path + dir_len + 1, entry->d_name, name_len + 1);
-        if (remove(path) == 0) {
-            deleted++;
-        } else {
-            ESP_LOGW(TAG, "Failed to delete %s", path);
-        }
+    int failed = result.open_errno != 0 || result.scan_errno != 0 ||
+                 result.close_errno != 0 || result.allocation_errno != 0 ||
+                 result.remove_failures != 0U || result.truncated != 0U;
+    if (failed) {
+        *incomplete = 1;
+        ESP_LOGW(TAG,
+                 "Delete incomplete: dir=%s matched=%zu snapshotted=%zu deleted=%zu "
+                 "failures=%zu truncated=%zu open=%d scan=%d close=%d alloc=%d remove=%d",
+                 dir_path, result.matched, result.snapshotted, result.deleted,
+                 result.remove_failures, result.truncated, result.open_errno,
+                 result.scan_errno, result.close_errno, result.allocation_errno,
+                 result.first_remove_errno);
     }
-    closedir(dir);
-    return deleted;
+    return (int)result.deleted;
 }
 
 static int recover_dir_artifacts(const char *dir_path)
@@ -6328,9 +6321,11 @@ int pj_board_wipe_recordings(pj_ui_context_t *ui)
         ESP_LOGW(TAG, "Wipe recordings ignored: audio task active");
         return -2;
     }
-    int audio_deleted = delete_dir_entries(PJ_AUDIO_DIR, is_audio_filename);
-    int transcripts_deleted = delete_dir_entries(PJ_TRANSCRIPT_DIR, is_transcript_filename);
-    int notes_deleted = delete_dir_entries(PJ_NOTE_DIR, is_transcript_filename);
+    int incomplete = 0;
+    int audio_deleted = delete_dir_entries(PJ_AUDIO_DIR, is_audio_filename, &incomplete);
+    int transcripts_deleted = delete_dir_entries(PJ_TRANSCRIPT_DIR, is_transcript_filename,
+                                                  &incomplete);
+    int notes_deleted = delete_dir_entries(PJ_NOTE_DIR, is_transcript_filename, &incomplete);
     g_ui_note_audio_count = 0;
     g_ui_note_transcript_view = 0;
     g_notes_update_pending = 1;
@@ -6339,6 +6334,11 @@ int pj_board_wipe_recordings(pj_ui_context_t *ui)
     }
     ESP_LOGI(TAG, "Wiped recordings: audio=%d transcripts=%d metadata=%d",
              audio_deleted, transcripts_deleted, notes_deleted);
+    if (incomplete) {
+        (void)snprintf(g_status.last_error, sizeof(g_status.last_error),
+                       "recording wipe incomplete");
+        return -3;
+    }
     return audio_deleted;
 #else
     char labels[PJ_UI_MAX_NOTES][PJ_UI_NOTE_LABEL_LEN] = {0};
@@ -6719,6 +6719,8 @@ static void serial_print_status(void)
         return;
     }
     cJSON_AddStringToObject(json, "device_id", status.device_id);
+    cJSON_AddStringToObject(json, "firmware_version",
+                            esp_app_get_description()->version);
     cJSON_AddStringToObject(json, "storage", service_name(status.storage));
     cJSON_AddStringToObject(json, "audio", service_name(status.audio));
     cJSON_AddBoolToObject(json, "time_set", status.time_set != 0);
@@ -6795,6 +6797,9 @@ static void serial_command_task(void *arg)
                 printf("PJ_OK {\"deleted\":%d}\n", deleted);
             } else if (deleted == -2) {
                 printf("PJ_ERR {\"error\":\"audio task active\"}\n");
+            } else if (deleted == -3) {
+                printf("PJ_ERR {\"error\":\"recording wipe incomplete\","
+                       "\"code\":\"wipe_incomplete\",\"retryable\":true}\n");
             } else {
                 printf("PJ_ERR {\"error\":\"storage unavailable\"}\n");
             }
@@ -7054,7 +7059,8 @@ static esp_err_t status_handler(httpd_req_t *req)
         return send_json(req, "{\"error\":\"status allocation failed\"}");
     }
     cJSON_AddStringToObject(json, "device_id", g_status.device_id);
-    cJSON_AddStringToObject(json, "firmware_version", "v0");
+    cJSON_AddStringToObject(json, "firmware_version",
+                            esp_app_get_description()->version);
     cJSON_AddStringToObject(json, "board_profile", "waveshare-esp32-s3-touch-epaper-1.54-v2");
     cJSON_AddStringToObject(json, "display", service_name(g_status.display));
     cJSON_AddStringToObject(json, "storage", service_name(g_status.storage));
@@ -7756,6 +7762,12 @@ static esp_err_t audio_delete_handler(httpd_req_t *req)
     if (deleted == -2) {
         httpd_resp_set_status(req, "409 Conflict");
         return send_json(req, "{\"error\":\"audio task active\"}");
+    }
+    if (deleted == -3) {
+        httpd_resp_set_status(req, "500 Internal Server Error");
+        return send_json(req,
+                         "{\"error\":\"recording wipe incomplete\","
+                         "\"code\":\"wipe_incomplete\",\"retryable\":true}");
     }
     if (deleted < 0) {
         httpd_resp_set_status(req, "503 Service Unavailable");
