@@ -8,6 +8,8 @@ from urllib import error, parse, request
 import glob
 import json
 import os
+import subprocess
+import sys
 import time
 
 
@@ -392,7 +394,18 @@ class SerialDeviceClient:
             return report
 
         report["recovery_attempted"] = True
-        report["reset_result"] = self._reset_usb_serial_jtag(serial)
+        connect_mode = "no-reset" if initial["state"] == "rom_download" else "usb-reset"
+        remaining = max(0.0, deadline - time.monotonic())
+        watchdog_timeout = min(4.0, max(0.1, remaining * 0.6))
+        watchdog_result = self._watchdog_reset_usb_serial_jtag(
+            connect_mode=connect_mode,
+            timeout=watchdog_timeout,
+        )
+        recovery_steps = [watchdog_result]
+        if watchdog_result != "watchdog_reset_completed" and time.monotonic() < deadline:
+            recovery_steps.append(self._hard_reset_usb_serial_jtag(serial))
+        report["reset_result"] = recovery_steps[-1]
+        report["recovery_steps"] = recovery_steps
 
         final: dict[str, Any] = {
             "state": "port_unavailable",
@@ -443,29 +456,94 @@ class SerialDeviceClient:
                     return {"state": "rom_download", "evidence": "rom_boot_log"}
         return {"state": "unresponsive", "evidence": "no_protocol_or_rom_response"}
 
-    def _reset_usb_serial_jtag(self, serial_module: Any) -> str:
+    def _watchdog_reset_usb_serial_jtag(self, *, connect_mode: str, timeout: float) -> str:
+        """Use esptool's ROM protocol to reset without relying on the RTS line."""
+        command = [
+            sys.executable,
+            "-m",
+            "esptool",
+            "--chip",
+            "esp32s3",
+            "--port",
+            self.port,
+            "--baud",
+            str(self.baudrate),
+            "--before",
+            connect_mode,
+            "--after",
+            "watchdog-reset",
+            "--no-stub",
+            "--connect-attempts",
+            "1",
+            "--silent",
+            "read-mac",
+        ]
+        process = None
+        try:
+            process = subprocess.Popen(
+                command,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            process.communicate(timeout=max(0.1, timeout))
+        except subprocess.TimeoutExpired:
+            if process is not None:
+                _stop_child_process(process)
+            return "watchdog_reset_timed_out"
+        except OSError:
+            if process is not None:
+                _stop_child_process(process)
+            return "watchdog_reset_unavailable"
+        except BaseException:
+            if process is not None:
+                _stop_child_process(process)
+            raise
+
+        if process.returncode == 0:
+            return "watchdog_reset_completed"
+        return f"watchdog_reset_failed_exit_{process.returncode}"
+
+    def _hard_reset_usb_serial_jtag(self, serial_module: Any) -> str:
         reset_asserted = False
         try:
             with self._connection(serial_module, read_timeout=0.1) as connection:
-                # This mirrors esptool's HardReset(uses_usb=True): DTR remains
-                # idle while RTS resets the chip, then both lines are released.
+                # ESP32-S3 passes uses_usb_otg=False for USB-Serial/JTAG, so its
+                # esptool hard reset is a short RTS pulse with DTR left idle.
                 connection.dtr = False
                 connection.rts = True
                 reset_asserted = True
-                time.sleep(0.2)
+                time.sleep(0.1)
                 connection.rts = False
                 connection.dtr = False
-                time.sleep(0.2)
+                time.sleep(0.1)
         except (serial_module.SerialException, OSError) as exc:
             if not reset_asserted:
                 raise DeviceError(f"USB recovery could not start reset on {self.port}: {exc}") from exc
             return "device_reenumerated_during_reset"
-        return "rts_pulse_completed"
+        return "rts_hard_reset_completed"
 
 
 def _idle_serial_control_lines(connection: Any) -> None:
     connection.dtr = False
     connection.rts = False
+
+
+def _stop_child_process(process: Any) -> None:
+    if process.poll() is None:
+        try:
+            process.terminate()
+        except ProcessLookupError:
+            pass
+    try:
+        process.communicate(timeout=0.5)
+    except subprocess.TimeoutExpired:
+        try:
+            process.kill()
+        except ProcessLookupError:
+            pass
+        process.communicate()
 
 
 def _usb_recovery_action(state: str, *, attempted: bool) -> str:

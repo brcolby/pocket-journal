@@ -7,7 +7,7 @@ name = "pocket-journal-partner"
 version = "0.1.0"
 description = "Partner CLI for Pocket Journal"
 requires-python = ">=3.11"
-dependencies = ["pyserial>=3.5"]
+dependencies = ["esptool>=5.3,<6", "pyserial>=3.5"]
 
 [project.optional-dependencies]
 ble = ["bleak>=0.22", "zeroconf>=0.132"]

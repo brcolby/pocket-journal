@@ -2,12 +2,13 @@ from __future__ import annotations
 
 from unittest.mock import patch
 import os
+import subprocess
 import sys
 import threading
 import tty
 import unittest
 
-from pocket_journal_partner.device import DeviceError, SerialDeviceClient
+from pocket_journal_partner.device import DeviceError, SerialDeviceClient, _stop_child_process
 
 
 class FakeSerialException(Exception):
@@ -91,6 +92,35 @@ class TracedConnection(FakeConnection):
         if name in {"dtr", "rts"} and "control_line_events" in self.__dict__:
             self.control_line_events.append((name, value))
         super().__setattr__(name, value)
+
+
+class FakeProcess:
+    def __init__(
+        self,
+        outcomes: list[tuple[str, str] | BaseException] | None = None,
+        *,
+        returncode: int | None = 0,
+    ) -> None:
+        self.outcomes = list(outcomes or [("", "")])
+        self.returncode = returncode
+        self.events: list[tuple[str, float | None] | tuple[str]] = []
+
+    def communicate(self, timeout: float | None = None) -> tuple[str, str]:
+        self.events.append(("communicate", timeout))
+        outcome = self.outcomes.pop(0) if self.outcomes else ("", "")
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
+
+    def poll(self) -> int | None:
+        self.events.append(("poll",))
+        return self.returncode
+
+    def terminate(self) -> None:
+        self.events.append(("terminate",))
+
+    def kill(self) -> None:
+        self.events.append(("kill",))
 
 
 class SerialLifecycleTests(unittest.TestCase):
@@ -195,22 +225,77 @@ class SerialLifecycleTests(unittest.TestCase):
         initial = TracedConnection([
             b"rst:0x15 (USB_UART_CHIP_RESET),boot:0x0 (DOWNLOAD(USB/UART0))\n",
         ])
-        reset = TracedConnection()
         final = TracedConnection([b'PJ_OK {"device_id":"pj-test","firmware_version":"v1"}\n'])
-        serial_module = QueuedSerialModule([initial, reset, final])
+        serial_module = QueuedSerialModule([initial, final])
+        client = SerialDeviceClient("/dev/cu.test", timeout=2)
 
         with patch.dict(sys.modules, {"serial": serial_module}):
-            with patch("pocket_journal_partner.device.time.sleep"):
-                result = SerialDeviceClient("/dev/cu.test", timeout=2).recover_usb()
+            with patch.object(
+                client,
+                "_watchdog_reset_usb_serial_jtag",
+                return_value="watchdog_reset_completed",
+            ) as watchdog_reset:
+                result = client.recover_usb()
 
         self.assertEqual(result["initial_state"], "rom_download")
         self.assertTrue(result["recovery_attempted"])
         self.assertTrue(result["recovered"])
         self.assertEqual(result["final_state"], "application")
-        self.assertEqual(result["reset_result"], "rts_pulse_completed")
-        self.assertIn(("rts", True), reset.control_line_events)
+        self.assertEqual(result["reset_result"], "watchdog_reset_completed")
+        self.assertEqual(result["recovery_steps"], ["watchdog_reset_completed"])
+        watchdog_reset.assert_called_once()
+        self.assertEqual(watchdog_reset.call_args.kwargs["connect_mode"], "no-reset")
+        self.assertGreater(watchdog_reset.call_args.kwargs["timeout"], 0)
+        self.assertTrue(all(connection.close_count == 1 for connection in (initial, final)))
+
+    def test_failed_watchdog_recovery_uses_exact_rts_hard_reset_fallback(self) -> None:
+        initial = TracedConnection([b"waiting for download\n"])
+        reset = TracedConnection()
+        final = TracedConnection([b'PJ_OK {"device_id":"pj-test"}\n'])
+        serial_module = QueuedSerialModule([initial, reset, final])
+        client = SerialDeviceClient("/dev/cu.test", timeout=2)
+
+        with patch.dict(sys.modules, {"serial": serial_module}):
+            with patch.object(
+                client,
+                "_watchdog_reset_usb_serial_jtag",
+                return_value="watchdog_reset_failed_exit_2",
+            ):
+                with patch("pocket_journal_partner.device.time.sleep"):
+                    result = client.recover_usb()
+
+        self.assertTrue(result["recovered"])
+        self.assertEqual(result["reset_result"], "rts_hard_reset_completed")
+        self.assertEqual(
+            result["recovery_steps"],
+            ["watchdog_reset_failed_exit_2", "rts_hard_reset_completed"],
+        )
+        asserted = reset.control_line_events.index(("rts", True))
+        released = reset.control_line_events.index(("rts", False), asserted + 1)
+        self.assertLess(asserted, released)
+        self.assertNotIn(("dtr", True), reset.control_line_events)
         self.assertEqual(reset.closed_control_lines, (False, False))
         self.assertTrue(all(connection.close_count == 1 for connection in (initial, reset, final)))
+
+    def test_unresponsive_probe_selects_usb_jtag_bootloader_reset(self) -> None:
+        serial_module = QueuedSerialModule([])
+        client = SerialDeviceClient("/dev/cu.test", timeout=2)
+        probe_results = [
+            {"state": "unresponsive", "evidence": "no_protocol_or_rom_response"},
+            {"state": "application", "evidence": "PJ_OK", "status": {"device_id": "pj-test"}},
+        ]
+
+        with patch.dict(sys.modules, {"serial": serial_module}):
+            with patch.object(client, "_probe_usb_state", side_effect=probe_results):
+                with patch.object(
+                    client,
+                    "_watchdog_reset_usb_serial_jtag",
+                    return_value="watchdog_reset_completed",
+                ) as watchdog_reset:
+                    result = client.recover_usb()
+
+        self.assertTrue(result["recovered"])
+        self.assertEqual(watchdog_reset.call_args.kwargs["connect_mode"], "usb-reset")
 
     def test_probe_only_reports_rom_without_toggling_reset(self) -> None:
         connection = TracedConnection([b"waiting for download\n"])
@@ -240,18 +325,98 @@ class SerialLifecycleTests(unittest.TestCase):
 
     def test_recovery_interrupt_releases_every_open_descriptor(self) -> None:
         initial = TracedConnection([b"waiting for download\n"])
-        reset = TracedConnection()
         final = TracedConnection([KeyboardInterrupt()])
-        serial_module = QueuedSerialModule([initial, reset, final])
+        serial_module = QueuedSerialModule([initial, final])
+        client = SerialDeviceClient("/dev/cu.test", timeout=2)
 
         with patch.dict(sys.modules, {"serial": serial_module}):
-            with patch("pocket_journal_partner.device.time.sleep"):
+            with patch.object(
+                client,
+                "_watchdog_reset_usb_serial_jtag",
+                return_value="watchdog_reset_completed",
+            ):
                 with self.assertRaises(KeyboardInterrupt):
-                    SerialDeviceClient("/dev/cu.test", timeout=2).recover_usb()
+                    client.recover_usb()
 
-        self.assertTrue(all(connection.close_count == 1 for connection in (initial, reset, final)))
-        self.assertTrue(all(not connection.is_open for connection in (initial, reset, final)))
-        self.assertTrue(all(connection.closed_control_lines == (False, False) for connection in (initial, reset, final)))
+        self.assertTrue(all(connection.close_count == 1 for connection in (initial, final)))
+        self.assertTrue(all(not connection.is_open for connection in (initial, final)))
+        self.assertTrue(all(connection.closed_control_lines == (False, False) for connection in (initial, final)))
+
+    def test_watchdog_recovery_runs_non_flashing_esptool_command(self) -> None:
+        process = FakeProcess(returncode=0)
+        client = SerialDeviceClient("/dev/cu.test", baudrate=230400, timeout=2)
+
+        with patch("pocket_journal_partner.device.subprocess.Popen", return_value=process) as popen:
+            result = client._watchdog_reset_usb_serial_jtag(connect_mode="usb-reset", timeout=1.5)
+
+        self.assertEqual(result, "watchdog_reset_completed")
+        command = popen.call_args.args[0]
+        self.assertEqual(command[:3], [sys.executable, "-m", "esptool"])
+        self.assertIn("usb-reset", command)
+        self.assertIn("watchdog-reset", command)
+        self.assertIn("--no-stub", command)
+        self.assertEqual(command[-1], "read-mac")
+        self.assertNotIn("write-flash", command)
+        self.assertEqual(process.events, [("communicate", 1.5)])
+
+    def test_watchdog_timeout_terminates_and_waits_for_child(self) -> None:
+        process = FakeProcess([
+            subprocess.TimeoutExpired("esptool", 0.2),
+            ("", ""),
+        ], returncode=None)
+        client = SerialDeviceClient("/dev/cu.test", timeout=2)
+
+        with patch("pocket_journal_partner.device.subprocess.Popen", return_value=process):
+            result = client._watchdog_reset_usb_serial_jtag(connect_mode="usb-reset", timeout=0.2)
+
+        self.assertEqual(result, "watchdog_reset_timed_out")
+        self.assertEqual(process.events, [
+            ("communicate", 0.2),
+            ("poll",),
+            ("terminate",),
+            ("communicate", 0.5),
+        ])
+
+    def test_watchdog_timeout_kills_child_that_ignores_terminate(self) -> None:
+        process = FakeProcess([
+            subprocess.TimeoutExpired("esptool", 0.2),
+            subprocess.TimeoutExpired("esptool", 0.5),
+            ("", ""),
+        ], returncode=None)
+        client = SerialDeviceClient("/dev/cu.test", timeout=2)
+
+        with patch("pocket_journal_partner.device.subprocess.Popen", return_value=process):
+            result = client._watchdog_reset_usb_serial_jtag(connect_mode="usb-reset", timeout=0.2)
+
+        self.assertEqual(result, "watchdog_reset_timed_out")
+        self.assertEqual(process.events[-3:], [
+            ("communicate", 0.5),
+            ("kill",),
+            ("communicate", None),
+        ])
+
+    def test_watchdog_interrupt_terminates_child_before_propagating(self) -> None:
+        process = FakeProcess([KeyboardInterrupt(), ("", "")], returncode=None)
+        client = SerialDeviceClient("/dev/cu.test", timeout=2)
+
+        with patch("pocket_journal_partner.device.subprocess.Popen", return_value=process):
+            with self.assertRaises(KeyboardInterrupt):
+                client._watchdog_reset_usb_serial_jtag(connect_mode="usb-reset", timeout=1)
+
+        self.assertIn(("terminate",), process.events)
+        self.assertEqual(process.events[-1], ("communicate", 0.5))
+
+    def test_child_cleanup_reaps_a_real_process(self) -> None:
+        process = subprocess.Popen([
+            sys.executable,
+            "-c",
+            "import time; time.sleep(60)",
+        ])
+
+        _stop_child_process(process)
+
+        self.assertIsNotNone(process.returncode)
+        self.assertIsNotNone(process.poll())
 
     @unittest.skipIf(os.name == "nt", "pseudo-terminals are POSIX-only")
     def test_application_probe_over_pty_releases_the_descriptor(self) -> None:
