@@ -605,10 +605,23 @@ static void test_audio_lifecycle_reconciliation(void)
     assert(ui.record_state == PJ_RECORD_STOPPING);
     pj_ui_set_audio_state(&ui, 1, 0);
     assert(ui.record_state == PJ_RECORD_STOPPING);
-    assert(pj_ui_handle_aux_short(&ui) == 0);
-    assert(pj_ui_current_state(&ui) == PJ_UI_STATE_HOME);
+    assert(pj_ui_handle_aux_short(&ui) == 1);
+    assert(ui.focus_index == 1);
+    assert(pj_ui_handle_aux_double(&ui) == 1);
+    assert(pj_ui_current_state(&ui) == PJ_UI_STATE_TIME);
+    assert(ui.record_state == PJ_RECORD_STOPPING);
     pj_ui_set_audio_state(&ui, 0, 0);
     assert(ui.record_state == PJ_RECORD_IDLE);
+
+    pj_ui_init(&ui);
+    ui.state = PJ_UI_STATE_HOME;
+    ui.record_state = PJ_RECORD_STOPPING;
+    assert(pj_ui_handle_aux_double(&ui) == 0);
+    assert(pj_ui_current_state(&ui) == PJ_UI_STATE_HOME);
+    assert(pj_ui_handle_touch(&ui, 20, 50, PJ_TOUCH_TAP) == 1);
+    assert(pj_ui_current_state(&ui) == PJ_UI_STATE_NOTES);
+    assert(pj_ui_handle_touch(&ui, 100, 30, PJ_TOUCH_TAP) == 0);
+    assert(pj_ui_current_state(&ui) == PJ_UI_STATE_NOTES);
 }
 
 static void test_settings_rows_control_volume_appearance_and_clock(void)
@@ -1373,6 +1386,9 @@ static void test_recording_elapsed_projection_is_bounded_and_monotonic_by_second
     assert(ui.dirty.partial == 1);
     assert(ui.dirty.y == 55 && ui.dirty.height == 90);
     pj_ui_mark_displayed(&ui);
+    assert(pj_ui_tick(&ui) == 0);
+    assert(ui.recording_seconds == 1);
+    assert(pj_ui_is_dirty(&ui) == 0);
     pj_ui_set_recording_elapsed(&ui, 1999);
     assert(pj_ui_is_dirty(&ui) == 0);
     pj_ui_set_recording_elapsed(&ui, 2000);
@@ -1423,7 +1439,8 @@ static void test_record_partial_render_replaces_status_through_bottom_edge(void)
     assert(ui.dirty.x == 0 && ui.dirty.y == 0);
     assert(ui.dirty.width == PJ_DISPLAY_WIDTH);
     assert(ui.dirty.y + ui.dirty.height == PJ_DISPLAY_HEIGHT);
-    assert(pj_ui_tick(&ui) == 1);
+    assert(pj_ui_tick(&ui) == 0);
+    pj_ui_set_recording_elapsed(&ui, 1000);
     pj_ui_render(&ui, &partial);
 
     expected_ui = ui;

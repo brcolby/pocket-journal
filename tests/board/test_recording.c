@@ -33,9 +33,11 @@ static void test_stop_process_and_completion_are_ordered_and_one_shot(void)
     assert(!pj_recording_take_completion(&recording, &succeeded));
     assert(pj_recording_finish_processing(&recording, 1));
     assert(recording.phase == PJ_RECORDING_READY);
+    assert(!pj_recording_start(&recording, 16000, 1, 16));
     assert(pj_recording_take_completion(&recording, &succeeded));
     assert(succeeded);
     assert(!pj_recording_take_completion(&recording, &succeeded));
+    assert(pj_recording_start(&recording, 16000, 1, 16));
 }
 
 static void test_capture_and_processing_failures_never_publish_success(void)

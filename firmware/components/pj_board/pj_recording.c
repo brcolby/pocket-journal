@@ -37,6 +37,7 @@ int pj_recording_start(pj_recording_t *recording, uint32_t sample_rate,
 {
     if (recording == NULL ||
         !format_valid(sample_rate, channels, bits_per_sample) ||
+        recording->completion_pending ||
         recording->phase == PJ_RECORDING_CAPTURING ||
         recording->phase == PJ_RECORDING_STOPPING ||
         recording->phase == PJ_RECORDING_PROCESSING) {

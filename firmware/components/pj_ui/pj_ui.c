@@ -1503,18 +1503,26 @@ int pj_ui_handle_aux_short(pj_ui_context_t *ctx)
         set_state(ctx, PJ_UI_STATE_HOME);
         return 1;
     case PJ_UI_STATE_HOME:
-        if (ctx->record_state != PJ_RECORD_IDLE || ctx->playback_state != PJ_PLAYBACK_IDLE) {
+        if (ctx->record_state == PJ_RECORD_ACTIVE ||
+            ctx->playback_state != PJ_PLAYBACK_IDLE) {
             return 0;
         }
         if (ctx->home_layout.slot_count == 1) {
             pj_ui_state_t only = state_from_destination(ctx->home_layout.slots[0].destination);
-            if (only == PJ_UI_STATE_HOME) return 0;
+            if (only == PJ_UI_STATE_HOME ||
+                (only == PJ_UI_STATE_RECORD && ctx->record_state != PJ_RECORD_IDLE)) {
+                return 0;
+            }
             set_state(ctx, only);
             return 1;
         }
         return cycle_focus(ctx);
     case PJ_UI_STATE_NOTES:
         if (ctx->focus_index == 0) {
+            if (ctx->record_state != PJ_RECORD_IDLE ||
+                ctx->playback_state != PJ_PLAYBACK_IDLE) {
+                return 0;
+            }
             ctx->record_state = PJ_RECORD_ACTIVE;
             ctx->recording_seconds = 0;
         }
@@ -1669,10 +1677,14 @@ int pj_ui_handle_aux_double(pj_ui_context_t *ctx)
         return 1;
     }
     if (ctx->state == PJ_UI_STATE_HOME) {
-        if (ctx->record_state != PJ_RECORD_IDLE || ctx->playback_state != PJ_PLAYBACK_IDLE) {
+        if (ctx->record_state == PJ_RECORD_ACTIVE ||
+            ctx->playback_state != PJ_PLAYBACK_IDLE) {
             return 0;
         }
         if (ctx->focus_index == 0) {
+            if (ctx->record_state != PJ_RECORD_IDLE) {
+                return 0;
+            }
             ctx->record_state = PJ_RECORD_ACTIVE;
             ctx->recording_seconds = 0;
             set_state(ctx, PJ_UI_STATE_RECORD);
@@ -1681,6 +1693,10 @@ int pj_ui_handle_aux_double(pj_ui_context_t *ctx)
         tile_t tiles[PJ_HOME_MAX_SLOTS];
         size_t count = home_tiles(ctx, tiles);
         if ((size_t)ctx->focus_index < count) {
+            if (tiles[ctx->focus_index].next == PJ_UI_STATE_RECORD &&
+                ctx->record_state != PJ_RECORD_IDLE) {
+                return 0;
+            }
             set_state(ctx, tiles[ctx->focus_index].next);
             return 1;
         }
@@ -1709,13 +1725,6 @@ int pj_ui_tick(pj_ui_context_t *ctx)
 {
     int changed = 0;
     switch (ctx->state) {
-    case PJ_UI_STATE_RECORD:
-        if (ctx->record_state == PJ_RECORD_ACTIVE) {
-            ctx->recording_seconds++;
-            mark_dynamic_partial(ctx, 0, 55, PJ_DISPLAY_WIDTH, 90);
-            changed = 1;
-        }
-        break;
     case PJ_UI_STATE_STOPWATCH:
         if (ctx->stopwatch_running) {
             ctx->stopwatch_seconds++;
@@ -1811,6 +1820,11 @@ int pj_ui_handle_touch(pj_ui_context_t *ctx, int x, int y, pj_touch_kind_t kind)
         tile_t tiles[PJ_HOME_MAX_SLOTS];
         size_t tile_count = home_tiles(ctx, tiles);
         if (tile_hit(tiles, tile_count, x, y, &next)) {
+            if (next == PJ_UI_STATE_RECORD &&
+                (ctx->record_state != PJ_RECORD_IDLE ||
+                 ctx->playback_state != PJ_PLAYBACK_IDLE)) {
+                return 0;
+            }
             set_state(ctx, next);
             return 1;
         }
@@ -1822,6 +1836,10 @@ int pj_ui_handle_touch(pj_ui_context_t *ctx, int x, int y, pj_touch_kind_t kind)
                 if (next == NOTES_TILES[i].next) ctx->focus_index = (int)i;
             }
             if (next == PJ_UI_STATE_RECORD) {
+                if (ctx->record_state != PJ_RECORD_IDLE ||
+                    ctx->playback_state != PJ_PLAYBACK_IDLE) {
+                    return 0;
+                }
                 ctx->record_state = PJ_RECORD_ACTIVE;
                 ctx->recording_seconds = 0;
             }
