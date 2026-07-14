@@ -67,7 +67,7 @@ function frame() {
 
 const fullBleed = (minEdgeSides = 3) => ({ maxEdgePixels: Infinity, maxComponentFraction: 1, minEdgeSides });
 const scenarios = [
-  ["static", "static", () => api.pj_sim_reset()],
+  ["static", "static", () => api.pj_sim_reset(), { ...fullBleed(4), maxDensity: 0.75 }],
   ["time-temp", "time_temp", () => { api.pj_sim_reset(); api.pj_sim_set_status(84, 22, 45); api.pj_sim_set_time(9, 41, 2026, 6, 6); api.pj_sim_wake(); }],
   ["time-temp-12h-f", "time_temp", () => { api.pj_sim_reset(); api.pj_sim_set_status(84, 22, 45); api.pj_sim_set_time(21, 41, 2026, 6, 6); api.pj_sim_set_preferences(0, 1, 3); api.pj_sim_wake(); }],
   ["home", "home", resetToHome, fullBleed()],

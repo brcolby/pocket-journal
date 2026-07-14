@@ -2,6 +2,34 @@
 
 The resting screen accepts one custom 200x200 monochrome bitmap through the authenticated device API.
 
+## Built-In Artwork
+
+The product default is preserved at
+`assets/static/pocket-journal-default.png`. It is a 200x200, 8-bit grayscale,
+non-interlaced PNG without alpha. Its pixels are already strictly monochrome
+(`0` or `255`), and its SHA-256 is
+`ef0fb9a1a2764e19d04056ee57bf9af0c86c2baba2aae098ed945dc07c0d4e9d`.
+
+`tools/generate_static_art.py` validates and decodes the PNG without a third-party
+image library. It treats grayscale values below 128 as black and generates:
+
+- `assets/static/pocket-journal-default.pbm`, an ASCII PBM accepted by `pj static-art set`
+- `firmware/components/pj_ui/include/pj_default_static_art.h`, dimensions and generation metadata
+- `firmware/components/pj_ui/pj_default_static_art.c`, the compiled 5,000-byte bitmap
+
+The compiled bitmap uses the same representation as `pj_static_art_t`: pixels
+are row-major from the top-left, black is `1`, and the first pixel in each byte
+is bit 0. Regenerate and verify the committed outputs with:
+
+```sh
+make generate-static-art
+make check-static-art
+```
+
+When the device has no valid custom artwork on microSD, firmware and simulator
+render this compiled bitmap without text or compositing. A valid custom bitmap
+still takes precedence over the built-in image.
+
 ## API
 
 `PUT /v1/static-art` accepts JSON with these exact bitmap dimensions and row encoding. The shape below shows one row; a request contains 200 such rows.

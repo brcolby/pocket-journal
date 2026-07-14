@@ -1,4 +1,5 @@
 #include "pj_static_art.h"
+#include "pj_default_static_art.h"
 
 #include <assert.h>
 #include <stdio.h>
@@ -77,11 +78,34 @@ static void test_record_round_trip_and_corruption(void)
     assert(pj_static_art_decode_record(record, sizeof(record) - 1, &decoded) == 0);
 }
 
+static void test_compiled_default_uses_static_art_record_format(void)
+{
+    pj_static_art_t art;
+    pj_static_art_t decoded;
+    uint8_t record[PJ_STATIC_ART_RECORD_BYTES];
+    int black_pixels = 0;
+
+    assert(PJ_DEFAULT_STATIC_ART_WIDTH == PJ_STATIC_ART_WIDTH);
+    assert(PJ_DEFAULT_STATIC_ART_HEIGHT == PJ_STATIC_ART_HEIGHT);
+    assert(PJ_DEFAULT_STATIC_ART_BYTES == PJ_STATIC_ART_BYTES);
+    memcpy(art.pixels, pj_default_static_art, sizeof(art.pixels));
+    for (int y = 0; y < PJ_STATIC_ART_HEIGHT; y++) {
+        for (int x = 0; x < PJ_STATIC_ART_WIDTH; x++) {
+            black_pixels += pj_static_art_pixel(&art, x, y);
+        }
+    }
+    assert(black_pixels == PJ_DEFAULT_STATIC_ART_BLACK_PIXELS);
+    assert(pj_static_art_encode_record(&art, record, sizeof(record)) == sizeof(record));
+    assert(pj_static_art_decode_record(record, sizeof(record), &decoded) == 1);
+    assert(memcmp(art.pixels, decoded.pixels, sizeof(art.pixels)) == 0);
+}
+
 int main(void)
 {
     test_valid_rows_and_pixel_mapping();
     test_validation_errors();
     test_record_round_trip_and_corruption();
+    test_compiled_default_uses_static_art_record_format();
     puts("static art tests passed");
     return 0;
 }

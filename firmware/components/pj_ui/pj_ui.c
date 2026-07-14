@@ -1,4 +1,5 @@
 #include "pj_ui.h"
+#include "pj_default_static_art.h"
 #include "pj_icon_carbon.h"
 #include "pj_font_space_mono.h"
 
@@ -26,6 +27,13 @@
 #define PJ_UI_NOTES_PER_PAGE 3
 #define PJ_UI_NOTE_PAGER_TOP 150
 #define PJ_UI_BUTTON_BORDER_WIDTH 3
+
+_Static_assert(PJ_DEFAULT_STATIC_ART_WIDTH == PJ_DISPLAY_WIDTH,
+               "default static art width must match the display");
+_Static_assert(PJ_DEFAULT_STATIC_ART_HEIGHT == PJ_DISPLAY_HEIGHT,
+               "default static art height must match the display");
+_Static_assert(PJ_DEFAULT_STATIC_ART_BYTES == PJ_FRAMEBUFFER_BYTES,
+               "default static art packing must match the framebuffer");
 
 #if defined(PJ_UI_USE_LVGL)
 #define PJ_LVGL_PALETTE_BYTES 8
@@ -1897,23 +1905,15 @@ int pj_ui_handle_touch(pj_ui_context_t *ctx, int x, int y, pj_touch_kind_t kind)
 
 static void draw_home_static(const pj_ui_context_t *ctx, pj_framebuffer_t *fb)
 {
-    if (ctx->static_art_valid) {
-        for (int y = 0; y < PJ_DISPLAY_HEIGHT; y++) {
-            for (int x = 0; x < PJ_DISPLAY_WIDTH; x++) {
-                size_t index = (size_t)y * PJ_DISPLAY_WIDTH + (size_t)x;
-                if ((ctx->static_art[index >> 3u] >> (index & 7u)) & 1u) {
-                    fb_set(fb, x, y, 1);
-                }
+    const uint8_t *pixels = ctx->static_art_valid ? ctx->static_art : pj_default_static_art;
+    for (int y = 0; y < PJ_DISPLAY_HEIGHT; y++) {
+        for (int x = 0; x < PJ_DISPLAY_WIDTH; x++) {
+            size_t index = (size_t)y * PJ_DISPLAY_WIDTH + (size_t)x;
+            if ((pixels[index >> 3u] >> (index & 7u)) & 1u) {
+                fb_set(fb, x, y, 1);
             }
         }
-        return;
     }
-    draw_rect(fb, 22, 12, 156, 176);
-    draw_vline(fb, 35, 22, 177);
-    draw_vline(fb, 40, 22, 177);
-    draw_icon(fb, "NOTE", 106, 98, 82);
-    draw_hline(fb, 58, 154, 154);
-    draw_hline(fb, 72, 140, 162);
 }
 
 static void draw_time_temp(const pj_ui_context_t *ctx, pj_framebuffer_t *fb)
@@ -2208,7 +2208,7 @@ static void render_scene(const pj_ui_context_t *ctx, pj_framebuffer_t *fb)
         draw_text(fb, 150, 8, "TIME?", 1);
     }
 
-    if (ctx->dark_mode && !(ctx->state == PJ_UI_STATE_STATIC && ctx->static_art_valid)) {
+    if (ctx->dark_mode && ctx->state != PJ_UI_STATE_STATIC) {
         invert_framebuffer(fb);
     }
 }

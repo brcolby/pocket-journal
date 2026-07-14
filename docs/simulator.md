@@ -41,7 +41,10 @@ Rebuild and test the generated WebAssembly runtime boundary:
 make test-simulator-runtime
 ```
 
-For custom resting art, set `localStorage.pocketJournalStaticArt` to the same `/v1/static-art` JSON shape. If none is present, the firmware renderer shows the text-free placeholder notebook splash.
+The simulator starts on the compiled product artwork documented in
+[`static-art.md`](static-art.md), using the same packed bytes as firmware. The
+WebAssembly runtime test compares all 40,000 rendered pixels with the generated
+PBM to catch rotation, mirroring, inversion, or packing changes.
 
 Run it:
 

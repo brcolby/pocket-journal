@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 
 const wasmBytes = await readFile("simulator/generated/pj_ui_wasm.wasm");
+const staticArtPbm = await readFile("assets/static/pocket-journal-default.pbm", "utf8");
 const { instance } = await WebAssembly.instantiate(wasmBytes, {
   env: {
     emscripten_resize_heap: () => 0,
@@ -38,10 +39,29 @@ function framebufferSnapshot() {
   return new Uint8Array(api.memory.buffer.slice(start, end));
 }
 
+function packedPbm(source) {
+  const tokens = source.replace(/^#.*$/gm, "").trim().split(/\s+/);
+  assert.equal(tokens.shift(), "P1");
+  assert.equal(Number(tokens.shift()), 200);
+  assert.equal(Number(tokens.shift()), 200);
+  assert.equal(tokens.length, 200 * 200);
+  const packed = new Uint8Array(5000);
+  tokens.forEach((pixel, index) => {
+    assert.ok(pixel === "0" || pixel === "1");
+    if (pixel === "1") packed[index >> 3] |= 1 << (index & 7);
+  });
+  return packed;
+}
+
 api.pj_sim_init();
 assert.equal(api.pj_sim_display_width(), 200);
 assert.equal(api.pj_sim_display_height(), 200);
 assert.equal(api.pj_sim_framebuffer_bytes(), 5000);
+assert.deepEqual(
+  framebufferSnapshot(),
+  packedPbm(staticArtPbm),
+  "simulator fallback must preserve the generated artwork orientation and pixels",
+);
 assert.equal(api.pj_sim_aux_double(), 1);
 assertRendered("record");
 assert.equal(api.pj_sim_record_state(), 1);

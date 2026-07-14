@@ -1,4 +1,4 @@
-.PHONY: test test-ui test-input test-partner test-simulator test-simulator-runtime test-ui-images ui-gallery check-lvgl-managed generate-font-assets generate-icon-assets generate-simulator-wasm simulator clean
+.PHONY: test test-ui test-input test-partner test-simulator test-simulator-runtime test-ui-images ui-gallery check-lvgl-managed check-static-art generate-static-art generate-font-assets generate-icon-assets generate-simulator-wasm simulator clean
 
 CC ?= cc
 CFLAGS ?= -std=c11 -Wall -Wextra -Werror -pedantic
@@ -48,12 +48,13 @@ check-lvgl-managed:
 		exit 1; \
 	fi
 
-test-ui: check-lvgl-managed
+test-ui: check-lvgl-managed check-static-art
 	mkdir -p build
 	$(CC) $(CFLAGS) $(LVGL_CFLAGS) \
 		-Ifirmware/components/pj_ui/include \
 		$(LVGL_SRCS) \
 		firmware/components/pj_ui/pj_home_layout.c \
+		firmware/components/pj_ui/pj_default_static_art.c \
 		firmware/components/pj_ui/pj_ui.c \
 		tests/ui/test_ui_core.c \
 		-o $(UI_TEST_BIN)
@@ -111,7 +112,9 @@ test-input:
 	$(SETTINGS_TEST_BIN)
 	$(CC) $(CFLAGS) \
 		-Ifirmware/components/pj_board/include \
+		-Ifirmware/components/pj_ui/include \
 		firmware/components/pj_board/pj_static_art.c \
+		firmware/components/pj_ui/pj_default_static_art.c \
 		tests/board/test_static_art.c \
 		-o $(STATIC_ART_TEST_BIN)
 	$(STATIC_ART_TEST_BIN)
@@ -183,6 +186,7 @@ test-simulator:
 	node tests/simulator/test_aux_input.mjs
 
 test-simulator-runtime: generate-simulator-wasm
+	node tests/simulator/test_static_art_render.mjs
 	node tests/simulator/test_wasm_runtime.mjs
 
 test-ui-images:
@@ -197,7 +201,13 @@ generate-font-assets:
 generate-icon-assets:
 	python3 tools/generate_icon_assets.py
 
-generate-simulator-wasm: check-lvgl-managed
+generate-static-art:
+	python3 tools/generate_static_art.py
+
+check-static-art:
+	python3 tools/generate_static_art.py --check
+
+generate-simulator-wasm: check-lvgl-managed check-static-art
 	@if ! command -v $(EMCC) >/dev/null 2>&1; then \
 		if [ -f "$(SIM_WASM_JS)" ] && [ -f "$(SIM_WASM)" ]; then \
 			echo "emcc not found; using existing $(SIM_WASM_JS)."; \
@@ -212,6 +222,7 @@ generate-simulator-wasm: check-lvgl-managed
 		-Ifirmware/components/pj_ui/include \
 		$(LVGL_SRCS) \
 		firmware/components/pj_ui/pj_home_layout.c \
+		firmware/components/pj_ui/pj_default_static_art.c \
 		firmware/components/pj_ui/pj_ui.c \
 		simulator/wasm/pj_ui_wasm_bridge.c \
 		-o $(SIM_WASM_JS) \

@@ -1,4 +1,5 @@
 #include "pj_ui.h"
+#include "pj_default_static_art.h"
 
 #include <assert.h>
 #include <stdio.h>
@@ -1594,16 +1595,27 @@ static void test_static_art_render_and_fallback(void)
     pj_ui_context_t ui;
     pj_framebuffer_t fallback;
     pj_framebuffer_t fallback_after_clock_change;
+    pj_framebuffer_t fallback_dark;
     pj_framebuffer_t custom;
     uint8_t pixels[PJ_FRAMEBUFFER_BYTES] = {0};
     pj_ui_init(&ui);
 
     pj_ui_render(&ui, &fallback);
-    assert(count_black_pixels(&fallback) > 10);
+    assert(PJ_DEFAULT_STATIC_ART_WIDTH == PJ_DISPLAY_WIDTH);
+    assert(PJ_DEFAULT_STATIC_ART_HEIGHT == PJ_DISPLAY_HEIGHT);
+    assert(PJ_DEFAULT_STATIC_ART_BYTES == PJ_FRAMEBUFFER_BYTES);
+    assert(count_black_pixels(&fallback) == PJ_DEFAULT_STATIC_ART_BLACK_PIXELS);
+    assert(memcmp(fallback.pixels, pj_default_static_art, sizeof(fallback.pixels)) == 0);
     pj_ui_set_time(&ui, 23, 59, 2030, 12, 31);
     pj_ui_set_status(&ui, 7, -4, 20);
     pj_ui_render(&ui, &fallback_after_clock_change);
     assert(memcmp(&fallback, &fallback_after_clock_change, sizeof(fallback)) == 0);
+
+    ui.dark_mode = 1;
+    pj_ui_request_full_refresh(&ui);
+    pj_ui_render(&ui, &fallback_dark);
+    assert(memcmp(&fallback, &fallback_dark, sizeof(fallback)) == 0);
+    ui.dark_mode = 0;
 
     size_t first = (size_t)4 * PJ_DISPLAY_WIDTH + 3;
     size_t second = (size_t)199 * PJ_DISPLAY_WIDTH + 199;
