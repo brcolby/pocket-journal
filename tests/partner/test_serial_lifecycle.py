@@ -120,6 +120,23 @@ class TracedConnection(FakeConnection):
         super().__setattr__(name, value)
 
 
+class ModemApplyingConnection(TracedConnection):
+    def __init__(self, lines: list[bytes | BaseException] | None = None) -> None:
+        self.modem_update_events: list[tuple[str, bool | None]] = []
+        super().__init__(lines)
+
+    def open(self) -> None:
+        super().open()
+        self._update_dtr_state()
+        self._update_rts_state()
+
+    def _update_dtr_state(self) -> None:
+        self.modem_update_events.append(("dtr", self.dtr))
+
+    def _update_rts_state(self) -> None:
+        self.modem_update_events.append(("rts", self.rts))
+
+
 class ResponseAfterWriteConnection(FakeConnection):
     def __init__(self, write_number: int, response: bytes) -> None:
         super().__init__()
@@ -241,6 +258,29 @@ class SerialLifecycleTests(unittest.TestCase):
         self.assertEqual(connection.open_count, 1)
         self.assertEqual(connection.close_count, 1)
         self.assertEqual(connection.closed_control_lines, (False, False))
+
+    def test_posix_open_suppresses_pyserial_modem_updates_without_flow_control(self) -> None:
+        connection = ModemApplyingConnection([b'PJ_OK {"device_id":"pj-test"}\n'])
+        serial_module = FakeSerialModule(connection)
+
+        with patch.dict(sys.modules, {"serial": serial_module}):
+            with patch("pocket_journal_partner.device.time.sleep"):
+                result = SerialDeviceClient("/dev/cu.test", timeout=1).status()
+
+        self.assertEqual(result, {"device_id": "pj-test"})
+        self.assertEqual(connection.modem_update_events, [])
+        self.assertNotIn("_update_dtr_state", connection.__dict__)
+        self.assertNotIn("_update_rts_state", connection.__dict__)
+        connection._update_dtr_state()
+        connection._update_rts_state()
+        self.assertEqual(connection.modem_update_events, [
+            ("dtr", False),
+            ("rts", False),
+        ])
+        self.assertEqual(serial_module.constructor_kwargs["dsrdtr"], False)
+        self.assertEqual(serial_module.constructor_kwargs["rtscts"], False)
+        self.assertEqual(connection.open_count, 1)
+        self.assertEqual(connection.close_count, 1)
 
     def test_interval_reset_is_tagged_confirmed_and_releases_descriptor(self) -> None:
         connection = FakeConnection([

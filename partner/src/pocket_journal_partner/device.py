@@ -476,7 +476,7 @@ class SerialDeviceClient:
             connection = serial_module.Serial(**serial_options)
             connection.port = self.port
             _idle_serial_control_lines(connection)
-            connection.open()
+            _open_serial_without_modem_control(connection)
             _disable_hangup_on_close(connection)
             yield connection
         finally:
@@ -1009,6 +1009,41 @@ class SerialDeviceClient:
 def _idle_serial_control_lines(connection: Any) -> None:
     connection.dtr = False
     connection.rts = False
+
+
+def _open_serial_without_modem_control(connection: Any) -> bool:
+    if os.name == "nt":
+        connection.open()
+        return False
+    method_names = ("_update_dtr_state", "_update_rts_state")
+    if any(not callable(getattr(connection, name, None)) for name in method_names):
+        connection.open()
+        return False
+
+    # Pyserial has no public preserve-lines mode: disabling its two open-time
+    # updates normally requires enabling DSR/DTR and RTS/CTS flow control.
+    instance_attributes = getattr(connection, "__dict__", {})
+    previous = {
+        name: instance_attributes.get(name)
+        for name in method_names
+        if name in instance_attributes
+    }
+    try:
+        for name in method_names:
+            setattr(connection, name, lambda: None)
+        connection.open()
+    except (AttributeError, TypeError) as exc:
+        raise DeviceError("USB serial could not preserve modem-control state during POSIX open") from exc
+    finally:
+        for name in method_names:
+            if name in previous:
+                setattr(connection, name, previous[name])
+            else:
+                try:
+                    delattr(connection, name)
+                except AttributeError:
+                    pass
+    return True
 
 
 def _disable_hangup_on_close(connection: Any) -> bool:
