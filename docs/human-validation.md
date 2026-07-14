@@ -9,7 +9,7 @@ The current visual treatment is accepted as the initial-release baseline.
 Future visual refinement is non-blocking unless hardware testing finds a
 legibility, navigation, clipping, refresh, or other usability defect.
 
-Last synchronized with `bd human list`: 2026-07-13 (25 beads).
+Last synchronized with `bd human list`: 2026-07-14 (26 beads).
 
 ## Ready To Validate
 
@@ -90,6 +90,9 @@ Last synchronized with `bd human list`: 2026-07-13 (25 beads).
   - Provision with the default USB-C flow, reboot, and confirm saved Wi-Fi reconnect and `_pocket-journal._tcp` discovery.
   - Separately validate optional `--ble` provisioning; BLE security approval remains tracked in `pocket-journal-db1`.
   - Disconnect/reconnect the network and confirm status plus pending/uploaded sync counts remain accurate.
+- [ ] **Default USB provisioning command robustness** (`pocket-journal-iig`)
+  - Rerun `pj provision --ssid <network> --password <password>` with the current partner CLI and confirm the command is accepted over USB-C without the `expected PJ_WIFI_HEX...` parser error.
+  - After the next firmware flash, repeat provisioning with the same partner CLI to confirm fragmented USB serial input is handled on-device.
 - [ ] **LAN bearer authentication** (`pocket-journal-3ie`)
   - Confirm valid token access after reboot; missing, malformed, and wrong tokens consistently return 401.
   - Check device logs and responses for leaked token or Wi-Fi credentials.

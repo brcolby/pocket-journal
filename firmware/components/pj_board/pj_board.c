@@ -5949,14 +5949,41 @@ static int hex_decode_string(const char *hex, char *out, size_t out_size)
 static void serial_command_task(void *arg)
 {
     (void)arg;
-    char line[512];
+    char line[512] = {0};
+    size_t line_length = 0;
+    int discarding_overflow = 0;
     setvbuf(stdin, NULL, _IONBF, 0);
     while (1) {
-        if (fgets(line, sizeof(line), stdin) == NULL) {
+        char *chunk = discarding_overflow ? line : line + line_length;
+        size_t available = discarding_overflow ? sizeof(line) : sizeof(line) - line_length;
+        if (fgets(chunk, available, stdin) == NULL) {
+            clearerr(stdin);
             vTaskDelay(pdMS_TO_TICKS(100));
             continue;
         }
+        size_t chunk_length = strlen(chunk);
+        int line_complete = chunk_length > 0 &&
+            (chunk[chunk_length - 1] == '\n' || chunk[chunk_length - 1] == '\r');
+        if (discarding_overflow) {
+            if (line_complete) {
+                discarding_overflow = 0;
+            }
+            continue;
+        }
+        line_length += chunk_length;
+        if (!line_complete) {
+            if (line_length + 1 < sizeof(line)) {
+                continue;
+            }
+            printf("PJ_ERR {\"error\":\"USB command too long\"}\n");
+            fflush(stdout);
+            line[0] = '\0';
+            line_length = 0;
+            discarding_overflow = 1;
+            continue;
+        }
         serial_trim_line(line);
+        line_length = 0;
         if (line[0] == '\0') {
             continue;
         }

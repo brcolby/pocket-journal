@@ -20,6 +20,9 @@ from .sync import sync_device_audio
 from .transcription import FakeTranscriptionBackend, backend_from_name
 
 
+USB_PROVISIONING_TOKEN_BYTES = 16
+
+
 def _print_json(payload) -> None:
     print(json.dumps(payload, indent=2, sort_keys=True))
 
@@ -33,7 +36,9 @@ def cmd_provision(args: argparse.Namespace) -> int:
         raise DeviceError("--mock requires --ble")
 
     if not args.ble:
-        token = secrets.token_urlsafe(24)
+        # Hex encoding doubles this value on the legacy serial protocol. 128 bits
+        # keeps ordinary provisioning commands below small USB console boundaries.
+        token = secrets.token_urlsafe(USB_PROVISIONING_TOKEN_BYTES)
         client = SerialDeviceClient(resolve_serial_port(args.serial_port), baudrate=args.serial_baud, timeout=args.timeout)
         response = client.provision_wifi(args.ssid, args.password, token)
         device_id = str(response.get("device_id") or "pj-usb")

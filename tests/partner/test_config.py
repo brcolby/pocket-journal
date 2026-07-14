@@ -158,6 +158,8 @@ class ConfigTests(unittest.TestCase):
         self.assertNotIn("token", json.loads(output))
 
     def test_provision_defaults_to_auto_detected_usb_serial(self) -> None:
+        ssid = "Example Guest"
+        password = "sample.pass!"
         with TemporaryDirectory() as tmp:
             with patch("pocket_journal_partner.cli.resolve_serial_port", return_value="/dev/cu.usbmodem-test") as resolve:
                 with patch("pocket_journal_partner.cli.SerialDeviceClient") as serial_client:
@@ -165,8 +167,8 @@ class ConfigTests(unittest.TestCase):
                     with redirect_stdout(StringIO()):
                         exit_code = cli.main([
                             "provision",
-                            "--ssid", "Lab",
-                            "--password", "very-secret-password",
+                            "--ssid", ssid,
+                            "--password", password,
                             "--data-dir", tmp,
                         ])
 
@@ -174,8 +176,13 @@ class ConfigTests(unittest.TestCase):
         resolve.assert_called_once_with(None)
         serial_client.assert_called_once_with("/dev/cu.usbmodem-test", baudrate=115200, timeout=6.0)
         provision_args = serial_client.return_value.provision_wifi.call_args.args
-        self.assertEqual(provision_args[:2], ("Lab", "very-secret-password"))
+        self.assertEqual(provision_args[:2], (ssid, password))
         self.assertTrue(provision_args[2])
+        serialized = (
+            f"PJ_WIFI_HEX {ssid.encode('utf-8').hex()} {password.encode('utf-8').hex()} "
+            f"{provision_args[2].encode('utf-8').hex()}\n"
+        )
+        self.assertLess(len(serialized.encode("ascii")), 128)
 
     def test_ble_specific_options_require_explicit_ble_transport(self) -> None:
         stderr = StringIO()
