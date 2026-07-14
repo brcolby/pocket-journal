@@ -9,7 +9,7 @@ The current visual treatment is accepted as the initial-release baseline.
 Future visual refinement is non-blocking unless hardware testing finds a
 legibility, navigation, clipping, refresh, or other usability defect.
 
-Last synchronized with `bd human list`: 2026-07-14 (15 beads).
+Last synchronized with `bd human list`: 2026-07-14 (14 beads).
 
 ## Batch Validation Strategy
 
@@ -65,6 +65,15 @@ Do not repeat these checks on an unchanged build.
   bounded RTS reboot, status reported exact version `558770f` with audio and
   storage ready, and another reset returned
   `interval_active_before=false` and `interval_active_after=false`.
+- Exact firmware `8b97009` was flashed with hash verification and no monitor.
+  The durable interval reset again returned `interval_active_before=false`,
+  `interval_active_after=false`, `persisted=true`, and `silenced=true`.
+  Partner `cbe3342` then prevented pyserial's normal POSIX open from changing
+  DTR/RTS or applying hangup-on-close. Repeated status sessions, an empty wipe,
+  and a separate post-wipe status all preserved boot ID `585729899` while
+  uptime advanced beyond 306 seconds. Wipe operation `1` remained in terminal
+  history and no process owned the USB descriptor afterward
+  (`pocket-journal-6ot`, `pocket-journal-rgo`, closed).
 - Saved Wi-Fi credentials loaded and the station repeatedly reached
   authentication and association, but it never obtained an IP address
   (`pocket-journal-d3d`, `pocket-journal-1qk`).
@@ -99,14 +108,6 @@ Do not retest these on the current firmware. They enter the next consolidated
 checklist only after their focused blockers pass automated checks and are
 included in the next identified firmware build.
 
-- **USB and storage:** `pocket-journal-6ot` has an asynchronous, correlated,
-  exclusive wipe worker. Firmware now gates the dual-core worker until the
-  operation-ID response has physically drained. Partner commit `2d40a42` then
-  kept one descriptor open through terminal polling; target operation `1`
-  succeeded and deleted seven audio plus seven note records. A fresh status
-  connection remained responsive without a replug but showed idle state and no
-  history, proving serial close/open resets the device. POSIX control-line
-  lifecycle work remains in `pocket-journal-rgo` and still blocks `6ot` closure.
 - **Connectivity:** `pocket-journal-r7s` adds a 15-second connect-attempt
   watchdog so a missing ESP-IDF terminal event becomes `connect_timeout` with
   increasing retry count and bounded backoff. `pocket-journal-d3d` still needs
@@ -136,11 +137,13 @@ art-fidelity, or image-analysis acceptance evidence recorded in Beads.
 
 ## Next Consolidated Hardware Batch
 
-**Nominated firmware: `558770f`.** It passed the complete native, partner, and
+**Nominated firmware: `8b97009`.** It passed the complete native, partner, and
 simulator test suite plus an ESP-IDF 6.0.1 build, was flashed with hash
-verification and no monitor, survived a bounded reboot with the interval still
-inactive, and was left with no USB descriptor owner. Use only this exact build
-for the next consolidated pass.
+verification and no monitor, retained a durably stopped interval beyond three
+default interval periods, and was left with no USB descriptor owner. Partner
+`cbe3342` passed 173 tests and preserved the same target boot across repeated
+USB commands. Use this exact firmware and partner revision for the next
+consolidated pass.
 
 When nominated, perform one ordered pass rather than isolated retests:
 
@@ -154,10 +157,6 @@ When nominated, perform one ordered pass rather than isolated retests:
   `connect_timeout` with retry count greater than zero; they never remain
   indefinitely at `connecting` and retry count zero (`pocket-journal-r7s`,
   `pocket-journal-d3d`).
-- [ ] Recording wipe returns an operation ID, status remains responsive during
-  and after it, and a passive USB probe succeeds without reset or replug. The
-  same-session wipe already succeeds; do not repeat it until serial close/open
-  reset has a focused lifecycle fix (`pocket-journal-6ot`, `pocket-journal-rgo`).
 - [ ] AUX hold acts once at 500 ms, permits navigation while recording
   finalizes, and produces no second action on release
   (`pocket-journal-61u`, `pocket-journal-sm1`).
