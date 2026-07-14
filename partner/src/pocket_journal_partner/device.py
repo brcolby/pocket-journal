@@ -6,6 +6,7 @@ from typing import Any
 from urllib import error, parse, request
 import glob
 import json
+import os
 import time
 
 
@@ -218,14 +219,18 @@ class SerialDeviceClient:
             # Configure the control lines before opening the descriptor. Opening
             # with a port argument lets pyserial apply its default DTR/RTS state
             # first, which can reset an ESP32-S3 or select its ROM downloader.
+            serial_options: dict[str, Any] = {
+                "port": None,
+                "baudrate": self.baudrate,
+                "timeout": 0.2,
+                "write_timeout": 2.0,
+                "dsrdtr": False,
+                "rtscts": False,
+            }
+            if os.name != "nt":
+                serial_options["exclusive"] = True
             connection = serial.Serial(
-                port=None,
-                baudrate=self.baudrate,
-                timeout=0.2,
-                write_timeout=2.0,
-                dsrdtr=False,
-                rtscts=False,
-                exclusive=True,
+                **serial_options,
             )
             connection.port = self.port
             connection.dtr = False

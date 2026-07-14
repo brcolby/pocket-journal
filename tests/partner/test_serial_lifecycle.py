@@ -108,6 +108,20 @@ class SerialLifecycleTests(unittest.TestCase):
         self.assertEqual(connection.close_count, 1)
         self.assertFalse(connection.is_open)
 
+    def test_windows_uses_native_exclusive_handle_without_posix_option(self) -> None:
+        connection = FakeConnection([b'PJ_OK {"device_id":"pj-test"}\n'])
+        serial_module = FakeSerialModule(connection)
+
+        with patch.dict(sys.modules, {"serial": serial_module}):
+            with patch("pocket_journal_partner.device.os.name", "nt"):
+                with patch("pocket_journal_partner.device.time.sleep"):
+                    result = SerialDeviceClient("COM7", timeout=1).status()
+
+        self.assertEqual(result, {"device_id": "pj-test"})
+        self.assertNotIn("exclusive", serial_module.constructor_kwargs)
+        self.assertEqual(connection.open_control_lines, (False, False))
+        self.assertEqual(connection.close_count, 1)
+
     def test_keyboard_interrupt_releases_descriptor(self) -> None:
         connection = FakeConnection([KeyboardInterrupt()])
         serial_module = FakeSerialModule(connection)
