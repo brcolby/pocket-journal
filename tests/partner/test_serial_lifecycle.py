@@ -30,12 +30,14 @@ class FakeConnection:
         self.is_open = False
         self.open_control_lines: tuple[bool | None, bool | None] | None = None
         self.closed_control_lines: tuple[bool | None, bool | None] | None = None
+        self.open_count = 0
         self.close_count = 0
         self.writes: list[bytes] = []
         self.input_reset = False
 
     def open(self) -> None:
         self.open_control_lines = (self.dtr, self.rts)
+        self.open_count += 1
         self.is_open = True
 
     def close(self) -> None:
@@ -100,6 +102,30 @@ class TracedConnection(FakeConnection):
         super().__setattr__(name, value)
 
 
+class ResponseAfterWriteConnection(FakeConnection):
+    def __init__(self, write_number: int, response: bytes) -> None:
+        super().__init__()
+        self.write_number = write_number
+        self.response = response
+
+    def write(self, payload: bytes) -> int:
+        written = super().write(payload)
+        if len(self.writes) == self.write_number:
+            self.lines.append(self.response)
+        return written
+
+
+class SteppingClock:
+    def __init__(self, step: float = 0.1) -> None:
+        self.value = 0.0
+        self.step = step
+
+    def __call__(self) -> float:
+        value = self.value
+        self.value += self.step
+        return value
+
+
 class FakeProcess:
     def __init__(
         self,
@@ -146,7 +172,7 @@ class SerialLifecycleTests(unittest.TestCase):
         self.assertEqual(serial_module.constructor_kwargs, {
             "port": None,
             "baudrate": 115200,
-            "timeout": 0.2,
+            "timeout": 0.05,
             "write_timeout": 2.0,
             "dsrdtr": False,
             "rtscts": False,
@@ -259,50 +285,77 @@ class SerialLifecycleTests(unittest.TestCase):
         self.assertEqual(start.close_count, 1)
         self.assertEqual(poll.close_count, 1)
 
-    def test_wipe_retries_lost_start_response_with_same_request_id(self) -> None:
-        client = SerialDeviceClient("/dev/cu.test", timeout=1)
-        calls = []
-        responses = iter([
-            DeviceRequestTimeout("lost start response"),
-            {
-                "command": "PJ_WIPE_RECORDINGS",
-                "request_id": "start",
-                "accepted": True,
-                "attached": True,
-                "recording_wipe": {"id": 52, "state": "running"},
-            },
-            {
-                "command": "PJ_STATUS",
-                "request_id": "poll",
-                "recording_wipe": {
-                    "id": 52,
-                    "state": "succeeded",
-                    "audio_deleted": 2,
-                    "transcripts_deleted": 1,
-                    "notes_deleted": 1,
-                },
-            },
+    def test_wipe_delayed_start_response_uses_one_descriptor_without_retransmit(self) -> None:
+        start = FakeConnection([
+            b"",
+            b"",
+            b'PJ_OK {"command":"PJ_WIPE_RECORDINGS","request_id":"start",'
+            b'"recording_wipe":{"id":51,"state":"succeeded","audio_deleted":2}}\n',
         ])
+        serial_module = QueuedSerialModule([start])
 
-        def fake_request(command, *, timeout=None, request_id=None):
-            calls.append((command, timeout, request_id))
-            result = next(responses)
-            if isinstance(result, BaseException):
-                raise result
-            return result
+        with patch.dict(sys.modules, {"serial": serial_module}):
+            with patch("pocket_journal_partner.device.time.sleep"):
+                with patch("pocket_journal_partner.device.time.monotonic", new=SteppingClock()):
+                    with patch("pocket_journal_partner.device._new_request_id", return_value="start"):
+                        result = SerialDeviceClient("/dev/cu.test", timeout=10).wipe_recordings()
 
-        client._request = fake_request  # type: ignore[method-assign]
-        with patch("pocket_journal_partner.device.time.sleep"):
-            with patch(
-                "pocket_journal_partner.device._new_request_id",
-                side_effect=["start", "poll"],
-            ):
-                result = client.wipe_recordings()
+        self.assertEqual(result["operation_id"], 51)
+        self.assertEqual(start.writes, [b"PJ_WIPE_RECORDINGS request_id=start\n"])
+        self.assertEqual(start.open_count, 1)
+        self.assertEqual(start.close_count, 1)
+        self.assertFalse(start.is_open)
+        self.assertEqual(len(serial_module.constructor_kwargs), 1)
+
+    def test_wipe_lost_start_ack_retransmits_same_request_on_one_descriptor(self) -> None:
+        start = ResponseAfterWriteConnection(
+            2,
+            b'PJ_OK {"command":"PJ_WIPE_RECORDINGS","request_id":"start",'
+            b'"attached":true,"recording_wipe":{"id":52,"state":"running"}}\n',
+        )
+        poll = FakeConnection([
+            b'PJ_OK {"command":"PJ_STATUS","request_id":"poll",'
+            b'"recording_wipe":{"id":52,"state":"succeeded","audio_deleted":2, '
+            b'"transcripts_deleted":1,"notes_deleted":1}}\n',
+        ])
+        serial_module = QueuedSerialModule([start, poll])
+
+        with patch.dict(sys.modules, {"serial": serial_module}):
+            with patch("pocket_journal_partner.device.time.sleep"):
+                with patch("pocket_journal_partner.device.time.monotonic", new=SteppingClock()):
+                    with patch(
+                        "pocket_journal_partner.device._new_request_id",
+                        side_effect=["start", "poll"],
+                    ):
+                        result = SerialDeviceClient("/dev/cu.test", timeout=10).wipe_recordings()
 
         self.assertEqual(result["operation_id"], 52)
-        self.assertEqual(calls[0][2], "start")
-        self.assertEqual(calls[1][2], "start")
-        self.assertEqual(calls[2][2], "poll")
+        self.assertEqual(start.writes, 2 * [b"PJ_WIPE_RECORDINGS request_id=start\n"])
+        self.assertEqual(poll.writes, [b"PJ_STATUS request_id=poll\n"])
+        self.assertTrue(all(connection.open_count == 1 for connection in (start, poll)))
+        self.assertTrue(all(connection.close_count == 1 for connection in (start, poll)))
+        self.assertTrue(all(not connection.is_open for connection in (start, poll)))
+        self.assertEqual(len(serial_module.constructor_kwargs), 2)
+
+    def test_wipe_start_total_timeout_bounds_writes_and_releases_one_descriptor(self) -> None:
+        start = FakeConnection()
+        serial_module = QueuedSerialModule([start])
+        clock = SteppingClock()
+
+        with patch.dict(sys.modules, {"serial": serial_module}):
+            with patch("pocket_journal_partner.device.time.sleep"):
+                with patch("pocket_journal_partner.device.time.monotonic", new=clock):
+                    with patch("pocket_journal_partner.device._new_request_id", return_value="start"):
+                        with self.assertRaises(DeviceRequestTimeout):
+                            SerialDeviceClient("/dev/cu.test", timeout=6).wipe_recordings()
+
+        self.assertEqual(start.writes, 3 * [b"PJ_WIPE_RECORDINGS request_id=start\n"])
+        self.assertGreaterEqual(clock.value, 6)
+        self.assertLess(clock.value, 6.5)
+        self.assertEqual(start.open_count, 1)
+        self.assertEqual(start.close_count, 1)
+        self.assertFalse(start.is_open)
+        self.assertEqual(len(serial_module.constructor_kwargs), 1)
 
     def test_windows_uses_native_exclusive_handle_without_posix_option(self) -> None:
         connection = FakeConnection([b'PJ_OK {"device_id":"pj-test"}\n'])

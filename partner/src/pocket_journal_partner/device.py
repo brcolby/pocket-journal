@@ -85,6 +85,34 @@ _USB_ROM_DOWNLOAD_MARKERS = (
 )
 
 _WIPE_STATES = {"idle", "queued", "running", "succeeded", "failed"}
+_WIPE_START_RETRY_INTERVAL_SECONDS = 1.5
+_WIPE_START_MAX_ATTEMPTS = 3
+
+
+def _serial_response(
+    raw: bytes,
+    expected_command: str,
+    request_id: str | None,
+) -> tuple[bool, dict[str, Any]] | None:
+    line = raw.decode("utf-8", errors="replace").strip()
+    ok = line.startswith("PJ_OK ")
+    failed = line.startswith("PJ_ERR ")
+    if not ok and not failed:
+        return None
+    encoded = line[6:] if ok else line[7:]
+    try:
+        payload = json.loads(encoded)
+    except json.JSONDecodeError as exc:
+        raise DeviceError("USB command failed: device returned invalid JSON") from exc
+    if not isinstance(payload, dict):
+        raise DeviceError("USB command failed: device returned invalid JSON")
+    response_command = payload.get("command")
+    if request_id is not None:
+        if response_command != expected_command or payload.get("request_id") != request_id:
+            return None
+    elif response_command is not None and response_command != expected_command:
+        return None
+    return ok, payload
 
 
 def _safe_code(value: Any) -> str | None:
@@ -444,63 +472,86 @@ class SerialDeviceClient:
         command: str,
         *,
         timeout: float | None = None,
+        deadline: float | None = None,
         request_id: str | None = None,
+        retry_interval: float | None = None,
+        max_attempts: int = 1,
     ) -> dict[str, Any]:
         try:
             import serial  # type: ignore
         except ImportError as exc:
             raise DeviceError("USB support requires pyserial; reinstall the partner CLI") from exc
 
-        request_timeout = self.timeout if timeout is None else timeout
+        if timeout is not None and deadline is not None:
+            raise ValueError("timeout and deadline are mutually exclusive")
+        if deadline is None:
+            request_timeout = max(0.0, self.timeout if timeout is None else timeout)
+            deadline = time.monotonic() + request_timeout
+        else:
+            request_timeout = max(0.0, deadline - time.monotonic())
+        if max_attempts < 1:
+            raise ValueError("max_attempts must be at least one")
+        if max_attempts > 1 and (
+            request_id is None or retry_interval is None or retry_interval <= 0
+        ):
+            raise ValueError("serial retries require a request ID and positive retry interval")
         expected_command = command.split(" ", 1)[0]
         wire_command = command if request_id is None else f"{command} request_id={request_id}"
         try:
-            with self._connection(serial) as connection:
-                time.sleep(0.1)
+            with self._connection(serial, read_timeout=min(0.2, request_timeout)) as connection:
+                remaining = deadline - time.monotonic()
+                if remaining > 0:
+                    time.sleep(min(0.1, remaining))
                 connection.reset_input_buffer()
-                connection.write(f"{wire_command}\n".encode("ascii"))
-                connection.flush()
-                deadline = time.monotonic() + request_timeout
-                while time.monotonic() < deadline:
+                wire_payload = f"{wire_command}\n".encode("ascii")
+                attempts = 0
+                next_retry_at: float | None = None
+                if time.monotonic() < deadline:
+                    connection.write(wire_payload)
+                    connection.flush()
+                    attempts = 1
+                    if retry_interval is not None:
+                        next_retry_at = time.monotonic() + retry_interval
+                while True:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    connection.timeout = min(0.2, remaining)
                     raw = connection.readline()
-                    if not raw:
-                        continue
-                    line = raw.decode("utf-8", errors="replace").strip()
-                    ok = line.startswith("PJ_OK ")
-                    failed = line.startswith("PJ_ERR ")
-                    if not ok and not failed:
-                        continue
-                    encoded = line[6:] if ok else line[7:]
-                    try:
-                        payload = json.loads(encoded)
-                    except json.JSONDecodeError as exc:
-                        raise DeviceError("USB command failed: device returned invalid JSON") from exc
-                    if not isinstance(payload, dict):
-                        raise DeviceError("USB command failed: device returned invalid JSON")
-                    response_command = payload.get("command")
-                    if request_id is not None:
-                        if response_command != expected_command or payload.get("request_id") != request_id:
-                            continue
-                    elif response_command is not None and response_command != expected_command:
-                        continue
-                    if ok:
-                        return payload
+                    decoded = _serial_response(raw, expected_command, request_id) if raw else None
+                    if decoded is not None:
+                        ok, payload = decoded
+                        if ok:
+                            return payload
 
-                    operation = _recording_wipe_operation(payload)
-                    code = _safe_code(payload.get("code"))
-                    retryable = payload.get("retryable") is True
-                    if operation is not None:
-                        code = operation["code"] or code
-                        retryable = operation["retryable"]
+                        operation = _recording_wipe_operation(payload)
+                        code = _safe_code(payload.get("code"))
+                        retryable = payload.get("retryable") is True
+                        if operation is not None:
+                            code = operation["code"] or code
+                            retryable = operation["retryable"]
+                            suffix = f" ({code})" if code is not None else ""
+                            raise DeviceOperationError(
+                                f"USB recording wipe operation {operation['id']} failed{suffix}",
+                                operation["id"],
+                                code=code,
+                                retryable=retryable,
+                            )
                         suffix = f" ({code})" if code is not None else ""
-                        raise DeviceOperationError(
-                            f"USB recording wipe operation {operation['id']} failed{suffix}",
-                            operation["id"],
-                            code=code,
-                            retryable=retryable,
-                        )
-                    suffix = f" ({code})" if code is not None else ""
-                    raise DeviceError(f"USB command failed: device rejected {expected_command}{suffix}")
+                        raise DeviceError(f"USB command failed: device rejected {expected_command}{suffix}")
+
+                    now = time.monotonic()
+                    if (
+                        next_retry_at is not None
+                        and attempts < max_attempts
+                        and now >= next_retry_at
+                        and now < deadline
+                    ):
+                        connection.write(wire_payload)
+                        connection.flush()
+                        attempts += 1
+                        assert retry_interval is not None
+                        next_retry_at = now + retry_interval
         except (serial.SerialException, OSError) as exc:
             raise DeviceError(f"USB serial connection failed on {self.port}: {exc}") from exc
         raise DeviceRequestTimeout(
@@ -529,18 +580,13 @@ class SerialDeviceClient:
     def wipe_recordings(self) -> dict[str, Any]:
         deadline = time.monotonic() + self.timeout
         start_request_id = _new_request_id()
-        while True:
-            remaining = max(0.0, deadline - time.monotonic())
-            try:
-                response = self._request(
-                    "PJ_WIPE_RECORDINGS",
-                    timeout=min(0.5, remaining),
-                    request_id=start_request_id,
-                )
-                break
-            except DeviceRequestTimeout:
-                if time.monotonic() >= deadline:
-                    raise
+        response = self._request(
+            "PJ_WIPE_RECORDINGS",
+            deadline=deadline,
+            request_id=start_request_id,
+            retry_interval=_WIPE_START_RETRY_INTERVAL_SECONDS,
+            max_attempts=_WIPE_START_MAX_ATTEMPTS,
+        )
         operation = _recording_wipe_operation(response)
         if operation is None:
             if isinstance(response.get("deleted"), int):
