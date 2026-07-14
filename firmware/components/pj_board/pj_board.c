@@ -371,6 +371,11 @@ typedef struct {
     uint8_t persistence_ok;
 } interval_reset_state_t;
 
+typedef enum {
+    PJ_WIPE_WORKER_RELEASE_NOW = 0,
+    PJ_WIPE_WORKER_RELEASE_AFTER_RESPONSE,
+} recording_wipe_release_mode_t;
+
 static portMUX_TYPE g_alert_audio_intent_lock = portMUX_INITIALIZER_UNLOCKED;
 static portMUX_TYPE g_interval_reset_lock = portMUX_INITIALIZER_UNLOCKED;
 static alert_audio_intent_t g_alert_audio_intent;
@@ -3411,9 +3416,17 @@ static size_t delete_dir_entries(const char *dir_path, int (*matches)(const char
 static void recording_wipe_worker(void *arg)
 {
     (void)arg;
+    /* xTaskCreate can schedule this task on the other core before returning. */
+    (void)ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+
     portENTER_CRITICAL(&g_storage_coordinator_lock);
     pj_storage_wipe_mark_running(&g_storage_coordinator);
+    pj_wipe_status_t wipe_status = pj_storage_wipe_status(&g_storage_coordinator);
     portEXIT_CRITICAL(&g_storage_coordinator_lock);
+
+    ESP_LOGI(TAG, "Recording wipe worker started: operation=%" PRIu32
+                  " stack_hwm=%u",
+             wipe_status.id, (unsigned)uxTaskGetStackHighWaterMark(NULL));
 
     int incomplete = 0;
     size_t audio_deleted = delete_dir_entries(PJ_AUDIO_DIR, is_audio_filename, &incomplete);
@@ -3430,8 +3443,10 @@ static void recording_wipe_worker(void *arg)
             g_status.last_error[0] = '\0';
         }
     }
-    ESP_LOGI(TAG, "Wiped recordings: audio=%zu transcripts=%zu metadata=%zu complete=%d",
-             audio_deleted, transcripts_deleted, notes_deleted, !incomplete);
+    ESP_LOGI(TAG, "Wiped recordings: operation=%" PRIu32
+                  " audio=%zu transcripts=%zu metadata=%zu complete=%d stack_hwm=%u",
+             wipe_status.id, audio_deleted, transcripts_deleted, notes_deleted,
+             !incomplete, (unsigned)uxTaskGetStackHighWaterMark(NULL));
 
     portENTER_CRITICAL(&g_storage_coordinator_lock);
     pj_storage_wipe_finish(&g_storage_coordinator, audio_deleted, transcripts_deleted,
@@ -3447,8 +3462,25 @@ static void recording_wipe_worker(void *arg)
     vTaskDelete(NULL);
 }
 
+static int recording_wipe_release(uint32_t operation_id)
+{
+    TaskHandle_t task = NULL;
+    portENTER_CRITICAL(&g_storage_coordinator_lock);
+    pj_wipe_status_t status = pj_storage_wipe_status(&g_storage_coordinator);
+    if (status.id == operation_id && status.state == PJ_WIPE_STATE_QUEUED) {
+        task = g_storage_wipe_task;
+    }
+    portEXIT_CRITICAL(&g_storage_coordinator_lock);
+    if (task == NULL) {
+        return 0;
+    }
+    xTaskNotifyGive(task);
+    return 1;
+}
+
 static pj_wipe_start_result_t recording_wipe_start(const char *request_id,
-                                                    pj_wipe_status_t *status)
+                                                    pj_wipe_status_t *status,
+                                                    recording_wipe_release_mode_t release_mode)
 {
     pj_wipe_status_t local_status;
     if (status == NULL) {
@@ -3466,9 +3498,9 @@ static pj_wipe_start_result_t recording_wipe_start(const char *request_id,
         return result;
     }
 
+    TaskHandle_t task = NULL;
     BaseType_t created = xTaskCreate(recording_wipe_worker, "pj-wipe",
-                                     PJ_STORAGE_WIPE_TASK_STACK, NULL, 2,
-                                     &g_storage_wipe_task);
+                                     PJ_STORAGE_WIPE_TASK_STACK, NULL, 2, &task);
     if (created != pdPASS) {
         portENTER_CRITICAL(&g_storage_coordinator_lock);
         pj_storage_wipe_finish(&g_storage_coordinator, 0U, 0U, 0U,
@@ -3476,6 +3508,14 @@ static pj_wipe_start_result_t recording_wipe_start(const char *request_id,
         *status = pj_storage_wipe_status(&g_storage_coordinator);
         portEXIT_CRITICAL(&g_storage_coordinator_lock);
         return PJ_WIPE_START_TASK_FAILED;
+    }
+    portENTER_CRITICAL(&g_storage_coordinator_lock);
+    g_storage_wipe_task = task;
+    portEXIT_CRITICAL(&g_storage_coordinator_lock);
+    if (release_mode == PJ_WIPE_WORKER_RELEASE_NOW &&
+        !recording_wipe_release(status->id)) {
+        ESP_LOGE(TAG, "Recording wipe worker release failed: operation=%" PRIu32,
+                 status->id);
     }
     return PJ_WIPE_START_STARTED;
 }
@@ -6749,7 +6789,8 @@ int pj_board_wipe_recordings(pj_ui_context_t *ui)
 #ifdef ESP_PLATFORM
     (void)ui;
     pj_wipe_status_t status;
-    pj_wipe_start_result_t result = recording_wipe_start(NULL, &status);
+    pj_wipe_start_result_t result =
+        recording_wipe_start(NULL, &status, PJ_WIPE_WORKER_RELEASE_NOW);
     if (result == PJ_WIPE_START_STARTED || result == PJ_WIPE_START_ATTACHED) {
         return (int)status.id;
     }
@@ -7329,6 +7370,17 @@ static void serial_print_wipe_start(pj_wipe_start_result_t result,
     cJSON_Delete(json);
 }
 
+static int serial_drain_stdout(void)
+{
+    if (fflush(stdout) != 0) {
+        return errno != 0 ? errno : EIO;
+    }
+    if (fsync(fileno(stdout)) != 0) {
+        return errno != 0 ? errno : EIO;
+    }
+    return 0;
+}
+
 static void serial_print_interval_reset(const char *request_id)
 {
     uint32_t generation = interval_reset_request();
@@ -7412,9 +7464,18 @@ static void serial_command_task(void *arg)
         }
         if (serial_request_matches(line, "PJ_WIPE_RECORDINGS", &request_id)) {
             pj_wipe_status_t wipe_status = {0};
-            pj_wipe_start_result_t result = recording_wipe_start(request_id, &wipe_status);
+            pj_wipe_start_result_t result = recording_wipe_start(
+                request_id, &wipe_status, PJ_WIPE_WORKER_RELEASE_AFTER_RESPONSE);
             serial_print_wipe_start(result, &wipe_status, request_id);
-            fflush(stdout);
+            int drain_error = serial_drain_stdout();
+            if (result == PJ_WIPE_START_STARTED &&
+                !recording_wipe_release(wipe_status.id)) {
+                ESP_LOGE(TAG, "Recording wipe ACK release failed: operation=%" PRIu32,
+                         wipe_status.id);
+            }
+            if (drain_error != 0) {
+                ESP_LOGW(TAG, "USB wipe response drain failed: errno=%d", drain_error);
+            }
             continue;
         }
         if (serial_request_matches(line, "PJ_INTERVAL_RESET", &request_id)) {
@@ -8408,7 +8469,8 @@ static esp_err_t audio_delete_handler(httpd_req_t *req)
         return ESP_OK;
     }
     pj_wipe_status_t status = {0};
-    pj_wipe_start_result_t start = recording_wipe_start(NULL, &status);
+    pj_wipe_start_result_t start =
+        recording_wipe_start(NULL, &status, PJ_WIPE_WORKER_RELEASE_NOW);
     cJSON *json = cJSON_CreateObject();
     if (json == NULL) {
         httpd_resp_set_status(req, "503 Service Unavailable");
