@@ -108,15 +108,16 @@ Important constraints from the panel datasheet:
   periodic full-refresh policy configurable and establish its cadence from
   ghosting tests on the shipping enclosure and temperature range.
 - The refresh planner clips dirty regions to the panel, byte-aligns partial X
-  bounds, tightens transfers to pixels that differ from the last confirmed
+  bounds, tightens transfers to pixels that differ from the current driver
   driver shadow, and suppresses byte-identical partial updates. It promotes the
   30th successful partial update to a full refresh until hardware testing
   establishes a board-profile cadence. The driver logs cumulative full,
   partial, and no-op counts plus changed pixels and total update latency.
-- A partial update copies only its confirmed transfer region into the panel
+- A partial update copies only its planned transfer region into the panel
   shadow. Pixels outside the invalidated region remain unchanged in the shadow,
   so an incomplete dirty-region declaration cannot hide a later required
-  update.
+  update. BUSY timeout and SPI error propagation must be completed before the
+  driver shadow can be treated as controller-confirmed state.
 - A display update is not complete until BUSY deasserts. Do not cut `EPD3V3`,
   reset the controller, or start another update during master activation.
 - Command `0x10` with data `0x01` enters panel deep sleep. BUSY then remains
