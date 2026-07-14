@@ -183,6 +183,7 @@ void pj_ui_set_audio_state(pj_ui_context_t *ctx, int recording, int playback_act
 void pj_ui_set_recording_elapsed(pj_ui_context_t *ctx, uint64_t elapsed_ms);
 void pj_ui_set_time_projection(pj_ui_context_t *ctx, const pj_ui_time_projection_t *projection);
 int pj_ui_consume_time_command(pj_ui_context_t *ctx, pj_ui_time_command_t *command);
+int pj_ui_discard_pending_interval_command(pj_ui_context_t *ctx);
 void pj_ui_set_sync_state(pj_ui_context_t *ctx, int pending, int transferred, int online);
 void pj_ui_set_static_art(pj_ui_context_t *ctx, const uint8_t *pixels, size_t pixel_bytes);
 void pj_ui_clear_static_art(pj_ui_context_t *ctx);

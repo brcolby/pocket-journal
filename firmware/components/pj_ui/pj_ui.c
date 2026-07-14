@@ -1261,6 +1261,18 @@ int pj_ui_consume_time_command(pj_ui_context_t *ctx, pj_ui_time_command_t *comma
     return 1;
 }
 
+int pj_ui_discard_pending_interval_command(pj_ui_context_t *ctx)
+{
+    if (ctx == NULL ||
+        (ctx->time_command.type != PJ_UI_TIME_COMMAND_INTERVAL_START &&
+         ctx->time_command.type != PJ_UI_TIME_COMMAND_INTERVAL_PAUSE &&
+         ctx->time_command.type != PJ_UI_TIME_COMMAND_INTERVAL_RESET)) {
+        return 0;
+    }
+    memset(&ctx->time_command, 0, sizeof(ctx->time_command));
+    return 1;
+}
+
 static void queue_time_command(pj_ui_context_t *ctx, pj_ui_time_command_type_t type,
                                uint64_t duration_ms, uint64_t secondary_duration_ms)
 {

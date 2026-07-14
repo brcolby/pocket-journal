@@ -1169,6 +1169,48 @@ static void test_untrusted_time_disarms_and_retrusted_time_rearms(void)
     assert(fixture.wake_deadline.delay_ms == 59000);
 }
 
+static void test_idempotent_interval_reset_is_persistence_barrier(void)
+{
+    fixture_t fixture;
+    fixture_defaults(&fixture);
+    pj_time_controller_t controller = init_default(&fixture);
+    pj_time_controller_result_t result = apply(
+        &controller, &fixture, PJ_TIME_CONTROLLER_COMMAND_INTERVAL_START,
+        90000, 90000);
+    assert(result.command_applied && controller.state.interval.running);
+
+    clear_observations(&fixture);
+    fixture.save_plan[0] = PJ_TIME_CONTROLLER_SAVE_TRANSIENT_ERROR;
+    fixture.save_plan_count = 1;
+    result = apply(&controller, &fixture,
+                   PJ_TIME_CONTROLLER_COMMAND_INTERVAL_RESET, 0, 0);
+    assert(result.command_applied && result.persistence_attempted);
+    assert(result.save_result == PJ_TIME_CONTROLLER_SAVE_TRANSIENT_ERROR);
+    assert(result.dirty && !controller.state.interval.running);
+    assert(controller.state.interval.remaining_ms == 0);
+
+    clear_observations(&fixture);
+    result = apply(&controller, &fixture,
+                   PJ_TIME_CONTROLLER_COMMAND_INTERVAL_RESET, 0, 0);
+    assert(result.command_attempted && !result.command_applied);
+    assert(!result.state_changed && result.persistence_attempted);
+    assert(result.save_result == PJ_TIME_CONTROLLER_SAVE_OK);
+    assert(fixture.save_calls == 1 && fixture.wake_calls == 1);
+    assert(!result.dirty && !fixture.saved_state.interval.running);
+    assert(fixture.saved_state.interval.remaining_ms == 0);
+    assert(fixture.saved_state.active_alert.source == PJ_TIME_ALERT_NONE);
+
+    fixture_t reboot;
+    fixture_defaults(&reboot);
+    reboot.load_result = PJ_TIME_CONTROLLER_LOAD_VALID;
+    memcpy(reboot.load_record, fixture.saved_record,
+           sizeof(reboot.load_record));
+    pj_time_controller_t restored = init_default(&reboot);
+    assert(!restored.state.interval.running);
+    assert(restored.state.interval.remaining_ms == 0);
+    assert(restored.state.active_alert.source == PJ_TIME_ALERT_NONE);
+}
+
 int main(void)
 {
     test_argument_validation_and_load_classes();
@@ -1191,6 +1233,7 @@ int main(void)
     test_callback_operation_ordering();
     test_staged_save_failures_preserve_latest_state();
     test_untrusted_time_disarms_and_retrusted_time_rearms();
+    test_idempotent_interval_reset_is_persistence_barrier();
     puts("time controller tests passed");
     return 0;
 }

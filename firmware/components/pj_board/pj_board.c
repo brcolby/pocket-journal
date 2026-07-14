@@ -362,6 +362,7 @@ typedef struct {
     uint8_t volume;
     uint8_t recording;
     uint8_t deferred;
+    uint32_t stop_generation;
 } alert_audio_intent_t;
 
 typedef struct {
@@ -369,6 +370,9 @@ typedef struct {
     uint32_t completed_generation;
     uint8_t state_changed;
     uint8_t persistence_ok;
+    uint8_t interval_active_before;
+    uint8_t interval_active_after;
+    uint8_t audio_silenced;
 } interval_reset_state_t;
 
 typedef enum {
@@ -380,6 +384,7 @@ static portMUX_TYPE g_alert_audio_intent_lock = portMUX_INITIALIZER_UNLOCKED;
 static portMUX_TYPE g_interval_reset_lock = portMUX_INITIALIZER_UNLOCKED;
 static alert_audio_intent_t g_alert_audio_intent;
 static uint64_t g_interval_alert_ack_pending;
+static uint32_t g_alert_audio_stop_completed_generation;
 static interval_reset_state_t g_interval_reset;
 
 static esp_err_t rtc_write_status_time(void);
@@ -982,6 +987,16 @@ static void alert_audio_task(void *arg)
         alert_audio_intent_t intent = alert_audio_intent_snapshot();
         alert_audio_apply_intent(&intent);
         pj_alert_audio_result_t result = pj_alert_audio_pump(&g_alert_audio, scratch);
+        if (intent.alert_id == 0 && g_alert_audio.alert_id == 0 &&
+            g_alert_audio.state != PJ_ALERT_AUDIO_PLAYING &&
+            !g_alert_audio.cleanup_pending) {
+            portENTER_CRITICAL(&g_alert_audio_intent_lock);
+            if (g_alert_audio_intent.alert_id == 0 &&
+                g_alert_audio_intent.stop_generation == intent.stop_generation) {
+                g_alert_audio_stop_completed_generation = intent.stop_generation;
+            }
+            portEXIT_CRITICAL(&g_alert_audio_intent_lock);
+        }
         if (g_alert_audio.alert_id != failure_alert_id) {
             failure_alert_id = g_alert_audio.alert_id;
             consecutive_failures = 0;
@@ -1100,6 +1115,14 @@ static uint32_t interval_reset_request(void)
     g_alert_audio_intent.kind = 0;
     g_alert_audio_intent.deferred = 0;
     g_interval_alert_ack_pending = 0;
+    uint32_t audio_generation = g_alert_audio_intent.stop_generation + 1U;
+    if (audio_generation == 0U) {
+        audio_generation = 1U;
+    }
+    g_alert_audio_intent.stop_generation = audio_generation;
+    if (g_alert_audio_task == NULL) {
+        g_alert_audio_stop_completed_generation = audio_generation;
+    }
     portEXIT_CRITICAL(&g_alert_audio_intent_lock);
     alert_audio_notify();
 
@@ -1109,6 +1132,7 @@ static uint32_t interval_reset_request(void)
         generation = 1U;
     }
     g_interval_reset.requested_generation = generation;
+    g_interval_reset.audio_silenced = 0;
     portEXIT_CRITICAL(&g_interval_reset_lock);
     return generation;
 }
@@ -1126,15 +1150,18 @@ static uint32_t interval_reset_take_pending(void)
 }
 
 static void interval_reset_complete(
-    uint32_t generation, const pj_time_controller_result_t *result)
+    uint32_t generation, const pj_time_controller_result_t *result,
+    int interval_active_before, int interval_active_after)
 {
     int persistence_ok = result != NULL && result->command_attempted &&
-        (!result->persistence_attempted ||
-         result->save_result == PJ_TIME_CONTROLLER_SAVE_OK);
+        result->persistence_attempted &&
+        result->save_result == PJ_TIME_CONTROLLER_SAVE_OK;
     portENTER_CRITICAL(&g_interval_reset_lock);
     g_interval_reset.completed_generation = generation;
     g_interval_reset.state_changed = result != NULL && result->state_changed;
     g_interval_reset.persistence_ok = persistence_ok;
+    g_interval_reset.interval_active_before = interval_active_before != 0;
+    g_interval_reset.interval_active_after = interval_active_after != 0;
     portEXIT_CRITICAL(&g_interval_reset_lock);
 }
 
@@ -1148,7 +1175,15 @@ static int interval_reset_wait(uint32_t generation,
         portENTER_CRITICAL(&g_interval_reset_lock);
         snapshot = g_interval_reset;
         portEXIT_CRITICAL(&g_interval_reset_lock);
-        if (snapshot.completed_generation == generation) {
+        uint32_t audio_requested;
+        uint32_t audio_completed;
+        portENTER_CRITICAL(&g_alert_audio_intent_lock);
+        audio_requested = g_alert_audio_intent.stop_generation;
+        audio_completed = g_alert_audio_stop_completed_generation;
+        portEXIT_CRITICAL(&g_alert_audio_intent_lock);
+        if (snapshot.completed_generation == generation &&
+            audio_requested == audio_completed) {
+            snapshot.audio_silenced = 1;
             if (result != NULL) {
                 *result = snapshot;
             }
@@ -4718,6 +4753,25 @@ static int time_state_apply_interval_audio_ack(void)
     return result.command_applied;
 }
 
+static int time_state_interval_active(void)
+{
+    const pj_time_state_t *state =
+        pj_time_controller_state(&g_time_controller);
+    if (state == NULL) {
+        return 0;
+    }
+    if (state->interval.running || state->interval.remaining_ms != 0 ||
+        state->active_alert.source == PJ_TIME_ALERT_INTERVAL) {
+        return 1;
+    }
+    for (size_t i = 0; i < state->pending_count; ++i) {
+        if (state->pending[i].source == PJ_TIME_ALERT_INTERVAL) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static int wav_write_header(FILE *file, uint32_t data_bytes, uint16_t channels, uint32_t sample_rate)
 {
     uint8_t header[PJ_STORAGE_WAV_HEADER_BYTES];
@@ -6391,18 +6445,24 @@ int pj_board_update_time_state(pj_ui_context_t *ui)
     pj_time_controller_result_t result;
     uint32_t reset_generation = interval_reset_take_pending();
     if (reset_generation != 0U) {
+        int interval_active_before = time_state_interval_active();
+        (void)pj_ui_discard_pending_interval_command(ui);
         const pj_time_controller_command_t command = {
             .type = PJ_TIME_CONTROLLER_COMMAND_INTERVAL_RESET,
         };
         if (!pj_time_controller_apply(&g_time_controller, &command, &result)) {
             memset(&result, 0, sizeof(result));
         }
-        interval_reset_complete(reset_generation, &result);
+        (void)time_state_apply_interval_audio_ack();
+        (void)time_state_project(ui);
+        interval_reset_complete(reset_generation, &result,
+                                interval_active_before,
+                                time_state_interval_active());
     } else {
         (void)pj_time_controller_update(&g_time_controller, &result);
+        (void)time_state_apply_interval_audio_ack();
+        (void)time_state_project(ui);
     }
-    (void)time_state_apply_interval_audio_ack();
-    (void)time_state_project(ui);
     return pj_ui_is_dirty(ui);
 #else
     (void)ui;
@@ -7395,7 +7455,16 @@ static void serial_print_interval_reset(const char *request_id)
     if (request_id != NULL) {
         cJSON_AddStringToObject(json, "request_id", request_id);
     }
-    cJSON_AddBoolToObject(json, "silenced", 1);
+    if (completed) {
+        cJSON_AddBoolToObject(json, "interval_active_before",
+                              result.interval_active_before);
+        cJSON_AddBoolToObject(json, "interval_active_after",
+                              result.interval_active_after);
+    }
+    cJSON_AddBoolToObject(json, "silence_requested", 1);
+    cJSON_AddBoolToObject(json, "silenced",
+                          completed && result.audio_silenced &&
+                          !result.interval_active_after);
     if (!completed) {
         cJSON_AddStringToObject(json, "error", "interval reset timed out");
         cJSON_AddStringToObject(json, "code", "interval_reset_timeout");

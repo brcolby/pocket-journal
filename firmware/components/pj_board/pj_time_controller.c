@@ -479,7 +479,9 @@ int pj_time_controller_apply(pj_time_controller_t *controller,
         memcmp(&before, &controller->state, sizeof(before)) != 0;
     result->transition = result->transition ||
         transition_changed(&before, &controller->state);
-    if (result->command_applied || result->transition) {
+    int persistence_barrier =
+        command->type == PJ_TIME_CONTROLLER_COMMAND_INTERVAL_RESET;
+    if (result->command_applied || result->transition || persistence_barrier) {
         persist(controller, &clock, 1, result);
         schedule_wake(controller, &clock, result);
     } else if (result->state_changed || controller->dirty) {

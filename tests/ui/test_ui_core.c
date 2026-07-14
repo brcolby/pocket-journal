@@ -1258,6 +1258,32 @@ static void test_aux_back_resets_time_pages_before_returning(void)
     assert(pending.timer_running == 1 && pending.timer_seconds == 30);
 }
 
+static void test_persistent_interval_reset_discards_stale_ui_command(void)
+{
+    static const pj_ui_time_command_type_t interval_commands[] = {
+        PJ_UI_TIME_COMMAND_INTERVAL_START,
+        PJ_UI_TIME_COMMAND_INTERVAL_PAUSE,
+        PJ_UI_TIME_COMMAND_INTERVAL_RESET,
+    };
+    for (size_t i = 0; i < sizeof(interval_commands) / sizeof(interval_commands[0]); i++) {
+        pj_ui_context_t ui;
+        pj_ui_time_command_t consumed;
+        pj_ui_init(&ui);
+        ui.time_command.type = interval_commands[i];
+        ui.time_command.duration_ms = 90000;
+        assert(pj_ui_discard_pending_interval_command(&ui) == 1);
+        assert(pj_ui_consume_time_command(&ui, &consumed) == 0);
+    }
+
+    pj_ui_context_t unrelated;
+    pj_ui_init(&unrelated);
+    unrelated.time_command.type = PJ_UI_TIME_COMMAND_TIMER_START;
+    assert(pj_ui_discard_pending_interval_command(&unrelated) == 0);
+    pj_ui_time_command_t consumed;
+    assert(pj_ui_consume_time_command(&unrelated, &consumed) == 1);
+    assert(consumed.type == PJ_UI_TIME_COMMAND_TIMER_START);
+}
+
 static void test_alert_overlay_commands_keep_model_authoritative(void)
 {
     pj_ui_context_t ui;
@@ -1830,6 +1856,7 @@ int main(void)
     test_recovery_notice_emits_acknowledgement();
     test_time_controls_emit_explicit_commands();
     test_aux_back_resets_time_pages_before_returning();
+    test_persistent_interval_reset_discards_stale_ui_command();
     test_alert_overlay_commands_keep_model_authoritative();
     test_sync_state_is_board_driven();
     test_dirty_lifecycle();
