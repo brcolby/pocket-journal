@@ -160,6 +160,32 @@ class SerialLifecycleTests(unittest.TestCase):
         self.assertTrue(connection.input_reset)
         self.assertEqual(connection.writes, [b"PJ_STATUS\n"])
 
+    def test_interval_reset_is_tagged_confirmed_and_releases_descriptor(self) -> None:
+        connection = FakeConnection([
+            b'PJ_OK {"command":"PJ_INTERVAL_RESET","request_id":"stop-1",'
+            b'"silenced":true,"reset":true,"persisted":true}\n',
+        ])
+        serial_module = FakeSerialModule(connection)
+
+        with patch.dict(sys.modules, {"serial": serial_module}):
+            with patch("pocket_journal_partner.device.time.sleep"):
+                with patch(
+                    "pocket_journal_partner.device._new_request_id",
+                    return_value="stop-1",
+                ):
+                    result = SerialDeviceClient(
+                        "/dev/cu.test", timeout=1,
+                    ).reset_interval()
+
+        self.assertTrue(result["reset"])
+        self.assertTrue(result["persisted"])
+        self.assertEqual(
+            connection.writes,
+            [b"PJ_INTERVAL_RESET request_id=stop-1\n"],
+        )
+        self.assertEqual(connection.close_count, 1)
+        self.assertFalse(connection.is_open)
+
     def test_timeout_releases_descriptor_and_reports_recovery(self) -> None:
         connection = FakeConnection()
         serial_module = FakeSerialModule(connection)

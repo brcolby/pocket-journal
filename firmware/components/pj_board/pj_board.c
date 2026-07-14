@@ -199,6 +199,8 @@
 #define PJ_STORAGE_WIPE_TASK_STACK 4096
 #define PJ_STORAGE_WIPE_BATCH_ENTRIES 64U
 #define PJ_STORAGE_WIPE_MAX_BATCHES 64U
+#define PJ_INTERVAL_RESET_WAIT_MS 3000U
+#define PJ_INTERVAL_RESET_POLL_MS 20U
 #define PJ_CONNECTIVITY_TASK_STACK 4096
 #define PJ_CONNECTIVITY_POLL_MS 250
 #define PJ_WIFI_RECONNECT_SETTLE_MS 250
@@ -362,9 +364,18 @@ typedef struct {
     uint8_t deferred;
 } alert_audio_intent_t;
 
+typedef struct {
+    uint32_t requested_generation;
+    uint32_t completed_generation;
+    uint8_t state_changed;
+    uint8_t persistence_ok;
+} interval_reset_state_t;
+
 static portMUX_TYPE g_alert_audio_intent_lock = portMUX_INITIALIZER_UNLOCKED;
+static portMUX_TYPE g_interval_reset_lock = portMUX_INITIALIZER_UNLOCKED;
 static alert_audio_intent_t g_alert_audio_intent;
 static uint64_t g_interval_alert_ack_pending;
+static interval_reset_state_t g_interval_reset;
 
 static esp_err_t rtc_write_status_time(void);
 static uint64_t board_monotonic_ms(void);
@@ -1075,6 +1086,74 @@ static void alert_audio_project(const pj_time_alert_t *alert,
         g_alert_audio_intent.recording;
     portEXIT_CRITICAL(&g_alert_audio_intent_lock);
     alert_audio_notify();
+}
+
+static uint32_t interval_reset_request(void)
+{
+    portENTER_CRITICAL(&g_alert_audio_intent_lock);
+    g_alert_audio_intent.alert_id = 0;
+    g_alert_audio_intent.kind = 0;
+    g_alert_audio_intent.deferred = 0;
+    g_interval_alert_ack_pending = 0;
+    portEXIT_CRITICAL(&g_alert_audio_intent_lock);
+    alert_audio_notify();
+
+    portENTER_CRITICAL(&g_interval_reset_lock);
+    uint32_t generation = g_interval_reset.requested_generation + 1U;
+    if (generation == 0U) {
+        generation = 1U;
+    }
+    g_interval_reset.requested_generation = generation;
+    portEXIT_CRITICAL(&g_interval_reset_lock);
+    return generation;
+}
+
+static uint32_t interval_reset_take_pending(void)
+{
+    uint32_t generation = 0;
+    portENTER_CRITICAL(&g_interval_reset_lock);
+    if (g_interval_reset.requested_generation !=
+        g_interval_reset.completed_generation) {
+        generation = g_interval_reset.requested_generation;
+    }
+    portEXIT_CRITICAL(&g_interval_reset_lock);
+    return generation;
+}
+
+static void interval_reset_complete(
+    uint32_t generation, const pj_time_controller_result_t *result)
+{
+    int persistence_ok = result != NULL && result->command_attempted &&
+        (!result->persistence_attempted ||
+         result->save_result == PJ_TIME_CONTROLLER_SAVE_OK);
+    portENTER_CRITICAL(&g_interval_reset_lock);
+    g_interval_reset.completed_generation = generation;
+    g_interval_reset.state_changed = result != NULL && result->state_changed;
+    g_interval_reset.persistence_ok = persistence_ok;
+    portEXIT_CRITICAL(&g_interval_reset_lock);
+}
+
+static int interval_reset_wait(uint32_t generation,
+                               interval_reset_state_t *result)
+{
+    TickType_t deadline = xTaskGetTickCount() +
+        pdMS_TO_TICKS(PJ_INTERVAL_RESET_WAIT_MS);
+    while (1) {
+        interval_reset_state_t snapshot;
+        portENTER_CRITICAL(&g_interval_reset_lock);
+        snapshot = g_interval_reset;
+        portEXIT_CRITICAL(&g_interval_reset_lock);
+        if (snapshot.completed_generation == generation) {
+            if (result != NULL) {
+                *result = snapshot;
+            }
+            return 1;
+        }
+        if ((int32_t)(xTaskGetTickCount() - deadline) >= 0) {
+            return 0;
+        }
+        vTaskDelay(pdMS_TO_TICKS(PJ_INTERVAL_RESET_POLL_MS));
+    }
 }
 
 static i2s_std_gpio_config_t audio_i2s_gpio_config(gpio_num_t dout_pin)
@@ -6270,7 +6349,18 @@ int pj_board_update_time_state(pj_ui_context_t *ui)
         return 0;
     }
     pj_time_controller_result_t result;
-    (void)pj_time_controller_update(&g_time_controller, &result);
+    uint32_t reset_generation = interval_reset_take_pending();
+    if (reset_generation != 0U) {
+        const pj_time_controller_command_t command = {
+            .type = PJ_TIME_CONTROLLER_COMMAND_INTERVAL_RESET,
+        };
+        if (!pj_time_controller_apply(&g_time_controller, &command, &result)) {
+            memset(&result, 0, sizeof(result));
+        }
+        interval_reset_complete(reset_generation, &result);
+    } else {
+        (void)pj_time_controller_update(&g_time_controller, &result);
+    }
     (void)time_state_apply_interval_audio_ack();
     (void)time_state_project(ui);
     return pj_ui_is_dirty(ui);
@@ -7239,6 +7329,40 @@ static void serial_print_wipe_start(pj_wipe_start_result_t result,
     cJSON_Delete(json);
 }
 
+static void serial_print_interval_reset(const char *request_id)
+{
+    uint32_t generation = interval_reset_request();
+    interval_reset_state_t result = {0};
+    int completed = interval_reset_wait(generation, &result);
+    cJSON *json = cJSON_CreateObject();
+    if (json == NULL) {
+        printf("PJ_ERR {\"error\":\"interval reset response allocation failed\"}\n");
+        return;
+    }
+    cJSON_AddStringToObject(json, "command", "PJ_INTERVAL_RESET");
+    if (request_id != NULL) {
+        cJSON_AddStringToObject(json, "request_id", request_id);
+    }
+    cJSON_AddBoolToObject(json, "silenced", 1);
+    if (!completed) {
+        cJSON_AddStringToObject(json, "error", "interval reset timed out");
+        cJSON_AddStringToObject(json, "code", "interval_reset_timeout");
+        cJSON_AddBoolToObject(json, "retryable", 1);
+        serial_print_json("PJ_ERR", json);
+    } else if (!result.persistence_ok) {
+        cJSON_AddStringToObject(json, "error", "interval reset could not be persisted");
+        cJSON_AddStringToObject(json, "code", "interval_reset_persist_failed");
+        cJSON_AddBoolToObject(json, "retryable", 1);
+        serial_print_json("PJ_ERR", json);
+    } else {
+        cJSON_AddBoolToObject(json, "reset", 1);
+        cJSON_AddBoolToObject(json, "state_changed", result.state_changed);
+        cJSON_AddBoolToObject(json, "persisted", 1);
+        serial_print_json("PJ_OK", json);
+    }
+    cJSON_Delete(json);
+}
+
 static void serial_command_task(void *arg)
 {
     (void)arg;
@@ -7290,6 +7414,11 @@ static void serial_command_task(void *arg)
             pj_wipe_status_t wipe_status = {0};
             pj_wipe_start_result_t result = recording_wipe_start(request_id, &wipe_status);
             serial_print_wipe_start(result, &wipe_status, request_id);
+            fflush(stdout);
+            continue;
+        }
+        if (serial_request_matches(line, "PJ_INTERVAL_RESET", &request_id)) {
+            serial_print_interval_reset(request_id);
             fflush(stdout);
             continue;
         }

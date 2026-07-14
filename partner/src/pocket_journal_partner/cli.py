@@ -400,6 +400,21 @@ def cmd_device_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_device_stop_interval(args: argparse.Namespace) -> int:
+    resolved_port = resolve_serial_port(args.serial_port)
+    client = SerialDeviceClient(
+        resolved_port,
+        baudrate=args.serial_baud,
+        timeout=args.timeout,
+    )
+    _print_json({
+        "device_id": "usb",
+        "transport": "usb",
+        "result": client.reset_interval(),
+    })
+    return 0
+
+
 def cmd_device_wifi_diagnostics(args: argparse.Namespace) -> int:
     session = _session_from_args(args)
     _print_json(session.envelope(wifi_diagnostics(session.status())))
@@ -680,6 +695,17 @@ def build_parser() -> argparse.ArgumentParser:
     device_status.add_argument("--serial-baud", type=int, default=115200)
     device_status.add_argument("--timeout", type=float, default=6.0)
     device_status.set_defaults(func=cmd_device_status)
+    device_stop_interval = device_sub.add_parser(
+        "stop-interval",
+        help="silence and persistently reset a running interval over USB-C",
+    )
+    device_stop_interval.add_argument(
+        "--serial-port",
+        help="USB-C serial port, such as /dev/cu.usbmodem1101; auto-detected when omitted",
+    )
+    device_stop_interval.add_argument("--serial-baud", type=int, default=115200)
+    device_stop_interval.add_argument("--timeout", type=float, default=6.0)
+    device_stop_interval.set_defaults(func=cmd_device_stop_interval)
     device_wifi = device_sub.add_parser(
         "wifi-diagnostics",
         help="explain Wi-Fi connection state without exposing credentials",

@@ -512,6 +512,15 @@ class SerialDeviceClient:
     def status(self) -> dict[str, Any]:
         return self._request("PJ_STATUS")
 
+    def reset_interval(self) -> dict[str, Any]:
+        response = self._request(
+            "PJ_INTERVAL_RESET",
+            request_id=_new_request_id(),
+        )
+        if response.get("reset") is not True or response.get("persisted") is not True:
+            raise DeviceError("USB command failed: interval reset was not confirmed")
+        return response
+
     def put_time(self, hour: int, minute: int, month: int, day: int, year: int | None = None) -> dict[str, Any]:
         if year is None:
             raise DeviceError("USB time sync requires a year")

@@ -233,6 +233,32 @@ class CalendarDeprecationTests(unittest.TestCase):
 
 
 class UsbRecoveryCliTests(unittest.TestCase):
+    def test_stop_interval_uses_usb_and_reports_persistent_reset(self) -> None:
+        client = Mock(spec=SerialDeviceClient)
+        client.reset_interval.return_value = {
+            "command": "PJ_INTERVAL_RESET",
+            "silenced": True,
+            "reset": True,
+            "persisted": True,
+        }
+        stdout = StringIO()
+
+        with patch("pocket_journal_partner.cli.resolve_serial_port", return_value="/dev/cu.test"):
+            with patch("pocket_journal_partner.cli.SerialDeviceClient", return_value=client) as serial_client:
+                with redirect_stdout(stdout):
+                    exit_code = cli.main([
+                        "device", "stop-interval", "--timeout", "4",
+                    ])
+
+        self.assertEqual(exit_code, 0)
+        serial_client.assert_called_once_with(
+            "/dev/cu.test", baudrate=115200, timeout=4.0,
+        )
+        client.reset_interval.assert_called_once_with()
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(payload["transport"], "usb")
+        self.assertTrue(payload["result"]["persisted"])
+
     def test_recovery_autodetects_usb_and_emits_a_credential_safe_report(self) -> None:
         client = Mock(spec=SerialDeviceClient)
         client.recover_usb.return_value = {
