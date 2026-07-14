@@ -197,6 +197,7 @@
 #define PJ_CONNECTIVITY_TASK_STACK 4096
 #define PJ_CONNECTIVITY_POLL_MS 250
 #define PJ_WIFI_RECONNECT_SETTLE_MS 250
+#define PJ_WIFI_CONTROL_EVENT_POLL_MS 10
 #define PJ_STORAGE_RESERVE_BYTES (256ULL * 1024ULL)
 #define PJ_STORAGE_RECORD_START_BYTES (64ULL * 1024ULL)
 #define PJ_STORAGE_CAPACITY_CHECK_BYTES (64U * 1024U)
@@ -1153,6 +1154,39 @@ static esp_err_t connectivity_sntp_ensure_initialized(void)
     return err;
 }
 
+static esp_err_t wifi_disconnect_for_control(void)
+{
+    portENTER_CRITICAL(&g_connectivity_lock);
+    g_wifi_control_disconnect_pending = 1;
+    portEXIT_CRITICAL(&g_connectivity_lock);
+
+    esp_err_t err = esp_wifi_disconnect();
+    if (err != ESP_OK) {
+        portENTER_CRITICAL(&g_connectivity_lock);
+        g_wifi_control_disconnect_pending = 0;
+        portEXIT_CRITICAL(&g_connectivity_lock);
+        return err;
+    }
+
+    for (unsigned waited_ms = 0; waited_ms < PJ_WIFI_RECONNECT_SETTLE_MS;
+         waited_ms += PJ_WIFI_CONTROL_EVENT_POLL_MS) {
+        int pending;
+        portENTER_CRITICAL(&g_connectivity_lock);
+        pending = g_wifi_control_disconnect_pending;
+        portEXIT_CRITICAL(&g_connectivity_lock);
+        if (!pending) {
+            return ESP_OK;
+        }
+        vTaskDelay(pdMS_TO_TICKS(PJ_WIFI_CONTROL_EVENT_POLL_MS));
+    }
+
+    /* Never let a missing control event hide the next genuine failure. */
+    portENTER_CRITICAL(&g_connectivity_lock);
+    g_wifi_control_disconnect_pending = 0;
+    portEXIT_CRITICAL(&g_connectivity_lock);
+    return ESP_OK;
+}
+
 static void connectivity_task(void *arg)
 {
     (void)arg;
@@ -1166,17 +1200,7 @@ static void connectivity_task(void *arg)
 
         if (g_wifi_started && wifi_action != PJ_WIFI_ACTION_NONE) {
             if (wifi_action == PJ_WIFI_ACTION_RECONNECT) {
-                portENTER_CRITICAL(&g_connectivity_lock);
-                g_wifi_control_disconnect_pending = 1;
-                portEXIT_CRITICAL(&g_connectivity_lock);
-                esp_err_t disconnect_err = esp_wifi_disconnect();
-                if (disconnect_err == ESP_OK) {
-                    vTaskDelay(pdMS_TO_TICKS(PJ_WIFI_RECONNECT_SETTLE_MS));
-                } else {
-                    portENTER_CRITICAL(&g_connectivity_lock);
-                    g_wifi_control_disconnect_pending = 0;
-                    portEXIT_CRITICAL(&g_connectivity_lock);
-                }
+                (void)wifi_disconnect_for_control();
             }
             esp_err_t connect_err = esp_wifi_connect();
             if (connect_err != ESP_OK) {
@@ -1377,17 +1401,7 @@ static esp_err_t wifi_start_or_reconfigure(void)
         ESP_RETURN_ON_ERROR(esp_wifi_start(), TAG, "Wi-Fi start failed");
         g_wifi_started = 1;
     } else {
-        portENTER_CRITICAL(&g_connectivity_lock);
-        g_wifi_control_disconnect_pending = 1;
-        portEXIT_CRITICAL(&g_connectivity_lock);
-        esp_err_t disconnect_err = esp_wifi_disconnect();
-        if (disconnect_err == ESP_OK) {
-            vTaskDelay(pdMS_TO_TICKS(PJ_WIFI_RECONNECT_SETTLE_MS));
-        } else {
-            portENTER_CRITICAL(&g_connectivity_lock);
-            g_wifi_control_disconnect_pending = 0;
-            portEXIT_CRITICAL(&g_connectivity_lock);
-        }
+        (void)wifi_disconnect_for_control();
         ESP_RETURN_ON_ERROR(wifi_apply_config(), TAG, "Wi-Fi station reconfiguration failed");
     }
     portENTER_CRITICAL(&g_connectivity_lock);
