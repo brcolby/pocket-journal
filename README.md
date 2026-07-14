@@ -6,7 +6,7 @@ The repo is split into four main areas:
 
 - `firmware/`: ESP-IDF firmware skeleton and shared UI/state-machine core.
 - `simulator/`: browser-based 200x200 black/white e-paper simulator for UI iteration before hardware arrives.
-- `partner/`: CLI-first laptop app for provisioning, sync, transcription, calendar sync, and settings.
+- `partner/`: CLI-first laptop app for provisioning, sync, transcription, diagnostics, and settings.
 - `docs/`: hardware, install, API, sync, and test notes.
 
 ## Current Status
@@ -49,4 +49,3 @@ PYTHONPATH=src python -m pocket_journal_partner --help
 - Storage: FAT32 TF card required for audio and local device data.
 - Networking: USB-C provisioning by default, optional BLE provisioning, then Wi-Fi station mode.
 - Partner host: Apple Silicon macOS and Linux first.
-- Google Calendar OAuth credentials stay on the partner host.

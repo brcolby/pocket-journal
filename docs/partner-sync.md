@@ -9,13 +9,14 @@ pj provision --ssid <ssid> --password <password>
 pj provision --ssid <ssid> --password <password> --serial-port /dev/cu.usbmodem1101
 pj provision --ssid <ssid> --password <password> --ble
 pj discover
-pj sync --device <device-id>
-pj calendar sync --device <device-id>
-pj settings get --device <device-id>
-pj settings set --device <device-id> volume=8 theme=dark
-pj settings set --device <device-id> alarm_enabled=true alarm_hour=7 alarm_minute=30
-pj settings set --device <device-id> clock_24h=false temperature_unit=f transcript_font_size=3
-pj device sync-time --device <device-id>
+pj sync
+pj settings get
+pj settings set volume=8 theme=dark
+pj settings set alarm_enabled=true alarm_hour=7 alarm_minute=30
+pj settings set clock_24h=false temperature_unit=f transcript_font_size=3
+pj device status
+pj device wifi-diagnostics
+pj device sync-time
 pj device tone
 pj device tone --pa-level 1
 pj device tone --pa-level 0 --dout-gpio 45
@@ -23,14 +24,19 @@ pj device tone --audio-power-level 0
 pj device tone --codec-gp45 0xff
 pj device mic-check --duration-ms 2000
 pj device mic-check --duration-ms 2000 --gain-db 30
-pj recordings wipe --device <device-id> --yes
-pj home get --device <device-id>
-pj home set --device <device-id> --file home.json
-pj static-art get --device <device-id>
-pj static-art set --device <device-id> --file static-art.pbm
+pj recordings wipe --yes
+pj home get
+pj home set --file home.json
+pj static-art get
+pj static-art set --file static-art.pbm
 ```
 
-Wi-Fi commands use the paired device config created by provisioning. USB-C support is included in the standard partner CLI install. The CLI auto-detects `/dev/cu.usbmodem1101` or the single attached USB serial port; pass `--serial-port` only to override detection.
+Wi-Fi commands use the paired device config created by provisioning. When one
+paired device is configured, or one paired device is visible over mDNS, LAN
+commands select it automatically. Pass `--device` when multiple candidates are
+available. USB-C support is included in the standard partner CLI install. The CLI
+auto-detects `/dev/cu.usbmodem1101` or the single attached USB serial port; pass
+`--serial-port` only to override detection.
 
 ```sh
 cd partner
@@ -39,7 +45,13 @@ pj device sync-time
 pj recordings wipe --yes
 ```
 
-`pj provision` uses USB-C by default. It stores Wi-Fi credentials and a generated API bearer token on the device, then writes the paired device profile into the local partner config. Pass `--serial-port` only when auto-detection cannot select the intended device.
+`pj provision` uses USB-C by default. It stores Wi-Fi credentials and a generated
+API bearer token on the device, writes the paired device profile into the local
+partner config, then sets and validates device time from the host. The result
+reports the host UTC anchor, local offset, and device civil time without exposing
+credentials. A time-sync failure does not discard the rotated token; retry with
+`pj device sync-time`. Pass `--serial-port` only when auto-detection cannot select
+the intended device.
 
 Pass `--ble` to provision without a cable. BLE provisioning discovers a device advertising as `PJ-XXXXXX` and uses the Pocket Journal GATT service. The SSID, password, token, and commit characteristics require an encrypted paired BLE connection before firmware accepts writes. The current firmware uses LE Secure Connections with bonding and no-display/no-input pairing; this prevents unauthenticated plaintext credential writes, but a product-owner passkey or display-confirmation UX is still required before claiming MITM-resistant first-time provisioning. Credentials are written as separate bounded values, then committed asynchronously so the BLE request does not block on NVS or Wi-Fi startup.
 
@@ -54,7 +66,23 @@ Pass `--ble` to provision without a cable. BLE provisioning discovers a device a
 
 The status characteristic returns the device id, provisioning state, and current Wi-Fi state. After credentials are stored, firmware connects as a station, reconnects after disconnects, and advertises `_pocket-journal._tcp.local.` over mDNS.
 
-Only one process can own the USB serial port. Quit `idf.py monitor` with `Ctrl+]` before running the partner utility over USB-C.
+Only one process can own the USB serial port. Quit `idf.py monitor` with `Ctrl+]`
+before running the partner utility over USB-C. Partner commands request exclusive
+ownership, preset DTR/RTS before opening, and release the descriptor on success,
+timeout, error, or interruption. A timeout includes recovery guidance for a board
+left in ROM download mode.
+
+`pj device wifi-diagnostics` presents an allowlisted, credential-safe view of
+provisioning, connection, DHCP, disconnect, retry, and radio state. Older firmware
+only reports a subset; missing values remain `null` or `unknown` rather than being
+guessed.
+
+## Deprecated Calendar Compatibility
+
+`pj calendar sync` remains available to existing automation through partner CLI
+`0.1.x`, emits a warning on every operation, and is omitted from primary help.
+It will be removed in `0.2.0`. Existing users that still need the compatibility
+command can install `.[calendar]` during this window.
 
 ## Data Stored Locally
 

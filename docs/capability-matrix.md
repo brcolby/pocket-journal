@@ -11,33 +11,40 @@ in command output or errors.
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | Device discovery | `pj discover` | No | Yes, mDNS | None for discovery; API remains authenticated | `_pocket-journal._tcp` advertisement | No | Safe to repeat |
 | Device status | `pj device status [--device ID]` | `PJ_STATUS` | `GET /v1/status` | Physical USB access or bearer token | v0 status command/endpoint | No | Safe to repeat |
+| Wi-Fi diagnostics | `pj device wifi-diagnostics [--device ID]` | Normalizes `PJ_STATUS` | Normalizes `GET /v1/status` | Physical USB access or bearer token | Structured fields are used when firmware advertises them; older status is classified conservatively | No | Safe to repeat; output is credential-safe |
 | Wi-Fi provisioning | `pj provision ... [--ble \| --serial-port PORT]` | `PJ_WIFI_HEX` (default) | No; BLE is an optional provisioning transport | Physical USB access or encrypted paired BLE; generates a new bearer token | v0 USB command or Pocket Journal BLE GATT service | Yes | Repeating intentionally replaces credentials and token |
-| Time sync | `pj device sync-time [--device ID]` | `PJ_TIME` | `PUT /v1/time` | Physical USB access or bearer token | v0 time command/endpoint | Yes | Safe to repeat; sets current host time |
-| Read settings | `pj settings get --device ID` | No | `GET /v1/settings` | Bearer token | v0 settings endpoint | No | Safe to repeat |
-| Update settings | `pj settings set --device ID KEY=VALUE...` | No | `PUT /v1/settings` | Bearer token | v0 settings endpoint | Yes | Safe to retry; updates are atomic values |
-| Read static art | `pj static-art get --device ID` | No | `GET /v1/static-art` | Bearer token | v0 static-art endpoint | No | Safe to repeat |
-| Update static art | `pj static-art set --device ID --file FILE` | No | `PUT /v1/static-art` | Bearer token | v0 static-art endpoint | Yes | Safe to retry; replaces the complete bitmap |
-| Read home layout | `pj home get --device ID` | No | `GET /v1/home` | Bearer token | v0 home endpoint | No | Safe to repeat |
-| Update home layout | `pj home set --device ID --file FILE` | No | `PUT /v1/home` | Bearer token | v0 home endpoint | Yes | Safe to retry; replaces the complete layout |
-| List audio | `pj recordings list --device ID` | No | `GET /v1/audio` | Bearer token | v0 audio endpoint | No | Safe to repeat |
-| Download audio | `pj recordings download --device ID --audio-id ID [--output-dir DIR]` | No | `GET /v1/audio/{id}` | Bearer token | v0 audio endpoint | Writes only the selected local file | Safe to retry; replaces the same local filename |
-| Sync audio and transcripts | `pj sync --device ID [--backend hf\|fake]` | No | Audio GET plus transcript PUT | Bearer token | v0 audio and transcript endpoints; selected transcription backend installed | Yes | Safe after interruption; cached audio/transcripts are reused and firmware skips uploaded notes |
+| Time sync | `pj device sync-time [--device ID]` | `PJ_TIME` | `PUT /v1/time` | Physical USB access or bearer token | v0 time command/endpoint | Yes | Safe to repeat; USB provisioning performs it automatically and validates the echoed civil time against a host UTC anchor |
+| Read settings | `pj settings get [--device ID]` | No | `GET /v1/settings` | Bearer token | v0 settings endpoint | No | Safe to repeat |
+| Update settings | `pj settings set [--device ID] KEY=VALUE...` | No | `PUT /v1/settings` | Bearer token | v0 settings endpoint | Yes | Safe to retry; updates are atomic values |
+| Read static art | `pj static-art get [--device ID]` | No | `GET /v1/static-art` | Bearer token | v0 static-art endpoint | No | Safe to repeat |
+| Update static art | `pj static-art set [--device ID] --file FILE` | No | `PUT /v1/static-art` | Bearer token | v0 static-art endpoint | Yes | Safe to retry; replaces the complete bitmap |
+| Read home layout | `pj home get [--device ID]` | No | `GET /v1/home` | Bearer token | v0 home endpoint | No | Safe to repeat |
+| Update home layout | `pj home set [--device ID] --file FILE` | No | `PUT /v1/home` | Bearer token | v0 home endpoint | Yes | Safe to retry; replaces the complete layout |
+| List audio | `pj recordings list [--device ID]` | No | `GET /v1/audio` | Bearer token | v0 audio endpoint | No | Safe to repeat |
+| Download audio | `pj recordings download [--device ID] --audio-id ID [--output-dir DIR]` | No | `GET /v1/audio/{id}` | Bearer token | v0 audio endpoint | Writes only the selected local file | Safe to retry; replaces the same local filename |
+| Sync audio and transcripts | `pj sync [--device ID] [--backend hf\|fake]` | No | Audio GET plus transcript PUT | Bearer token | v0 audio and transcript endpoints; selected transcription backend installed | Yes | Safe after interruption; cached audio/transcripts are reused and firmware skips uploaded notes |
 | Upload transcript | Performed by `pj sync` | No | `PUT /v1/transcripts/{id}` | Bearer token | v0 transcript endpoint and an existing recording | Yes | Safe to retry for the same recording |
 | Delete recordings | `pj recordings wipe [--device ID] --yes` | `PJ_WIPE_RECORDINGS` | `DELETE /v1/audio` | Physical USB access or bearer token | v0 wipe command/endpoint | Yes, destructive | Requires `--yes`; retry leaves the device empty |
-| Calendar sync | `pj calendar sync --device ID [--fixture FILE]` | No | `PUT /v1/calendar/today` | Bearer token; Google OAuth when no fixture is used | v0 calendar endpoint; calendar extra for Google | Yes | Safe to retry; replaces today's normalized payload |
 | Speaker diagnostic | `pj device tone ...` | `PJ_AUDIO_TONE` | No | Physical USB access | v0 diagnostic command | Temporarily changes diagnostic routing | Safe to repeat; firmware restores temporary overrides |
 | Microphone diagnostic | `pj device mic-check ...` | `PJ_MIC_CHECK` | No | Physical USB access | v0 diagnostic command | No retained recording | Safe to repeat |
 | OTA firmware update | None | Not implemented | Reserved `POST /v1/ota`; not production-ready | Not applicable | Rollback and version verification are required first | Yes | Undefined; CLI intentionally refuses by having no command |
 
 ## Transport Selection
 
-Commands that support both transports select LAN/Wi-Fi when `--device` is
-provided. Without `--device`, they auto-detect USB-C. `--base-url`,
-`--token`, `--serial-port`, `--serial-baud`, and `--timeout` retain explicit
-control. LAN commands normally use a paired device profile; `--base-url` and
-`--token` can provide a complete one-command override. Discovery reports candidates
-but never attempts an authenticated operation. Treat command-line token overrides
-as sensitive because the operating system may expose process arguments.
+Commands that support both transports select LAN/Wi-Fi when `--device`,
+`--base-url`, or `--token` is provided. Otherwise they prefer an unambiguous USB-C
+device and fall back to LAN when no USB serial device is present. LAN-only commands
+select a single complete paired profile directly, or join mDNS discovery with the
+stored token when provisioning did not know the eventual IP address. Zero and
+multiple candidates produce deterministic guidance. `--base-url`, `--token`,
+`--serial-port`, `--serial-baud`, and `--timeout` retain explicit control. Treat
+command-line token overrides as sensitive because the operating system may expose
+process arguments.
+
+USB serial commands request exclusive ownership, set DTR and RTS while the port is
+still closed, and release the descriptor in every success, timeout, error, and
+interrupt path. The partner never intentionally toggles those lines into an ESP32
+download/reset sequence.
 
 The shared operation session reports transport as `"usb"` or `"lan"`, preflights
 mutations, honors a firmware `capabilities` advertisement when present, and rejects
@@ -78,19 +85,24 @@ bodies in errors, preventing device-provided content from leaking secrets.
 ```sh
 pj discover
 pj device status
-pj device status --device pj-123abc
-pj device sync-time --device pj-123abc
-pj settings set --device pj-123abc volume=8 theme=dark
-pj recordings list --device pj-123abc
-pj recordings download --device pj-123abc --audio-id rec-001.wav --output-dir ./audio
-pj sync --device pj-123abc --backend hf
-pj recordings wipe --device pj-123abc --yes
+pj device wifi-diagnostics
+pj device sync-time
+pj settings set volume=8 theme=dark
+pj recordings list
+pj recordings download --audio-id rec-001.wav --output-dir ./audio
+pj sync --backend hf
+pj recordings wipe --yes
 ```
 
 USB-C serial support is included in the standard partner CLI install. Install optional transports and integrations from `partner/` as needed:
 
 ```sh
 pip install -e '.[ble]'
-pip install -e '.[calendar]'
 pip install -e '.[transcription]'
 ```
+
+## Deprecated Compatibility
+
+`pj calendar sync` is hidden from primary help and emits a deprecation warning.
+It remains compatible through `0.1.x` and will be removed in `0.2.0`. Install the
+`calendar` extra only when maintaining existing automation during that window.

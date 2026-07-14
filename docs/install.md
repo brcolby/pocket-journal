@@ -40,7 +40,7 @@ pj --help
 Optional extras:
 
 ```sh
-pip install -e '.[ble,calendar,transcription]'
+pip install -e '.[ble,transcription]'
 ```
 
 For source-tree runs before installation:
@@ -50,7 +50,9 @@ cd partner
 PYTHONPATH=src python -m pocket_journal_partner --help
 ```
 
-After flashing, you can sync the device clock from the computer that built/flashed the firmware:
+USB-C provisioning also sets and validates the device's local civil time from the
+host, with its corresponding UTC anchor included in the command result. You can
+retry that operation explicitly after flashing:
 
 ```sh
 cd partner
