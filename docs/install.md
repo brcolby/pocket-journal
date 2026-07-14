@@ -10,10 +10,20 @@ Expected flow after ESP-IDF is installed:
 cd firmware
 idf.py set-target esp32s3
 idf.py build
-idf.py flash monitor
+idf.py flash
 ```
 
 The initial firmware app compiles the shared UI core and starts placeholder service boundaries. Hardware drivers should be enabled only after board revision verification.
+
+Use `idf.py monitor` only when you explicitly need serial logs, and stop it
+with `Ctrl+]` before running any `pj` USB-C command. The monitor and partner
+CLI cannot share `/dev/cu.usbmodem*`.
+
+On the current board, BOOT/AUX is GPIO0 and is also the ESP32-S3 ROM download
+strap. If serial logs show `boot:0x0 (DOWNLOAD(USB/UART0))` and `waiting for
+download`, stop the monitor and reset or power-cycle the board with BOOT/AUX
+released. Do not hold BOOT/AUX during reset unless you intentionally want ROM
+download mode.
 
 ## Partner CLI
 
