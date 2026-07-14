@@ -7,6 +7,7 @@
 #include "pj_note_model.h"
 #include "pj_recording.h"
 #include "pj_rtc_wake.h"
+#include "pj_runtime_diagnostics.h"
 #include "pj_settings.h"
 #include "pj_static_art.h"
 #include "pj_static_art_ui.h"
@@ -342,6 +343,7 @@ static portMUX_TYPE g_recording_lock = portMUX_INITIALIZER_UNLOCKED;
 static portMUX_TYPE g_storage_coordinator_lock = portMUX_INITIALIZER_UNLOCKED;
 static portMUX_TYPE g_aux_state_lock = portMUX_INITIALIZER_UNLOCKED;
 static pj_storage_coordinator_t g_storage_coordinator;
+static uint32_t g_runtime_boot_id;
 static int g_cached_pending_sync;
 static int g_cached_transferred_sync;
 static pj_recording_t g_recording;
@@ -4227,6 +4229,29 @@ static uint64_t board_monotonic_ms(void)
     return (uint64_t)esp_timer_get_time() / 1000u;
 }
 
+static pj_reset_reason_t runtime_reset_reason(void)
+{
+    switch (esp_reset_reason()) {
+    case ESP_RST_POWERON: return PJ_RESET_REASON_POWER_ON;
+    case ESP_RST_EXT: return PJ_RESET_REASON_EXTERNAL;
+    case ESP_RST_SW: return PJ_RESET_REASON_SOFTWARE;
+    case ESP_RST_PANIC: return PJ_RESET_REASON_PANIC;
+    case ESP_RST_INT_WDT: return PJ_RESET_REASON_INTERRUPT_WATCHDOG;
+    case ESP_RST_TASK_WDT: return PJ_RESET_REASON_TASK_WATCHDOG;
+    case ESP_RST_WDT: return PJ_RESET_REASON_WATCHDOG;
+    case ESP_RST_DEEPSLEEP: return PJ_RESET_REASON_DEEP_SLEEP;
+    case ESP_RST_BROWNOUT: return PJ_RESET_REASON_BROWNOUT;
+    case ESP_RST_SDIO: return PJ_RESET_REASON_SDIO;
+    case ESP_RST_USB: return PJ_RESET_REASON_USB;
+    case ESP_RST_JTAG: return PJ_RESET_REASON_JTAG;
+    case ESP_RST_EFUSE: return PJ_RESET_REASON_EFUSE;
+    case ESP_RST_PWR_GLITCH: return PJ_RESET_REASON_POWER_GLITCH;
+    case ESP_RST_CPU_LOCKUP: return PJ_RESET_REASON_CPU_LOCKUP;
+    case ESP_RST_UNKNOWN:
+    default: return PJ_RESET_REASON_UNKNOWN;
+    }
+}
+
 static board_time_snapshot_t board_time_snapshot(void)
 {
     board_time_snapshot_t snapshot;
@@ -5881,6 +5906,12 @@ void pj_board_init(const pj_board_profile_t *profile)
     pj_home_layout_defaults(&g_home_layout);
 
 #ifdef ESP_PLATFORM
+    g_runtime_boot_id = esp_random();
+    if (g_runtime_boot_id == 0U) {
+        g_runtime_boot_id = 1U;
+    }
+    ESP_LOGI(TAG, "Runtime identity: boot_id=%" PRIu32 " reset_reason=%s",
+             g_runtime_boot_id, pj_reset_reason_name(runtime_reset_reason()));
     pj_storage_coordinator_init(&g_storage_coordinator);
     pj_recording_init(&g_recording);
     g_json_write_lock = xSemaphoreCreateMutex();
@@ -7280,6 +7311,17 @@ static void wipe_status_fill_json(cJSON *wipe, const pj_wipe_status_t *status)
     cJSON_AddBoolToObject(wipe, "retryable", status->retryable != 0);
 }
 
+static int runtime_identity_add_json(cJSON *parent)
+{
+    pj_reset_reason_t reason = runtime_reset_reason();
+    return parent != NULL &&
+           cJSON_AddNumberToObject(parent, "boot_id", (double)g_runtime_boot_id) != NULL &&
+           cJSON_AddNumberToObject(parent, "uptime_ms", (double)board_monotonic_ms()) != NULL &&
+           cJSON_AddStringToObject(parent, "reset_reason",
+                                   pj_reset_reason_name(reason)) != NULL &&
+           cJSON_AddNumberToObject(parent, "reset_reason_code", (double)reason) != NULL;
+}
+
 static int wipe_status_add_json(cJSON *parent, const pj_wipe_status_t *status)
 {
     cJSON *wipe = cJSON_AddObjectToObject(parent, "recording_wipe");
@@ -7375,7 +7417,8 @@ static void serial_print_status(const char *request_id)
     cJSON_AddNumberToObject(json, "pending_sync", pending_sync);
     cJSON_AddNumberToObject(json, "transferred_sync", transferred_sync);
     storage_wipe_snapshot_t wipe = storage_wipe_snapshot();
-    if (!wipe_status_add_json(json, &wipe.current) ||
+    if (!runtime_identity_add_json(json) ||
+        !wipe_status_add_json(json, &wipe.current) ||
         !wipe_history_add_json(json, wipe.history, wipe.history_count) ||
         !connectivity_add_json(json, &status)) {
         cJSON_Delete(json);
@@ -7398,6 +7441,11 @@ static void serial_print_wipe_start(pj_wipe_start_result_t result,
     cJSON_AddStringToObject(json, "command", "PJ_WIPE_RECORDINGS");
     if (request_id != NULL) {
         cJSON_AddStringToObject(json, "request_id", request_id);
+    }
+    if (!runtime_identity_add_json(json)) {
+        cJSON_Delete(json);
+        printf("PJ_ERR {\"error\":\"wipe response allocation failed\"}\n");
+        return;
     }
     const char *prefix = "PJ_ERR";
     if (result == PJ_WIPE_START_STARTED || result == PJ_WIPE_START_ATTACHED) {
@@ -7838,7 +7886,8 @@ static esp_err_t status_handler(httpd_req_t *req)
     cJSON_AddNumberToObject(json, "transferred_sync", transferred_sync);
     cJSON_AddStringToObject(json, "last_error", g_status.last_error);
     storage_wipe_snapshot_t wipe = storage_wipe_snapshot();
-    if (!wipe_status_add_json(json, &wipe.current) ||
+    if (!runtime_identity_add_json(json) ||
+        !wipe_status_add_json(json, &wipe.current) ||
         !wipe_history_add_json(json, wipe.history, wipe.history_count) ||
         !connectivity_add_json(json, &status)) {
         cJSON_Delete(json);
@@ -8542,6 +8591,11 @@ static esp_err_t audio_delete_handler(httpd_req_t *req)
         recording_wipe_start(NULL, &status, PJ_WIPE_WORKER_RELEASE_NOW);
     cJSON *json = cJSON_CreateObject();
     if (json == NULL) {
+        httpd_resp_set_status(req, "503 Service Unavailable");
+        return send_json(req, "{\"error\":\"wipe response allocation failed\"}");
+    }
+    if (!runtime_identity_add_json(json)) {
+        cJSON_Delete(json);
         httpd_resp_set_status(req, "503 Service Unavailable");
         return send_json(req, "{\"error\":\"wipe response allocation failed\"}");
     }
