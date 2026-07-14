@@ -4901,11 +4901,6 @@ static void record_task_exit(void)
         g_record_audio_owned = 0;
         xSemaphoreGive(g_audio_lock);
     }
-    recording_publish_completion();
-    g_record_task = NULL;
-    board_audio_state_set(0, -1);
-    alert_audio_set_recording(0);
-    g_audio_state_update_pending = 1;
     int processing;
     portENTER_CRITICAL(&g_storage_coordinator_lock);
     processing = g_record_storage_processing;
@@ -4913,6 +4908,11 @@ static void record_task_exit(void)
     if (!processing) {
         record_storage_release();
     }
+    recording_publish_completion();
+    g_record_task = NULL;
+    board_audio_state_set(0, -1);
+    alert_audio_set_recording(0);
+    g_audio_state_update_pending = 1;
     vTaskDelete(NULL);
 }
 
@@ -6134,6 +6134,7 @@ int pj_board_consume_notes_update(pj_ui_context_t *ui)
     }
     g_notes_update_pending = 0;
     refresh_ui_notes_from_sd(ui);
+    refresh_ui_sync_state(ui);
     return 1;
 #else
     (void)ui;

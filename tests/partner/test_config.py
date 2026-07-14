@@ -6,6 +6,7 @@ from contextlib import redirect_stderr
 from contextlib import redirect_stdout
 from io import BytesIO, StringIO
 import json
+import socket
 import stat
 from urllib import error
 from unittest.mock import patch
@@ -19,6 +20,8 @@ from pocket_journal_partner.device import (
     DeviceError,
     DeviceHTTPError,
     DeviceOperationError,
+    DeviceOperationTimeout,
+    DeviceRequestTimeout,
     SerialDeviceClient,
     resolve_serial_port,
 )
@@ -142,6 +145,18 @@ class ConfigTests(unittest.TestCase):
                 failure.close()
                 self.assertEqual(raised.exception.status_code, code)
                 self.assertEqual(raised.exception.retryable, retryable)
+
+    def test_http_request_timeouts_have_specific_type(self) -> None:
+        client = DeviceClient("http://device.local", "token")
+        failures = (
+            socket.timeout("timed out"),
+            error.URLError(socket.timeout("timed out")),
+        )
+        for failure in failures:
+            with self.subTest(failure=type(failure).__name__):
+                with patch("pocket_journal_partner.device.request.urlopen", side_effect=failure):
+                    with self.assertRaises(DeviceRequestTimeout):
+                        client.status()
 
     def test_http_errors_preserve_only_validated_device_details(self) -> None:
         client = DeviceClient("http://device.local", "token")
@@ -350,6 +365,61 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(raised.exception.operation_id, 18)
         self.assertEqual(raised.exception.code, "wipe_incomplete")
         self.assertTrue(raised.exception.retryable)
+
+    def test_http_wipe_retries_transient_poll_timeout(self) -> None:
+        client = DeviceClient("http://device.local", "token", timeout=1)
+        responses: list[object] = [
+            {"recording_wipe": {"id": 23, "state": "running"}},
+            DeviceRequestTimeout("status timed out"),
+            {"recording_wipe": {
+                "id": 23,
+                "state": "succeeded",
+                "audio_deleted": 2,
+            }},
+        ]
+        calls = []
+
+        def fake_request(method, path, body=None, **kwargs):
+            calls.append((method, path, body, kwargs))
+            response = responses.pop(0)
+            if isinstance(response, BaseException):
+                raise response
+            return response
+
+        client._request = fake_request  # type: ignore[method-assign]
+        with patch("pocket_journal_partner.device.time.sleep"):
+            result = client.wipe_recordings()
+
+        self.assertEqual(result["operation_id"], 23)
+        self.assertEqual(result["audio_deleted"], 2)
+        self.assertEqual([call[:2] for call in calls], [
+            ("DELETE", "/v1/audio"),
+            ("GET", "/v1/status"),
+            ("GET", "/v1/status"),
+        ])
+
+    def test_http_wipe_poll_timeout_preserves_operation_at_deadline(self) -> None:
+        client = DeviceClient("http://device.local", "token", timeout=0.1)
+        calls = []
+
+        def fake_request(method, path, body=None, **kwargs):
+            calls.append((method, path, body, kwargs))
+            if method == "DELETE":
+                return {"recording_wipe": {"id": 29, "state": "running"}}
+            raise DeviceRequestTimeout("status timed out")
+
+        client._request = fake_request  # type: ignore[method-assign]
+        with patch("pocket_journal_partner.device.time.monotonic", side_effect=[0.0, 0.0, 0.2]):
+            with self.assertRaises(DeviceOperationTimeout) as raised:
+                client.wipe_recordings()
+
+        self.assertEqual(raised.exception.operation_id, 29)
+        self.assertEqual(raised.exception.code, "operation_timeout")
+        self.assertTrue(raised.exception.retryable)
+        self.assertEqual([call[:2] for call in calls], [
+            ("DELETE", "/v1/audio"),
+            ("GET", "/v1/status"),
+        ])
 
     def test_audio_source_digest_is_optional_for_older_or_failed_device_hashing(self) -> None:
         client = DeviceClient("http://127.0.0.1", "token")

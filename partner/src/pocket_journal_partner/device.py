@@ -9,6 +9,7 @@ import glob
 import json
 import os
 import secrets
+import socket
 import subprocess
 import sys
 import time
@@ -278,7 +279,11 @@ class DeviceClient:
                 operation=operation,
             ) from exc
         except error.URLError as exc:
+            if isinstance(exc.reason, (TimeoutError, socket.timeout)):
+                raise DeviceRequestTimeout(f"{method} {path} timed out") from exc
             raise DeviceError(f"{method} {path} failed: {exc.reason}") from exc
+        except (TimeoutError, socket.timeout) as exc:
+            raise DeviceRequestTimeout(f"{method} {path} timed out") from exc
 
     def status(self) -> dict[str, Any]:
         return self._request("GET", "/v1/status")
@@ -353,11 +358,14 @@ class DeviceClient:
                     code="operation_timeout",
                     retryable=True,
                 )
-            status = self._request(
-                "GET",
-                "/v1/status",
-                timeout=min(1.0, remaining),
-            )
+            try:
+                status = self._request(
+                    "GET",
+                    "/v1/status",
+                    timeout=min(1.0, remaining),
+                )
+            except DeviceRequestTimeout:
+                continue
             current = _recording_wipe_operation(status, operation["id"])
             if current is not None:
                 operation = current
