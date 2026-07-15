@@ -18,6 +18,7 @@ HOME_LAYOUT_TEST_BIN := build/test_home_layout
 STORAGE_TEST_BIN := build/test_storage
 STORAGE_COORDINATOR_TEST_BIN := build/test_storage_coordinator
 RUNTIME_DIAGNOSTICS_TEST_BIN := build/test_runtime_diagnostics
+LOOP_SCHEDULE_TEST_BIN := build/test_loop_schedule
 DISPLAY_REFRESH_TEST_BIN := build/test_display_refresh
 TIME_CIVIL_TEST_BIN := build/test_time_civil
 TIME_CLOCK_TEST_BIN := build/test_time_clock
@@ -148,6 +149,12 @@ test-input:
 		tests/board/test_runtime_diagnostics.c \
 		-o $(RUNTIME_DIAGNOSTICS_TEST_BIN)
 	$(RUNTIME_DIAGNOSTICS_TEST_BIN)
+	$(CC) $(CFLAGS) \
+		-Ifirmware/main \
+		firmware/main/pj_loop_schedule.c \
+		tests/board/test_loop_schedule.c \
+		-o $(LOOP_SCHEDULE_TEST_BIN)
+	$(LOOP_SCHEDULE_TEST_BIN)
 	$(CC) $(CFLAGS) \
 		-Ifirmware/components/pj_board/include \
 		-Ifirmware/components/pj_ui/include \

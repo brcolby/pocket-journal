@@ -1,7 +1,9 @@
+#include "esp_timer.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "pj_board.h"
+#include "pj_loop_schedule.h"
 #include "pj_ui.h"
 
 static const char *TAG = "pocket-journal";
@@ -9,8 +11,12 @@ static pj_ui_context_t g_ui;
 static pj_framebuffer_t g_framebuffer;
 
 #define PJ_MAIN_LOOP_PERIOD_MS 50
-#define PJ_UI_TICKS_PER_SECOND (1000 / PJ_MAIN_LOOP_PERIOD_MS)
-#define PJ_STATUS_REFRESH_TICKS 6000
+
+static uint64_t monotonic_ms(void)
+{
+    int64_t now_us = esp_timer_get_time();
+    return now_us <= 0 ? 0 : (uint64_t)now_us / 1000u;
+}
 
 static int render_and_flush_if_dirty(pj_ui_context_t *ui)
 {
@@ -144,9 +150,8 @@ void app_main(void)
              (unsigned)PJ_FRAMEBUFFER_BYTES);
     pj_board_confirm_boot_health(services_ready && initial_render_ready);
 
-    int loop_ticks = 0;
-    int second_ticks = 0;
-    int clock_seconds = 0;
+    pj_loop_schedule_t schedule;
+    pj_loop_schedule_init(&schedule, monotonic_ms());
     int sleep_pending = 0;
     while (1) {
         pj_board_event_t event;
@@ -176,23 +181,23 @@ void app_main(void)
             }
         }
 
-        second_ticks++;
-        if (second_ticks >= PJ_UI_TICKS_PER_SECOND) {
-            second_ticks = 0;
-            int dynamic_changed = pj_ui_tick(&g_ui);
+        pj_loop_schedule_events_t due = pj_loop_schedule_poll(
+            &schedule, monotonic_ms());
+        int dynamic_changed = 0;
+        if (due.second_due) {
+            dynamic_changed = pj_ui_tick(&g_ui);
             sync_ui_audio_from_board(&g_ui);
             dynamic_changed |= pj_board_update_time_state(&g_ui);
-            clock_seconds++;
-            if (clock_seconds >= 60) {
-                clock_seconds = 0;
-                dynamic_changed |= pj_board_tick_time(&g_ui);
-            }
-            if (dynamic_changed || pj_ui_is_dirty(&g_ui)) {
-                render_and_flush_if_dirty(&g_ui);
-            }
+        }
+        if (due.minute_due) {
+            dynamic_changed |= pj_board_tick_time(&g_ui);
+        }
+        if ((due.second_due || due.minute_due) &&
+            (dynamic_changed || pj_ui_is_dirty(&g_ui))) {
+            render_and_flush_if_dirty(&g_ui);
         }
 
-        if ((loop_ticks % PJ_STATUS_REFRESH_TICKS) == 0) {
+        if (due.status_due) {
             pj_board_refresh_status(&g_ui);
             sync_ui_audio_from_board(&g_ui);
             render_and_flush_if_dirty(&g_ui);
@@ -205,7 +210,7 @@ void app_main(void)
         }
 
         if (pj_board_consume_time_update(&g_ui)) {
-            clock_seconds = 0;
+            pj_loop_schedule_rebase_minute(&schedule, monotonic_ms());
             render_and_flush_if_dirty(&g_ui);
         }
 
@@ -226,7 +231,6 @@ void app_main(void)
             render_and_flush_if_dirty(&g_ui);
         }
 
-        loop_ticks++;
         vTaskDelay(pdMS_TO_TICKS(PJ_MAIN_LOOP_PERIOD_MS));
     }
 }
