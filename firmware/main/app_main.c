@@ -3,6 +3,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "pj_board.h"
+#include "pj_display_worker.h"
 #include "pj_loop_schedule.h"
 #include "pj_ui.h"
 
@@ -18,13 +19,14 @@ static uint64_t monotonic_ms(void)
     return now_us <= 0 ? 0 : (uint64_t)now_us / 1000u;
 }
 
-static int render_and_flush_if_dirty(pj_ui_context_t *ui)
+static int render_and_submit_if_dirty(pj_ui_context_t *ui)
 {
     if (!pj_ui_is_dirty(ui)) {
         return 1;
     }
     pj_ui_render(ui, &g_framebuffer);
-    if (pj_board_display_framebuffer(&g_framebuffer, &ui->dirty)) {
+    pj_ui_dirty_region_t dirty = pj_ui_dirty_region(ui);
+    if (pj_display_worker_submit(&g_framebuffer, &dirty)) {
         pj_ui_mark_displayed(ui);
         return 1;
     }
@@ -143,12 +145,17 @@ void app_main(void)
     pj_board_refresh_time_state(&g_ui);
     (void)pj_board_companion_sync_resume();
     pj_ui_request_full_refresh(&g_ui);
-    int initial_render_ready = render_and_flush_if_dirty(&g_ui);
+    int display_worker_ready = pj_display_worker_start();
+    int initial_render_ready = display_worker_ready &&
+        render_and_submit_if_dirty(&g_ui);
 
     ESP_LOGI(TAG, "Initial UI state: %s, framebuffer bytes: %u",
              pj_ui_state_name(pj_ui_current_state(&g_ui)),
              (unsigned)PJ_FRAMEBUFFER_BYTES);
-    pj_board_confirm_boot_health(services_ready && initial_render_ready);
+    int boot_health_pending = services_ready && initial_render_ready;
+    if (!boot_health_pending) {
+        pj_board_confirm_boot_health(0);
+    }
 
     pj_loop_schedule_t schedule;
     pj_loop_schedule_init(&schedule, monotonic_ms());
@@ -157,7 +164,7 @@ void app_main(void)
         pj_board_event_t event;
         if (pj_board_poll_event(&event)) {
             handle_board_event(&g_ui, &event);
-            render_and_flush_if_dirty(&g_ui);
+            render_and_submit_if_dirty(&g_ui);
             if (pj_ui_current_state(&g_ui) == PJ_UI_STATE_STATIC) {
                 sleep_pending = 1;
             } else {
@@ -165,19 +172,20 @@ void app_main(void)
             }
         }
 
-        if (sleep_pending && pj_board_aux_released() && pj_board_power_released()) {
+        if (sleep_pending && pj_board_aux_released() && pj_board_power_released() &&
+            pj_display_worker_is_idle()) {
             sleep_pending = 0;
             int sleep_result = pj_board_enter_sleep();
             if (sleep_result > 0) {
                 pj_ui_wake(&g_ui);
                 pj_board_refresh_status(&g_ui);
                 (void)pj_board_update_time_state(&g_ui);
-                render_and_flush_if_dirty(&g_ui);
+                render_and_submit_if_dirty(&g_ui);
             } else if (sleep_result == 0) {
                 sleep_pending = 1;
             } else {
                 pj_ui_wake(&g_ui);
-                render_and_flush_if_dirty(&g_ui);
+                render_and_submit_if_dirty(&g_ui);
             }
         }
 
@@ -188,19 +196,16 @@ void app_main(void)
             dynamic_changed = pj_ui_tick(&g_ui);
             sync_ui_audio_from_board(&g_ui);
             dynamic_changed |= pj_board_update_time_state(&g_ui);
-        }
-        if (due.minute_due) {
             dynamic_changed |= pj_board_tick_time(&g_ui);
         }
-        if ((due.second_due || due.minute_due) &&
-            (dynamic_changed || pj_ui_is_dirty(&g_ui))) {
-            render_and_flush_if_dirty(&g_ui);
+        if (due.second_due && (dynamic_changed || pj_ui_is_dirty(&g_ui))) {
+            render_and_submit_if_dirty(&g_ui);
         }
 
         if (due.status_due) {
             pj_board_refresh_status(&g_ui);
             sync_ui_audio_from_board(&g_ui);
-            render_and_flush_if_dirty(&g_ui);
+            render_and_submit_if_dirty(&g_ui);
             ESP_LOGI(TAG, "UI=%s display=%d storage=%d audio=%d http=%d",
                      pj_ui_state_name(pj_ui_current_state(&g_ui)),
                      pj_board_status().display,
@@ -210,25 +215,29 @@ void app_main(void)
         }
 
         if (pj_board_consume_time_update(&g_ui)) {
-            pj_loop_schedule_rebase_minute(&schedule, monotonic_ms());
-            render_and_flush_if_dirty(&g_ui);
+            render_and_submit_if_dirty(&g_ui);
         }
 
         if (pj_board_consume_audio_update(&g_ui)) {
-            render_and_flush_if_dirty(&g_ui);
+            render_and_submit_if_dirty(&g_ui);
         }
 
         if (pj_board_consume_notes_update(&g_ui)) {
             sync_ui_audio_from_board(&g_ui);
-            render_and_flush_if_dirty(&g_ui);
+            render_and_submit_if_dirty(&g_ui);
         }
 
         if (pj_board_consume_settings_update(&g_ui)) {
-            render_and_flush_if_dirty(&g_ui);
+            render_and_submit_if_dirty(&g_ui);
         }
 
         if (pj_board_consume_companion_sync_update(&g_ui)) {
-            render_and_flush_if_dirty(&g_ui);
+            render_and_submit_if_dirty(&g_ui);
+        }
+
+        if (boot_health_pending && pj_display_worker_committed_frames() > 0) {
+            pj_board_confirm_boot_health(1);
+            boot_health_pending = 0;
         }
 
         vTaskDelay(pdMS_TO_TICKS(PJ_MAIN_LOOP_PERIOD_MS));
