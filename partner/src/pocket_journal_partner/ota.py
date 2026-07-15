@@ -18,6 +18,7 @@ OTA_CHUNK_BYTES = 64 * 1024
 DEFAULT_MAX_IMAGE_BYTES = 2 * 1024 * 1024
 MAX_SIGNATURE_BYTES = 128
 _SIGNED_TEXT = re.compile(r"^[A-Za-z0-9._+\-]+$")
+_STRICT_SEMVER = re.compile(r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$")
 _MANIFEST_FIELDS = {
     "size", "sha256", "project", "board", "target", "version", "secure_version"
 }
@@ -104,6 +105,13 @@ def _manifest_integer(value: Any, field: str, *, positive: bool = False) -> int:
     return value
 
 
+def _manifest_version(value: Any) -> str:
+    version = _manifest_text(value, "version")
+    if _STRICT_SEMVER.fullmatch(version) is None:
+        raise DeviceError("firmware manifest version must be strict X.Y.Z semver")
+    return version
+
+
 def _read_signature(path: Path) -> bytes:
     try:
         raw = path.read_bytes()
@@ -182,7 +190,7 @@ def inspect_firmware_bundle(
         project=_manifest_text(payload.get("project"), "project"),
         board=_manifest_text(payload.get("board"), "board"),
         target=_manifest_text(payload.get("target"), "target"),
-        version=_manifest_text(payload.get("version"), "version"),
+        version=_manifest_version(payload.get("version")),
         secure_version=_manifest_integer(payload.get("secure_version"), "secure_version"),
     )
     if manifest.size != image.size:

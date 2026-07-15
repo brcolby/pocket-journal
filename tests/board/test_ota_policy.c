@@ -56,9 +56,20 @@ static void test_preflight_rejection_matrix(void)
     strcpy(candidate.version, "0.9.0");
     assert(pj_ota_preflight_check(&candidate, &running, 1, 1, 1, 0) == PJ_OTA_CHECK_VERSION_DOWNGRADE);
     candidate = manifest();
-    strcpy(candidate.version, "7e6ce1e-dirty");
     running.version = "e4805d6";
     assert(pj_ota_preflight_check(&candidate, &running, 1, 1, 1, 0) == PJ_OTA_CHECK_ACCEPTED);
+    strcpy(candidate.version, "7e6ce1e-dirty");
+    assert(pj_ota_preflight_check(&candidate, &running, 1, 1, 1, 0) ==
+           PJ_OTA_CHECK_VERSION_FORMAT);
+    running = identity();
+    assert(pj_ota_preflight_check(&candidate, &running, 1, 1, 1, 0) ==
+           PJ_OTA_CHECK_VERSION_FORMAT);
+    strcpy(candidate.version, "v2.0.0");
+    assert(pj_ota_preflight_check(&candidate, &running, 1, 1, 1, 0) ==
+           PJ_OTA_CHECK_VERSION_FORMAT);
+    strcpy(candidate.version, "02.0.0");
+    assert(pj_ota_preflight_check(&candidate, &running, 1, 1, 1, 0) ==
+           PJ_OTA_CHECK_VERSION_FORMAT);
     running = identity();
     candidate = manifest();
     candidate.secure_version = 1U;
@@ -99,6 +110,11 @@ static void test_transfer_interruption_concurrency_and_replay(void)
     assert(pj_ota_session_prepare(&session, id, 10U) == PJ_OTA_TRANSFER_OK);
     assert(!session.mutations_reserved); /* Preflight is advisory and nonblocking. */
     assert(pj_ota_session_prepare(&session, id, 10U) == PJ_OTA_TRANSFER_REPLAY);
+    const char *replacement = "11111111111111111111111111111111";
+    assert(pj_ota_session_prepare(&session, replacement, 12U) == PJ_OTA_TRANSFER_OK);
+    assert(session.expected_bytes == 12U);
+    assert(pj_ota_session_begin(&session, id) == PJ_OTA_TRANSFER_ID_MISMATCH);
+    assert(pj_ota_session_prepare(&session, id, 10U) == PJ_OTA_TRANSFER_OK);
     assert(pj_ota_session_begin(&session, "ffffffffffffffffffffffffffffffff") ==
            PJ_OTA_TRANSFER_ID_MISMATCH);
     assert(pj_ota_session_reserve(&session, id, 0) == PJ_OTA_TRANSFER_BUSY);
@@ -124,13 +140,31 @@ static void test_transfer_interruption_concurrency_and_replay(void)
     assert(session.state == PJ_OTA_TRANSFER_PENDING_REBOOT);
 }
 
+static void test_mutation_reservation_is_request_owned(void)
+{
+    pj_ota_mutation_reservation_t reservation = {0};
+    pj_ota_mutation_lease_t owner = {0};
+    pj_ota_mutation_lease_t concurrent = {0};
+
+    assert(pj_ota_mutation_reservation_claim(&reservation, &owner));
+    assert(pj_ota_mutation_reservation_held(&reservation));
+    assert(!pj_ota_mutation_reservation_claim(&reservation, &concurrent));
+    assert(!pj_ota_mutation_reservation_release(&reservation, &concurrent));
+    assert(pj_ota_mutation_reservation_held(&reservation));
+    assert(pj_ota_mutation_reservation_release(&reservation, &owner));
+    assert(!pj_ota_mutation_reservation_held(&reservation));
+    assert(!pj_ota_mutation_reservation_release(&reservation, &owner));
+}
+
 static void test_activation_health_reset_and_factory_migration(void)
 {
     pj_ota_boot_inputs_t boot = {0};
     assert(pj_ota_boot_evaluate(&boot) == PJ_OTA_BOOT_IDLE); /* factory migration */
 
     boot.update_recorded = 1;
-    boot.running_matches_target = 1;
+    boot.record_state = PJ_OTA_RECORD_PENDING_REBOOT;
+    boot.running_version_matches_target = 1;
+    boot.running_partition_matches_target = 1;
     boot.running_pending_verify = 1;
     assert(pj_ota_boot_evaluate(&boot) == PJ_OTA_BOOT_TESTING);
     boot.health_checked = 1;
@@ -143,10 +177,58 @@ static void test_activation_health_reset_and_factory_migration(void)
     assert(pj_ota_boot_evaluate(&boot) == PJ_OTA_BOOT_FAILED);
 
     /* A reset before confirmation boots the previous image and preserves the target record. */
-    boot.running_matches_target = 0;
+    boot.running_partition_matches_target = 0;
     boot.running_pending_verify = 0;
     boot.health_checked = 0;
     assert(pj_ota_boot_evaluate(&boot) == PJ_OTA_BOOT_ROLLED_BACK);
+}
+
+static void test_persisted_state_boot_matrix(void)
+{
+    assert(pj_ota_record_state_parse("pending_reboot") ==
+           PJ_OTA_RECORD_PENDING_REBOOT);
+    assert(pj_ota_record_state_parse("testing") == PJ_OTA_RECORD_TESTING);
+    assert(pj_ota_record_state_parse("confirmed") == PJ_OTA_RECORD_CONFIRMED);
+    assert(pj_ota_record_state_parse("rollback_requested") ==
+           PJ_OTA_RECORD_ROLLBACK_REQUESTED);
+    assert(pj_ota_record_state_parse("rolled_back") ==
+           PJ_OTA_RECORD_ROLLED_BACK);
+    assert(pj_ota_record_state_parse("failed") == PJ_OTA_RECORD_FAILED);
+    assert(pj_ota_record_state_parse("unknown") == PJ_OTA_RECORD_INVALID);
+    assert(pj_ota_record_state_parse(NULL) == PJ_OTA_RECORD_INVALID);
+
+    pj_ota_boot_inputs_t boot = {
+        .update_recorded = 1,
+        .running_version_matches_target = 1,
+        .running_partition_matches_target = 1,
+        .running_pending_verify = 1,
+    };
+    const pj_ota_record_state_t rejected[] = {
+        PJ_OTA_RECORD_INVALID,
+        PJ_OTA_RECORD_CONFIRMED,
+        PJ_OTA_RECORD_ROLLBACK_REQUESTED,
+        PJ_OTA_RECORD_ROLLED_BACK,
+        PJ_OTA_RECORD_FAILED,
+    };
+    for (size_t index = 0U;
+         index < sizeof(rejected) / sizeof(rejected[0]); index++) {
+        boot.record_state = rejected[index];
+        assert(pj_ota_boot_evaluate(&boot) == PJ_OTA_BOOT_FAILED);
+        boot.health_checked = 1;
+        boot.health_ok = 1;
+        boot.rollback_possible = 1;
+        assert(pj_ota_boot_evaluate(&boot) ==
+               PJ_OTA_BOOT_ROLLBACK_REQUIRED);
+        boot.health_checked = 0;
+        boot.health_ok = 0;
+        boot.rollback_possible = 0;
+    }
+
+    boot.running_pending_verify = 0;
+    boot.record_state = PJ_OTA_RECORD_CONFIRMED;
+    assert(pj_ota_boot_evaluate(&boot) == PJ_OTA_BOOT_CONFIRMED);
+    boot.record_state = PJ_OTA_RECORD_PENDING_REBOOT;
+    assert(pj_ota_boot_evaluate(&boot) == PJ_OTA_BOOT_FAILED);
 }
 
 int main(void)
@@ -154,7 +236,9 @@ int main(void)
     test_preflight_rejection_matrix();
     test_canonical_manifest_and_image_validation();
     test_transfer_interruption_concurrency_and_replay();
+    test_mutation_reservation_is_request_owned();
     test_activation_health_reset_and_factory_migration();
+    test_persisted_state_boot_matrix();
     puts("OTA policy tests passed");
     return 0;
 }

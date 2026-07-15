@@ -124,10 +124,77 @@ PUT /v1/transcripts/{audio_id}
 Uploads a JSON transcription containing non-empty `text` for an existing recording. A successful upload atomically stores the transcript and marks the note synced; the READ view is populated from these transcript records.
 
 ```http
+GET /v1/ota
+POST /v1/ota/preflight
 POST /v1/ota
 ```
 
-Reserved for partner-driven firmware updates after rollback and version checks are implemented.
+The authenticated OTA status reports the running and target versions, digest,
+running/target partition address and subtype, `running_slot`/`target_slot`,
+`target_partition_matches`, transferred bytes, `reboot_required`, and
+`boot_outcome`. It also exposes whether PSA crypto initialization, rollback, the
+trusted manifest key, ESP-IDF signed-app verification, and the boot-time
+manifest-signature self-test are ready. `boot_outcome` is one of `not_started`, `awaiting_reboot`,
+`testing`, `confirmed`, `rollback_requested`, `rolled_back`, or `failed`.
+
+Preflight accepts an exact JSON object containing `size`, lowercase `sha256`,
+`project`, `board`, `target`, `version`, `secure_version`, and an ECDSA DER
+`signature` encoded as hex. The signature covers these canonical
+ASCII bytes:
+
+```text
+PJOTA1
+sha256=<sha256>
+size=<decimal bytes>
+project=<project>
+board=<board>
+target=<target>
+version=<version>
+secure_version=<decimal>
+```
+
+The final newline is part of the signed message. Unknown, missing, duplicate,
+malformed, mismatched, replayed, downgraded, or unsigned manifests are rejected.
+A non-semver factory/development version may migrate once to an `X.Y.Z`
+candidate. After that transition both versions must be strict comparable semver;
+semver-to-nonsemver and nonsemver-to-nonsemver updates are rejected.
+
+An accepted preflight returns a random `upload_id`, exact device id, versions,
+and size. Preflight is advisory and does not reserve flash/storage mutations. A
+later valid preflight atomically supersedes an unused READY preflight, so a
+cancelled CLI prompt or lost response does not strand OTA. Only an active write
+or a pending reboot is exclusive.
+
+Upload the exact image with `Content-Type: application/octet-stream`, the
+preflight size as `Content-Length`, and these headers:
+
+```http
+X-PJ-Upload-ID: <upload_id>
+X-PJ-Image-SHA256: <sha256>
+X-PJ-Activate: true
+```
+
+The device atomically excludes recording, playback, processing, wipe, recovery,
+sleep, and other storage mutations at upload start. A busy device returns
+`409 ota_busy` without releasing the active upload's reservation. The bounded
+stream is written only to the inactive OTA partition, hashed while writing,
+validated as an ESP32-S3 application, checked against the signed descriptor and
+secure version, and accepted by ESP-IDF signed-app verification before the boot
+partition changes. Interrupted or rejected uploads abort without activation.
+The device arms its bounded restart task before returning `202 Accepted`. If
+that task cannot be created, it restarts synchronously; if response delivery
+fails, the already-armed task still restarts the device. The exclusive mutation
+lease therefore remains held from verified activation until reset.
+
+Activation records the exact target partition address/subtype as well as version
+and digest. On reboot, both version and running partition must match, and only a
+persisted `pending_reboot`/`testing` record can enter health confirmation. A
+`confirmed` record requires an already-valid image; failed, rollback, or unknown
+records never promote an image. Firmware is confirmed only after required
+services/tasks, UI initialization, and the first display flush succeed;
+otherwise ESP-IDF rollback is requested. LAN OTA authentication reads the
+current provisioned token for every request and fails closed before
+provisioning.
 
 ## USB-C Partner Commands
 

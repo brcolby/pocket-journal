@@ -314,6 +314,7 @@ static int g_connectivity_state_initialized;
 static int g_sntp_initialized;
 static int g_wifi_control_disconnect_pending;
 static portMUX_TYPE g_connectivity_lock = portMUX_INITIALIZER_UNLOCKED;
+static portMUX_TYPE g_credentials_lock = portMUX_INITIALIZER_UNLOCKED;
 static pj_wifi_state_t g_wifi_state;
 static pj_time_sync_state_t g_time_sync_state;
 static int g_mdns_started;
@@ -2188,6 +2189,19 @@ static esp_err_t time_offset_save(int offset_minutes)
     return ESP_OK;
 }
 
+static int provisioned_token_read(char *token, size_t capacity)
+{
+    if (token == NULL || capacity == 0U) {
+        return 0;
+    }
+    int available = 0;
+    portENTER_CRITICAL(&g_credentials_lock);
+    available = pj_auth_copy_provisioned_token(
+        g_wifi_credentials_stored, g_status.token, token, capacity);
+    portEXIT_CRITICAL(&g_credentials_lock);
+    return available;
+}
+
 static void wifi_load_provisioning(void)
 {
     nvs_handle_t nvs;
@@ -2198,17 +2212,19 @@ static void wifi_load_provisioning(void)
 
     size_t ssid_len = sizeof(g_wifi_ssid);
     size_t password_len = sizeof(g_wifi_password);
-    char token[sizeof(g_status.token)];
+    char token[sizeof(g_status.token)] = {0};
     size_t token_len = sizeof(token);
     int have_ssid = nvs_get_str(nvs, PJ_NVS_WIFI_SSID, g_wifi_ssid, &ssid_len) == ESP_OK && g_wifi_ssid[0] != '\0';
     int have_password = nvs_get_str(nvs, PJ_NVS_WIFI_PASSWORD, g_wifi_password, &password_len) == ESP_OK;
-    if (nvs_get_str(nvs, PJ_NVS_TOKEN, token, &token_len) == ESP_OK && token[0] != '\0') {
-        (void)snprintf(g_status.token, sizeof(g_status.token), "%s", token);
-    }
+    int have_token = nvs_get_str(nvs, PJ_NVS_TOKEN, token, &token_len) == ESP_OK &&
+                     token[0] != '\0';
     nvs_close(nvs);
 
-    if (have_ssid && have_password) {
+    if (have_ssid && have_password && have_token) {
+        portENTER_CRITICAL(&g_credentials_lock);
+        (void)snprintf(g_status.token, sizeof(g_status.token), "%s", token);
         g_wifi_credentials_stored = 1;
+        portEXIT_CRITICAL(&g_credentials_lock);
         wifi_apply_provisioning_status();
         ESP_LOGI(TAG, "Wi-Fi credentials loaded from NVS");
     }
@@ -2247,8 +2263,10 @@ static esp_err_t wifi_save_provisioning(const char *ssid, const char *password, 
 
     (void)snprintf(g_wifi_ssid, sizeof(g_wifi_ssid), "%s", ssid);
     (void)snprintf(g_wifi_password, sizeof(g_wifi_password), "%s", password);
+    portENTER_CRITICAL(&g_credentials_lock);
     (void)snprintf(g_status.token, sizeof(g_status.token), "%s", token);
     g_wifi_credentials_stored = 1;
+    portEXIT_CRITICAL(&g_credentials_lock);
     wifi_apply_provisioning_status();
     ESP_LOGI(TAG, "Wi-Fi credentials stored from partner provisioning");
     esp_err_t connect_err = wifi_start_or_reconfigure();
@@ -6107,15 +6125,18 @@ void pj_board_init(const pj_board_profile_t *profile)
 #endif
 }
 
-void pj_board_start_services(const pj_board_profile_t *profile)
+int pj_board_start_services(const pj_board_profile_t *profile)
 {
+    int services_ready = 1;
 #ifdef ESP_PLATFORM
-    pj_ota_init(g_status.device_id, g_status.token, profile->name,
+    pj_ota_init(g_status.device_id, provisioned_token_read, profile->name,
                 ota_mutations_reserve, ota_mutations_release);
 #else
     (void)profile;
 #endif
-    (void)pj_board_http_start();
+    if (!pj_board_http_start()) {
+        services_ready = 0;
+    }
 #ifdef ESP_PLATFORM
     if (!g_wifi_credentials_stored) {
         esp_err_t ble_err = ble_provisioning_start();
@@ -6124,6 +6145,7 @@ void pj_board_start_services(const pj_board_profile_t *profile)
             (void)snprintf(g_status.last_error, sizeof(g_status.last_error),
                            "BLE provisioning start failed: %s", esp_err_to_name(ble_err));
             ESP_LOGE(TAG, "%s", g_status.last_error);
+            services_ready = 0;
         }
     } else {
         g_status.ble_provisioning = PJ_BOARD_SERVICE_UNAVAILABLE;
@@ -6136,14 +6158,34 @@ void pj_board_start_services(const pj_board_profile_t *profile)
             (void)snprintf(g_status.last_error, sizeof(g_status.last_error),
                            "Wi-Fi start failed: %s", esp_err_to_name(wifi_err));
             ESP_LOGE(TAG, "%s", g_status.last_error);
+            services_ready = 0;
         }
     }
-    ESP_ERROR_CHECK_WITHOUT_ABORT(serial_command_task_start());
+    esp_err_t serial_err = serial_command_task_start();
+    if (serial_err != ESP_OK) {
+        ESP_LOGE(TAG, "USB-C command task failed to start: %s",
+                 esp_err_to_name(serial_err));
+        services_ready = 0;
+    }
+    services_ready = services_ready && g_aux_task_started &&
+        (!g_touch_ready || g_touch_task_started) &&
+        (g_status.audio != PJ_BOARD_SERVICE_READY ||
+         g_alert_audio_task != NULL);
+#endif
+    return services_ready;
+}
+
+void pj_board_confirm_boot_health(int startup_and_ui_ready)
+{
+#ifdef ESP_PLATFORM
     pj_ota_confirm_boot_health(
+        startup_and_ui_ready &&
         g_status.display == PJ_BOARD_SERVICE_READY &&
         g_status.storage != PJ_BOARD_SERVICE_ERROR &&
         g_status.audio == PJ_BOARD_SERVICE_READY &&
         g_status.http == PJ_BOARD_SERVICE_READY);
+#else
+    (void)startup_and_ui_ready;
 #endif
 }
 
@@ -7046,10 +7088,15 @@ int pj_board_storage_recover(void)
 static int auth_ok(httpd_req_t *req)
 {
     char header[96];
-    if (httpd_req_get_hdr_value_str(req, "Authorization", header, sizeof(header)) != ESP_OK) {
+    char token[sizeof(g_status.token)] = {0};
+    if (httpd_req_get_hdr_value_str(req, "Authorization", header,
+                                    sizeof(header)) != ESP_OK ||
+        !provisioned_token_read(token, sizeof(token))) {
         return 0;
     }
-    return pj_auth_header_valid(header, g_status.token);
+    int valid = pj_auth_header_valid(header, token);
+    memset(token, 0, sizeof(token));
+    return valid;
 }
 
 static esp_err_t send_json(httpd_req_t *req, const char *json)

@@ -86,7 +86,8 @@ typedef struct {
 
 pj_board_profile_t pj_board_default_profile(void);
 void pj_board_init(const pj_board_profile_t *profile);
-void pj_board_start_services(const pj_board_profile_t *profile);
+int pj_board_start_services(const pj_board_profile_t *profile);
+void pj_board_confirm_boot_health(int startup_and_ui_ready);
 pj_board_status_t pj_board_status(void);
 void pj_board_refresh_status(pj_ui_context_t *ui);
 void pj_board_refresh_settings(pj_ui_context_t *ui);

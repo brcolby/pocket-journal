@@ -45,6 +45,7 @@ typedef enum {
     PJ_OTA_CHECK_TARGET_MISMATCH,
     PJ_OTA_CHECK_VERSION_REPLAY,
     PJ_OTA_CHECK_VERSION_DOWNGRADE,
+    PJ_OTA_CHECK_VERSION_FORMAT,
     PJ_OTA_CHECK_SECURE_VERSION,
     PJ_OTA_CHECK_IMAGE_INVALID,
     PJ_OTA_CHECK_IMAGE_DIGEST,
@@ -117,6 +118,24 @@ pj_ota_transfer_result_t pj_ota_session_finish(pj_ota_session_t *session,
                                                const char *upload_id);
 void pj_ota_session_abort(pj_ota_session_t *session);
 
+typedef struct {
+    uint32_t generation;
+    int held;
+} pj_ota_mutation_reservation_t;
+
+typedef struct {
+    uint32_t generation;
+} pj_ota_mutation_lease_t;
+
+int pj_ota_mutation_reservation_held(
+    const pj_ota_mutation_reservation_t *reservation);
+int pj_ota_mutation_reservation_claim(
+    pj_ota_mutation_reservation_t *reservation,
+    pj_ota_mutation_lease_t *lease);
+int pj_ota_mutation_reservation_release(
+    pj_ota_mutation_reservation_t *reservation,
+    pj_ota_mutation_lease_t *lease);
+
 typedef enum {
     PJ_OTA_BOOT_IDLE = 0,
     PJ_OTA_BOOT_TESTING,
@@ -126,9 +145,23 @@ typedef enum {
     PJ_OTA_BOOT_FAILED,
 } pj_ota_boot_state_t;
 
+typedef enum {
+    PJ_OTA_RECORD_INVALID = 0,
+    PJ_OTA_RECORD_PENDING_REBOOT,
+    PJ_OTA_RECORD_TESTING,
+    PJ_OTA_RECORD_CONFIRMED,
+    PJ_OTA_RECORD_ROLLBACK_REQUESTED,
+    PJ_OTA_RECORD_ROLLED_BACK,
+    PJ_OTA_RECORD_FAILED,
+} pj_ota_record_state_t;
+
+pj_ota_record_state_t pj_ota_record_state_parse(const char *state);
+
 typedef struct {
     int update_recorded;
-    int running_matches_target;
+    pj_ota_record_state_t record_state;
+    int running_version_matches_target;
+    int running_partition_matches_target;
     int running_pending_verify;
     int health_checked;
     int health_ok;

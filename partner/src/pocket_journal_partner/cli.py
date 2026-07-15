@@ -665,6 +665,8 @@ def cmd_firmware_update(args: argparse.Namespace) -> int:
     if outcome.get("state") == "confirmed" and (
         outcome.get("running_version") != bundle.manifest.version
         or outcome.get("target_sha256") != image.sha256
+        or outcome.get("target_partition_matches") is not True
+        or outcome.get("boot_outcome") != "confirmed"
     ):
         raise DeviceError("OTA confirmation did not match the signed firmware image")
     _print_json(session.envelope({

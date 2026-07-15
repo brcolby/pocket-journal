@@ -21,3 +21,21 @@ int pj_auth_header_valid(const char *authorization, const char *token)
     }
     return difference == 0;
 }
+
+int pj_auth_copy_provisioned_token(int provisioned, const char *token,
+                                   char *output, size_t capacity)
+{
+    if (output == NULL || capacity == 0U) {
+        return 0;
+    }
+    output[0] = '\0';
+    if (!provisioned || token == NULL || token[0] == '\0') {
+        return 0;
+    }
+    size_t length = strlen(token);
+    if (length >= capacity) {
+        return 0;
+    }
+    memcpy(output, token, length + 1U);
+    return 1;
+}

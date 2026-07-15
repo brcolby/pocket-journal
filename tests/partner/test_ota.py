@@ -25,6 +25,74 @@ from pocket_journal_partner.ota import (
 
 
 UPLOAD_ID = "0123456789abcdef0123456789abcdef"
+P256_P = 0xFFFFFFFF00000001000000000000000000000000FFFFFFFFFFFFFFFFFFFFFFFF
+P256_A = P256_P - 3
+P256_N = 0xFFFFFFFF00000000FFFFFFFFFFFFFFFFBCE6FAADA7179E84F3B9CAC2FC632551
+P256_G = (
+    0x6B17D1F2E12C4247F8BCE6E563A440F277037D812DEB33A0F4A13945D898C296,
+    0x4FE342E2FE1A7F9B8EE7EB4A7C0F9E162BCE33576B315ECECBB6406837BF51F5,
+)
+
+
+def p256_add(left, right):
+    if left is None:
+        return right
+    if right is None:
+        return left
+    x1, y1 = left
+    x2, y2 = right
+    if x1 == x2 and (y1 + y2) % P256_P == 0:
+        return None
+    if left == right:
+        slope = (3 * x1 * x1 + P256_A) * pow(2 * y1, -1, P256_P)
+    else:
+        slope = (y2 - y1) * pow(x2 - x1, -1, P256_P)
+    slope %= P256_P
+    x3 = (slope * slope - x1 - x2) % P256_P
+    return x3, (slope * (x1 - x3) - y1) % P256_P
+
+
+def p256_multiply(scalar, point):
+    result = None
+    addend = point
+    while scalar:
+        if scalar & 1:
+            result = p256_add(result, addend)
+        addend = p256_add(addend, addend)
+        scalar >>= 1
+    return result
+
+
+def decode_der_ecdsa(signature: bytes) -> tuple[int, int]:
+    if len(signature) < 8 or signature[0] != 0x30 or signature[1] != len(signature) - 2:
+        raise ValueError("invalid signature sequence")
+    cursor = 2
+    values = []
+    for _ in range(2):
+        if cursor + 2 > len(signature) or signature[cursor] != 0x02:
+            raise ValueError("invalid signature integer")
+        size = signature[cursor + 1]
+        value = signature[cursor + 2 : cursor + 2 + size]
+        if len(value) != size:
+            raise ValueError("truncated signature integer")
+        values.append(int.from_bytes(value, "big"))
+        cursor += 2 + size
+    if cursor != len(signature):
+        raise ValueError("trailing signature data")
+    return values[0], values[1]
+
+
+def verify_p256_sha256(message: bytes, signature: bytes, public_key) -> bool:
+    r, s = decode_der_ecdsa(signature)
+    if not 1 <= r < P256_N or not 1 <= s < P256_N:
+        return False
+    inverse = pow(s, -1, P256_N)
+    digest = int.from_bytes(hashlib.sha256(message).digest(), "big")
+    point = p256_add(
+        p256_multiply((digest * inverse) % P256_N, P256_G),
+        p256_multiply((r * inverse) % P256_N, public_key),
+    )
+    return point is not None and point[0] % P256_N == r
 
 
 def esp_image(payload: bytes = b"") -> bytes:
@@ -133,6 +201,25 @@ class OtaTests(unittest.TestCase):
             with self.assertRaisesRegex(DeviceError, "size|sha256"):
                 inspect_firmware_bundle(path)
 
+    def test_manifest_signature_known_vector_and_tamper_rejection(self) -> None:
+        manifest = FirmwareManifest(
+            1703936,
+            "0123456789abcdef" * 4,
+            "pocket_journal",
+            "waveshare-esp32-s3-touch-epaper-1.54-v2",
+            "esp32s3",
+            "2.0.0",
+            1,
+        )
+        signature = bytes.fromhex(
+            "304502201cce6bb5eea3fca9f3836139a8f4a27e7fd0c4303e918a0d6bfe7e0d"
+            "8343687a02210080b29c5d09145a73efeaaaf020cde3934b7f9926db8459391f61"
+            "3f1cc4b76bdd"
+        )
+        self.assertTrue(verify_p256_sha256(manifest.canonical_bytes(), signature, P256_G))
+        tampered = manifest.canonical_bytes().replace(b"version=2.0.0", b"version=2.0.1")
+        self.assertFalse(verify_p256_sha256(tampered, signature, P256_G))
+
     def test_bundle_fails_closed_without_signature(self) -> None:
         with TemporaryDirectory() as tmp:
             path = Path(tmp) / "app.bin"
@@ -152,6 +239,18 @@ class OtaTests(unittest.TestCase):
             manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
             with self.assertRaisesRegex(DeviceError, "version does not match"):
                 inspect_firmware_bundle(path)
+
+    def test_bundle_requires_strict_semver_candidate(self) -> None:
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "app.bin"
+            write_bundle(path)
+            manifest_path = path.with_suffix(path.suffix + ".manifest.json")
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            for version in ("dev-hash", "v2.0.0", "02.0.0"):
+                manifest["version"] = version
+                manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+                with self.assertRaisesRegex(DeviceError, "strict X.Y.Z semver"):
+                    inspect_firmware_bundle(path)
 
     def test_bundle_rejects_duplicate_manifest_fields(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -360,7 +459,7 @@ class OtaTests(unittest.TestCase):
             with patch("pocket_journal_partner.cli._lan_session_from_args", return_value=session), \
                  patch("pocket_journal_partner.cli.ota_preflight", return_value={"accepted": True, "upload_id": UPLOAD_ID, "device_id": "pj-test", "target_version": "2.0.0"}), \
                  patch("pocket_journal_partner.cli.stream_firmware_image", side_effect=upload), \
-                 patch("pocket_journal_partner.cli.wait_for_ota_result", return_value=(client, {"state": "confirmed", "running_version": "2.0.0", "target_sha256": bundle.image.sha256})), \
+                 patch("pocket_journal_partner.cli.wait_for_ota_result", return_value=(client, {"state": "confirmed", "running_version": "2.0.0", "target_sha256": bundle.image.sha256, "target_partition_matches": True, "boot_outcome": "confirmed"})), \
                  redirect_stdout(stdout), redirect_stderr(stderr):
                 result = cli.main(["firmware", "update", "--device", "pj-test", "--file", str(path), "--yes"])
         self.assertEqual(result, 0)

@@ -12,15 +12,17 @@ static pj_framebuffer_t g_framebuffer;
 #define PJ_UI_TICKS_PER_SECOND (1000 / PJ_MAIN_LOOP_PERIOD_MS)
 #define PJ_STATUS_REFRESH_TICKS 6000
 
-static void render_and_flush_if_dirty(pj_ui_context_t *ui)
+static int render_and_flush_if_dirty(pj_ui_context_t *ui)
 {
     if (!pj_ui_is_dirty(ui)) {
-        return;
+        return 1;
     }
     pj_ui_render(ui, &g_framebuffer);
     if (pj_board_display_framebuffer(&g_framebuffer, &ui->dirty)) {
         pj_ui_mark_displayed(ui);
+        return 1;
     }
+    return 0;
 }
 
 static int state_is_playback(pj_ui_state_t state)
@@ -122,7 +124,7 @@ void app_main(void)
     ESP_LOGI(TAG, "Pocket Journal booting on board profile %s", profile.name);
 
     pj_board_init(&profile);
-    pj_board_start_services(&profile);
+    int services_ready = pj_board_start_services(&profile);
 
     pj_ui_init(&g_ui);
     pj_board_refresh_settings(&g_ui);
@@ -130,11 +132,12 @@ void app_main(void)
     pj_board_refresh_status(&g_ui);
     pj_board_refresh_time_state(&g_ui);
     pj_ui_request_full_refresh(&g_ui);
-    render_and_flush_if_dirty(&g_ui);
+    int initial_render_ready = render_and_flush_if_dirty(&g_ui);
 
     ESP_LOGI(TAG, "Initial UI state: %s, framebuffer bytes: %u",
              pj_ui_state_name(pj_ui_current_state(&g_ui)),
              (unsigned)PJ_FRAMEBUFFER_BYTES);
+    pj_board_confirm_boot_health(services_ready && initial_render_ready);
 
     int loop_ticks = 0;
     int second_ticks = 0;

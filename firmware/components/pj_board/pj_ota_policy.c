@@ -42,11 +42,11 @@ static int parse_semver(const char *value, uint32_t parts[3])
         return 0;
     }
     const char *cursor = value;
-    if (*cursor == 'v') {
-        cursor++;
-    }
     for (size_t part = 0; part < 3U; part++) {
         if (!isdigit((unsigned char)*cursor)) {
+            return 0;
+        }
+        if (*cursor == '0' && isdigit((unsigned char)cursor[1])) {
             return 0;
         }
         uint64_t number = 0U;
@@ -94,7 +94,8 @@ const char *pj_ota_check_code(pj_ota_check_t result)
         "signed_app_verification_unconfigured", "signature_invalid",
         "manifest_invalid", "image_size_invalid",
         "project_mismatch", "board_mismatch", "target_mismatch",
-        "version_replay", "version_downgrade", "secure_version_rejected",
+        "version_replay", "version_downgrade", "version_format_rejected",
+        "secure_version_rejected",
         "image_invalid", "image_digest_mismatch", "image_descriptor_mismatch",
         "active_partition_rejected",
     };
@@ -178,9 +179,21 @@ pj_ota_check_t pj_ota_preflight_check(const pj_ota_manifest_t *manifest,
     if (strcmp(manifest->version, identity->version) == 0) {
         return PJ_OTA_CHECK_VERSION_REPLAY;
     }
-    int comparable = 0;
-    if (semver_compare(manifest->version, identity->version, &comparable) < 0 && comparable) {
-        return PJ_OTA_CHECK_VERSION_DOWNGRADE;
+    uint32_t candidate_parts[3];
+    uint32_t running_parts[3];
+    int candidate_semver = parse_semver(manifest->version, candidate_parts);
+    int running_semver = parse_semver(identity->version, running_parts);
+    if (!candidate_semver) {
+        return PJ_OTA_CHECK_VERSION_FORMAT;
+    }
+    if (running_semver) {
+        int comparable = 0;
+        if (semver_compare(manifest->version, identity->version,
+                           &comparable) < 0 && comparable) {
+            return PJ_OTA_CHECK_VERSION_DOWNGRADE;
+        }
+    } else {
+        /* The factory/dev build gets one migration into the semver sequence. */
     }
     if (manifest->secure_version < identity->secure_version) {
         return PJ_OTA_CHECK_SECURE_VERSION;
@@ -252,10 +265,13 @@ pj_ota_transfer_result_t pj_ota_session_prepare(pj_ota_session_t *session,
     if (session->state == PJ_OTA_TRANSFER_WRITING) {
         return PJ_OTA_TRANSFER_BUSY;
     }
-    if (session->state == PJ_OTA_TRANSFER_READY ||
-        session->state == PJ_OTA_TRANSFER_PENDING_REBOOT) {
+    if (session->state == PJ_OTA_TRANSFER_PENDING_REBOOT) {
         return strcmp(session->upload_id, upload_id) == 0 ?
             PJ_OTA_TRANSFER_REPLAY : PJ_OTA_TRANSFER_BUSY;
+    }
+    if (session->state == PJ_OTA_TRANSFER_READY &&
+        strcmp(session->upload_id, upload_id) == 0) {
+        return PJ_OTA_TRANSFER_REPLAY;
     }
     memset(session, 0, sizeof(*session));
     session->state = PJ_OTA_TRANSFER_READY;
@@ -356,16 +372,91 @@ void pj_ota_session_abort(pj_ota_session_t *session)
     }
 }
 
+int pj_ota_mutation_reservation_held(
+    const pj_ota_mutation_reservation_t *reservation)
+{
+    return reservation != NULL && reservation->held;
+}
+
+int pj_ota_mutation_reservation_claim(
+    pj_ota_mutation_reservation_t *reservation,
+    pj_ota_mutation_lease_t *lease)
+{
+    if (reservation == NULL || lease == NULL || reservation->held) {
+        return 0;
+    }
+    uint32_t generation = reservation->generation + 1U;
+    if (generation == 0U) {
+        generation = 1U;
+    }
+    reservation->generation = generation;
+    reservation->held = 1;
+    lease->generation = generation;
+    return 1;
+}
+
+int pj_ota_mutation_reservation_release(
+    pj_ota_mutation_reservation_t *reservation,
+    pj_ota_mutation_lease_t *lease)
+{
+    if (reservation == NULL || lease == NULL || !reservation->held ||
+        lease->generation == 0U ||
+        lease->generation != reservation->generation) {
+        return 0;
+    }
+    reservation->held = 0;
+    lease->generation = 0U;
+    return 1;
+}
+
+pj_ota_record_state_t pj_ota_record_state_parse(const char *state)
+{
+    static const char *const names[] = {
+        NULL,
+        "pending_reboot",
+        "testing",
+        "confirmed",
+        "rollback_requested",
+        "rolled_back",
+        "failed",
+    };
+    if (state == NULL) {
+        return PJ_OTA_RECORD_INVALID;
+    }
+    for (size_t index = 1U; index < sizeof(names) / sizeof(names[0]); index++) {
+        if (strcmp(state, names[index]) == 0) {
+            return (pj_ota_record_state_t)index;
+        }
+    }
+    return PJ_OTA_RECORD_INVALID;
+}
+
 pj_ota_boot_state_t pj_ota_boot_evaluate(const pj_ota_boot_inputs_t *inputs)
 {
     if (inputs == NULL || !inputs->update_recorded) {
         return PJ_OTA_BOOT_IDLE;
     }
-    if (!inputs->running_matches_target) {
+    if (!inputs->running_version_matches_target ||
+        !inputs->running_partition_matches_target) {
         return PJ_OTA_BOOT_ROLLED_BACK;
     }
+    if (inputs->record_state == PJ_OTA_RECORD_CONFIRMED) {
+        if (!inputs->running_pending_verify) {
+            return PJ_OTA_BOOT_CONFIRMED;
+        }
+        return inputs->health_checked && inputs->rollback_possible ?
+            PJ_OTA_BOOT_ROLLBACK_REQUIRED : PJ_OTA_BOOT_FAILED;
+    }
+    int activation_pending =
+        inputs->record_state == PJ_OTA_RECORD_PENDING_REBOOT ||
+        inputs->record_state == PJ_OTA_RECORD_TESTING;
+    if (!activation_pending) {
+        return inputs->running_pending_verify && inputs->health_checked &&
+            inputs->rollback_possible ? PJ_OTA_BOOT_ROLLBACK_REQUIRED :
+            PJ_OTA_BOOT_FAILED;
+    }
     if (!inputs->running_pending_verify) {
-        return PJ_OTA_BOOT_CONFIRMED;
+        return PJ_OTA_BOOT_FAILED;
     }
     if (!inputs->health_checked) {
         return PJ_OTA_BOOT_TESTING;

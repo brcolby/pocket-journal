@@ -13,7 +13,42 @@ idf.py build
 idf.py flash
 ```
 
-The initial firmware app compiles the shared UI core and starts placeholder service boundaries. Hardware drivers should be enabled only after board revision verification.
+The firmware app compiles the shared UI core and starts the board display,
+input, storage, audio, connectivity, and partner-service integrations.
+
+### Signed OTA Builds
+
+The ordinary `sdkconfig.defaults` build intentionally reports `ota.write=false`.
+OTA activation requires both independent trust paths:
+
+- ESP-IDF signed-app update verification, enabled by adding
+  `sdkconfig.ota-signed.defaults` to `SDKCONFIG_DEFAULTS` and supplying an
+  untracked `CONFIG_SECURE_BOOT_SIGNING_KEY` for the RSA image signature.
+- A trusted P-256 manifest public key in
+  `CONFIG_PJ_OTA_TRUSTED_PUBLIC_KEY_HEX`, encoded as DER SubjectPublicKeyInfo
+  hex. The corresponding ECDSA private key signs the canonical sidecar manifest
+  and must remain outside the repository.
+
+Keep both private keys outside the repository and release artifacts. A missing
+or invalid key, failed known-vector self-test, unsigned ESP image, missing
+provisioned bearer token, or ordinary non-signed build leaves OTA read-only.
+Use an untracked sdkconfig fragment for the key paths/material, for example:
+
+```sh
+idf.py -B build-ota \
+  -D 'SDKCONFIG_DEFAULTS=sdkconfig.defaults;sdkconfig.ota-signed.defaults;/absolute/path/ota-keys.defaults' \
+  -D PROJECT_VER=1.0.0 build
+```
+
+The USB-flashed factory image must already contain this OTA trust configuration;
+an ordinary fail-closed factory image cannot bootstrap OTA. The first update
+from factory targets `ota_0` and relies on the intact factory partition as its
+rollback image. Leave factory intact through first-OTA confirmation. A factory
+development/git version gets one migration to a strict `X.Y.Z` version; all
+subsequent OTA releases must remain increasing strict semver and alternate the
+OTA slots. `pj firmware update --file app.bin --yes` expects
+`app.bin.manifest.json` and `app.bin.sig` unless explicit sidecar paths are
+provided.
 
 Use `idf.py monitor` only for an explicit serial-log session. Stop it with
 `Ctrl+]` as soon as that session is complete and before running any `pj` USB-C

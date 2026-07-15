@@ -41,13 +41,19 @@
 #define PJ_OTA_IDF_SIGNED_APP_ENABLED 0
 #endif
 
+#ifdef CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE
+#define PJ_OTA_ROLLBACK_ENABLED 1
+#else
+#define PJ_OTA_ROLLBACK_ENABLED 0
+#endif
+
 typedef struct {
     SemaphoreHandle_t lock;
     TimerHandle_t preflight_timer;
     pj_ota_session_t session;
+    pj_ota_mutation_reservation_t mutation_reservation;
     pj_ota_manifest_t manifest;
     char device_id[32];
-    char token[64];
     char board[PJ_OTA_BOARD_LEN];
     char state[24];
     char reason[64];
@@ -55,9 +61,15 @@ typedef struct {
     char target_sha256[PJ_OTA_SHA256_HEX_LEN + 1U];
     int initialized;
     int boot_pending_verify;
+    pj_ota_record_state_t boot_record_state;
     int nvs_ready;
+    int crypto_ready;
     int verification_key_ready;
-    int mutations_reserved;
+    int signature_self_test_ready;
+    uint32_t target_partition_address;
+    uint8_t target_partition_subtype;
+    int target_partition_recorded;
+    pj_ota_token_read_fn read_token;
     pj_ota_mutation_reserve_fn reserve_mutations;
     pj_ota_mutation_release_fn release_mutations;
     TickType_t ready_expires_at;
@@ -67,7 +79,9 @@ static const char *TAG = "pj-ota";
 static pj_ota_context_t g_ota;
 
 static void preflight_timer_callback(TimerHandle_t timer);
-static void ota_abort(esp_ota_handle_t handle, int begun, const char *reason);
+static void ota_abort(esp_ota_handle_t handle, int begun,
+                      pj_ota_mutation_lease_t *lease, const char *reason);
+static void preflight_abort(const char *upload_id, const char *reason);
 
 static void copy_text(char *destination, size_t capacity, const char *source)
 {
@@ -84,9 +98,14 @@ static void copy_text(char *destination, size_t capacity, const char *source)
 static int auth_ok(httpd_req_t *request)
 {
     char header[96];
-    return httpd_req_get_hdr_value_str(request, "Authorization", header,
-                                       sizeof(header)) == ESP_OK &&
-           pj_auth_header_valid(header, g_ota.token);
+    char token[64] = {0};
+    int valid = httpd_req_get_hdr_value_str(request, "Authorization", header,
+                                            sizeof(header)) == ESP_OK &&
+                g_ota.read_token != NULL &&
+                g_ota.read_token(token, sizeof(token)) &&
+                pj_auth_header_valid(header, token);
+    memset(token, 0, sizeof(token));
+    return valid;
 }
 
 static esp_err_t send_json(httpd_req_t *request, const char *status, const char *json)
@@ -158,15 +177,13 @@ static int trusted_key_parse(mbedtls_pk_context *public_key)
                                  PSA_KEY_USAGE_VERIFY_HASH);
 }
 
-static int signature_verify(const pj_ota_manifest_t *manifest,
-                            const char *signature_hex)
+static int signature_verify_parsed(const pj_ota_manifest_t *manifest,
+                                   const uint8_t *signature,
+                                   size_t signature_size,
+                                   mbedtls_pk_context *public_key)
 {
-    if (!g_ota.verification_key_ready) {
-        return 0;
-    }
-    uint8_t signature[PJ_OTA_SIGNATURE_MAX_BYTES];
-    size_t signature_size = 0U;
-    if (!hex_decode(signature_hex, signature, sizeof(signature), &signature_size)) {
+    if (manifest == NULL || signature == NULL || signature_size == 0U ||
+        public_key == NULL) {
         return 0;
     }
     char canonical[PJ_OTA_CANONICAL_MAX];
@@ -177,19 +194,78 @@ static int signature_verify(const pj_ota_manifest_t *manifest,
     }
     uint8_t digest[32];
     size_t digest_size = 0U;
-    if (psa_crypto_init() != PSA_SUCCESS ||
-        psa_hash_compute(PSA_ALG_SHA_256, (const uint8_t *)canonical,
+    if (psa_hash_compute(PSA_ALG_SHA_256, (const uint8_t *)canonical,
                          canonical_size, digest, sizeof(digest),
                          &digest_size) != PSA_SUCCESS ||
         digest_size != sizeof(digest)) {
         return 0;
     }
+    return mbedtls_pk_verify(public_key, MBEDTLS_MD_SHA256,
+                             digest, sizeof(digest), signature,
+                             signature_size) == 0;
+}
+
+static int signature_verify(const pj_ota_manifest_t *manifest,
+                            const char *signature_hex)
+{
+    if (!g_ota.verification_key_ready) {
+        return 0;
+    }
+    uint8_t signature[PJ_OTA_SIGNATURE_MAX_BYTES];
+    size_t signature_size = 0U;
+    if (!hex_decode(signature_hex, signature, sizeof(signature),
+                    &signature_size)) {
+        return 0;
+    }
     mbedtls_pk_context public_key;
     mbedtls_pk_init(&public_key);
     int verified = trusted_key_parse(&public_key) &&
-                   mbedtls_pk_verify(&public_key, MBEDTLS_MD_SHA256,
-                                     digest, sizeof(digest), signature,
-                                     signature_size) == 0;
+                   signature_verify_parsed(manifest, signature,
+                                           signature_size, &public_key);
+    mbedtls_pk_free(&public_key);
+    return verified;
+}
+
+static int signature_known_vector_self_test(void)
+{
+    static const char public_key_hex[] =
+        "3059301306072a8648ce3d020106082a8648ce3d03010703420004"
+        "6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296"
+        "4fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5";
+    static const char signature_hex[] =
+        "304502201cce6bb5eea3fca9f3836139a8f4a27e7fd0c4303e918a0d6bfe7e0d"
+        "8343687a02210080b29c5d09145a73efeaaaf020cde3934b7f9926db8459391f61"
+        "3f1cc4b76bdd";
+    pj_ota_manifest_t manifest = {
+        .size = 1703936U,
+        .sha256 =
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        .project = "pocket_journal",
+        .board = "waveshare-esp32-s3-touch-epaper-1.54-v2",
+        .target = "esp32s3",
+        .version = "2.0.0",
+        .secure_version = 1U,
+    };
+    uint8_t public_key_der[PJ_OTA_KEY_MAX_BYTES];
+    uint8_t signature[PJ_OTA_SIGNATURE_MAX_BYTES];
+    size_t public_key_size = 0U;
+    size_t signature_size = 0U;
+    if (!hex_decode(public_key_hex, public_key_der, sizeof(public_key_der),
+                    &public_key_size) ||
+        !hex_decode(signature_hex, signature, sizeof(signature),
+                    &signature_size)) {
+        return 0;
+    }
+    mbedtls_pk_context public_key;
+    mbedtls_pk_init(&public_key);
+    int verified =
+        mbedtls_pk_parse_public_key(&public_key, public_key_der,
+                                    public_key_size) == 0 &&
+        mbedtls_pk_can_do_psa(&public_key,
+                             PSA_ALG_ECDSA(PSA_ALG_SHA_256),
+                             PSA_KEY_USAGE_VERIFY_HASH) &&
+        signature_verify_parsed(&manifest, signature, signature_size,
+                                &public_key);
     mbedtls_pk_free(&public_key);
     return verified;
 }
@@ -305,24 +381,67 @@ static void state_set(const char *state, const char *reason)
     copy_text(g_ota.reason, sizeof(g_ota.reason), reason);
 }
 
-static int mutations_reserve_locked(void)
+static void partition_slot_name(uint8_t subtype, char *output, size_t capacity)
 {
-    if (g_ota.mutations_reserved) {
-        return 1;
+    if (subtype == ESP_PARTITION_SUBTYPE_APP_FACTORY) {
+        copy_text(output, capacity, "factory");
+    } else if (subtype >= ESP_PARTITION_SUBTYPE_APP_OTA_MIN &&
+               subtype < ESP_PARTITION_SUBTYPE_APP_OTA_MAX) {
+        (void)snprintf(output, capacity, "ota_%u",
+                       (unsigned)(subtype - ESP_PARTITION_SUBTYPE_APP_OTA_MIN));
+    } else {
+        copy_text(output, capacity, "unknown");
+    }
+}
+
+static const char *boot_outcome_name(const char *state)
+{
+    if (strcmp(state, "pending_reboot") == 0) {
+        return "awaiting_reboot";
+    }
+    if (strcmp(state, "testing") == 0) {
+        return "testing";
+    }
+    if (strcmp(state, "confirmed") == 0) {
+        return "confirmed";
+    }
+    if (strcmp(state, "rolled_back") == 0) {
+        return "rolled_back";
+    }
+    if (strcmp(state, "rollback_requested") == 0) {
+        return "rollback_requested";
+    }
+    if (strcmp(state, "failed") == 0) {
+        return "failed";
+    }
+    return "not_started";
+}
+
+static int mutations_reserve_locked(pj_ota_mutation_lease_t *lease)
+{
+    if (lease == NULL ||
+        pj_ota_mutation_reservation_held(&g_ota.mutation_reservation)) {
+        return 0;
     }
     if (g_ota.reserve_mutations == NULL || !g_ota.reserve_mutations()) {
         return 0;
     }
-    g_ota.mutations_reserved = 1;
+    if (!pj_ota_mutation_reservation_claim(&g_ota.mutation_reservation,
+                                           lease)) {
+        if (g_ota.release_mutations != NULL) {
+            g_ota.release_mutations();
+        }
+        return 0;
+    }
     return 1;
 }
 
-static void mutations_release_locked(void)
+static void mutations_release_locked(pj_ota_mutation_lease_t *lease)
 {
-    if (!g_ota.mutations_reserved) {
+    if (!pj_ota_mutation_reservation_release(&g_ota.mutation_reservation,
+                                             lease)) {
         return;
     }
-    g_ota.mutations_reserved = 0;
     if (g_ota.release_mutations != NULL) {
         g_ota.release_mutations();
     }
@@ -330,6 +449,9 @@ static void mutations_release_locked(void)
 
 static esp_err_t record_write(const char *state)
 {
+    if (!g_ota.target_partition_recorded) {
+        return ESP_ERR_INVALID_STATE;
+    }
     nvs_handle_t handle;
     esp_err_t result = nvs_open(PJ_OTA_NVS_NAMESPACE, NVS_READWRITE, &handle);
     if (result != ESP_OK) {
@@ -341,6 +463,14 @@ static esp_err_t record_write(const char *state)
     }
     if (result == ESP_OK) {
         result = nvs_set_str(handle, "sha256", g_ota.target_sha256);
+    }
+    if (result == ESP_OK) {
+        result = nvs_set_u32(handle, "part_addr",
+                             g_ota.target_partition_address);
+    }
+    if (result == ESP_OK) {
+        result = nvs_set_u8(handle, "part_sub",
+                            g_ota.target_partition_subtype);
     }
     if (result == ESP_OK) {
         result = nvs_commit(handle);
@@ -359,44 +489,90 @@ static void record_load(void)
     }
     char persisted_state[24] = {0};
     size_t state_size = sizeof(persisted_state);
-    size_t version_size = sizeof(g_ota.target_version);
-    size_t sha_size = sizeof(g_ota.target_sha256);
     esp_err_t state_result = nvs_get_str(handle, "state", persisted_state,
                                          &state_size);
+    if (state_result == ESP_ERR_NVS_NOT_FOUND) {
+        nvs_close(handle);
+        state_set("idle", "");
+        return;
+    }
+    size_t version_size = sizeof(g_ota.target_version);
+    size_t sha_size = sizeof(g_ota.target_sha256);
     esp_err_t version_result = nvs_get_str(handle, "version",
                                            g_ota.target_version,
                                            &version_size);
     esp_err_t sha_result = nvs_get_str(handle, "sha256", g_ota.target_sha256,
                                        &sha_size);
+    uint32_t partition_address = 0U;
+    uint8_t partition_subtype = 0U;
+    esp_err_t address_result = nvs_get_u32(handle, "part_addr",
+                                           &partition_address);
+    esp_err_t subtype_result = nvs_get_u8(handle, "part_sub",
+                                          &partition_subtype);
     nvs_close(handle);
-    if (state_result == ESP_ERR_NVS_NOT_FOUND) {
-        state_set("idle", "");
-        return;
-    }
-    if (state_result != ESP_OK || version_result != ESP_OK || sha_result != ESP_OK) {
+    if (state_result != ESP_OK || version_result != ESP_OK ||
+        sha_result != ESP_OK || address_result != ESP_OK ||
+        subtype_result != ESP_OK || partition_address == 0U ||
+        partition_subtype < ESP_PARTITION_SUBTYPE_APP_OTA_MIN ||
+        partition_subtype >= ESP_PARTITION_SUBTYPE_APP_OTA_MAX) {
         state_set("failed", "ota_state_corrupt");
         return;
     }
+    g_ota.target_partition_address = partition_address;
+    g_ota.target_partition_subtype = partition_subtype;
+    g_ota.target_partition_recorded = 1;
+    g_ota.boot_record_state = pj_ota_record_state_parse(persisted_state);
     const esp_app_desc_t *running = esp_app_get_description();
-    if (strcmp(running->version, g_ota.target_version) != 0) {
-        state_set("rolled_back", "target_not_running");
+    const esp_partition_t *partition = esp_ota_get_running_partition();
+    pj_ota_boot_inputs_t boot = {
+        .update_recorded = 1,
+        .record_state = g_ota.boot_record_state,
+        .running_version_matches_target =
+            strcmp(running->version, g_ota.target_version) == 0,
+        .running_partition_matches_target =
+            partition != NULL && partition->address == partition_address &&
+            (uint8_t)partition->subtype == partition_subtype,
+    };
+    pj_ota_boot_state_t outcome = pj_ota_boot_evaluate(&boot);
+    if (outcome == PJ_OTA_BOOT_ROLLED_BACK) {
+        state_set("rolled_back", "target_partition_not_running");
         (void)record_write("rolled_back");
         return;
     }
-    const esp_partition_t *partition = esp_ota_get_running_partition();
     esp_ota_img_states_t image_state = ESP_OTA_IMG_UNDEFINED;
-    if (partition != NULL &&
-        esp_ota_get_state_partition(partition, &image_state) == ESP_OK &&
-        image_state == ESP_OTA_IMG_PENDING_VERIFY) {
+    if (esp_ota_get_state_partition(partition, &image_state) != ESP_OK ||
+        (image_state != ESP_OTA_IMG_PENDING_VERIFY &&
+         image_state != ESP_OTA_IMG_VALID)) {
+        state_set("failed", "boot_state_unavailable");
+        return;
+    }
+    boot.running_pending_verify = image_state == ESP_OTA_IMG_PENDING_VERIFY;
+    outcome = pj_ota_boot_evaluate(&boot);
+    if (outcome == PJ_OTA_BOOT_TESTING) {
         g_ota.boot_pending_verify = 1;
         state_set("testing", "awaiting_health_confirmation");
         return;
     }
-    state_set("confirmed", "");
-    (void)record_write("confirmed");
+    if (outcome == PJ_OTA_BOOT_CONFIRMED) {
+        state_set("confirmed", "");
+        (void)record_write("confirmed");
+        return;
+    }
+    if (outcome == PJ_OTA_BOOT_FAILED) {
+        g_ota.boot_pending_verify =
+            image_state == ESP_OTA_IMG_PENDING_VERIFY;
+        if (g_ota.boot_record_state == PJ_OTA_RECORD_ROLLBACK_REQUESTED) {
+            state_set("rollback_requested", "persisted_rollback_request");
+        } else {
+            state_set("failed", "persisted_state_rejected");
+        }
+        return;
+    }
+    state_set("failed", "boot_state_invalid");
 }
 
-void pj_ota_init(const char *device_id, const char *token, const char *board,
+void pj_ota_init(const char *device_id, pj_ota_token_read_fn read_token,
+                 const char *board,
                  pj_ota_mutation_reserve_fn reserve_mutations,
                  pj_ota_mutation_release_fn release_mutations)
 {
@@ -405,8 +581,8 @@ void pj_ota_init(const char *device_id, const char *token, const char *board,
     }
     memset(&g_ota, 0, sizeof(g_ota));
     copy_text(g_ota.device_id, sizeof(g_ota.device_id), device_id);
-    copy_text(g_ota.token, sizeof(g_ota.token), token);
     copy_text(g_ota.board, sizeof(g_ota.board), board);
+    g_ota.read_token = read_token;
     g_ota.reserve_mutations = reserve_mutations;
     g_ota.release_mutations = release_mutations;
     pj_ota_session_init(&g_ota.session);
@@ -421,14 +597,26 @@ void pj_ota_init(const char *device_id, const char *token, const char *board,
         NULL, preflight_timer_callback);
     mbedtls_pk_context public_key;
     mbedtls_pk_init(&public_key);
-    g_ota.verification_key_ready = trusted_key_parse(&public_key);
+    psa_status_t crypto_status = psa_crypto_init();
+    g_ota.crypto_ready = crypto_status == PSA_SUCCESS;
+    if (!g_ota.crypto_ready) {
+        ESP_LOGE(TAG, "PSA crypto initialization failed: %ld",
+                 (long)crypto_status);
+    }
+    g_ota.signature_self_test_ready = g_ota.crypto_ready &&
+                                      signature_known_vector_self_test();
+    g_ota.verification_key_ready = g_ota.signature_self_test_ready &&
+                                   trusted_key_parse(&public_key);
     mbedtls_pk_free(&public_key);
     record_load();
     if (g_ota.preflight_timer == NULL) {
         state_set("failed", "ota_timer_unavailable");
     }
     g_ota.initialized = 1;
-    ESP_LOGI(TAG, "OTA state=%s trusted_key=%s", g_ota.state,
+    ESP_LOGI(TAG, "OTA state=%s crypto=%s signature_self_test=%s trusted_key=%s",
+             g_ota.state,
+             g_ota.crypto_ready ? "ready" : "failed",
+             g_ota.signature_self_test_ready ? "passed" : "failed",
              g_ota.verification_key_ready ? "configured" : "unconfigured");
 }
 
@@ -452,7 +640,6 @@ static void preflight_timer_callback(TimerHandle_t timer)
         (int32_t)(xTaskGetTickCount() - g_ota.ready_expires_at) >= 0) {
         pj_ota_session_abort(&g_ota.session);
         state_set("failed", "preflight_expired");
-        mutations_release_locked();
     }
     xSemaphoreGive(g_ota.lock);
 }
@@ -481,11 +668,41 @@ static esp_err_t ota_status_handler(httpd_req_t *request)
     uint64_t received_bytes = g_ota.session.received_bytes;
     uint64_t total_bytes = g_ota.session.expected_bytes;
     int verification_key_ready = g_ota.verification_key_ready;
-    int mutations_reserved = g_ota.mutations_reserved;
+    int signature_self_test_ready = g_ota.signature_self_test_ready;
+    int crypto_ready = g_ota.crypto_ready;
+    int mutations_reserved =
+        pj_ota_mutation_reservation_held(&g_ota.mutation_reservation);
+    uint32_t target_partition_address = g_ota.target_partition_address;
+    uint8_t target_partition_subtype = g_ota.target_partition_subtype;
+    int target_partition_recorded = g_ota.target_partition_recorded;
     xSemaphoreGive(g_ota.lock);
 
     const esp_app_desc_t *running = esp_app_get_description();
+    const esp_partition_t *running_partition = esp_ota_get_running_partition();
+    char running_slot[16];
+    char target_slot[16];
+    partition_slot_name(running_partition == NULL ? 0xffU :
+                        (uint8_t)running_partition->subtype,
+                        running_slot, sizeof(running_slot));
+    partition_slot_name(target_partition_subtype, target_slot,
+                        sizeof(target_slot));
     cJSON *json = cJSON_CreateObject();
+    cJSON *target_address_json = NULL;
+    cJSON *target_subtype_json = NULL;
+    cJSON *target_slot_json = NULL;
+    if (json != NULL) {
+        target_address_json = target_partition_recorded ?
+            cJSON_AddNumberToObject(json, "target_partition_address",
+                                   (double)target_partition_address) :
+            cJSON_AddNullToObject(json, "target_partition_address");
+        target_subtype_json = target_partition_recorded ?
+            cJSON_AddNumberToObject(json, "target_partition_subtype",
+                                   target_partition_subtype) :
+            cJSON_AddNullToObject(json, "target_partition_subtype");
+        target_slot_json = target_partition_recorded ?
+            cJSON_AddStringToObject(json, "target_slot", target_slot) :
+            cJSON_AddNullToObject(json, "target_slot");
+    }
     int valid = json != NULL &&
         cJSON_AddStringToObject(json, "device_id", device_id) != NULL &&
         cJSON_AddStringToObject(json, "state", state) != NULL &&
@@ -493,11 +710,32 @@ static esp_err_t ota_status_handler(httpd_req_t *request)
         cJSON_AddStringToObject(json, "running_version", running->version) != NULL &&
         cJSON_AddStringToObject(json, "target_version", target_version) != NULL &&
         cJSON_AddStringToObject(json, "target_sha256", target_sha256) != NULL &&
+        cJSON_AddStringToObject(json, "running_slot", running_slot) != NULL &&
+        cJSON_AddNumberToObject(json, "running_partition_address",
+                               running_partition == NULL ? 0.0 :
+                               (double)running_partition->address) != NULL &&
+        cJSON_AddNumberToObject(json, "running_partition_subtype",
+                               running_partition == NULL ? -1.0 :
+                               (double)running_partition->subtype) != NULL &&
+        target_address_json != NULL && target_subtype_json != NULL &&
+        target_slot_json != NULL &&
+        cJSON_AddBoolToObject(json, "target_partition_matches",
+            target_partition_recorded && running_partition != NULL &&
+            running_partition->address == target_partition_address &&
+            (uint8_t)running_partition->subtype == target_partition_subtype) != NULL &&
+        cJSON_AddBoolToObject(json, "reboot_required",
+                              strcmp(state, "pending_reboot") == 0) != NULL &&
+        cJSON_AddStringToObject(json, "boot_outcome",
+                                boot_outcome_name(state)) != NULL &&
         cJSON_AddNumberToObject(json, "received_bytes", (double)received_bytes) != NULL &&
         cJSON_AddNumberToObject(json, "total_bytes", (double)total_bytes) != NULL &&
-        cJSON_AddBoolToObject(json, "rollback_enabled", 1) != NULL &&
+        cJSON_AddBoolToObject(json, "rollback_enabled",
+                              PJ_OTA_ROLLBACK_ENABLED) != NULL &&
+        cJSON_AddBoolToObject(json, "crypto_ready", crypto_ready) != NULL &&
         cJSON_AddBoolToObject(json, "verification_key_configured",
                               verification_key_ready) != NULL &&
+        cJSON_AddBoolToObject(json, "manifest_signature_self_test",
+                              signature_self_test_ready) != NULL &&
         cJSON_AddBoolToObject(json, "idf_signed_app_verification",
                               PJ_OTA_IDF_SIGNED_APP_ENABLED) != NULL &&
         cJSON_AddBoolToObject(json, "mutations_reserved", mutations_reserved) != NULL;
@@ -552,14 +790,12 @@ static esp_err_t ota_preflight_handler(httpd_req_t *request)
                          "\"reason\":\"OTA busy\","
                          "\"code\":\"ota_busy\"}");
     }
-    int active = g_ota.session.state == PJ_OTA_TRANSFER_READY ||
-                 g_ota.session.state == PJ_OTA_TRANSFER_WRITING ||
+    int active = g_ota.session.state == PJ_OTA_TRANSFER_WRITING ||
                  g_ota.session.state == PJ_OTA_TRANSFER_PENDING_REBOOT;
     if (g_ota.session.state == PJ_OTA_TRANSFER_READY &&
         (int32_t)(xTaskGetTickCount() - g_ota.ready_expires_at) >= 0) {
         pj_ota_session_abort(&g_ota.session);
         state_set("failed", "preflight_expired");
-        mutations_release_locked();
         active = 0;
     }
     int signature_valid = signature_verify(&candidate, signature_hex);
@@ -573,7 +809,9 @@ static esp_err_t ota_preflight_handler(httpd_req_t *request)
         check = PJ_OTA_CHECK_SECURE_VERSION;
     }
     if (check == PJ_OTA_CHECK_ACCEPTED &&
-        (!g_ota.nvs_ready || update == NULL || g_ota.preflight_timer == NULL ||
+        (!g_ota.nvs_ready || !PJ_OTA_ROLLBACK_ENABLED || update == NULL ||
+         g_ota.preflight_timer == NULL ||
+         g_ota.read_token == NULL ||
          g_ota.reserve_mutations == NULL || g_ota.release_mutations == NULL)) {
         check = PJ_OTA_CHECK_IMAGE_INVALID;
     }
@@ -589,10 +827,14 @@ static esp_err_t ota_preflight_handler(httpd_req_t *request)
                       candidate.version);
             copy_text(g_ota.target_sha256, sizeof(g_ota.target_sha256),
                       candidate.sha256);
+            g_ota.target_partition_address = update->address;
+            g_ota.target_partition_subtype = (uint8_t)update->subtype;
+            g_ota.target_partition_recorded = 1;
             g_ota.ready_expires_at = xTaskGetTickCount() +
                                      pdMS_TO_TICKS(PJ_OTA_PREFLIGHT_TTL_MS);
             if (xTimerReset(g_ota.preflight_timer, 0) != pdPASS) {
                 pj_ota_session_abort(&g_ota.session);
+                state_set("failed", "preflight_timer_failed");
                 check = PJ_OTA_CHECK_IMAGE_INVALID;
             } else {
                 state_set("ready", "");
@@ -622,7 +864,7 @@ static esp_err_t ota_preflight_handler(httpd_req_t *request)
     char *encoded = response_valid ? cJSON_PrintUnformatted(response) : NULL;
     cJSON_Delete(response);
     if (encoded == NULL) {
-        ota_abort(0, 0, "response_allocation_failed");
+        preflight_abort(upload_id, "response_allocation_failed");
         return send_json(request, "503 Service Unavailable",
                          "{\"error\":\"OTA response allocation failed\","
                          "\"code\":\"out_of_memory\"}");
@@ -632,7 +874,23 @@ static esp_err_t ota_preflight_handler(httpd_req_t *request)
     return result;
 }
 
-static void ota_abort(esp_ota_handle_t handle, int begun, const char *reason)
+static void preflight_abort(const char *upload_id, const char *reason)
+{
+    if (g_ota.lock == NULL || upload_id == NULL ||
+        xSemaphoreTake(g_ota.lock, portMAX_DELAY) != pdTRUE) {
+        return;
+    }
+    if (g_ota.session.state == PJ_OTA_TRANSFER_READY &&
+        strcmp(g_ota.session.upload_id, upload_id) == 0) {
+        (void)xTimerStop(g_ota.preflight_timer, 0);
+        pj_ota_session_abort(&g_ota.session);
+        state_set("failed", reason);
+    }
+    xSemaphoreGive(g_ota.lock);
+}
+
+static void ota_abort(esp_ota_handle_t handle, int begun,
+                      pj_ota_mutation_lease_t *lease, const char *reason)
 {
     if (begun) {
         (void)esp_ota_abort(handle);
@@ -644,7 +902,7 @@ static void ota_abort(esp_ota_handle_t handle, int begun, const char *reason)
         xSemaphoreTake(g_ota.lock, portMAX_DELAY) == pdTRUE) {
         pj_ota_session_abort(&g_ota.session);
         state_set("failed", reason);
-        mutations_release_locked();
+        mutations_release_locked(lease);
         xSemaphoreGive(g_ota.lock);
     }
     ESP_LOGW(TAG, "OTA upload aborted: %s", reason);
@@ -663,6 +921,7 @@ static esp_err_t ota_upload_handler(httpd_req_t *request)
         return ESP_OK;
     }
     char upload_id[PJ_OTA_UPLOAD_ID_LEN + 1U];
+    pj_ota_mutation_lease_t mutation_lease = {0};
     if (httpd_req_get_hdr_value_str(request, "X-PJ-Upload-ID", upload_id,
                                     sizeof(upload_id)) != ESP_OK) {
         return send_json(request, "400 Bad Request",
@@ -678,7 +937,6 @@ static esp_err_t ota_upload_handler(httpd_req_t *request)
         (int32_t)(xTaskGetTickCount() - g_ota.ready_expires_at) >= 0) {
         pj_ota_session_abort(&g_ota.session);
         state_set("failed", "preflight_expired");
-        mutations_release_locked();
     }
     char image_sha256[PJ_OTA_SHA256_HEX_LEN + 1U];
     char activate[6];
@@ -695,7 +953,7 @@ static esp_err_t ota_upload_handler(httpd_req_t *request)
     pj_ota_transfer_result_t begin = PJ_OTA_TRANSFER_INVALID_STATE;
     pj_ota_transfer_result_t reservation = PJ_OTA_TRANSFER_INVALID_STATE;
     if (headers_match && length_matches) {
-        int reserved = mutations_reserve_locked();
+        int reserved = mutations_reserve_locked(&mutation_lease);
         reservation = pj_ota_session_reserve(&g_ota.session, upload_id,
                                              reserved);
         if (reservation == PJ_OTA_TRANSFER_OK) {
@@ -703,7 +961,7 @@ static esp_err_t ota_upload_handler(httpd_req_t *request)
         }
         if (reservation != PJ_OTA_TRANSFER_OK ||
             begin != PJ_OTA_TRANSFER_OK) {
-            mutations_release_locked();
+            mutations_release_locked(&mutation_lease);
         }
     }
     if (!headers_match || !length_matches || begin != PJ_OTA_TRANSFER_OK) {
@@ -728,12 +986,17 @@ static esp_err_t ota_upload_handler(httpd_req_t *request)
     (void)xTimerStop(g_ota.preflight_timer, 0);
     state_set("uploading", "");
     pj_ota_manifest_t manifest = g_ota.manifest;
+    uint32_t target_partition_address = g_ota.target_partition_address;
+    uint8_t target_partition_subtype = g_ota.target_partition_subtype;
     xSemaphoreGive(g_ota.lock);
 
     const esp_partition_t *running = esp_ota_get_running_partition();
     const esp_partition_t *update = esp_ota_get_next_update_partition(running);
-    if (update == NULL || update == running || manifest.size > update->size) {
-        ota_abort(0, 0, "inactive_partition_unavailable");
+    if (update == NULL || update == running || manifest.size > update->size ||
+        update->address != target_partition_address ||
+        (uint8_t)update->subtype != target_partition_subtype) {
+        ota_abort(0, 0, &mutation_lease,
+                  "inactive_partition_unavailable");
         return send_json(request, "422 Unprocessable Entity",
                          "{\"error\":\"inactive partition unavailable\","
                          "\"code\":\"active_partition_rejected\"}");
@@ -741,17 +1004,17 @@ static esp_err_t ota_upload_handler(httpd_req_t *request)
     esp_ota_handle_t handle = 0;
     esp_err_t error = esp_ota_begin(update, (size_t)manifest.size, &handle);
     if (error != ESP_OK) {
-        ota_abort(handle, 0, "ota_begin_failed");
+        ota_abort(handle, 0, &mutation_lease, "ota_begin_failed");
         return send_json(request, "503 Service Unavailable",
                          "{\"error\":\"OTA begin failed\","
                          "\"code\":\"ota_begin_failed\"}");
     }
     uint8_t *buffer = malloc(PJ_OTA_STREAM_BUFFER_BYTES);
     psa_hash_operation_t hash = PSA_HASH_OPERATION_INIT;
-    if (buffer == NULL || psa_crypto_init() != PSA_SUCCESS ||
+    if (buffer == NULL || !g_ota.crypto_ready ||
         psa_hash_setup(&hash, PSA_ALG_SHA_256) != PSA_SUCCESS) {
         free(buffer);
-        ota_abort(handle, 1, "ota_hash_unavailable");
+        ota_abort(handle, 1, &mutation_lease, "ota_hash_unavailable");
         return send_json(request, "503 Service Unavailable",
                          "{\"error\":\"OTA resources unavailable\","
                          "\"code\":\"ota_resources_unavailable\"}");
@@ -766,7 +1029,8 @@ static esp_err_t ota_upload_handler(httpd_req_t *request)
             esp_ota_write(handle, buffer, (size_t)count) != ESP_OK) {
             (void)psa_hash_abort(&hash);
             free(buffer);
-            ota_abort(handle, 1, count <= 0 ? "upload_interrupted" :
+            ota_abort(handle, 1, &mutation_lease,
+                      count <= 0 ? "upload_interrupted" :
                       "flash_write_failed");
             return ESP_FAIL;
         }
@@ -780,7 +1044,7 @@ static esp_err_t ota_upload_handler(httpd_req_t *request)
             }
             (void)psa_hash_abort(&hash);
             free(buffer);
-            ota_abort(handle, 1, "upload_state_failed");
+            ota_abort(handle, 1, &mutation_lease, "upload_state_failed");
             return ESP_FAIL;
         }
         xSemaphoreGive(g_ota.lock);
@@ -791,7 +1055,7 @@ static esp_err_t ota_upload_handler(httpd_req_t *request)
     size_t digest_size = 0U;
     if (psa_hash_finish(&hash, digest, sizeof(digest), &digest_size) != PSA_SUCCESS ||
         digest_size != sizeof(digest)) {
-        ota_abort(handle, 1, "image_digest_failed");
+        ota_abort(handle, 1, &mutation_lease, "image_digest_failed");
         return send_json(request, "422 Unprocessable Entity",
                          "{\"error\":\"image digest failed\","
                          "\"code\":\"image_digest_mismatch\"}");
@@ -800,14 +1064,14 @@ static esp_err_t ota_upload_handler(httpd_req_t *request)
     bytes_to_hex(digest, sizeof(digest), digest_hex);
     int digest_matches = strcmp(digest_hex, manifest.sha256) == 0;
     if (!digest_matches) {
-        ota_abort(handle, 1, "image_digest_mismatch");
+        ota_abort(handle, 1, &mutation_lease, "image_digest_mismatch");
         return send_json(request, "422 Unprocessable Entity",
                          "{\"error\":\"image digest mismatch\","
                          "\"code\":\"image_digest_mismatch\"}");
     }
     error = esp_ota_end(handle);
     if (error != ESP_OK) {
-        ota_abort(0, 0, "image_invalid");
+        ota_abort(0, 0, &mutation_lease, "image_invalid");
         return send_json(request, "422 Unprocessable Entity",
                          "{\"error\":\"invalid ESP application image\","
                          "\"code\":\"image_invalid\"}");
@@ -832,7 +1096,7 @@ static esp_err_t ota_upload_handler(httpd_req_t *request)
         check = PJ_OTA_CHECK_SECURE_VERSION;
     }
     if (check != PJ_OTA_CHECK_ACCEPTED) {
-        ota_abort(0, 0, pj_ota_check_code(check));
+        ota_abort(0, 0, &mutation_lease, pj_ota_check_code(check));
         char response[256];
         (void)snprintf(response, sizeof(response),
                        "{\"error\":\"flashed image rejected\","
@@ -841,29 +1105,36 @@ static esp_err_t ota_upload_handler(httpd_req_t *request)
     }
     if (record_write("pending_reboot") != ESP_OK ||
         esp_ota_set_boot_partition(update) != ESP_OK) {
-        ota_abort(0, 0, "activation_failed");
+        ota_abort(0, 0, &mutation_lease, "activation_failed");
         return send_json(request, "503 Service Unavailable",
                          "{\"error\":\"OTA activation failed\","
                          "\"code\":\"activation_failed\"}");
     }
+    pj_ota_transfer_result_t finish = PJ_OTA_TRANSFER_INVALID_STATE;
     if (xSemaphoreTake(g_ota.lock, portMAX_DELAY) == pdTRUE) {
-        (void)pj_ota_session_finish(&g_ota.session, upload_id);
-        state_set("pending_reboot", "");
+        finish = pj_ota_session_finish(&g_ota.session, upload_id);
+        if (finish == PJ_OTA_TRANSFER_OK) {
+            state_set("pending_reboot", "");
+        }
         xSemaphoreGive(g_ota.lock);
     }
+    if (finish != PJ_OTA_TRANSFER_OK) {
+        ESP_LOGE(TAG, "OTA activation state failed after boot selection; restarting");
+        esp_restart();
+    }
+    if (xTaskCreate(restart_task, "pj-ota-restart", 2048, NULL, 5,
+                    NULL) != pdPASS) {
+        ESP_LOGW(TAG, "OTA restart task unavailable; restarting synchronously");
+        esp_restart();
+    }
+    mutation_lease.generation = 0U;
     char response[384];
     (void)snprintf(response, sizeof(response),
                    "{\"device_id\":\"%s\",\"state\":\"pending_reboot\","
                    "\"upload_id\":\"%s\",\"version\":\"%s\","
                    "\"sha256\":\"%s\"}", g_ota.device_id, upload_id,
                    manifest.version, manifest.sha256);
-    esp_err_t result = send_json(request, "202 Accepted", response);
-    if (xTaskCreate(restart_task, "pj-ota-restart", 2048, NULL, 5,
-                    NULL) != pdPASS) {
-        vTaskDelay(pdMS_TO_TICKS(PJ_OTA_RESTART_DELAY_MS));
-        esp_restart();
-    }
-    return result;
+    return send_json(request, "202 Accepted", response);
 }
 
 static esp_err_t register_uri(httpd_handle_t server, const char *uri,
@@ -907,10 +1178,28 @@ void pj_ota_confirm_boot_health(int healthy)
         xSemaphoreGive(g_ota.lock);
         return;
     }
-    if (healthy) {
+    const esp_app_desc_t *running = esp_app_get_description();
+    const esp_partition_t *partition = esp_ota_get_running_partition();
+    pj_ota_boot_inputs_t boot = {
+        .update_recorded = g_ota.target_partition_recorded,
+        .record_state = g_ota.boot_record_state,
+        .running_version_matches_target =
+            strcmp(running->version, g_ota.target_version) == 0,
+        .running_partition_matches_target =
+            partition != NULL &&
+            partition->address == g_ota.target_partition_address &&
+            (uint8_t)partition->subtype == g_ota.target_partition_subtype,
+        .running_pending_verify = 1,
+        .health_checked = 1,
+        .health_ok = healthy,
+        .rollback_possible = esp_ota_check_rollback_is_possible(),
+    };
+    pj_ota_boot_state_t outcome = pj_ota_boot_evaluate(&boot);
+    if (outcome == PJ_OTA_BOOT_CONFIRMED) {
         esp_err_t result = esp_ota_mark_app_valid_cancel_rollback();
         if (result == ESP_OK) {
             g_ota.boot_pending_verify = 0;
+            g_ota.boot_record_state = PJ_OTA_RECORD_CONFIRMED;
             state_set("confirmed", "");
             (void)record_write("confirmed");
             ESP_LOGI(TAG, "OTA image confirmed healthy");
@@ -923,7 +1212,21 @@ void pj_ota_confirm_boot_health(int healthy)
         xSemaphoreGive(g_ota.lock);
         return;
     }
+    if (outcome == PJ_OTA_BOOT_ROLLED_BACK) {
+        g_ota.boot_pending_verify = 0;
+        state_set("rolled_back", "target_partition_not_running");
+        (void)record_write("rolled_back");
+        xSemaphoreGive(g_ota.lock);
+        return;
+    }
+    if (outcome != PJ_OTA_BOOT_ROLLBACK_REQUIRED) {
+        state_set("failed", healthy ? "boot_identity_invalid" :
+                  "rollback_unavailable");
+        xSemaphoreGive(g_ota.lock);
+        return;
+    }
     state_set("rollback_requested", "post_boot_health_failed");
+    g_ota.boot_record_state = PJ_OTA_RECORD_ROLLBACK_REQUESTED;
     (void)record_write("rollback_requested");
     ESP_LOGE(TAG, "Post-boot health failed; rolling back OTA image");
     esp_err_t result = esp_ota_mark_app_invalid_rollback_and_reboot();
@@ -936,8 +1239,13 @@ void pj_ota_confirm_boot_health(int healthy)
 
 int pj_ota_write_enabled(void)
 {
-    return g_ota.initialized && g_ota.nvs_ready &&
+    char token[64] = {0};
+    int provisioned = g_ota.read_token != NULL &&
+                      g_ota.read_token(token, sizeof(token));
+    memset(token, 0, sizeof(token));
+    return g_ota.initialized && provisioned && g_ota.nvs_ready &&
            g_ota.verification_key_ready && PJ_OTA_IDF_SIGNED_APP_ENABLED &&
+           PJ_OTA_ROLLBACK_ENABLED &&
            g_ota.preflight_timer != NULL &&
            g_ota.reserve_mutations != NULL && g_ota.release_mutations != NULL;
 }
