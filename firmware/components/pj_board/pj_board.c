@@ -19,6 +19,7 @@
 #include "pj_time_controller.h"
 #include "pj_time_sync.h"
 #include "pj_transcript_upload.h"
+#include "pj_usb_sync.h"
 #include "pj_wifi_state.h"
 
 #include <stdio.h>
@@ -204,8 +205,9 @@
 #define PJ_AUDIO_DIR "/sdcard/pj/audio"
 #define PJ_TRANSCRIPT_DIR "/sdcard/pj/transcripts"
 #define PJ_NOTE_DIR "/sdcard/pj/notes"
+#define PJ_USB_TRANSCRIPT_TEMP_PATH PJ_TRANSCRIPT_DIR "/.usb-upload.tmp"
 #define PJ_AUDIO_MAX_INDEXED_FILES 16
-#define PJ_SERIAL_COMMAND_TASK_STACK 4096
+#define PJ_SERIAL_COMMAND_TASK_STACK 6144
 #define PJ_STORAGE_WIPE_TASK_STACK 4096
 #define PJ_STORAGE_WIPE_BATCH_ENTRIES 64U
 #define PJ_STORAGE_WIPE_MAX_BATCHES 64U
@@ -361,6 +363,15 @@ static uint32_t g_runtime_boot_id;
 static int g_cached_pending_sync;
 static int g_cached_transferred_sync;
 static pj_recording_t g_recording;
+static pj_usb_upload_t g_usb_upload;
+typedef struct {
+    char audio_id[PJ_NOTE_FILENAME_LEN];
+    char sha256[PJ_USB_SYNC_SHA256_HEX_BYTES];
+    off_t size;
+    time_t modified;
+    int valid;
+} usb_audio_identity_cache_t;
+static usb_audio_identity_cache_t g_usb_audio_identity;
 #ifdef ESP_PLATFORM
 static DMA_ATTR int16_t g_record_stereo_buffer[PJ_AUDIO_IO_BUFFER_BYTES / sizeof(int16_t)];
 static DMA_ATTR int16_t g_record_mono_buffer[PJ_AUDIO_IO_BUFFER_BYTES / PJ_AUDIO_FRAME_BYTES];
@@ -6110,6 +6121,8 @@ void pj_board_init(const pj_board_profile_t *profile)
              g_runtime_boot_id, pj_reset_reason_name(runtime_reset_reason()));
     pj_storage_coordinator_init(&g_storage_coordinator);
     pj_recording_init(&g_recording);
+    pj_usb_upload_init(&g_usb_upload);
+    memset(&g_usb_audio_identity, 0, sizeof(g_usb_audio_identity));
     g_json_write_lock = xSemaphoreCreateMutex();
     if (g_json_write_lock == NULL) {
         ESP_LOGW(TAG, "JSON write mutex allocation failed");
@@ -6229,6 +6242,7 @@ void pj_board_init(const pj_board_profile_t *profile)
     if (storage_err == ESP_OK) {
         g_status.storage = PJ_BOARD_SERVICE_READY;
         ESP_LOGI(TAG, "microSD mounted at %s", g_status.storage_path);
+        remove(PJ_USB_TRANSCRIPT_TEMP_PATH);
         static_art_load();
     } else {
         g_status.storage = PJ_BOARD_SERVICE_ERROR;
@@ -7808,10 +7822,726 @@ static void serial_print_interval_reset(const char *request_id)
     cJSON_Delete(json);
 }
 
+static int file_sha256_hex_unlocked(const char *path, char out[65]);
+static int audio_sha256_hex_unlocked(const char *filename, char out[65]);
+static int audio_sha256_hex(const char *filename, char out[65]);
+
+static int serial_command_prefix(const char *line, const char *command)
+{
+    size_t size = strlen(command);
+    return strncmp(line, command, size) == 0 &&
+           (line[size] == '\0' || line[size] == ' ');
+}
+
+static void serial_sync_error(const char *command, const char *request_id,
+                              const char *message, const char *code,
+                              int retryable)
+{
+    cJSON *json = cJSON_CreateObject();
+    if (json == NULL) {
+        printf("PJ_ERR {\"error\":\"USB response allocation failed\"}\n");
+        return;
+    }
+    cJSON_AddStringToObject(json, "command", command);
+    if (request_id != NULL && pj_usb_sync_request_id_valid(request_id)) {
+        cJSON_AddStringToObject(json, "request_id", request_id);
+    }
+    cJSON_AddStringToObject(json, "error", message);
+    cJSON_AddStringToObject(json, "code", code);
+    cJSON_AddBoolToObject(json, "retryable", retryable != 0);
+    serial_print_json("PJ_ERR", json);
+    cJSON_Delete(json);
+}
+
+static cJSON *serial_sync_response(const char *command, const char *request_id)
+{
+    cJSON *json = cJSON_CreateObject();
+    if (json == NULL) {
+        return NULL;
+    }
+    cJSON_AddStringToObject(json, "command", command);
+    if (request_id != NULL && pj_usb_sync_request_id_valid(request_id)) {
+        cJSON_AddStringToObject(json, "request_id", request_id);
+    }
+    return json;
+}
+
+static int serial_sync_audio_id(const char *encoded, char *audio_id,
+                                size_t audio_id_size)
+{
+    if (encoded == NULL || audio_id == NULL || audio_id_size < 2U) {
+        return 0;
+    }
+    size_t decoded = 0;
+    if (!pj_usb_sync_hex_decode(encoded, (uint8_t *)audio_id,
+                                audio_id_size - 1U, &decoded) ||
+        decoded == 0U || memchr(audio_id, '\0', decoded) != NULL) {
+        return 0;
+    }
+    audio_id[decoded] = '\0';
+    return decoded < PJ_NOTE_FILENAME_LEN && strstr(audio_id, "..") == NULL &&
+           strchr(audio_id, '/') == NULL && strchr(audio_id, '\\') == NULL &&
+           is_audio_filename(audio_id);
+}
+
+static uint32_t serial_audio_snapshot(const pj_audio_entry_t *entries,
+                                      size_t count)
+{
+    uint32_t snapshot = pj_usb_sync_snapshot_update(0U, &count, sizeof(count));
+    for (size_t i = 0; i < count; i++) {
+        snapshot = pj_usb_sync_snapshot_update(
+            snapshot, entries[i].filename, strlen(entries[i].filename) + 1U);
+        snapshot = pj_usb_sync_snapshot_update(
+            snapshot, &entries[i].size_bytes, sizeof(entries[i].size_bytes));
+        snapshot = pj_usb_sync_snapshot_update(
+            snapshot, &entries[i].data_bytes, sizeof(entries[i].data_bytes));
+        snapshot = pj_usb_sync_snapshot_update(
+            snapshot, &entries[i].note.synced, sizeof(entries[i].note.synced));
+        snapshot = pj_usb_sync_snapshot_update(
+            snapshot, entries[i].note.transcript_path,
+            strlen(entries[i].note.transcript_path) + 1U);
+    }
+    return pj_usb_sync_snapshot_finish(snapshot);
+}
+
+static int serial_json_add_hex(cJSON *json, const char *key,
+                               const char *value)
+{
+    size_t size = strlen(value);
+    if (size > PJ_NOTE_TRANSCRIPT_PATH_LEN - 1U) {
+        return 0;
+    }
+    char encoded[PJ_NOTE_TRANSCRIPT_PATH_LEN * 2U + 1U];
+    return pj_usb_sync_hex_encode((const uint8_t *)value, size, encoded,
+                                  sizeof(encoded)) &&
+           cJSON_AddStringToObject(json, key, encoded) != NULL;
+}
+
+static void serial_audio_list(char *line)
+{
+    const char *command = "PJ_AUDIO_LIST";
+    pj_usb_sync_args_t args;
+    if (!pj_usb_sync_parse_args(line, command, &args)) {
+        serial_sync_error(command, NULL, "invalid audio list arguments",
+                          "invalid_arguments", 0);
+        return;
+    }
+    const char *request_id = pj_usb_sync_arg(&args, "request_id");
+    uint32_t cursor = 0;
+    uint32_t requested_snapshot = 0;
+    if (!pj_usb_sync_parse_u32(pj_usb_sync_arg(&args, "cursor"), &cursor) ||
+        !pj_usb_sync_parse_u32(pj_usb_sync_arg(&args, "snapshot"),
+                               &requested_snapshot) ||
+        (request_id != NULL && !pj_usb_sync_request_id_valid(request_id))) {
+        serial_sync_error(command, request_id, "invalid audio list arguments",
+                          "invalid_arguments", 0);
+        return;
+    }
+    if (g_status.storage != PJ_BOARD_SERVICE_READY) {
+        serial_sync_error(command, request_id, "storage unavailable",
+                          "storage_unavailable", 1);
+        return;
+    }
+    pj_audio_entry_t *entries = calloc(PJ_AUDIO_MAX_INDEXED_FILES,
+                                       sizeof(entries[0]));
+    if (entries == NULL) {
+        serial_sync_error(command, request_id, "audio list out of memory",
+                          "out_of_memory", 1);
+        return;
+    }
+    int count = collect_audio_entries(entries, PJ_AUDIO_MAX_INDEXED_FILES);
+    if (count < 0) {
+        free(entries);
+        serial_sync_error(command, request_id, "storage maintenance active",
+                          "storage_busy", 1);
+        return;
+    }
+    uint32_t snapshot = serial_audio_snapshot(entries, (size_t)count);
+    if (requested_snapshot != 0U && requested_snapshot != snapshot) {
+        free(entries);
+        serial_sync_error(command, request_id, "audio list changed",
+                          "list_changed", 1);
+        return;
+    }
+    if (cursor > (uint32_t)count) {
+        free(entries);
+        serial_sync_error(command, request_id, "audio list cursor out of range",
+                          "invalid_cursor", 0);
+        return;
+    }
+
+    cJSON *json = serial_sync_response(command, request_id);
+    cJSON *item = NULL;
+    if (json != NULL) {
+        cJSON_AddNumberToObject(json, "snapshot", snapshot);
+        cJSON_AddNumberToObject(json, "cursor", cursor);
+        uint32_t next = cursor < (uint32_t)count ? cursor + 1U : cursor;
+        cJSON_AddNumberToObject(json, "next_cursor", next);
+        cJSON_AddBoolToObject(json, "done", next >= (uint32_t)count);
+        if (cursor < (uint32_t)count) {
+            const pj_audio_entry_t *entry = &entries[cursor];
+            item = cJSON_AddObjectToObject(json, "item");
+            char source_sha256[65];
+            if (item == NULL ||
+                !serial_json_add_hex(item, "audio_id_hex", entry->filename) ||
+                !serial_json_add_hex(item, "filename_hex", entry->filename)) {
+                cJSON_Delete(json);
+                json = NULL;
+            } else {
+                if (entry->label[0] != '\0') {
+                    (void)serial_json_add_hex(item, "label_hex", entry->label);
+                }
+                cJSON_AddNumberToObject(item, "size", entry->size_bytes);
+                cJSON_AddNumberToObject(item, "data_bytes", entry->data_bytes);
+                if (audio_sha256_hex(entry->filename, source_sha256)) {
+                    cJSON_AddStringToObject(item, "source_sha256", source_sha256);
+                } else {
+                    cJSON_AddNullToObject(item, "source_sha256");
+                }
+                if (entry->note.created_at[0] != '\0') {
+                    (void)serial_json_add_hex(item, "created_at_hex",
+                                              entry->note.created_at);
+                }
+                cJSON_AddNumberToObject(item, "duration_ms",
+                                        entry->note.duration_ms);
+                cJSON_AddBoolToObject(item, "synced",
+                                      entry->note.synced != 0);
+                cJSON_AddBoolToObject(item, "transcript_uploaded",
+                                      entry->note.synced != 0);
+                if (entry->note.transcript_path[0] != '\0') {
+                    (void)serial_json_add_hex(item, "transcript_path_hex",
+                                              entry->note.transcript_path);
+                }
+            }
+        }
+    }
+    free(entries);
+    if (json == NULL) {
+        serial_sync_error(command, request_id, "audio list response allocation failed",
+                          "out_of_memory", 1);
+        return;
+    }
+    serial_print_json("PJ_OK", json);
+    cJSON_Delete(json);
+}
+
+static int serial_audio_identity_unlocked(const char *audio_id,
+                                          const struct stat *st,
+                                          char sha256[65])
+{
+    if (g_usb_audio_identity.valid &&
+        strcmp(g_usb_audio_identity.audio_id, audio_id) == 0 &&
+        g_usb_audio_identity.size == st->st_size &&
+        g_usb_audio_identity.modified == st->st_mtime) {
+        (void)memcpy(sha256, g_usb_audio_identity.sha256,
+                     sizeof(g_usb_audio_identity.sha256));
+        return 1;
+    }
+    if (!audio_sha256_hex_unlocked(audio_id, sha256)) {
+        return 0;
+    }
+    memset(&g_usb_audio_identity, 0, sizeof(g_usb_audio_identity));
+    (void)snprintf(g_usb_audio_identity.audio_id,
+                   sizeof(g_usb_audio_identity.audio_id), "%s", audio_id);
+    (void)memcpy(g_usb_audio_identity.sha256, sha256, 65U);
+    g_usb_audio_identity.size = st->st_size;
+    g_usb_audio_identity.modified = st->st_mtime;
+    g_usb_audio_identity.valid = 1;
+    return 1;
+}
+
+static void serial_audio_read(char *line)
+{
+    const char *command = "PJ_AUDIO_READ";
+    pj_usb_sync_args_t args;
+    if (!pj_usb_sync_parse_args(line, command, &args)) {
+        serial_sync_error(command, NULL, "invalid audio read arguments",
+                          "invalid_arguments", 0);
+        return;
+    }
+    const char *request_id = pj_usb_sync_arg(&args, "request_id");
+    const char *expected_sha = pj_usb_sync_arg(&args, "source_sha256");
+    char audio_id[PJ_NOTE_FILENAME_LEN];
+    uint64_t offset = 0;
+    uint32_t maximum = 0;
+    if (!serial_sync_audio_id(pj_usb_sync_arg(&args, "id_hex"), audio_id,
+                              sizeof(audio_id)) ||
+        !pj_usb_sync_parse_u64(pj_usb_sync_arg(&args, "offset"), &offset) ||
+        !pj_usb_sync_parse_u32(pj_usb_sync_arg(&args, "max_bytes"), &maximum) ||
+        maximum == 0U || maximum > PJ_USB_SYNC_CHUNK_BYTES ||
+        (expected_sha != NULL && !pj_usb_sync_sha256_hex_valid(expected_sha)) ||
+        (request_id != NULL && !pj_usb_sync_request_id_valid(request_id))) {
+        serial_sync_error(command, request_id, "invalid audio read arguments",
+                          "invalid_arguments", 0);
+        return;
+    }
+    if (!storage_shared_try_acquire()) {
+        serial_sync_error(command, request_id, "storage maintenance active",
+                          "storage_busy", 1);
+        return;
+    }
+    char path[160];
+    (void)snprintf(path, sizeof(path), PJ_AUDIO_DIR "/%s", audio_id);
+    struct stat st;
+    char actual_sha[65];
+    if (stat(path, &st) != 0 || st.st_size < 0 ||
+        !serial_audio_identity_unlocked(audio_id, &st, actual_sha)) {
+        storage_shared_release();
+        serial_sync_error(command, request_id, "audio not found",
+                          "audio_not_found", 0);
+        return;
+    }
+    if (expected_sha != NULL && strcasecmp(expected_sha, actual_sha) != 0) {
+        storage_shared_release();
+        serial_sync_error(command, request_id, "audio source changed",
+                          "source_changed", 1);
+        return;
+    }
+    if (offset > (uint64_t)st.st_size) {
+        storage_shared_release();
+        serial_sync_error(command, request_id, "audio offset out of range",
+                          "invalid_offset", 0);
+        return;
+    }
+    uint8_t data[PJ_USB_SYNC_CHUNK_BYTES];
+    size_t wanted = maximum;
+    uint64_t remaining = (uint64_t)st.st_size - offset;
+    if ((uint64_t)wanted > remaining) {
+        wanted = (size_t)remaining;
+    }
+    FILE *file = fopen(path, "rb");
+    size_t read = 0;
+    int read_ok = file != NULL && fseeko(file, (off_t)offset, SEEK_SET) == 0;
+    if (read_ok && wanted > 0U) {
+        read = fread(data, 1, wanted, file);
+        read_ok = read == wanted && ferror(file) == 0;
+    }
+    if (file != NULL) {
+        read_ok = fclose(file) == 0 && read_ok;
+    }
+    storage_shared_release();
+    if (!read_ok) {
+        serial_sync_error(command, request_id, "audio read failed",
+                          "storage_io", 1);
+        return;
+    }
+    char encoded[PJ_USB_SYNC_CHUNK_BYTES * 2U + 1U];
+    cJSON *json = serial_sync_response(command, request_id);
+    if (json == NULL ||
+        !pj_usb_sync_hex_encode(data, read, encoded, sizeof(encoded))) {
+        cJSON_Delete(json);
+        serial_sync_error(command, request_id, "audio response allocation failed",
+                          "out_of_memory", 1);
+        return;
+    }
+    cJSON_AddStringToObject(json, "id_hex", pj_usb_sync_arg(&args, "id_hex"));
+    cJSON_AddNumberToObject(json, "offset", (double)offset);
+    cJSON_AddNumberToObject(json, "total_bytes", (double)st.st_size);
+    cJSON_AddStringToObject(json, "data_hex", encoded);
+    cJSON_AddBoolToObject(json, "eof", offset + read == (uint64_t)st.st_size);
+    cJSON_AddStringToObject(json, "source_sha256", actual_sha);
+    serial_print_json("PJ_OK", json);
+    cJSON_Delete(json);
+}
+
+static uint32_t serial_upload_id(void)
+{
+    uint32_t id = esp_random();
+    return id == 0U ? 1U : id;
+}
+
+static int serial_create_upload_file(uint32_t expected_bytes)
+{
+    if (!storage_shared_try_acquire()) {
+        return 0;
+    }
+    int ready = g_status.storage == PJ_BOARD_SERVICE_READY &&
+                storage_preflight(expected_bytes, "USB transcript upload");
+    remove(PJ_USB_TRANSCRIPT_TEMP_PATH);
+    FILE *file = ready ? fopen(PJ_USB_TRANSCRIPT_TEMP_PATH, "wb") : NULL;
+    int ok = file != NULL;
+    if (file != NULL) {
+        ok = fflush(file) == 0 && fsync(fileno(file)) == 0;
+        ok = fclose(file) == 0 && ok;
+    }
+    if (!ok) {
+        remove(PJ_USB_TRANSCRIPT_TEMP_PATH);
+    }
+    storage_shared_release();
+    return ok;
+}
+
+static void serial_transcript_begin(char *line)
+{
+    const char *command = "PJ_TRANSCRIPT_BEGIN";
+    pj_usb_sync_args_t args;
+    if (!pj_usb_sync_parse_args(line, command, &args)) {
+        serial_sync_error(command, NULL, "invalid transcript begin arguments",
+                          "invalid_arguments", 0);
+        return;
+    }
+    const char *request_id = pj_usb_sync_arg(&args, "request_id");
+    const char *sha256 = pj_usb_sync_arg(&args, "sha256");
+    char audio_id[PJ_NOTE_FILENAME_LEN];
+    uint32_t expected_bytes = 0;
+    if (!pj_usb_sync_request_id_valid(request_id) ||
+        !serial_sync_audio_id(pj_usb_sync_arg(&args, "id_hex"), audio_id,
+                              sizeof(audio_id)) ||
+        !pj_usb_sync_parse_u32(pj_usb_sync_arg(&args, "bytes"),
+                               &expected_bytes) ||
+        expected_bytes == 0U ||
+        expected_bytes > PJ_USB_SYNC_TRANSCRIPT_MAX_BYTES ||
+        !pj_usb_sync_sha256_hex_valid(sha256)) {
+        serial_sync_error(command, request_id,
+                          "invalid transcript begin arguments",
+                          "invalid_arguments", 0);
+        return;
+    }
+    if (g_status.storage != PJ_BOARD_SERVICE_READY) {
+        serial_sync_error(command, request_id, "storage unavailable",
+                          "storage_unavailable", 1);
+        return;
+    }
+    pj_audio_entry_t entry;
+    if (!probe_audio_entry(audio_id, &entry)) {
+        serial_sync_error(command, request_id, "audio not found",
+                          "audio_not_found", 0);
+        return;
+    }
+    pj_usb_upload_begin_result_t begin = pj_usb_upload_begin(
+        &g_usb_upload, serial_upload_id(), request_id, audio_id,
+        expected_bytes, sha256);
+    if (begin == PJ_USB_UPLOAD_BEGIN_BUSY) {
+        serial_sync_error(command, request_id,
+                          "another transcript upload is active",
+                          "upload_busy", 1);
+        return;
+    }
+    if (begin == PJ_USB_UPLOAD_BEGIN_INVALID) {
+        serial_sync_error(command, request_id,
+                          "invalid transcript begin arguments",
+                          "invalid_arguments", 0);
+        return;
+    }
+    if (begin == PJ_USB_UPLOAD_BEGIN_STARTED &&
+        !serial_create_upload_file(expected_bytes)) {
+        pj_usb_upload_init(&g_usb_upload);
+        serial_sync_error(command, request_id,
+                          "transcript upload file could not be created",
+                          g_status.storage_health == PJ_STORAGE_HEALTH_FULL ?
+                              "storage_full" : "storage_io",
+                          1);
+        return;
+    }
+    cJSON *json = serial_sync_response(command, request_id);
+    if (json == NULL) {
+        serial_sync_error(command, request_id, "response allocation failed",
+                          "out_of_memory", 1);
+        return;
+    }
+    cJSON_AddNumberToObject(json, "upload_id", g_usb_upload.upload_id);
+    cJSON_AddNumberToObject(json, "offset", g_usb_upload.received_bytes);
+    cJSON_AddBoolToObject(json, "accepted", 1);
+    cJSON_AddBoolToObject(json, "attached",
+                          begin == PJ_USB_UPLOAD_BEGIN_ATTACHED);
+    serial_print_json("PJ_OK", json);
+    cJSON_Delete(json);
+}
+
+static void serial_transcript_write(char *line)
+{
+    const char *command = "PJ_TRANSCRIPT_WRITE";
+    pj_usb_sync_args_t args;
+    if (!pj_usb_sync_parse_args(line, command, &args)) {
+        serial_sync_error(command, NULL, "invalid transcript write arguments",
+                          "invalid_arguments", 0);
+        return;
+    }
+    const char *request_id = pj_usb_sync_arg(&args, "request_id");
+    uint32_t upload_id = 0;
+    uint32_t offset = 0;
+    uint8_t data[PJ_USB_SYNC_CHUNK_BYTES];
+    size_t data_size = 0;
+    if (!pj_usb_sync_request_id_valid(request_id) ||
+        !pj_usb_sync_parse_u32(pj_usb_sync_arg(&args, "upload_id"),
+                               &upload_id) || upload_id == 0U ||
+        !pj_usb_sync_parse_u32(pj_usb_sync_arg(&args, "offset"), &offset) ||
+        !pj_usb_sync_hex_decode(pj_usb_sync_arg(&args, "data_hex"), data,
+                                sizeof(data), &data_size) || data_size == 0U) {
+        serial_sync_error(command, request_id,
+                          "invalid transcript write arguments",
+                          "invalid_arguments", 0);
+        return;
+    }
+    pj_usb_upload_write_result_t check = pj_usb_upload_check_write(
+        &g_usb_upload, upload_id, offset, data, data_size);
+    if (check == PJ_USB_UPLOAD_WRITE_UNKNOWN) {
+        serial_sync_error(command, request_id, "unknown transcript upload",
+                          "upload_not_found", 0);
+        return;
+    }
+    if (check == PJ_USB_UPLOAD_WRITE_OFFSET) {
+        serial_sync_error(command, request_id, "transcript offset mismatch",
+                          "offset_mismatch", 1);
+        return;
+    }
+    if (check == PJ_USB_UPLOAD_WRITE_CONTENT) {
+        serial_sync_error(command, request_id,
+                          "transcript replay content mismatch",
+                          "content_mismatch", 0);
+        return;
+    }
+    if (check == PJ_USB_UPLOAD_WRITE_TOO_LARGE) {
+        serial_sync_error(command, request_id, "transcript chunk out of bounds",
+                          "chunk_out_of_bounds", 0);
+        return;
+    }
+    if (check == PJ_USB_UPLOAD_WRITE_NEW) {
+        if (!storage_shared_try_acquire()) {
+            serial_sync_error(command, request_id, "storage maintenance active",
+                              "storage_busy", 1);
+            return;
+        }
+        struct stat st;
+        FILE *file = NULL;
+        int ok = stat(PJ_USB_TRANSCRIPT_TEMP_PATH, &st) == 0 &&
+                 st.st_size == (off_t)g_usb_upload.received_bytes;
+        if (ok) {
+            file = fopen(PJ_USB_TRANSCRIPT_TEMP_PATH, "r+b");
+            ok = file != NULL && fseeko(file, (off_t)offset, SEEK_SET) == 0 &&
+                 fwrite(data, 1, data_size, file) == data_size &&
+                 fflush(file) == 0 && fsync(fileno(file)) == 0;
+        }
+        if (file != NULL) {
+            ok = fclose(file) == 0 && ok;
+        }
+        storage_shared_release();
+        if (!ok) {
+            serial_sync_error(command, request_id,
+                              "transcript chunk could not be stored",
+                              "storage_io", 1);
+            return;
+        }
+        pj_usb_upload_apply_write(&g_usb_upload, offset, data, data_size);
+    }
+    cJSON *json = serial_sync_response(command, request_id);
+    if (json == NULL) {
+        serial_sync_error(command, request_id, "response allocation failed",
+                          "out_of_memory", 1);
+        return;
+    }
+    cJSON_AddNumberToObject(json, "upload_id", upload_id);
+    cJSON_AddNumberToObject(json, "next_offset", g_usb_upload.received_bytes);
+    cJSON_AddBoolToObject(json, "replayed",
+                          check == PJ_USB_UPLOAD_WRITE_REPLAY);
+    serial_print_json("PJ_OK", json);
+    cJSON_Delete(json);
+}
+
+static int serial_read_upload_body(char **body, size_t *body_size)
+{
+    struct stat st;
+    if (body == NULL || body_size == NULL || !storage_shared_try_acquire()) {
+        return 0;
+    }
+    if (stat(PJ_USB_TRANSCRIPT_TEMP_PATH, &st) != 0 || st.st_size <= 0 ||
+        (uint64_t)st.st_size > PJ_USB_SYNC_TRANSCRIPT_MAX_BYTES ||
+        (uint32_t)st.st_size != g_usb_upload.expected_bytes) {
+        storage_shared_release();
+        return 0;
+    }
+    char *allocated = heap_caps_malloc((size_t)st.st_size + 1U,
+                                       MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (allocated == NULL) {
+        allocated = malloc((size_t)st.st_size + 1U);
+    }
+    if (allocated == NULL) {
+        storage_shared_release();
+        return 0;
+    }
+    FILE *file = fopen(PJ_USB_TRANSCRIPT_TEMP_PATH, "rb");
+    size_t read = file == NULL ? 0U : fread(allocated, 1, (size_t)st.st_size, file);
+    int ok = file != NULL && read == (size_t)st.st_size && ferror(file) == 0;
+    if (file != NULL) {
+        ok = fclose(file) == 0 && ok;
+    }
+    storage_shared_release();
+    if (!ok) {
+        free(allocated);
+        return 0;
+    }
+    allocated[read] = '\0';
+    *body = allocated;
+    *body_size = read;
+    return 1;
+}
+
+static void serial_transcript_commit(char *line)
+{
+    const char *command = "PJ_TRANSCRIPT_COMMIT";
+    pj_usb_sync_args_t args;
+    if (!pj_usb_sync_parse_args(line, command, &args)) {
+        serial_sync_error(command, NULL, "invalid transcript commit arguments",
+                          "invalid_arguments", 0);
+        return;
+    }
+    const char *request_id = pj_usb_sync_arg(&args, "request_id");
+    const char *sha256 = pj_usb_sync_arg(&args, "sha256");
+    uint32_t upload_id = 0;
+    if (!pj_usb_sync_request_id_valid(request_id) ||
+        !pj_usb_sync_parse_u32(pj_usb_sync_arg(&args, "upload_id"),
+                               &upload_id) ||
+        !pj_usb_sync_sha256_hex_valid(sha256) ||
+        !pj_usb_upload_commit_ready(&g_usb_upload, upload_id, sha256)) {
+        serial_sync_error(command, request_id,
+                          "transcript upload is incomplete or unknown",
+                          "upload_incomplete", 1);
+        return;
+    }
+    if (g_usb_upload.status != PJ_USB_UPLOAD_COMMITTED) {
+        if (!storage_shared_try_acquire()) {
+            serial_sync_error(command, request_id, "storage maintenance active",
+                              "storage_busy", 1);
+            return;
+        }
+        char actual_sha[65];
+        int digest_ok = file_sha256_hex_unlocked(PJ_USB_TRANSCRIPT_TEMP_PATH,
+                                                 actual_sha);
+        storage_shared_release();
+        if (!digest_ok || strcasecmp(actual_sha, sha256) != 0) {
+            serial_sync_error(command, request_id,
+                              "transcript checksum mismatch",
+                              "checksum_mismatch", 0);
+            return;
+        }
+        char *body = NULL;
+        size_t body_size = 0;
+        if (!serial_read_upload_body(&body, &body_size)) {
+            serial_sync_error(command, request_id,
+                              "transcript body could not be read",
+                              "out_of_memory", 1);
+            return;
+        }
+        pj_transcript_body_result_t validation = pj_transcript_body_validate(
+            body, body_size, body_size);
+        if (validation != PJ_TRANSCRIPT_BODY_VALID) {
+            free(body);
+            serial_sync_error(command, request_id,
+                              validation == PJ_TRANSCRIPT_BODY_MALFORMED ?
+                                  "malformed transcript JSON" :
+                                  "transcript requires non-empty text",
+                              "invalid_transcript", 0);
+            return;
+        }
+        pj_audio_entry_t entry;
+        if (!probe_audio_entry(g_usb_upload.audio_id, &entry)) {
+            free(body);
+            serial_sync_error(command, request_id, "audio not found",
+                              "audio_not_found", 0);
+            return;
+        }
+        char path[PJ_NOTE_TRANSCRIPT_PATH_LEN];
+        transcript_path_for_audio(path, sizeof(path), g_usb_upload.audio_id);
+        esp_err_t write_error = json_write_file_atomic(path, body, body_size);
+        free(body);
+        if (write_error != ESP_OK) {
+            serial_sync_error(command, request_id,
+                              "transcript could not be committed",
+                              write_error == ESP_ERR_INVALID_STATE ?
+                                  "storage_busy" : "storage_io",
+                              1);
+            return;
+        }
+        if (storage_shared_try_acquire()) {
+            remove(PJ_USB_TRANSCRIPT_TEMP_PATH);
+            storage_shared_release();
+        }
+        if (!probe_audio_entry(g_usb_upload.audio_id, &entry)) {
+            ESP_LOGW(TAG, "USB transcript committed but metadata refresh failed");
+        }
+        pj_usb_upload_mark_committed(&g_usb_upload);
+        g_notes_update_pending = 1;
+    }
+    cJSON *json = serial_sync_response(command, request_id);
+    if (json == NULL) {
+        serial_sync_error(command, request_id, "response allocation failed",
+                          "out_of_memory", 1);
+        return;
+    }
+    cJSON_AddNumberToObject(json, "upload_id", upload_id);
+    cJSON_AddBoolToObject(json, "committed", 1);
+    cJSON_AddNumberToObject(json, "bytes", g_usb_upload.expected_bytes);
+    serial_print_json("PJ_OK", json);
+    cJSON_Delete(json);
+}
+
+static void serial_transcript_abort(char *line)
+{
+    const char *command = "PJ_TRANSCRIPT_ABORT";
+    pj_usb_sync_args_t args;
+    if (!pj_usb_sync_parse_args(line, command, &args)) {
+        serial_sync_error(command, NULL, "invalid transcript abort arguments",
+                          "invalid_arguments", 0);
+        return;
+    }
+    const char *request_id = pj_usb_sync_arg(&args, "request_id");
+    uint32_t upload_id = 0;
+    if (!pj_usb_sync_request_id_valid(request_id) ||
+        !pj_usb_sync_parse_u32(pj_usb_sync_arg(&args, "upload_id"),
+                               &upload_id) || upload_id == 0U) {
+        serial_sync_error(command, request_id,
+                          "invalid transcript abort arguments",
+                          "invalid_arguments", 0);
+        return;
+    }
+    int matched_active = g_usb_upload.status == PJ_USB_UPLOAD_ACTIVE &&
+                         g_usb_upload.upload_id == upload_id;
+    if (!pj_usb_upload_abort(&g_usb_upload, upload_id)) {
+        serial_sync_error(command, request_id,
+                          "committed transcript cannot be aborted",
+                          "already_committed", 0);
+        return;
+    }
+    if (matched_active && storage_shared_try_acquire()) {
+        remove(PJ_USB_TRANSCRIPT_TEMP_PATH);
+        storage_shared_release();
+    }
+    cJSON *json = serial_sync_response(command, request_id);
+    if (json == NULL) {
+        serial_sync_error(command, request_id, "response allocation failed",
+                          "out_of_memory", 1);
+        return;
+    }
+    cJSON_AddNumberToObject(json, "upload_id", upload_id);
+    cJSON_AddBoolToObject(json, "aborted", 1);
+    serial_print_json("PJ_OK", json);
+    cJSON_Delete(json);
+}
+
+static int serial_try_sync_command(char *line)
+{
+    if (serial_command_prefix(line, "PJ_AUDIO_LIST")) {
+        serial_audio_list(line);
+    } else if (serial_command_prefix(line, "PJ_AUDIO_READ")) {
+        serial_audio_read(line);
+    } else if (serial_command_prefix(line, "PJ_TRANSCRIPT_BEGIN")) {
+        serial_transcript_begin(line);
+    } else if (serial_command_prefix(line, "PJ_TRANSCRIPT_WRITE")) {
+        serial_transcript_write(line);
+    } else if (serial_command_prefix(line, "PJ_TRANSCRIPT_COMMIT")) {
+        serial_transcript_commit(line);
+    } else if (serial_command_prefix(line, "PJ_TRANSCRIPT_ABORT")) {
+        serial_transcript_abort(line);
+    } else {
+        return 0;
+    }
+    return 1;
+}
+
 static void serial_command_task(void *arg)
 {
     (void)arg;
-    char line[512] = {0};
+    char line[768] = {0};
     size_t line_length = 0;
     int discarding_overflow = 0;
     setvbuf(stdin, NULL, _IONBF, 0);
@@ -7847,6 +8577,10 @@ static void serial_command_task(void *arg)
         serial_trim_line(line);
         line_length = 0;
         if (line[0] == '\0') {
+            continue;
+        }
+        if (serial_try_sync_command(line)) {
+            fflush(stdout);
             continue;
         }
         const char *request_id = NULL;
@@ -8732,15 +9466,13 @@ static esp_err_t static_art_put_handler(httpd_req_t *req)
     return send_json(req, "{\"updated\":true}");
 }
 
-static int audio_sha256_hex_unlocked(const char *filename, char out[65])
+static int file_sha256_hex_unlocked(const char *path, char out[65])
 {
-    char path[160];
     uint8_t buffer[1024];
     uint8_t digest[PSA_HASH_LENGTH(PSA_ALG_SHA_256)];
     size_t digest_length = 0;
     psa_hash_operation_t operation = PSA_HASH_OPERATION_INIT;
     int valid = 0;
-    (void)snprintf(path, sizeof(path), PJ_AUDIO_DIR "/%s", filename);
     FILE *file = fopen(path, "rb");
     if (file == NULL || psa_crypto_init() != PSA_SUCCESS ||
         psa_hash_setup(&operation, PSA_ALG_SHA_256) != PSA_SUCCESS) {
@@ -8774,6 +9506,13 @@ static int audio_sha256_hex_unlocked(const char *filename, char out[65])
         (void)psa_hash_abort(&operation);
     }
     return valid;
+}
+
+static int audio_sha256_hex_unlocked(const char *filename, char out[65])
+{
+    char path[160];
+    (void)snprintf(path, sizeof(path), PJ_AUDIO_DIR "/%s", filename);
+    return file_sha256_hex_unlocked(path, out);
 }
 
 static int audio_sha256_hex(const char *filename, char out[65])
