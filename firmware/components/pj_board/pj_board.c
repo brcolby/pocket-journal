@@ -202,7 +202,11 @@
 #define PJ_TRANSCRIPT_DIR "/sdcard/pj/transcripts"
 #define PJ_NOTE_DIR "/sdcard/pj/notes"
 #define PJ_USB_TRANSCRIPT_TEMP_PATH PJ_TRANSCRIPT_DIR "/.usb-upload.tmp"
-#define PJ_AUDIO_MAX_INDEXED_FILES 16
+#define PJ_AUDIO_INITIAL_INDEX_CAPACITY 16U
+#define PJ_AUDIO_MAX_INDEXED_FILES 512U
+#define PJ_AUDIO_COLLECT_STORAGE_BUSY (-1)
+#define PJ_AUDIO_COLLECT_TOO_MANY (-2)
+#define PJ_AUDIO_COLLECT_NO_MEMORY (-3)
 #define PJ_SERIAL_COMMAND_TASK_STACK 6144
 #define PJ_STORAGE_WIPE_TASK_STACK 4096
 #define PJ_STORAGE_WIPE_BATCH_ENTRIES 64U
@@ -406,7 +410,7 @@ typedef enum {
 static portMUX_TYPE g_alert_audio_intent_lock = portMUX_INITIALIZER_UNLOCKED;
 static portMUX_TYPE g_interval_reset_lock = portMUX_INITIALIZER_UNLOCKED;
 static alert_audio_intent_t g_alert_audio_intent;
-static uint64_t g_interval_alert_ack_pending;
+static uint64_t g_alert_ack_pending;
 static uint32_t g_alert_audio_stop_completed_generation;
 static interval_reset_state_t g_interval_reset;
 
@@ -962,20 +966,20 @@ static alert_audio_intent_t alert_audio_intent_snapshot(void)
     return intent;
 }
 
-static void alert_audio_publish_interval_ack(uint64_t alert_id)
+static void alert_audio_publish_ack(uint64_t alert_id)
 {
     portENTER_CRITICAL(&g_alert_audio_intent_lock);
-    g_interval_alert_ack_pending = alert_id;
+    g_alert_ack_pending = alert_id;
     portEXIT_CRITICAL(&g_alert_audio_intent_lock);
     g_audio_state_update_pending = 1;
 }
 
-static uint64_t alert_audio_take_interval_ack(void)
+static uint64_t alert_audio_take_ack(void)
 {
     uint64_t alert_id;
     portENTER_CRITICAL(&g_alert_audio_intent_lock);
-    alert_id = g_interval_alert_ack_pending;
-    g_interval_alert_ack_pending = 0;
+    alert_id = g_alert_ack_pending;
+    g_alert_ack_pending = 0;
     portEXIT_CRITICAL(&g_alert_audio_intent_lock);
     return alert_id;
 }
@@ -1007,7 +1011,7 @@ static void alert_audio_task(void *arg)
 {
     (void)arg;
     int16_t scratch[PJ_ALERT_AUDIO_BLOCK_SAMPLES];
-    uint64_t reported_interval_id = 0;
+    uint64_t reported_alert_id = 0;
     uint64_t failure_alert_id = 0;
     unsigned consecutive_failures = 0;
     while (1) {
@@ -1039,16 +1043,14 @@ static void alert_audio_task(void *arg)
         pj_alert_audio_kind_t settled_kind = 0;
         int settled = pj_alert_audio_settled(
             &g_alert_audio, &settled_id, &settled_kind);
-        int interval_failed = consecutive_failures >=
+        int alert_failed = consecutive_failures >=
             PJ_ALERT_AUDIO_FAILURE_ACK_THRESHOLD &&
-            g_alert_audio.alert_id != 0 &&
-            g_alert_audio.kind == PJ_ALERT_AUDIO_INTERVAL;
-        if (((settled && settled_kind == PJ_ALERT_AUDIO_INTERVAL) ||
-             interval_failed) &&
-            (settled ? settled_id : g_alert_audio.alert_id) != reported_interval_id) {
+            g_alert_audio.alert_id != 0;
+        if ((settled || alert_failed) &&
+            (settled ? settled_id : g_alert_audio.alert_id) != reported_alert_id) {
             settled_id = settled ? settled_id : g_alert_audio.alert_id;
-            alert_audio_publish_interval_ack(settled_id);
-            reported_interval_id = settled_id;
+            alert_audio_publish_ack(settled_id);
+            reported_alert_id = settled_id;
         }
         int active = g_alert_audio.state == PJ_ALERT_AUDIO_PLAYING ||
                      g_alert_audio.cleanup_pending;
@@ -1091,7 +1093,7 @@ static int alert_audio_desired(void)
     int desired;
     portENTER_CRITICAL(&g_alert_audio_intent_lock);
     desired = g_alert_audio_intent.alert_id != 0 &&
-        g_alert_audio_intent.alert_id != g_interval_alert_ack_pending;
+        g_alert_audio_intent.alert_id != g_alert_ack_pending;
     portEXIT_CRITICAL(&g_alert_audio_intent_lock);
     return desired;
 }
@@ -1141,7 +1143,7 @@ static uint32_t interval_reset_request(void)
     g_alert_audio_intent.alert_id = 0;
     g_alert_audio_intent.kind = 0;
     g_alert_audio_intent.deferred = 0;
-    g_interval_alert_ack_pending = 0;
+    g_alert_ack_pending = 0;
     uint32_t audio_generation = g_alert_audio_intent.stop_generation + 1U;
     if (audio_generation == 0U) {
         audio_generation = 1U;
@@ -3374,50 +3376,72 @@ static int audio_entry_compare_newest_first(const void *left, const void *right)
     return strcmp(b->filename, a->filename);
 }
 
-static int collect_audio_entries(pj_audio_entry_t *entries, int capacity)
+static int collect_audio_entries(pj_audio_entry_t **entries_out)
 {
-    if (entries == NULL || capacity <= 0) {
+    if (entries_out == NULL) {
         return 0;
     }
+    *entries_out = NULL;
     if (!storage_shared_try_acquire()) {
-        return -1;
+        return PJ_AUDIO_COLLECT_STORAGE_BUSY;
     }
     DIR *dir = opendir(PJ_AUDIO_DIR);
     if (dir == NULL) {
         storage_shared_release();
         return 0;
     }
-    int count = 0;
+    pj_audio_entry_t *entries = NULL;
+    size_t capacity = 0;
+    size_t count = 0;
+    int result = 0;
     struct dirent *entry;
-    while ((entry = readdir(dir)) != NULL && count < capacity) {
+    while ((entry = readdir(dir)) != NULL) {
         if (entry->d_name[0] == '.' || !is_audio_filename(entry->d_name)) {
             continue;
         }
-        if (probe_audio_entry(entry->d_name, &entries[count])) {
+        if (count == capacity) {
+            if (capacity == PJ_AUDIO_MAX_INDEXED_FILES) {
+                result = PJ_AUDIO_COLLECT_TOO_MANY;
+                break;
+            }
+            size_t next_capacity = capacity == 0U ?
+                PJ_AUDIO_INITIAL_INDEX_CAPACITY : capacity * 2U;
+            if (next_capacity > PJ_AUDIO_MAX_INDEXED_FILES) {
+                next_capacity = PJ_AUDIO_MAX_INDEXED_FILES;
+            }
+            pj_audio_entry_t *resized = heap_caps_realloc(
+                entries, next_capacity * sizeof(entries[0]),
+                MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+            if (resized == NULL) {
+                result = PJ_AUDIO_COLLECT_NO_MEMORY;
+                break;
+            }
+            entries = resized;
+            capacity = next_capacity;
+        }
+        if (probe_audio_entry_unlocked(entry->d_name, &entries[count])) {
             count++;
         }
     }
     closedir(dir);
-    qsort(entries, (size_t)count, sizeof(entries[0]), audio_entry_compare_newest_first);
+    if (result == 0) {
+        qsort(entries, count, sizeof(entries[0]), audio_entry_compare_newest_first);
+        *entries_out = entries;
+        result = (int)count;
+    } else {
+        free(entries);
+    }
     storage_shared_release();
-    return count;
+    return result;
 }
 
 static void collect_sync_counts(int *pending, int *transferred)
 {
     storage_sync_counts_snapshot(pending, transferred);
-    if (!storage_shared_try_acquire()) {
-        return;
-    }
-    pj_audio_entry_t *entries = calloc(PJ_AUDIO_MAX_INDEXED_FILES, sizeof(entries[0]));
-    if (entries == NULL) {
-        storage_shared_release();
-        return;
-    }
-    int count = collect_audio_entries(entries, PJ_AUDIO_MAX_INDEXED_FILES);
+    pj_audio_entry_t *entries = NULL;
+    int count = collect_audio_entries(&entries);
     if (count < 0) {
         free(entries);
-        storage_shared_release();
         return;
     }
     *pending = 0;
@@ -3431,7 +3455,6 @@ static void collect_sync_counts(int *pending, int *transferred)
     }
     free(entries);
     storage_sync_counts_cache(*pending, *transferred);
-    storage_shared_release();
 }
 
 static void refresh_ui_sync_state(pj_ui_context_t *ui)
@@ -3638,11 +3661,8 @@ static int cleanup_storage_artifacts(void)
 
 static int audio_filename_for_index(int target_index, char *out, size_t out_size)
 {
-    pj_audio_entry_t *entries = calloc(PJ_AUDIO_MAX_INDEXED_FILES, sizeof(entries[0]));
-    if (entries == NULL) {
-        return 0;
-    }
-    int count = collect_audio_entries(entries, PJ_AUDIO_MAX_INDEXED_FILES);
+    pj_audio_entry_t *entries = NULL;
+    int count = collect_audio_entries(&entries);
     int audio_index = target_index;
     if (target_index >= 0 && target_index < g_ui_note_audio_count) {
         audio_index = g_ui_note_audio_indices[target_index];
@@ -3686,14 +3706,14 @@ static void next_recording_path(char *out, size_t out_size)
 static void refresh_ui_notes_from_sd(pj_ui_context_t *ui)
 {
     char labels[PJ_UI_MAX_NOTES][PJ_UI_NOTE_LABEL_LEN];
-    pj_audio_entry_t *entries = calloc(PJ_AUDIO_MAX_INDEXED_FILES, sizeof(entries[0]));
+    pj_audio_entry_t *entries = NULL;
     memset(labels, 0, sizeof(labels));
-    if (entries == NULL) {
+    int count = collect_audio_entries(&entries);
+    if (count == PJ_AUDIO_COLLECT_NO_MEMORY) {
         g_ui_note_audio_count = 0;
         pj_ui_set_notes(ui, 0, labels);
         return;
     }
-    int count = collect_audio_entries(entries, PJ_AUDIO_MAX_INDEXED_FILES);
     if (count < 0) {
         free(entries);
         return;
@@ -4818,13 +4838,11 @@ static int time_state_project(pj_ui_context_t *ui)
     return 1;
 }
 
-static int time_state_apply_interval_audio_ack(void)
+static int time_state_apply_audio_ack(void)
 {
-    uint64_t alert_id = alert_audio_take_interval_ack();
+    uint64_t alert_id = alert_audio_take_ack();
     const pj_time_state_t *state = pj_time_controller_state(&g_time_controller);
-    if (alert_id == 0 || state == NULL ||
-        state->active_alert.id != alert_id ||
-        state->active_alert.source != PJ_TIME_ALERT_INTERVAL) {
+    if (alert_id == 0 || state == NULL || state->active_alert.id != alert_id) {
         return 0;
     }
     pj_time_controller_command_t command = {
@@ -6274,7 +6292,7 @@ int pj_board_consume_audio_update(pj_ui_context_t *ui)
     }
     g_audio_state_update_pending = 0;
     pj_ui_set_audio_state(ui, g_status.recording, g_status.playback_active);
-    if (time_state_apply_interval_audio_ack()) {
+    if (time_state_apply_audio_ack()) {
         (void)time_state_project(ui);
     }
     return 1;
@@ -6343,7 +6361,7 @@ void pj_board_refresh_time_state(pj_ui_context_t *ui)
     }
     pj_time_controller_result_t result;
     (void)pj_time_controller_update(&g_time_controller, &result);
-    (void)time_state_apply_interval_audio_ack();
+    (void)time_state_apply_audio_ack();
     (void)time_state_project(ui);
 #else
     (void)ui;
@@ -6434,14 +6452,14 @@ int pj_board_update_time_state(pj_ui_context_t *ui)
         if (!pj_time_controller_apply(&g_time_controller, &command, &result)) {
             memset(&result, 0, sizeof(result));
         }
-        (void)time_state_apply_interval_audio_ack();
+        (void)time_state_apply_audio_ack();
         (void)time_state_project(ui);
         interval_reset_complete(reset_generation, &result,
                                 interval_active_before,
                                 time_state_interval_active());
     } else {
         (void)pj_time_controller_update(&g_time_controller, &result);
-        (void)time_state_apply_interval_audio_ack();
+        (void)time_state_apply_audio_ack();
         (void)time_state_project(ui);
     }
     return pj_ui_is_dirty(ui);
@@ -7687,18 +7705,20 @@ static void serial_audio_list(char *line)
                           "storage_unavailable", 1);
         return;
     }
-    pj_audio_entry_t *entries = calloc(PJ_AUDIO_MAX_INDEXED_FILES,
-                                       sizeof(entries[0]));
-    if (entries == NULL) {
-        serial_sync_error(command, request_id, "audio list out of memory",
-                          "out_of_memory", 1);
-        return;
-    }
-    int count = collect_audio_entries(entries, PJ_AUDIO_MAX_INDEXED_FILES);
+    pj_audio_entry_t *entries = NULL;
+    int count = collect_audio_entries(&entries);
     if (count < 0) {
         free(entries);
-        serial_sync_error(command, request_id, "storage maintenance active",
-                          "storage_busy", 1);
+        if (count == PJ_AUDIO_COLLECT_TOO_MANY) {
+            serial_sync_error(command, request_id, "audio library exceeds device index limit",
+                              "too_many_audio_files", 0);
+        } else if (count == PJ_AUDIO_COLLECT_NO_MEMORY) {
+            serial_sync_error(command, request_id, "audio list out of memory",
+                              "out_of_memory", 1);
+        } else {
+            serial_sync_error(command, request_id, "storage maintenance active",
+                              "storage_busy", 1);
+        }
         return;
     }
     uint32_t snapshot = serial_audio_snapshot(entries, (size_t)count);
@@ -8944,14 +8964,22 @@ static esp_err_t audio_list_handler(httpd_req_t *req)
         httpd_resp_set_status(req, "503 Service Unavailable");
         return send_json(req, "{\"error\":\"storage unavailable; run storage recovery\"}");
     }
-    pj_audio_entry_t *entries = calloc(PJ_AUDIO_MAX_INDEXED_FILES, sizeof(entries[0]));
-    if (entries == NULL) {
-        httpd_resp_set_status(req, "503 Service Unavailable");
-        return send_json(req, "{\"error\":\"audio list out of memory\"}");
-    }
-    int count = collect_audio_entries(entries, PJ_AUDIO_MAX_INDEXED_FILES);
+    pj_audio_entry_t *entries = NULL;
+    int count = collect_audio_entries(&entries);
     if (count < 0) {
         free(entries);
+        if (count == PJ_AUDIO_COLLECT_TOO_MANY) {
+            httpd_resp_set_status(req, "507 Insufficient Storage");
+            return send_json(req,
+                             "{\"error\":\"audio library exceeds device index limit\","
+                             "\"code\":\"too_many_audio_files\",\"retryable\":false}");
+        }
+        if (count == PJ_AUDIO_COLLECT_NO_MEMORY) {
+            httpd_resp_set_status(req, "503 Service Unavailable");
+            return send_json(req,
+                             "{\"error\":\"audio list out of memory\","
+                             "\"code\":\"out_of_memory\",\"retryable\":true}");
+        }
         httpd_resp_set_status(req, "409 Conflict");
         return send_json(req,
                          "{\"error\":\"storage maintenance active\","
