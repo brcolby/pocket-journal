@@ -49,7 +49,7 @@ from .web import DEFAULT_HOST, DEFAULT_PORT, create_server
 
 
 USB_PROVISIONING_TOKEN_BYTES = 16
-TIME_SYNC_PRECISION_SECONDS = 60
+TIME_SYNC_PRECISION_SECONDS = 1
 TIME_SYNC_RETRY_COMMAND = "pj device sync-time"
 TIME_REPAIR_REASON = "legacy_missing_utc_offset"
 
@@ -63,7 +63,7 @@ def _sync_time_from_host(
     now: datetime | None = None,
 ) -> dict[str, Any]:
     local_now = now or datetime.now().astimezone()
-    local_now = local_now.replace(second=0, microsecond=0)
+    local_now = local_now.replace(microsecond=0)
     offset = local_now.utcoffset() if local_now.tzinfo is not None else None
     if offset is None:
         raise DeviceError("host time must include a UTC offset")
@@ -73,6 +73,7 @@ def _sync_time_from_host(
     expected = {
         "hour": local_now.hour,
         "minute": local_now.minute,
+        "second": local_now.second,
         "year": local_now.year,
         "month": local_now.month,
         "day": local_now.day,
@@ -84,14 +85,12 @@ def _sync_time_from_host(
         expected["day"],
         expected["year"],
         int(offset_seconds // 60),
+        local_now.second,
     )
     if (
         not isinstance(response, dict)
         or any(response.get(key) != value for key, value in expected.items())
-        or (
-            "utc_offset_minutes" in response
-            and response.get("utc_offset_minutes") != int(offset_seconds // 60)
-        )
+        or response.get("utc_offset_minutes") != int(offset_seconds // 60)
     ):
         raise DeviceError(f"device time sync could not be validated; run '{TIME_SYNC_RETRY_COMMAND}' to retry")
     return {
@@ -120,6 +119,22 @@ def _repair_legacy_time_offset(
         and time_sync["utc_offset_minutes"] is None
     ):
         return None
+
+    capabilities = status.get("capabilities")
+    time_write_enabled = (
+        isinstance(capabilities, dict)
+        and capabilities.get("time.write") is True
+    ) or (
+        isinstance(capabilities, list)
+        and "time.write" in capabilities
+    )
+    if not time_write_enabled:
+        return {
+            "state": "unsupported",
+            "reason": TIME_REPAIR_REASON,
+            "error": "device does not advertise time.write capability",
+            "retryable": False,
+        }
 
     try:
         result = _sync_time_from_host(client, now)

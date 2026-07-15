@@ -144,24 +144,27 @@ class DeviceDiscoveryTests(unittest.TestCase):
 
 class AutomaticTimeSyncTests(unittest.TestCase):
     def test_sync_uses_explicit_local_time_and_reports_utc_anchor(self) -> None:
-        local = datetime(2026, 7, 14, 8, 42, tzinfo=timezone(timedelta(hours=-7)))
+        local = datetime(2026, 7, 14, 8, 42, 37,
+                         tzinfo=timezone(timedelta(hours=-7)))
         client = Mock(spec=SerialDeviceClient)
         client.put_time.return_value = {
             "hour": 8,
             "minute": 42,
+            "second": 37,
             "year": 2026,
             "month": 7,
             "day": 14,
+            "utc_offset_minutes": -420,
         }
 
         result = cli._sync_time_from_host(client, local)
 
-        client.put_time.assert_called_once_with(8, 42, 7, 14, 2026, -420)
+        client.put_time.assert_called_once_with(8, 42, 7, 14, 2026, -420, 37)
         self.assertEqual(result["state"], "synced")
         self.assertTrue(result["validated"])
-        self.assertEqual(result["precision_seconds"], 60)
-        self.assertEqual(result["host_local"], "2026-07-14T08:42:00-07:00")
-        self.assertEqual(result["host_utc"], "2026-07-14T15:42:00Z")
+        self.assertEqual(result["precision_seconds"], 1)
+        self.assertEqual(result["host_local"], "2026-07-14T08:42:37-07:00")
+        self.assertEqual(result["host_utc"], "2026-07-14T15:42:37Z")
         self.assertEqual(result["utc_offset_minutes"], -420)
 
     def test_sync_rejects_ambiguous_or_subminute_host_offsets(self) -> None:
@@ -191,10 +194,26 @@ class AutomaticTimeSyncTests(unittest.TestCase):
         client.put_time.return_value = {
             "hour": 8,
             "minute": 42,
+            "second": 0,
             "year": 2026,
             "month": 7,
             "day": 14,
             "utc_offset_minutes": 0,
+        }
+
+        with self.assertRaisesRegex(DeviceError, "could not be validated"):
+            cli._sync_time_from_host(client, local)
+
+    def test_sync_rejects_a_missing_echoed_utc_offset(self) -> None:
+        local = datetime(2026, 7, 14, 8, 42, tzinfo=timezone(timedelta(hours=-7)))
+        client = Mock(spec=SerialDeviceClient)
+        client.put_time.return_value = {
+            "hour": 8,
+            "minute": 42,
+            "second": 0,
+            "year": 2026,
+            "month": 7,
+            "day": 14,
         }
 
         with self.assertRaisesRegex(DeviceError, "could not be validated"):
@@ -206,12 +225,14 @@ class AutomaticTimeSyncTests(unittest.TestCase):
         client.put_time.return_value = {
             "hour": 8,
             "minute": 42,
+            "second": 0,
             "year": 2026,
             "month": 7,
             "day": 15,
             "utc_offset_minutes": -420,
         }
         status = {
+            "capabilities": {"time.write": True},
             "time_sync": {
                 "civil_time_semantics": "unconfigured",
                 "publication": "timezone_required",
@@ -224,7 +245,7 @@ class AutomaticTimeSyncTests(unittest.TestCase):
         self.assertEqual(repair["state"], "repaired")
         self.assertEqual(repair["reason"], "legacy_missing_utc_offset")
         self.assertEqual(repair["sync"]["utc_offset_minutes"], -420)
-        client.put_time.assert_called_once_with(8, 42, 7, 15, 2026, -420)
+        client.put_time.assert_called_once_with(8, 42, 7, 15, 2026, -420, 0)
 
     def test_status_time_repair_is_a_noop_for_every_other_state(self) -> None:
         cases = (
@@ -264,6 +285,7 @@ class AutomaticTimeSyncTests(unittest.TestCase):
         client = Mock(spec=SerialDeviceClient)
         client.put_time.side_effect = DeviceRequestTimeout("time write timed out")
         status = {
+            "capabilities": {"time.write": True},
             "time_sync": {
                 "civil_time_semantics": "unconfigured",
                 "publication": "timezone_required",
@@ -280,7 +302,27 @@ class AutomaticTimeSyncTests(unittest.TestCase):
             "retryable": True,
             "retry_command": "pj device sync-time",
         })
-        client.put_time.assert_called_once_with(8, 42, 7, 15, 2026, 0)
+        client.put_time.assert_called_once_with(8, 42, 7, 15, 2026, 0, 0)
+
+    def test_status_time_repair_requires_an_explicit_time_write_capability(self) -> None:
+        sentinel = {
+            "time_sync": {
+                "civil_time_semantics": "unconfigured",
+                "publication": "timezone_required",
+                "utc_offset_minutes": None,
+            },
+        }
+        for capabilities in (None, {}, {"time.write": False}, []):
+            with self.subTest(capabilities=capabilities):
+                status = dict(sentinel)
+                if capabilities is not None:
+                    status["capabilities"] = capabilities
+                client = Mock(spec=SerialDeviceClient)
+
+                repair = cli._repair_legacy_time_offset(client, status)
+
+                self.assertEqual(repair["state"], "unsupported")
+                client.put_time.assert_not_called()
 
     def test_sync_reanchors_stale_and_already_valid_clocks_without_a_preflight_read(self) -> None:
         local = datetime(2026, 7, 14, 8, 42, tzinfo=timezone.utc)
@@ -294,24 +336,27 @@ class AutomaticTimeSyncTests(unittest.TestCase):
                 client.put_time.return_value = {
                     "hour": 8,
                     "minute": 42,
+                    "second": 0,
                     "year": 2026,
                     "month": 7,
                     "day": 14,
+                    "utc_offset_minutes": 0,
                 }
 
                 result = cli._sync_time_from_host(client, local)
 
                 self.assertEqual(result["state"], "synced")
                 client.get_time.assert_not_called()
-                client.put_time.assert_called_once_with(8, 42, 7, 14, 2026, 0)
+                client.put_time.assert_called_once_with(8, 42, 7, 14, 2026, 0, 0)
 
     def test_usb_provisioning_syncs_time_automatically(self) -> None:
         with TemporaryDirectory() as tmp:
             serial = Mock(spec=SerialDeviceClient)
             serial.provision_wifi.return_value = {"device_id": "pj-usb"}
-            serial.put_time.side_effect = lambda hour, minute, month, day, year, utc_offset: {
+            serial.put_time.side_effect = lambda hour, minute, month, day, year, utc_offset, second: {
                 "hour": hour,
                 "minute": minute,
+                "second": second,
                 "year": year,
                 "month": month,
                 "day": day,
@@ -361,7 +406,8 @@ class AutomaticTimeSyncTests(unittest.TestCase):
         serial.provision_wifi.return_value = {"device_id": "pj-usb"}
         serial.put_time.side_effect = [
             DeviceRequestTimeout("first write timed out"),
-            {"hour": 8, "minute": 42, "year": 2026, "month": 7, "day": 14},
+            {"hour": 8, "minute": 42, "second": 0, "year": 2026,
+             "month": 7, "day": 14, "utc_offset_minutes": -420},
         ]
 
         with TemporaryDirectory() as tmp:

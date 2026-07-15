@@ -554,6 +554,7 @@ class DeviceClient:
         day: int,
         year: int | None = None,
         utc_offset_minutes: int | None = None,
+        second: int | None = None,
     ) -> dict[str, Any] | None:
         payload = {
             "hour": hour,
@@ -571,6 +572,10 @@ class DeviceClient:
             ):
                 raise DeviceError("UTC offset must be between -840 and 840 minutes")
             payload["utc_offset_minutes"] = utc_offset_minutes
+        if second is not None:
+            if isinstance(second, bool) or not isinstance(second, int) or not 0 <= second <= 59:
+                raise DeviceError("second must be between 0 and 59")
+            payload["second"] = second
         return self._request("PUT", "/v1/time", payload)
 
     def list_audio(self) -> list[AudioItem]:
@@ -1208,6 +1213,7 @@ class SerialDeviceClient:
         day: int,
         year: int | None = None,
         utc_offset_minutes: int | None = None,
+        second: int | None = None,
     ) -> dict[str, Any]:
         if year is None:
             raise DeviceError("USB time sync requires a year")
@@ -1220,6 +1226,12 @@ class SerialDeviceClient:
             ):
                 raise DeviceError("UTC offset must be between -840 and 840 minutes")
             command += f" {utc_offset_minutes}"
+        if second is not None:
+            if utc_offset_minutes is None:
+                raise DeviceError("USB second precision requires a UTC offset")
+            if isinstance(second, bool) or not isinstance(second, int) or not 0 <= second <= 59:
+                raise DeviceError("second must be between 0 and 59")
+            command += f" {second}"
         return self._request(command)
 
     def _wipe_operation_lost(

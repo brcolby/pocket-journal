@@ -254,6 +254,7 @@ static pj_usb_settings_replay_t g_usb_settings_replay;
 typedef struct {
     int hour;
     int minute;
+    int second;
     int year;
     int month;
     int day;
@@ -4426,7 +4427,10 @@ static pj_reset_reason_t runtime_reset_reason(void)
 static board_time_snapshot_t board_time_snapshot(void)
 {
     board_time_snapshot_t snapshot;
+    pj_time_clock_anchor_t anchor;
+    uint64_t now_ms = board_monotonic_ms();
     portENTER_CRITICAL(&g_time_lock);
+    anchor = g_time_clock_anchor;
     snapshot = (board_time_snapshot_t) {
         .hour = g_status.hour,
         .minute = g_status.minute,
@@ -4437,6 +4441,14 @@ static board_time_snapshot_t board_time_snapshot(void)
         .generation = g_time_generation,
     };
     portEXIT_CRITICAL(&g_time_lock);
+    pj_time_clock_t clock;
+    if (snapshot.time_set && pj_time_clock_snapshot(&anchor, 1, now_ms, &clock) &&
+        pj_time_clock_civil_from_day(clock.local_day, &snapshot.year,
+                                     &snapshot.month, &snapshot.day)) {
+        snapshot.hour = (int)(clock.local_second / 3600u);
+        snapshot.minute = (int)(clock.local_second % 3600u / 60u);
+        snapshot.second = (int)(clock.local_second % 60u);
+    }
     return snapshot;
 }
 
@@ -7229,39 +7241,24 @@ static int read_body(httpd_req_t *req, char *body, size_t body_size)
     return 1;
 }
 
-static int json_int_field(const char *json, const char *field, int *value)
-{
-    char needle[32];
-    (void)snprintf(needle, sizeof(needle), "\"%s\"", field);
-    const char *cursor = strstr(json, needle);
-    if (cursor == NULL) {
-        return 0;
-    }
-    cursor = strchr(cursor + strlen(needle), ':');
-    if (cursor == NULL) {
-        return 0;
-    }
-    cursor++;
-    while (*cursor == ' ' || *cursor == '\t') {
-        cursor++;
-    }
-    char *end = NULL;
-    long parsed = strtol(cursor, &end, 10);
-    if (end == cursor) {
-        return 0;
-    }
-    *value = (int)parsed;
-    return 1;
-}
-
-static int board_set_time_date(int hour, int minute, int year, int month, int day,
+static int board_set_time_date(int hour, int minute, int second,
+                               int year, int month, int day,
                                int update_utc_offset, int utc_offset_minutes,
                                const char *source)
 {
     if (!valid_time_date(hour, minute, year, month, day) ||
+        second < 0 || second > 59 ||
         (update_utc_offset &&
          !pj_time_utc_offset_valid(utc_offset_minutes))) {
         ESP_LOGE(TAG, "Rejected invalid time/date from %s", source);
+        return 0;
+    }
+    esp_err_t err = rtc_write_civil_time(hour, minute, year, month, day, second);
+    if (err != ESP_OK) {
+        (void)snprintf(g_status.last_error, sizeof(g_status.last_error),
+                       "RTC write failed for %s time update: %s",
+                       source, esp_err_to_name(err));
+        ESP_LOGW(TAG, "%s", g_status.last_error);
         return 0;
     }
     if (update_utc_offset) {
@@ -7274,15 +7271,7 @@ static int board_set_time_date(int hour, int minute, int year, int month, int da
             return 0;
         }
     }
-    esp_err_t err = rtc_write_civil_time(hour, minute, year, month, day, 0);
-    if (err != ESP_OK) {
-        (void)snprintf(g_status.last_error, sizeof(g_status.last_error),
-                       "RTC write failed for %s time update: %s",
-                       source, esp_err_to_name(err));
-        ESP_LOGW(TAG, "%s", g_status.last_error);
-        return 0;
-    }
-    if (!board_time_publish(hour, minute, year, month, day, 0,
+    if (!board_time_publish(hour, minute, year, month, day, second,
                             board_monotonic_ms(), 1)) {
         ESP_LOGE(TAG, "Rejected invalid time/date from %s", source);
         return 0;
@@ -7291,8 +7280,8 @@ static int board_set_time_date(int hour, int minute, int year, int month, int da
     g_time_sync_state.time_known = 1;
     portEXIT_CRITICAL(&g_connectivity_lock);
     board_time_mark_pending();
-    ESP_LOGI(TAG, "Time/date updated from %s: %02d:%02d %04d-%02d-%02d",
-             source, hour, minute, year, month, day);
+    ESP_LOGI(TAG, "Time/date updated from %s: %02d:%02d:%02d %04d-%02d-%02d",
+             source, hour, minute, second, year, month, day);
     return 1;
 }
 
@@ -9214,32 +9203,35 @@ static void serial_command_task(void *arg)
             int hour = 0;
             int minute = 0;
             int utc_offset_minutes = 0;
+            int second = 0;
             char extra = '\0';
-            int fields = sscanf(time_payload, "%d %d %d %d %d %d %c",
+            int fields = sscanf(time_payload, "%d %d %d %d %d %d %d %c",
                                 &year, &month, &day, &hour, &minute,
-                                &utc_offset_minutes, &extra);
-            int update_utc_offset = fields == 6;
-            if ((fields == 5 || fields == 6) &&
+                                &utc_offset_minutes, &second, &extra);
+            int update_utc_offset = fields >= 6;
+            if ((fields == 5 || fields == 6 || fields == 7) &&
                 valid_time_date(hour, minute, year, month, day) &&
+                second >= 0 && second <= 59 &&
                 (!update_utc_offset ||
                  pj_time_utc_offset_valid(utc_offset_minutes))) {
-                if (board_set_time_date(hour, minute, year, month, day,
+                if (board_set_time_date(hour, minute, second,
+                                        year, month, day,
                                         update_utc_offset,
                                         utc_offset_minutes,
                                         "USB-C partner")) {
                     if (update_utc_offset) {
-                        printf("PJ_OK {\"hour\":%d,\"minute\":%d,\"year\":%d,\"month\":%d,\"day\":%d,\"utc_offset_minutes\":%d}\n",
-                               hour, minute, year, month, day,
+                        printf("PJ_OK {\"hour\":%d,\"minute\":%d,\"second\":%d,\"year\":%d,\"month\":%d,\"day\":%d,\"utc_offset_minutes\":%d}\n",
+                               hour, minute, second, year, month, day,
                                utc_offset_minutes);
                     } else {
-                        printf("PJ_OK {\"hour\":%d,\"minute\":%d,\"year\":%d,\"month\":%d,\"day\":%d}\n",
-                               hour, minute, year, month, day);
+                        printf("PJ_OK {\"hour\":%d,\"minute\":%d,\"second\":%d,\"year\":%d,\"month\":%d,\"day\":%d}\n",
+                               hour, minute, second, year, month, day);
                     }
                 } else {
                     printf("PJ_ERR {\"error\":\"time update could not be persisted to RTC\"}\n");
                 }
             } else {
-                printf("PJ_ERR {\"error\":\"expected PJ_TIME yyyy mm dd hh mm [utc_offset_minutes]\"}\n");
+                printf("PJ_ERR {\"error\":\"expected PJ_TIME yyyy mm dd hh mm [utc_offset_minutes [second]]\"}\n");
             }
             fflush(stdout);
             continue;
@@ -9343,17 +9335,106 @@ static esp_err_t status_handler(httpd_req_t *req)
     return result;
 }
 
+static esp_err_t time_send_response(httpd_req_t *req,
+                                    const board_time_snapshot_t *time,
+                                    int offset_known, int offset_minutes)
+{
+    cJSON *json = cJSON_CreateObject();
+    if (json == NULL ||
+        cJSON_AddNumberToObject(json, "hour", time->hour) == NULL ||
+        cJSON_AddNumberToObject(json, "minute", time->minute) == NULL ||
+        cJSON_AddNumberToObject(json, "second", time->second) == NULL ||
+        cJSON_AddNumberToObject(json, "year", time->year) == NULL ||
+        cJSON_AddNumberToObject(json, "month", time->month) == NULL ||
+        cJSON_AddNumberToObject(json, "day", time->day) == NULL ||
+        (offset_known &&
+         cJSON_AddNumberToObject(json, "utc_offset_minutes", offset_minutes) == NULL)) {
+        cJSON_Delete(json);
+        httpd_resp_set_status(req, "500 Internal Server Error");
+        return send_json(req, "{\"error\":\"time response allocation failed\"}");
+    }
+    esp_err_t result = send_json_object(req, json);
+    cJSON_Delete(json);
+    return result;
+}
+
 static esp_err_t time_get_handler(httpd_req_t *req)
 {
     if (require_auth(req) != ESP_OK) {
         return ESP_OK;
     }
     board_time_snapshot_t time = board_time_snapshot();
-    char json[96];
-    (void)snprintf(json, sizeof(json),
-                   "{\"hour\":%d,\"minute\":%d,\"year\":%d,\"month\":%d,\"day\":%d}",
-                   time.hour, time.minute, time.year, time.month, time.day);
-    return send_json(req, json);
+    int offset_known;
+    int offset_minutes;
+    portENTER_CRITICAL(&g_connectivity_lock);
+    offset_known = g_utc_offset_known;
+    offset_minutes = g_utc_offset_minutes;
+    portEXIT_CRITICAL(&g_connectivity_lock);
+    return time_send_response(req, &time, offset_known, offset_minutes);
+}
+
+static int json_exact_int(const cJSON *item, int *value)
+{
+    if (!cJSON_IsNumber(item) || item->valuedouble != (double)item->valueint) {
+        return 0;
+    }
+    *value = item->valueint;
+    return 1;
+}
+
+static int time_parse_update(const char *body, int *hour, int *minute,
+                             int *second,
+                             int *year, int *month, int *day,
+                             int *has_offset, int *offset_minutes)
+{
+    cJSON *json = cJSON_Parse(body);
+    if (!cJSON_IsObject(json) || json->child == NULL) {
+        cJSON_Delete(json);
+        return 0;
+    }
+    unsigned seen = 0;
+    for (const cJSON *item = json->child; item != NULL; item = item->next) {
+        const char *key = item->string;
+        unsigned field = 0;
+        int *target = NULL;
+        if (key != NULL && strcmp(key, "hour") == 0) {
+            field = 1u << 0;
+            target = hour;
+        } else if (key != NULL && strcmp(key, "minute") == 0) {
+            field = 1u << 1;
+            target = minute;
+        } else if (key != NULL && strcmp(key, "year") == 0) {
+            field = 1u << 2;
+            target = year;
+        } else if (key != NULL && strcmp(key, "month") == 0) {
+            field = 1u << 3;
+            target = month;
+        } else if (key != NULL && strcmp(key, "day") == 0) {
+            field = 1u << 4;
+            target = day;
+        } else if (key != NULL && strcmp(key, "utc_offset_minutes") == 0) {
+            field = 1u << 5;
+            target = offset_minutes;
+        } else if (key != NULL && strcmp(key, "second") == 0) {
+            field = 1u << 6;
+            target = second;
+        } else {
+            cJSON_Delete(json);
+            return 0;
+        }
+        if ((seen & field) != 0 || !json_exact_int(item, target)) {
+            cJSON_Delete(json);
+            return 0;
+        }
+        seen |= field;
+    }
+    cJSON_Delete(json);
+    const unsigned required = (1u << 0) | (1u << 1) | (1u << 3) | (1u << 4);
+    *has_offset = (seen & (1u << 5)) != 0;
+    return (seen & required) == required &&
+           valid_time_date(*hour, *minute, *year, *month, *day) &&
+           *second >= 0 && *second <= 59 &&
+           (!*has_offset || pj_time_utc_offset_valid(*offset_minutes));
 }
 
 static esp_err_t time_put_handler(httpd_req_t *req)
@@ -9365,28 +9446,38 @@ static esp_err_t time_put_handler(httpd_req_t *req)
     board_time_snapshot_t time = board_time_snapshot();
     int hour = time.hour;
     int minute = time.minute;
+    int second = time.second;
     int year = time.year;
     int month = time.month;
     int day = time.day;
+    int has_offset = 0;
+    int offset_minutes = 0;
     if (!read_body(req, body, sizeof(body))) {
         httpd_resp_set_status(req, "400 Bad Request");
-        return send_json(req, "{\"error\":\"expected hour/minute/month/day integers; optional year\"}");
+        return send_json(req, "{\"error\":\"expected hour/minute/month/day integers; optional second, year, and utc_offset_minutes\"}");
     }
-    (void)json_int_field(body, "year", &year);
-    if (!json_int_field(body, "hour", &hour) ||
-        !json_int_field(body, "minute", &minute) ||
-        !json_int_field(body, "month", &month) ||
-        !json_int_field(body, "day", &day) ||
-        !valid_time_date(hour, minute, year, month, day)) {
+    if (!time_parse_update(body, &hour, &minute, &second,
+                           &year, &month, &day,
+                           &has_offset, &offset_minutes)) {
         httpd_resp_set_status(req, "400 Bad Request");
-        return send_json(req, "{\"error\":\"expected hour/minute/month/day integers; optional year\"}");
+        return send_json(req, "{\"error\":\"expected hour/minute/month/day integers; optional second, year, and utc_offset_minutes\"}");
     }
-    if (!board_set_time_date(hour, minute, year, month, day, 0, 0, "HTTP")) {
+    if (!board_set_time_date(hour, minute, second, year, month, day, has_offset,
+                             offset_minutes, "HTTP")) {
         httpd_resp_set_status(req, "503 Service Unavailable");
         return send_json(req,
-                         "{\"error\":\"time update could not be persisted to RTC\"}");
+                         "{\"error\":\"time or UTC offset could not be persisted\"}");
     }
-    return time_get_handler(req);
+    time = (board_time_snapshot_t) {
+        .hour = hour,
+        .minute = minute,
+        .second = second,
+        .year = year,
+        .month = month,
+        .day = day,
+        .time_set = 1,
+    };
+    return time_send_response(req, &time, has_offset, offset_minutes);
 }
 
 static esp_err_t settings_get_handler(httpd_req_t *req)
@@ -9412,15 +9503,6 @@ static esp_err_t settings_get_handler(httpd_req_t *req)
     esp_err_t result = send_json(req, encoded);
     cJSON_free(encoded);
     return result;
-}
-
-static int json_exact_int(const cJSON *item, int *value)
-{
-    if (!cJSON_IsNumber(item) || item->valuedouble != (double)item->valueint) {
-        return 0;
-    }
-    *value = item->valueint;
-    return 1;
 }
 
 static int json_exact_u32(const cJSON *item, uint32_t *value)

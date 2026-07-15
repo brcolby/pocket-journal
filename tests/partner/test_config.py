@@ -52,12 +52,17 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(client.get_time(), {"updated": True})
         self.assertEqual(client.put_time(14, 5, 6, 19), {"updated": True})
         self.assertEqual(client.put_time(14, 5, 6, 19, 2026, -420), {"updated": True})
+        self.assertEqual(client.put_time(14, 5, 6, 19, 2026, -420, 37), {"updated": True})
 
         self.assertEqual(calls[0], ("GET", "/v1/time", None))
         self.assertEqual(calls[1], ("PUT", "/v1/time", {"hour": 14, "minute": 5, "month": 6, "day": 19}))
         self.assertEqual(calls[2], ("PUT", "/v1/time", {
             "hour": 14, "minute": 5, "month": 6, "day": 19,
             "year": 2026, "utc_offset_minutes": -420,
+        }))
+        self.assertEqual(calls[3], ("PUT", "/v1/time", {
+            "hour": 14, "minute": 5, "month": 6, "day": 19,
+            "year": 2026, "utc_offset_minutes": -420, "second": 37,
         }))
 
     def test_http_client_sends_bearer_authorization(self) -> None:
@@ -465,10 +470,10 @@ class ConfigTests(unittest.TestCase):
             "day": 14,
         }
 
-        response = client.put_time(8, 42, 7, 14, 2026, -420)
+        response = client.put_time(8, 42, 7, 14, 2026, -420, 37)
 
         self.assertEqual(response["minute"], 42)
-        self.assertEqual(calls, ["PJ_TIME 2026 7 14 8 42 -420"])
+        self.assertEqual(calls, ["PJ_TIME 2026 7 14 8 42 -420 37"])
 
     def test_serial_time_command_keeps_legacy_call_shape_and_validates_offset(self) -> None:
         calls = []
@@ -478,6 +483,10 @@ class ConfigTests(unittest.TestCase):
         client.put_time(8, 42, 7, 14, 2026)
         with self.assertRaisesRegex(DeviceError, "UTC offset"):
             client.put_time(8, 42, 7, 14, 2026, 841)
+        with self.assertRaisesRegex(DeviceError, "requires a UTC offset"):
+            client.put_time(8, 42, 7, 14, 2026, second=30)
+        with self.assertRaisesRegex(DeviceError, "second"):
+            client.put_time(8, 42, 7, 14, 2026, -420, 60)
 
         self.assertEqual(calls, ["PJ_TIME 2026 7 14 8 42"])
 

@@ -46,10 +46,12 @@ PUT /v1/time
 ```
 
 Reads or updates the local time/date shown on the time/temp screen. The firmware
-accepts integer `hour`, `minute`, `month`, and `day` fields, plus optional `year`
+accepts integer `hour`, `minute`, `month`, and `day` fields, plus optional `second` and `year`
 for weekday calculation and `utc_offset_minutes` from `-840` through `840` for
 projecting SNTP UTC into the same local civil time and RTC basis. Omitting the
 offset preserves compatibility with older callers.
+When an offset is supplied, a successful response echoes the persisted value;
+clients must treat a missing or different echo as an unvalidated update.
 
 `pj device status` also performs one narrowly guarded upgrade repair. When status
 reports all three legacy-migration signals (`civil_time_semantics` is
@@ -65,6 +67,7 @@ offset, so later status calls are idempotent no-ops.
 {
   "hour": 14,
   "minute": 5,
+  "second": 37,
   "year": 2026,
   "month": 6,
   "day": 19,
@@ -222,7 +225,7 @@ The firmware also accepts a small line protocol on the USB Serial/JTAG console f
 ```text
 PJ_STATUS [request_id=ID]
 PJ_WIFI_HEX 4c61622057694669 70617373776f7264 746f6b656e
-PJ_TIME 2026 06 20 14 05 -420
+PJ_TIME 2026 06 20 14 05 -420 37
 PJ_WIPE_RECORDINGS [request_id=ID]
 PJ_SETTINGS_GET request_id=ID
 PJ_SETTINGS_SET expected_generation=N payload_hex=JSON_HEX request_id=ID
@@ -238,7 +241,8 @@ PJ_MIC_CHECK [duration_ms] [ms=1..10000] [gain_db=0..42]
 
 `PJ_WIFI_HEX` stores hex-encoded UTF-8 `ssid`, `password`, and bearer-token strings in NVS. It intentionally does not echo credentials back over serial.
 `PJ_TIME` and its `PJ_SET_TIME` alias accept an optional sixth fixed UTC-offset
-field in minutes, from `-840` through `840`. When supplied, firmware persists
+field in minutes, from `-840` through `840`, and optional seventh seconds field
+from `0` through `59`. When supplied, firmware persists
 the offset and uses it to project later background SNTP UTC results into the
 local civil clock and PCF85063 RTC. The legacy five-field form remains valid
 and leaves any saved offset unchanged. A fixed offset does not automatically
