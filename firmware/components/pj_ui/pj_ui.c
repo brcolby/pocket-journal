@@ -1343,7 +1343,8 @@ static int activate_focused_control(pj_ui_context_t *ctx)
             queue_time_command(ctx, PJ_UI_TIME_COMMAND_TIMER_RESET, 0, 0);
         } else {
             int delta = ctx->focus_index == 2 ? -30 : 30;
-            int base = ctx->timer_running ? ctx->timer_seconds : ctx->timer_preset_seconds;
+            int base = ctx->timer_seconds > 0 ?
+                ctx->timer_seconds : ctx->timer_preset_seconds;
             int preset = max_int(30, min_int(PJ_UI_MAX_DURATION_SECONDS, base + delta));
             queue_time_command(ctx, ctx->timer_running ?
                                PJ_UI_TIME_COMMAND_TIMER_START :
@@ -1371,7 +1372,7 @@ static int activate_focused_control(pj_ui_context_t *ctx)
             queue_time_command(ctx, PJ_UI_TIME_COMMAND_INTERVAL_RESET, 0, 0);
         } else {
             int delta = ctx->focus_index == 2 ? -60 : 60;
-            int base = ctx->interval_running ?
+            int base = ctx->interval_seconds > 0 ?
                 ctx->interval_seconds : ctx->interval_preset_seconds;
             int preset = max_int(60, min_int(PJ_UI_MAX_DURATION_SECONDS, base + delta));
             queue_time_command(ctx, ctx->interval_running ?

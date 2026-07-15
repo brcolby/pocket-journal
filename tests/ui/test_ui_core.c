@@ -715,6 +715,56 @@ static void test_timer_presets_are_not_runtime_counters(void)
     assert(pj_ui_consume_time_command(&ui, &command) == 1);
 }
 
+static void test_paused_time_adjustments_use_visible_remainder(void)
+{
+    pj_ui_context_t ui;
+    pj_ui_time_command_t command;
+
+    pj_ui_init(&ui);
+    ui.state = PJ_UI_STATE_TIMER;
+    ui.timer_running = 0;
+    ui.timer_seconds = 17;
+    ui.timer_preset_seconds = 90;
+    assert(pj_ui_handle_touch(&ui, 150, 177, PJ_TOUCH_TAP) == 1);
+    assert(ui.timer_preset_seconds == 47);
+    assert(pj_ui_consume_time_command(&ui, &command) == 1);
+    assert(command.type == PJ_UI_TIME_COMMAND_TIMER_RESET);
+    assert(command.duration_ms == 47000);
+
+    pj_ui_init(&ui);
+    ui.state = PJ_UI_STATE_TIMER;
+    ui.timer_seconds = 0;
+    ui.timer_preset_seconds = 90;
+    assert(pj_ui_handle_touch(&ui, 150, 177, PJ_TOUCH_TAP) == 1);
+    assert(ui.timer_preset_seconds == 120);
+    assert(pj_ui_consume_time_command(&ui, &command) == 1);
+    assert(command.type == PJ_UI_TIME_COMMAND_TIMER_RESET);
+    assert(command.duration_ms == 120000);
+
+    pj_ui_init(&ui);
+    ui.state = PJ_UI_STATE_INTERVAL;
+    ui.interval_running = 0;
+    ui.interval_seconds = 70;
+    ui.interval_preset_seconds = 120;
+    assert(pj_ui_handle_touch(&ui, 150, 177, PJ_TOUCH_TAP) == 1);
+    assert(ui.interval_preset_seconds == 130);
+    assert(pj_ui_consume_time_command(&ui, &command) == 1);
+    assert(command.type == PJ_UI_TIME_COMMAND_INTERVAL_RESET);
+    assert(command.duration_ms == 130000);
+    assert(command.secondary_duration_ms == 130000);
+
+    pj_ui_init(&ui);
+    ui.state = PJ_UI_STATE_INTERVAL;
+    ui.interval_seconds = 0;
+    ui.interval_preset_seconds = 120;
+    assert(pj_ui_handle_touch(&ui, 50, 177, PJ_TOUCH_TAP) == 1);
+    assert(ui.interval_preset_seconds == 60);
+    assert(pj_ui_consume_time_command(&ui, &command) == 1);
+    assert(command.type == PJ_UI_TIME_COMMAND_INTERVAL_RESET);
+    assert(command.duration_ms == 60000);
+    assert(command.secondary_duration_ms == 60000);
+}
+
 static void test_interval_repeats_one_stable_duration_across_rounds(void)
 {
     pj_ui_context_t ui;
@@ -2126,6 +2176,7 @@ int main(void)
     test_volume_only_bottom_controls_adjust_and_clamp();
     test_volume_fill_uses_full_top_half_and_controls_have_thick_borders();
     test_timer_presets_are_not_runtime_counters();
+    test_paused_time_adjustments_use_visible_remainder();
     test_interval_repeats_one_stable_duration_across_rounds();
     test_timer_geometry_and_adjustment_focus_timeout();
     test_time_projection_updates_values_without_alert_subscreen();
