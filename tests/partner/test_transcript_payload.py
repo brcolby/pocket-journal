@@ -33,10 +33,13 @@ class TranscriptPayloadTests(unittest.TestCase):
             "sync": {"stale": True},
         }
 
-        payload = build_device_transcript_payload(transcript, SOURCE, IDENTITY)
+        payload = build_device_transcript_payload(
+            transcript, SOURCE, IDENTITY, title="Morning note"
+        )
 
         self.assertEqual(payload["schema_version"], 1)
         self.assertEqual(payload["text"], "hello world")
+        self.assertEqual(payload["title"], "Morning note")
         self.assertEqual(payload["source"], SOURCE)
         self.assertEqual(payload["transcription"], IDENTITY)
         self.assertEqual(payload["language"], "en")
@@ -50,24 +53,38 @@ class TranscriptPayloadTests(unittest.TestCase):
         self.assertEqual(encoded, b'{"text":"caf\xc3\xa9","v":1}')
 
     def test_accepts_exact_limit_and_rejects_one_byte_over_without_truncation(self) -> None:
-        base = build_device_transcript_payload({"text": "x"}, SOURCE, IDENTITY)
+        base = build_device_transcript_payload(
+            {"text": "x"}, SOURCE, IDENTITY, title="Test note"
+        )
         fixed_size = len(serialize_device_transcript(base)) - 1
         exact_text = "x" * (DEVICE_TRANSCRIPT_MAX_BYTES - fixed_size)
-        exact = build_device_transcript_payload({"text": exact_text}, SOURCE, IDENTITY)
+        exact = build_device_transcript_payload(
+            {"text": exact_text}, SOURCE, IDENTITY, title="Test note"
+        )
         self.assertEqual(len(serialize_device_transcript(exact)), DEVICE_TRANSCRIPT_MAX_BYTES)
         self.assertEqual(exact["text"], exact_text)
 
         with self.assertRaisesRegex(ValueError, "exceeds the 61440-byte"):
-            build_device_transcript_payload({"text": exact_text + "x"}, SOURCE, IDENTITY)
+            build_device_transcript_payload(
+                {"text": exact_text + "x"}, SOURCE, IDENTITY,
+                title="Test note",
+            )
 
     def test_non_ascii_limit_counts_utf8_bytes(self) -> None:
-        base = build_device_transcript_payload({"text": "x"}, SOURCE, IDENTITY)
+        base = build_device_transcript_payload(
+            {"text": "x"}, SOURCE, IDENTITY, title="Test note"
+        )
         fixed_size = len(serialize_device_transcript(base)) - 1
         fit_count = (DEVICE_TRANSCRIPT_MAX_BYTES - fixed_size) // 2
-        payload = build_device_transcript_payload({"text": "é" * fit_count}, SOURCE, IDENTITY)
+        payload = build_device_transcript_payload(
+            {"text": "é" * fit_count}, SOURCE, IDENTITY, title="Test note"
+        )
         self.assertLessEqual(len(serialize_device_transcript(payload)), DEVICE_TRANSCRIPT_MAX_BYTES)
         with self.assertRaisesRegex(ValueError, "exceeds"):
-            build_device_transcript_payload({"text": "é" * (fit_count + 1)}, SOURCE, IDENTITY)
+            build_device_transcript_payload(
+                {"text": "é" * (fit_count + 1)}, SOURCE, IDENTITY,
+                title="Test note",
+            )
 
     def test_rejects_malformed_inputs_and_non_json_metadata(self) -> None:
         invalid_cases = [
@@ -81,13 +98,25 @@ class TranscriptPayloadTests(unittest.TestCase):
         for transcript, source, identity, error in invalid_cases:
             with self.subTest(error=error):
                 with self.assertRaisesRegex(ValueError, error):
-                    build_device_transcript_payload(transcript, source, identity)
+                    build_device_transcript_payload(
+                        transcript, source, identity, title="Test note"
+                    )
 
     def test_result_is_detached_from_nested_unknown_metadata(self) -> None:
         transcript = {"text": "ok", "unknown": {"items": [1]}}
-        payload = build_device_transcript_payload(transcript, SOURCE, IDENTITY)
+        payload = build_device_transcript_payload(
+            transcript, SOURCE, IDENTITY, title="Test note"
+        )
         transcript["unknown"]["items"].append(2)
         self.assertEqual(payload["unknown"], {"items": [1]})
+
+    def test_device_title_is_uploaded_and_utf8_bounded(self) -> None:
+        payload = build_device_transcript_payload(
+            {"text": "body"}, SOURCE, IDENTITY,
+            title="  Field   note  " + "é" * 100,
+        )
+        self.assertTrue(payload["title"].startswith("Field note"))
+        self.assertLessEqual(len(payload["title"].encode("utf-8")), 95)
 
 
 if __name__ == "__main__":

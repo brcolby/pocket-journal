@@ -17,5 +17,7 @@ typedef enum {
 pj_transcript_body_result_t pj_transcript_body_validate(const char *body,
                                                         size_t received_length,
                                                         size_t declared_length);
+int pj_transcript_label_extract(const char *body, size_t body_length,
+                                char *label, size_t label_size);
 
 #endif

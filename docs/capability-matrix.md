@@ -1,9 +1,12 @@
 # Partner CLI Capability Matrix
 
 The `pj` companion uses JSON on stdout for successful operations and concise,
-actionable errors on stderr. LAN/Wi-Fi requests use the per-device bearer token
-stored during provisioning. Tokens, Wi-Fi passwords, and SSIDs are never included
-in command output or errors.
+actionable errors on stderr. Interactive LAN/Wi-Fi commands use the per-device
+bearer token stored during provisioning. Device-initiated sync instead uses mutual
+domain-separated HMAC control envelopes and a temporary method/path-scoped data
+credential; the raw token is not sent on that control path. Plain HTTP does not
+encrypt LAN metadata or payloads. Tokens, Wi-Fi passwords, and SSIDs are never
+included in command output or errors.
 
 ## Capability Matrix
 
@@ -20,7 +23,7 @@ in command output or errors.
 | List audio | `pj recordings list [--transport usb\|lan]` | Snapshot-paged `PJ_AUDIO_LIST`, one hex-safe item per response | `GET /v1/audio` | Physical USB access or bearer token | USB transfer protocol or v0 audio endpoint | No | Safe to repeat; snapshot changes abort the list |
 | Download audio | `pj recordings download --audio-id ID [--transport usb\|lan]` | Chunked `PJ_AUDIO_READ`, 256 bytes per response | `GET /v1/audio/{id}` | Physical USB access or bearer token | USB transfer protocol or v0 audio endpoint | Writes only the selected local file | USB uses temp-file replace after size, offset, EOF, and digest validation; full sync also validates the WAV structure |
 | Sync audio and transcripts | `pj sync [--transport usb\|lan] [--backend whisper-cpp\|hf\|fake]` | Snapshot list, chunked reads, atomic transcript upload | Audio GET plus transcript PUT | Physical USB access or bearer token | USB transfer protocol or v0 audio/transcript endpoints; selected local backend installed | Yes | Safe after interruption; cached audio/transcripts are reused and firmware skips uploaded notes |
-| Device-initiated sync | `pj companion serve [--device ID] [--serial-port PORT]` | Polls durable `PJ_SYNC_STATUS`, conditionally claims a generation, then uses bounded audio/transcript commands; descriptors close between polls | Advertises `_pj-companion._tcp`, accepts an authenticated generation request, then uses device audio/transcript endpoints | Physical USB access or shared per-device LAN bearer token | Paired profile, running local transcription backend, and either USB-C or configured LAN | Yes | Checksummed NVS generation; atomic claim; exact terminal acknowledgement; restart/replay safe; an older completion never clears a newer request |
+| Device-initiated sync | `pj companion serve [--device ID] [--serial-port PORT]` | Polls durable `PJ_SYNC_STATUS`, conditionally claims a generation, then uses bounded audio/transcript commands; descriptors close between polls | Advertises `_pj-companion._tcp` API 2, exchanges peer-IP- and fresh-challenge-bound mutual HMAC envelopes, then uses a temporary credential limited to audio GET and transcript PUT | Physical USB access or provisioned-token-derived request/response/data keys; raw token is not sent on the control path | Paired profile, running local transcription backend, and either USB-C or configured LAN; HTTP is authenticated but unencrypted | Yes | Checksummed NVS generation plus pairing-epoch companion high-water; terminal results are served only after exact durable commit; restart/replay safe; an older completion never clears a newer request |
 | Upload transcript | Performed by `pj sync` | `PJ_TRANSCRIPT_BEGIN/WRITE/COMMIT`, with best-effort abort | `PUT /v1/transcripts/{id}` | Physical USB access or bearer token | USB transfer protocol or v0 transcript endpoint and an existing recording | Yes | Digest-verified atomic commit; request-tagged chunks and commit are idempotent |
 | Delete recordings | `pj recordings wipe [--device ID] --yes` | Tagged `PJ_WIPE_RECORDINGS` start plus `PJ_STATUS` polls | `DELETE /v1/audio` plus `GET /v1/status` polls | Physical USB access or bearer token | Async wipe operation status | Yes, destructive | Requires `--yes`; concurrent starts attach to one operation; terminal counts and retryability are reported |
 | Speaker diagnostic | `pj device tone ...` | `PJ_AUDIO_TONE` | No | Physical USB access | v0 diagnostic command | Temporarily changes diagnostic routing | Safe to repeat; firmware restores temporary overrides |
@@ -70,7 +73,8 @@ console line. Identifiers and payload chunks are hex encoded, current recording
 identifiers are bounded to 95 UTF-8 bytes, audio chunks are bounded to 256 bytes,
 transcript chunks are bounded to 192 bytes,
 lists return at most one item per response, and transcripts are limited to 64
-KiB. Audio reads validate a stable snapshot/source digest and exact offsets.
+KiB. Firmware reads title metadata across that same full bound, including titles
+located after the first 8 KiB. Audio reads validate a stable snapshot/source digest and exact offsets.
 Transcript uploads validate declared byte count and SHA-256 before an atomic
 commit; failures trigger a best-effort abort without treating an unknown commit
 outcome as success.
@@ -121,8 +125,8 @@ pj device sync-time
 pj settings set volume=8 theme=dark
 pj recordings list
 pj recordings download --audio-id rec-001.wav --output-dir ./audio
-pj transcription status --model /models/ggml-base.en.bin
-pj sync --model /models/ggml-base.en.bin
+pj transcription status --model /models/ggml-base.en-q5_0.bin
+pj sync --model /models/ggml-base.en-q5_0.bin
 pj library tui
 pj library serve
 pj recordings wipe --yes

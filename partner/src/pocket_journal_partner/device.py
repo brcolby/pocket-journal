@@ -17,6 +17,8 @@ import threading
 import time
 import unicodedata
 
+from .companion_auth import MAX_ERROR_BYTES, normalize_error
+
 
 class DeviceError(RuntimeError):
     pass
@@ -321,17 +323,33 @@ def _usb_uint(value: Any, field: str, *, positive: bool = False) -> int:
 
 
 def _validated_companion_sync_response(response: dict[str, Any]) -> dict[str, Any]:
-    states = {"idle", "pending", "discovering", "requesting", "running", "succeeded", "failed"}
+    states = {
+        "idle", "pending", "discovering", "requesting", "running",
+        "succeeded", "failed", "offline", "auth_failed", "protocol_failed",
+    }
     transports = {"none", "lan", "usb"}
     for field in (
         "requested_generation", "acknowledged_generation", "active_generation",
-        "claim_generation", "pending", "transferred", "failed",
+        "claim_generation", "total", "pending", "transferred", "failed",
     ):
         _usb_uint(response.get(field), f"sync {field}")
     requested = response["requested_generation"]
     acknowledged = response["acknowledged_generation"]
     active = response["active_generation"]
     claim = response["claim_generation"]
+    total = response["total"]
+    pending = response["pending"]
+    transferred = response["transferred"]
+    failed = response["failed"]
+    if transferred > total or failed > total - transferred or pending != total - transferred - failed:
+        raise DeviceError("USB command failed: inconsistent sync progress counts")
+    for field in ("requested_ms", "active_requested_ms", "claim_requested_ms"):
+        value = response.get(field)
+        if (
+            isinstance(value, bool) or not isinstance(value, int)
+            or not 0 <= value <= (1 << 53) - 1
+        ):
+            raise DeviceError(f"USB command failed: invalid sync {field}")
     if acknowledged > requested or (active and not acknowledged < active <= requested):
         raise DeviceError("USB command failed: invalid sync generations")
     request_pending = response.get("request_pending")
@@ -343,6 +361,11 @@ def _validated_companion_sync_response(response: dict[str, Any]) -> dict[str, An
     expected_claim = active if request_pending and active else requested if request_pending else 0
     if claim != expected_claim:
         raise DeviceError("USB command failed: inconsistent sync claim generation")
+    expected_requested_ms = (
+        response["active_requested_ms"] if active else response["requested_ms"]
+    ) if request_pending else response["requested_ms"]
+    if response["claim_requested_ms"] != expected_requested_ms:
+        raise DeviceError("USB command failed: inconsistent sync request timestamp")
     if response.get("state") not in states or response.get("transport") not in transports:
         raise DeviceError("USB command failed: invalid sync phase or transport")
     operation_id = response.get("operation_id")
@@ -354,8 +377,9 @@ def _validated_companion_sync_response(response: dict[str, Any]) -> dict[str, An
     if request_pending and not operation_id:
         raise DeviceError("USB command failed: missing sync operation id")
     error = response.get("error")
-    if not isinstance(error, str) or len(error.encode("utf-8")) > 127 or any(
-        unicodedata.category(character) == "Cc" for character in error
+    if (
+        not isinstance(error, str) or len(error.encode("utf-8")) > MAX_ERROR_BYTES
+        or normalize_error(error, "") != error
     ):
         raise DeviceError("USB command failed: invalid sync error text")
     replayed = response.get("replayed")
@@ -861,6 +885,7 @@ class SerialDeviceClient:
         generation: int,
         operation_id: str,
         state: str,
+        total: int,
         pending: int,
         transferred: int,
         failed: int,
@@ -872,9 +897,11 @@ class SerialDeviceClient:
             raise ValueError("sync generation must be between 1 and 4294967295")
         if not isinstance(operation_id, str) or not 1 <= len(operation_id) <= 64:
             raise ValueError("invalid sync operation id")
-        for value in (pending, transferred, failed):
+        for value in (total, pending, transferred, failed):
             if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 0x7FFFFFFF:
                 raise ValueError("sync progress counts must be nonnegative 32-bit integers")
+        if transferred > total or failed > total - transferred or pending != total - transferred - failed:
+            raise ValueError("sync progress counts are inconsistent")
         command_name = {
             "running": "PJ_SYNC_PROGRESS",
             "succeeded": "PJ_SYNC_COMPLETE",
@@ -882,17 +909,11 @@ class SerialDeviceClient:
         }[state]
         command = (
             f"{command_name} generation={generation} operation_id={operation_id} "
-            f"pending={pending} transferred={transferred} failed={failed}"
+            f"total={total} pending={pending} transferred={transferred} failed={failed}"
         )
         if state == "failed":
-            try:
-                encoded_error = error.encode("utf-8")
-            except (AttributeError, UnicodeEncodeError) as exc:
-                raise ValueError("sync error must be valid UTF-8") from exc
-            if len(encoded_error) > 127 or any(
-                unicodedata.category(character) == "Cc" for character in error
-            ):
-                raise ValueError("sync error must contain at most 127 printable UTF-8 bytes")
+            error = normalize_error(error, "Sync failed")
+            encoded_error = error.encode("utf-8")
             command += f" error_hex={encoded_error.hex()}"
         response = self._request(
             command,

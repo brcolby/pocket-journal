@@ -992,7 +992,13 @@ def build_parser() -> argparse.ArgumentParser:
     companion = sub.add_parser("companion", help="run the USB-C and LAN companion for device-initiated sync")
     companion_sub = companion.add_subparsers(dest="companion_command", required=True)
     companion_serve = companion_sub.add_parser(
-        "serve", help="advertise and process authenticated sync requests"
+        "serve",
+        help="process USB-C or mutually authenticated LAN sync requests",
+        description=(
+            "Process device-initiated sync over short-lived USB-C commands or "
+            "mutual-HMAC LAN requests. LAN HTTP authenticates but does not "
+            "encrypt metadata or payloads; use it only on a trusted network."
+        ),
     )
     companion_serve.add_argument("--device", help="paired device id; required when config has multiple devices")
     companion_serve.add_argument("--data-dir")

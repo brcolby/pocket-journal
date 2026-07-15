@@ -40,6 +40,24 @@ int main(void)
            PJ_TRANSCRIPT_BODY_TOO_LARGE);
     free(boundary);
 
+    const size_t large_size = 9000u;
+    char *large = malloc(large_size + 1u);
+    assert(large != NULL);
+    const char large_prefix[] = "{\"text\":\"fallback\",\"padding\":\"";
+    const char large_suffix[] = "\",\"title\":\"  LARGE   TITLE  \"}";
+    size_t padding = large_size - (sizeof(large_prefix) - 1u) -
+                     (sizeof(large_suffix) - 1u);
+    memcpy(large, large_prefix, sizeof(large_prefix) - 1u);
+    memset(large + sizeof(large_prefix) - 1u, 'x', padding);
+    memcpy(large + sizeof(large_prefix) - 1u + padding, large_suffix,
+           sizeof(large_suffix) - 1u);
+    large[large_size] = '\0';
+    char label[32];
+    assert(pj_transcript_label_extract(large, large_size, label,
+                                       sizeof(label)));
+    assert(strcmp(label, "LARGE TITLE") == 0);
+    free(large);
+
     puts("transcript upload tests passed");
     return 0;
 }

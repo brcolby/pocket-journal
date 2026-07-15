@@ -1333,6 +1333,48 @@ static void test_sync_state_is_board_driven(void)
     assert(ui.sync_online == 0);
 }
 
+static void test_sync_render_distinguishes_transport_and_failure_states(void)
+{
+    pj_ui_context_t ui;
+    pj_framebuffer_t pending;
+    pj_framebuffer_t active;
+    pj_framebuffer_t offline;
+    pj_framebuffer_t auth_failed;
+    pj_framebuffer_t protocol_failed;
+    pj_framebuffer_t terminal_failed;
+    pj_ui_init(&ui);
+    ui.state = PJ_UI_STATE_SYNC;
+    pj_ui_set_sync_state(&ui, 3, 1, 1);
+
+    pj_ui_set_sync_detail(&ui, "pending", 0, "", 1);
+    pj_ui_render(&ui, &pending);
+    pj_ui_set_sync_detail(&ui, "running", 0, "", 1);
+    pj_ui_render(&ui, &active);
+    pj_ui_set_sync_state(&ui, 3, 1, 0);
+    pj_ui_set_sync_detail(&ui, "offline", 0, "", 1);
+    pj_ui_render(&ui, &offline);
+    pj_ui_set_sync_detail(&ui, "auth_failed", 0, "", 1);
+    pj_ui_render(&ui, &auth_failed);
+    pj_ui_set_sync_detail(&ui, "protocol_failed", 0, "", 1);
+    pj_ui_render(&ui, &protocol_failed);
+    pj_ui_set_sync_detail(&ui, "failed", 1, "", 0);
+    pj_ui_render(&ui, &terminal_failed);
+
+    assert(count_pixel_differences_in_region(
+               &pending, &active, 0, 0, PJ_DISPLAY_WIDTH, 70) > 20);
+    assert(count_pixel_differences_in_region(
+               &offline, &auth_failed, 0, 0, PJ_DISPLAY_WIDTH, 70) > 20);
+    assert(count_pixel_differences_in_region(
+               &auth_failed, &protocol_failed,
+               0, 0, PJ_DISPLAY_WIDTH, 70) == 0);
+    assert(count_pixel_differences_in_region(
+               &auth_failed, &protocol_failed,
+               0, 145, PJ_DISPLAY_WIDTH, 55) > 20);
+    assert(count_pixel_differences_in_region(
+               &protocol_failed, &terminal_failed,
+               0, 145, PJ_DISPLAY_WIDTH, 55) > 20);
+}
+
 static void test_dirty_lifecycle(void)
 {
     pj_ui_context_t ui;
@@ -1856,6 +1898,7 @@ int main(void)
     test_persistent_interval_reset_discards_stale_ui_command();
     test_alerts_never_replace_or_intercept_the_active_page();
     test_sync_state_is_board_driven();
+    test_sync_render_distinguishes_transport_and_failure_states();
     test_dirty_lifecycle();
     test_dynamic_updates_force_periodic_full_refresh();
     test_recording_elapsed_projection_is_bounded_and_monotonic_by_seconds();

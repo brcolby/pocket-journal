@@ -175,6 +175,23 @@ class PartnerStore:
         _migrate_legacy_file(legacy_path, path)
         return path
 
+    def companion_state_path(self, device_id: str) -> Path:
+        return self.root / "companion" / f"{_path_component(device_id)}.json"
+
+    def save_companion_state(self, device_id: str, state: dict[str, Any]) -> Path:
+        path = self.companion_state_path(device_id)
+        self._save_json(path, state)
+        return path
+
+    def load_companion_state(self, device_id: str) -> dict[str, Any] | None:
+        path = self.companion_state_path(device_id)
+        if not path.exists():
+            return None
+        payload = self._load_json(path)
+        if payload is None:
+            raise ValueError("companion replay state is unreadable")
+        return payload
+
     @contextmanager
     def workflow_lock(self, device_id: str, audio_id: str):
         """Serialize one audio item's complete sync workflow."""
@@ -218,6 +235,12 @@ class PartnerStore:
                     handle.flush()
                     os.fsync(handle.fileno())
                 temp_path.replace(path)
+                if os.name != "nt":
+                    directory = os.open(path.parent, os.O_RDONLY)
+                    try:
+                        os.fsync(directory)
+                    finally:
+                        os.close(directory)
             finally:
                 if temp_path is not None and temp_path.exists():
                     temp_path.unlink()

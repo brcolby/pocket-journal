@@ -107,8 +107,8 @@ pj sync --model /models/ggml-base.en-q5_0.bin
 
 To let the device's Settings **Sync** action initiate that pipeline, keep the
 companion running. USB-C polling is enabled by default, and the same process also
-advertises the authenticated LAN service. It runs each request asynchronously and
-reports conditional generation progress back to firmware:
+advertises the mutually authenticated LAN service. It runs each request
+asynchronously and reports conditional generation progress back to firmware:
 
 ```sh
 pj companion serve --model /models/ggml-base.en-q5_0.bin
@@ -117,6 +117,17 @@ pj companion serve --model /models/ggml-base.en-q5_0.bin
 See [Device-Initiated Sync](device-initiated-sync.md) for discovery,
 authentication, retry, and port-selection details. Explicit `pj sync --transport
 usb` remains available and does not require the listener.
+
+For device-initiated LAN sync, the raw pairing token is not sent in control
+requests. Domain-separated request and response HMACs bind the direct device IPv4
+peer, exact operation identity, and a fresh per-request challenge. Durable
+companion replay state resumes an unfinished operation after restart and withholds
+terminal results until they are on disk. A separately derived temporary
+credential can only list/read audio and upload a transcript while that
+LAN claim is active. The transport is still plain HTTP: it authenticates participants and
+limits authorization, but it does not encrypt metadata or payloads and does not
+protect data-plane content from an active on-path attacker. Prefer USB-C outside a
+trusted local network.
 
 The listener opens USB-C only for bounded commands and releases the descriptor
 between its default two-second polls. Use `--serial-port`,
@@ -169,6 +180,8 @@ By default the partner stores data under `~/.pocket-journal`:
 - `audio/<device-id>/`: downloaded WAV files.
 - `transcripts/<device-id>/`: transcript JSON files.
 - `jobs/<device-id>/`: resumable, versioned per-note sync state.
+- `companion/<device-id>.json`: device-initiated generation high-water and exact
+  terminal replay state for the current pairing epoch.
 - `library.sqlite3`: migrated structured index pairing title, WAV, transcript,
   stable device identity, source digest, and sync status.
 - `sync-log.jsonl`: append-only sync results.

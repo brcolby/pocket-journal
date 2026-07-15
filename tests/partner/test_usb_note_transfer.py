@@ -267,9 +267,13 @@ class UsbCompanionControlTests(unittest.TestCase):
             "acknowledged_generation": 3,
             "active_generation": 0,
             "claim_generation": 4,
+            "requested_ms": 4000,
+            "active_requested_ms": 0,
+            "claim_requested_ms": 4000,
             "state": "pending",
             "transport": "none",
             "operation_id": "pj-test-00000004",
+            "total": 0,
             "pending": 0,
             "transferred": 0,
             "failed": 0,
@@ -290,6 +294,7 @@ class UsbCompanionControlTests(unittest.TestCase):
                 return self.response()
             return self.response(
                 active_generation=4,
+                active_requested_ms=4000,
                 state="running",
                 transport="usb",
                 online=True,
@@ -317,22 +322,26 @@ class UsbCompanionControlTests(unittest.TestCase):
         def request(command: str, **kwargs):  # type: ignore[no-untyped-def]
             _ = kwargs
             commands.append(command)
+            failed = command.startswith("PJ_SYNC_FAIL")
             return self.response(
                 request_pending=False,
                 acknowledged_generation=4,
                 claim_generation=0,
-                state="failed" if command.startswith("PJ_SYNC_FAIL") else "succeeded",
+                state="failed" if failed else "succeeded",
                 operation_id="pj-test-00000004",
-                failed=1 if command.startswith("PJ_SYNC_FAIL") else 0,
-                error="noise" if command.startswith("PJ_SYNC_FAIL") else "",
+                total=3 if failed else 2,
+                pending=1 if failed else 0,
+                transferred=1 if failed else 2,
+                failed=1 if failed else 0,
+                error="noise" if failed else "",
             )
 
         client._request = request  # type: ignore[method-assign]
         client.companion_sync_progress(
-            4, "pj-test-00000004", "succeeded", 0, 2, 0
+            4, "pj-test-00000004", "succeeded", 2, 0, 2, 0
         )
         client.companion_sync_progress(
-            4, "pj-test-00000004", "failed", 1, 1, 1, "noise"
+            4, "pj-test-00000004", "failed", 3, 1, 1, 1, "noise"
         )
         self.assertTrue(commands[0].startswith(
             "PJ_SYNC_COMPLETE generation=4 operation_id=pj-test-00000004"

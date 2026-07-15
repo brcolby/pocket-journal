@@ -3140,6 +3140,34 @@ static cJSON *json_read_file(const char *path, size_t max_bytes)
     return json;
 }
 
+static char *text_read_file(const char *path, size_t max_bytes,
+                            size_t *body_size)
+{
+    struct stat st;
+    if (path == NULL || body_size == NULL || stat(path, &st) != 0 ||
+        st.st_size <= 0 || (size_t)st.st_size > max_bytes) {
+        return NULL;
+    }
+    FILE *file = fopen(path, "rb");
+    if (file == NULL) {
+        return NULL;
+    }
+    char *body = malloc((size_t)st.st_size + 1U);
+    if (body == NULL) {
+        fclose(file);
+        return NULL;
+    }
+    size_t read = fread(body, 1, (size_t)st.st_size, file);
+    fclose(file);
+    if (read != (size_t)st.st_size) {
+        free(body);
+        return NULL;
+    }
+    body[read] = '\0';
+    *body_size = read;
+    return body;
+}
+
 static esp_err_t json_write_file_atomic(const char *path, const char *body, size_t body_size)
 {
     char temporary_path[256];
@@ -3264,32 +3292,14 @@ static int transcript_label_for_audio(const char *filename, char *label, size_t 
                                       char *path, size_t path_size)
 {
     transcript_path_for_audio(path, path_size, filename);
-    cJSON *json = json_read_file(path, 8192);
-    if (json == NULL) {
+    size_t body_size = 0U;
+    char *body = text_read_file(path, PJ_TRANSCRIPT_MAX_BODY_BYTES, &body_size);
+    if (body == NULL) {
         return 0;
     }
-    cJSON *text = cJSON_GetObjectItemCaseSensitive(json, "text");
-    if (!cJSON_IsString(text) || text->valuestring == NULL || text->valuestring[0] == '\0') {
-        cJSON_Delete(json);
-        return 0;
-    }
-    size_t used = 0;
-    int pending_space = 0;
-    for (const char *cursor = text->valuestring; *cursor != '\0' && used + 1 < label_size; cursor++) {
-        unsigned char ch = (unsigned char)*cursor;
-        if (isspace(ch)) {
-            pending_space = used > 0;
-            continue;
-        }
-        if (pending_space && used + 1 < label_size) {
-            label[used++] = ' ';
-        }
-        label[used++] = (char)ch;
-        pending_space = 0;
-    }
-    label[used] = '\0';
-    cJSON_Delete(json);
-    return used > 0;
+    int result = pj_transcript_label_extract(body, body_size, label, label_size);
+    free(body);
+    return result;
 }
 
 static void write_recording_metadata(const char *final_path, uint32_t data_bytes)
@@ -7094,7 +7104,12 @@ static int auth_ok(httpd_req_t *req)
         !provisioned_token_read(token, sizeof(token))) {
         return 0;
     }
-    int valid = pj_auth_header_valid(header, token);
+    const char *method = req->method == HTTP_GET ? "GET" :
+                         req->method == HTTP_PUT ? "PUT" :
+                         req->method == HTTP_DELETE ? "DELETE" : "OTHER";
+    int valid = pj_auth_header_valid(header, token) ||
+           pj_board_companion_sync_scoped_auth_valid(header, method,
+                                                      req->uri, token);
     memset(token, 0, sizeof(token));
     return valid;
 }
@@ -7632,9 +7647,17 @@ static int companion_sync_add_json(cJSON *json,
                                    sync->acknowledged_generation) != NULL &&
            cJSON_AddNumberToObject(json, "active_generation",
                                    sync->active_generation) != NULL &&
+           cJSON_AddNumberToObject(json, "requested_ms",
+                                   (double)sync->requested_ms) != NULL &&
+           cJSON_AddNumberToObject(json, "active_requested_ms",
+                                   (double)sync->active_requested_ms) != NULL &&
            cJSON_AddNumberToObject(
                json, "claim_generation",
                pj_companion_sync_state_claim_generation(sync)) != NULL &&
+           cJSON_AddNumberToObject(
+               json, "claim_requested_ms",
+               (double)(sync->active_generation != 0U ?
+                            sync->active_requested_ms : sync->requested_ms)) != NULL &&
            cJSON_AddStringToObject(json, "state",
                                    pj_companion_sync_phase_name(sync->phase)) != NULL &&
            cJSON_AddStringToObject(
@@ -7642,6 +7665,7 @@ static int companion_sync_add_json(cJSON *json,
                pj_companion_sync_transport_name(sync->transport)) != NULL &&
            cJSON_AddStringToObject(json, "operation_id",
                                    sync->operation_id) != NULL &&
+           cJSON_AddNumberToObject(json, "total", sync->total) != NULL &&
            cJSON_AddNumberToObject(json, "pending", sync->pending) != NULL &&
            cJSON_AddNumberToObject(json, "transferred",
                                    sync->transferred) != NULL &&
@@ -7941,9 +7965,10 @@ static void serial_companion_claim(char *line)
 }
 
 static int serial_companion_counts(const pj_usb_sync_args_t *args,
-                                   uint32_t *generation, int *pending,
+                                   uint32_t *generation, int *total, int *pending,
                                    int *transferred, int *failed)
 {
+    uint32_t total_value = 0U;
     uint32_t pending_value = 0U;
     uint32_t transferred_value = 0U;
     uint32_t failed_value = 0U;
@@ -7951,14 +7976,18 @@ static int serial_companion_counts(const pj_usb_sync_args_t *args,
                                  generation) && *generation != 0U &&
            pj_usb_sync_parse_u32(pj_usb_sync_arg(args, "pending"),
                                  &pending_value) &&
+           pj_usb_sync_parse_u32(pj_usb_sync_arg(args, "total"),
+                                 &total_value) &&
            pj_usb_sync_parse_u32(pj_usb_sync_arg(args, "transferred"),
                                  &transferred_value) &&
            pj_usb_sync_parse_u32(pj_usb_sync_arg(args, "failed"),
                                  &failed_value) &&
+           total_value <= (uint32_t)INT_MAX &&
            pending_value <= (uint32_t)INT_MAX &&
            transferred_value <= (uint32_t)INT_MAX &&
            failed_value <= (uint32_t)INT_MAX &&
-           ((*pending = (int)pending_value),
+           ((*total = (int)total_value),
+            (*pending = (int)pending_value),
             (*transferred = (int)transferred_value),
             (*failed = (int)failed_value), 1);
 }
@@ -7967,11 +7996,11 @@ static void serial_companion_progress(char *line, const char *command,
                                       const char *phase, int include_error)
 {
     const char *const progress_allowed[] = {
-        "request_id", "generation", "operation_id", "pending",
+        "request_id", "generation", "operation_id", "total", "pending",
         "transferred", "failed",
     };
     const char *const failure_allowed[] = {
-        "request_id", "generation", "operation_id", "pending",
+        "request_id", "generation", "operation_id", "total", "pending",
         "transferred", "failed", "error_hex",
     };
     const char *const *allowed = include_error ? failure_allowed :
@@ -7989,6 +8018,7 @@ static void serial_companion_progress(char *line, const char *command,
     const char *request_id = pj_usb_sync_arg(&args, "request_id");
     const char *operation_id = pj_usb_sync_arg(&args, "operation_id");
     uint32_t generation = 0U;
+    int total = 0;
     int pending = 0;
     int transferred = 0;
     int failed = 0;
@@ -7996,8 +8026,8 @@ static void serial_companion_progress(char *line, const char *command,
     if (!pj_usb_sync_request_id_valid(request_id) || operation_id == NULL ||
         operation_id[0] == '\0' ||
         strlen(operation_id) >= PJ_COMPANION_SYNC_OPERATION_ID_BYTES ||
-        !serial_companion_counts(&args, &generation, &pending, &transferred,
-                                 &failed)) {
+        !serial_companion_counts(&args, &generation, &total, &pending,
+                                 &transferred, &failed)) {
         serial_sync_error(command, request_id,
                           "invalid sync progress arguments",
                           "invalid_arguments", 0);
@@ -8015,10 +8045,15 @@ static void serial_companion_progress(char *line, const char *command,
             return;
         }
         error[decoded] = '\0';
+        if (!pj_companion_sync_error_valid(error)) {
+            serial_sync_error(command, request_id, "invalid sync error text",
+                              "invalid_arguments", 0);
+            return;
+        }
     }
     pj_companion_sync_state_t sync;
     int result = pj_board_companion_sync_usb_progress(
-        generation, operation_id, phase, pending, transferred, failed,
+        generation, operation_id, phase, total, pending, transferred, failed,
         error, &sync);
     if (result < 0) {
         serial_sync_error(command, request_id,

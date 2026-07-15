@@ -1750,9 +1750,12 @@ static void draw_sync(const pj_ui_context_t *ctx, pj_framebuffer_t *fb)
     const char *status = "IDLE";
     if (strcmp(ctx->sync_phase, "succeeded") == 0) {
         status = "COMPLETE";
-    } else if (strcmp(ctx->sync_phase, "failed") == 0) {
-        status = ctx->sync_request_pending && !ctx->sync_online ?
-                 "OFFLINE" : "FAILED";
+    } else if (strcmp(ctx->sync_phase, "offline") == 0) {
+        status = "OFFLINE";
+    } else if (strcmp(ctx->sync_phase, "failed") == 0 ||
+               strcmp(ctx->sync_phase, "auth_failed") == 0 ||
+               strcmp(ctx->sync_phase, "protocol_failed") == 0) {
+        status = "FAILED";
     } else if (strcmp(ctx->sync_phase, "discovering") == 0 ||
                strcmp(ctx->sync_phase, "requesting") == 0 ||
                strcmp(ctx->sync_phase, "running") == 0) {
@@ -1777,6 +1780,14 @@ static void draw_sync(const pj_ui_context_t *ctx, pj_framebuffer_t *fb)
         }
         message[i] = '\0';
         draw_text_center_at(fb, 100, 171, message, 2);
+    } else if (strcmp(ctx->sync_phase, "auth_failed") == 0) {
+        draw_text_center_at(fb, 100, 171, "AUTH", 2);
+    } else if (strcmp(ctx->sync_phase, "protocol_failed") == 0) {
+        draw_text_center_at(fb, 100, 171, "PROTOCOL", 2);
+    } else if (strcmp(ctx->sync_phase, "failed") == 0) {
+        draw_text_center_at(fb, 100, 171, "TERMINAL", 2);
+    } else if (strcmp(ctx->sync_phase, "offline") == 0) {
+        draw_text_center_at(fb, 100, 171, "NETWORK", 2);
     } else {
         draw_text_center_at(fb, 100, 171,
                             ctx->sync_online ? "CONNECTED" : "WAITING", 2);

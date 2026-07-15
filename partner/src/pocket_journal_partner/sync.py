@@ -378,7 +378,9 @@ def _sync_audio_item(
 
         if upload_transcripts:
             operation = "prepare_upload"
-            device_payload = build_device_transcript_payload(transcript, source, fingerprint)
+            device_payload = build_device_transcript_payload(
+                transcript, source, fingerprint, title=note.title
+            )
             operation = "upload_transcript"
             client.upload_transcript(item.audio_id, device_payload)
             job["stage"] = "uploaded"

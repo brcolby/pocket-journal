@@ -96,6 +96,13 @@ The web library binds only to `127.0.0.1` by default.
 The benchmark command and cross-platform evidence procedure are documented in
 [Transcription Benchmark](transcription-benchmark.md).
 
+`pj companion serve` prefers short-lived USB-C commands and also advertises a
+device-initiated LAN listener. The LAN control plane uses mutual HMAC-SHA256 and a
+fresh request challenge, plus a temporary credential restricted to audio reads
+and transcript writes; it never sends the raw pairing token in a control request.
+Its HTTP transport is not
+encrypted, so use it only on a trusted local network and prefer USB-C elsewhere.
+
 For source-tree runs before installation:
 
 ```sh

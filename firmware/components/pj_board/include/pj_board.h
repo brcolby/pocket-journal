@@ -127,8 +127,12 @@ int pj_board_companion_sync_usb_claim(
     pj_companion_sync_state_t *snapshot);
 int pj_board_companion_sync_usb_progress(
     uint32_t generation, const char *operation_id, const char *phase,
-    int pending, int transferred, int failed, const char *error,
+    int total, int pending, int transferred, int failed, const char *error,
     pj_companion_sync_state_t *snapshot);
+int pj_board_companion_sync_scoped_auth_valid(const char *authorization,
+                                               const char *method,
+                                               const char *uri,
+                                               const char *token);
 int pj_board_consume_companion_sync_update(pj_ui_context_t *ui);
 
 #ifdef __cplusplus

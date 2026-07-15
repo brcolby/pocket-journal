@@ -135,6 +135,7 @@ class SyncTests(unittest.TestCase):
         self.assertTrue(library_note.device_synced)  # type: ignore[union-attr]
         self.assertEqual(transcript["sync"]["cache_key"], job["cache_key"])  # type: ignore[index]
         self.assertNotIn("sync", client.upload_payloads[0])
+        self.assertEqual(client.upload_payloads[0]["title"], "new")
         self.assertLessEqual(
             len(json.dumps(client.upload_payloads[0], separators=(",", ":")).encode()),
             DEVICE_TRANSCRIPT_MAX_BYTES,
