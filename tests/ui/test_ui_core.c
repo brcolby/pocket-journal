@@ -42,6 +42,22 @@ static int count_pixel_differences_in_region(const pj_framebuffer_t *left,
     return count;
 }
 
+static int black_row_span_in_region(const pj_framebuffer_t *fb,
+                                    int y, int height)
+{
+    int first = -1;
+    int last = -1;
+    for (int row = y; row < y + height; row++) {
+        if (count_black_pixels_in_region(fb, 0, row, PJ_DISPLAY_WIDTH, 1) > 0) {
+            if (first < 0) {
+                first = row;
+            }
+            last = row;
+        }
+    }
+    return first < 0 ? 0 : last - first + 1;
+}
+
 static void seed_notes(pj_ui_context_t *ui)
 {
     const char labels[][PJ_UI_NOTE_LABEL_LEN] = {
@@ -487,7 +503,7 @@ static void test_audio_lifecycle_reconciliation(void)
     assert(pj_ui_handle_aux_long(&ui) == 1);
     assert(ui.playback_state == PJ_PLAYBACK_STOPPING);
     assert(ui.playback_exit_pending == 1);
-    assert(pj_ui_current_state(&ui) == PJ_UI_STATE_NOTE_DETAIL);
+    assert(pj_ui_current_state(&ui) == PJ_UI_STATE_LISTEN);
     pj_ui_set_audio_state(&ui, 0, 0);
     assert(ui.playback_state == PJ_PLAYBACK_IDLE);
     assert(ui.playback_exit_pending == 0);
@@ -665,12 +681,14 @@ static void test_timer_presets_are_not_runtime_counters(void)
     ui.state = PJ_UI_STATE_TIMER;
 
     assert(pj_ui_handle_touch(&ui, 150, 177, PJ_TOUCH_TAP) == 1);
-    assert(ui.timer_seconds == 330);
+    assert(ui.timer_seconds == 300);
+    assert(ui.timer_preset_seconds == 330);
+    assert(pj_ui_handle_touch(&ui, 50, 177, PJ_TOUCH_TAP) == 0);
     assert(ui.timer_preset_seconds == 330);
     assert(pj_ui_consume_time_command(&ui, &command) == 1);
     ui.timer_running = 1;
     assert(pj_ui_tick(&ui) == 0);
-    assert(ui.timer_seconds == 330);
+    assert(ui.timer_seconds == 300);
     pj_ui_time_projection_t projection = {
         .timer_running = 1,
         .timer_remaining_ms = 329000,
@@ -692,7 +710,7 @@ static void test_timer_presets_are_not_runtime_counters(void)
     pj_ui_init(&ui);
     ui.state = PJ_UI_STATE_INTERVAL;
     assert(pj_ui_handle_touch(&ui, 150, 177, PJ_TOUCH_TAP) == 1);
-    assert(ui.interval_seconds == 150);
+    assert(ui.interval_seconds == 90);
     assert(ui.interval_preset_seconds == 150);
     assert(pj_ui_consume_time_command(&ui, &command) == 1);
 }
@@ -755,10 +773,15 @@ static void test_timer_geometry_and_adjustment_focus_timeout(void)
     assert(ui.timer_running == 0 && ui.timer_seconds == 300);
 
     assert(pj_ui_handle_touch(&ui, 50, 170, PJ_TOUCH_TAP) == 1);
-    assert(ui.focus_index == 2 && ui.timer_seconds == 270);
+    assert(ui.focus_index == 2 && ui.timer_seconds == 300);
+    assert(ui.timer_preset_seconds == 270);
     assert(pj_ui_consume_time_command(&ui, &command) == 1);
+    projection.timer_remaining_ms = 0;
+    pj_ui_set_time_projection(&ui, &projection);
+    assert(ui.timer_seconds == 0 && ui.timer_preset_seconds == 270);
     assert(pj_ui_handle_touch(&ui, 150, 170, PJ_TOUCH_TAP) == 1);
-    assert(ui.focus_index == 3 && ui.timer_seconds == 300);
+    assert(ui.focus_index == 3 && ui.timer_seconds == 0);
+    assert(ui.timer_preset_seconds == 300);
     assert(pj_ui_consume_time_command(&ui, &command) == 1);
 
     pj_ui_mark_displayed(&ui);
@@ -1189,6 +1212,7 @@ static void test_time_controls_emit_explicit_commands(void)
 
     ui.state = PJ_UI_STATE_TIMER;
     ui.timer_seconds = 86400;
+    ui.timer_preset_seconds = 86400;
     assert(pj_ui_handle_touch(&ui, 150, 177, PJ_TOUCH_TAP) == 1);
     assert(ui.timer_seconds == 86400);
     assert(pj_ui_consume_time_command(&ui, &command) == 1);
@@ -1196,6 +1220,7 @@ static void test_time_controls_emit_explicit_commands(void)
 
     ui.state = PJ_UI_STATE_INTERVAL;
     ui.interval_seconds = 86400;
+    ui.interval_preset_seconds = 86400;
     assert(pj_ui_handle_touch(&ui, 150, 177, PJ_TOUCH_TAP) == 1);
     assert(ui.interval_seconds == 86400);
     assert(pj_ui_consume_time_command(&ui, &command) == 1);
@@ -1233,12 +1258,12 @@ static void test_aux_back_resets_time_pages_before_returning(void)
         assert(pj_ui_consume_time_command(&ui, &command) == 1);
         assert(command.type == cases[i].command);
         if (cases[i].state == PJ_UI_STATE_STOPWATCH) {
-            assert(ui.stopwatch_running == 0 && ui.stopwatch_seconds == 0);
+            assert(ui.stopwatch_running == 1 && ui.stopwatch_seconds == 42);
         } else if (cases[i].state == PJ_UI_STATE_TIMER) {
-            assert(ui.timer_running == 0 && ui.timer_seconds == 90);
+            assert(ui.timer_running == 1 && ui.timer_seconds == 17);
         } else {
-            assert(ui.interval_running == 0 && ui.interval_seconds == 120);
-            assert(ui.interval_round == 0);
+            assert(ui.interval_running == 1 && ui.interval_seconds == 11);
+            assert(ui.interval_round == 4);
         }
     }
 
@@ -1373,6 +1398,12 @@ static void test_sync_render_distinguishes_transport_and_failure_states(void)
     assert(count_pixel_differences_in_region(
                &protocol_failed, &terminal_failed,
                0, 145, PJ_DISPLAY_WIDTH, 55) > 20);
+
+    for (int band = 0; band < 5; band++) {
+        assert(count_black_pixels_in_region(&active, 0, band * 40,
+                                            PJ_DISPLAY_WIDTH, 40) > 100);
+        assert(black_row_span_in_region(&active, band * 40, 40) >= 15);
+    }
 }
 
 static void test_dirty_lifecycle(void)
@@ -1463,6 +1494,131 @@ static void test_recording_elapsed_projection_is_bounded_and_monotonic_by_second
     pj_ui_set_recording_elapsed(&ui, 2000);
     assert(ui.recording_seconds == 2);
     assert(ui.dirty.partial == 1);
+    pj_ui_mark_displayed(&ui);
+    pj_ui_set_recording_elapsed(&ui, 1000);
+    assert(ui.recording_seconds == 2);
+    assert(pj_ui_is_dirty(&ui) == 0);
+
+    ui.record_state = PJ_RECORD_IDLE;
+    pj_ui_set_recording_elapsed(&ui, 0);
+    assert(ui.recording_seconds == 0);
+}
+
+static void test_time_projection_uses_one_hz_model_granularity(void)
+{
+    pj_ui_context_t stopwatch;
+    pj_ui_context_t timer;
+    pj_ui_context_t interval;
+    pj_ui_time_projection_t projection = {0};
+
+    pj_ui_init(&stopwatch);
+    stopwatch.state = PJ_UI_STATE_STOPWATCH;
+    projection.stopwatch_running = 1;
+    projection.stopwatch_elapsed_ms = 1001;
+    pj_ui_set_time_projection(&stopwatch, &projection);
+    assert(stopwatch.stopwatch_seconds == 1);
+    pj_ui_mark_displayed(&stopwatch);
+    projection.stopwatch_elapsed_ms = 1999;
+    pj_ui_set_time_projection(&stopwatch, &projection);
+    assert(stopwatch.stopwatch_seconds == 1 && !pj_ui_is_dirty(&stopwatch));
+    projection.stopwatch_elapsed_ms = 2000;
+    pj_ui_set_time_projection(&stopwatch, &projection);
+    assert(stopwatch.stopwatch_seconds == 2 && pj_ui_is_dirty(&stopwatch));
+
+    memset(&projection, 0, sizeof(projection));
+    pj_ui_init(&timer);
+    timer.state = PJ_UI_STATE_TIMER;
+    projection.timer_running = 1;
+    projection.timer_remaining_ms = 2999;
+    pj_ui_set_time_projection(&timer, &projection);
+    assert(timer.timer_seconds == 3);
+    pj_ui_mark_displayed(&timer);
+    projection.timer_remaining_ms = 2001;
+    pj_ui_set_time_projection(&timer, &projection);
+    assert(timer.timer_seconds == 3 && !pj_ui_is_dirty(&timer));
+    projection.timer_remaining_ms = 2000;
+    pj_ui_set_time_projection(&timer, &projection);
+    assert(timer.timer_seconds == 2 && pj_ui_is_dirty(&timer));
+
+    memset(&projection, 0, sizeof(projection));
+    pj_ui_init(&interval);
+    interval.state = PJ_UI_STATE_INTERVAL;
+    projection.interval_running = 1;
+    projection.interval_remaining_ms = 59999;
+    pj_ui_set_time_projection(&interval, &projection);
+    assert(interval.interval_seconds == 60);
+    pj_ui_mark_displayed(&interval);
+    projection.interval_remaining_ms = 59001;
+    pj_ui_set_time_projection(&interval, &projection);
+    assert(interval.interval_seconds == 60 && !pj_ui_is_dirty(&interval));
+    projection.interval_remaining_ms = 59000;
+    pj_ui_set_time_projection(&interval, &projection);
+    assert(interval.interval_seconds == 59 && pj_ui_is_dirty(&interval));
+}
+
+static void test_time_partial_projection_matches_full_model_render(void)
+{
+    const pj_ui_state_t states[] = {
+        PJ_UI_STATE_STOPWATCH,
+        PJ_UI_STATE_TIMER,
+        PJ_UI_STATE_INTERVAL,
+    };
+    for (size_t i = 0; i < sizeof(states) / sizeof(states[0]); i++) {
+        pj_ui_context_t ui;
+        pj_ui_context_t expected_ui;
+        pj_framebuffer_t actual;
+        pj_framebuffer_t expected;
+        pj_ui_init(&ui);
+        ui.state = states[i];
+        pj_ui_render(&ui, &actual);
+        pj_ui_mark_displayed(&ui);
+
+        pj_ui_time_projection_t projection = {
+            .stopwatch_running = 1,
+            .stopwatch_elapsed_ms = 43000,
+            .timer_running = 1,
+            .timer_remaining_ms = 17000,
+            .interval_running = 1,
+            .interval_remaining_ms = 11000,
+            .interval_phase = 4,
+        };
+        pj_ui_set_time_projection(&ui, &projection);
+        assert(ui.dirty.partial == 1);
+        pj_ui_render(&ui, &actual);
+
+        expected_ui = ui;
+        pj_ui_request_full_refresh(&expected_ui);
+        pj_ui_render(&expected_ui, &expected);
+        assert(memcmp(&actual, &expected, sizeof(actual)) == 0);
+    }
+}
+
+static void test_inactive_time_pages_render_their_durable_presets(void)
+{
+    pj_ui_context_t preset;
+    pj_ui_context_t projected;
+    pj_framebuffer_t preset_fb;
+    pj_framebuffer_t projected_fb;
+
+    pj_ui_init(&preset);
+    pj_ui_init(&projected);
+    preset.state = projected.state = PJ_UI_STATE_TIMER;
+    preset.timer_seconds = 0;
+    preset.timer_preset_seconds = 330;
+    projected.timer_seconds = 330;
+    projected.timer_preset_seconds = 330;
+    pj_ui_render(&preset, &preset_fb);
+    pj_ui_render(&projected, &projected_fb);
+    assert(memcmp(&preset_fb, &projected_fb, sizeof(preset_fb)) == 0);
+
+    preset.state = projected.state = PJ_UI_STATE_INTERVAL;
+    preset.interval_seconds = 0;
+    preset.interval_preset_seconds = 150;
+    projected.interval_seconds = 150;
+    projected.interval_preset_seconds = 150;
+    pj_ui_render(&preset, &preset_fb);
+    pj_ui_render(&projected, &projected_fb);
+    assert(memcmp(&preset_fb, &projected_fb, sizeof(preset_fb)) == 0);
 }
 
 static void test_partial_render_preserves_outside_region(void)
@@ -1575,16 +1731,25 @@ static void test_voice_note_back_paths_are_consistent(void)
     ui.state = PJ_UI_STATE_NOTE_DETAIL;
     ui.playback_state = PJ_PLAYBACK_ACTIVE;
     assert(pj_ui_handle_aux_long(&ui) == 1);
-    assert(ui.state == PJ_UI_STATE_NOTE_DETAIL);
+    assert(ui.state == PJ_UI_STATE_LISTEN);
     assert(ui.playback_state == PJ_PLAYBACK_STOPPING);
     assert(ui.playback_exit_pending == 1);
     pj_ui_set_audio_state(&ui, 0, 0);
     assert(ui.state == PJ_UI_STATE_LISTEN);
 
     pj_ui_init(&ui);
+    ui.state = PJ_UI_STATE_NOTE_DETAIL;
+    ui.playback_state = PJ_PLAYBACK_ACTIVE;
+    assert(pj_ui_handle_aux_short(&ui) == 1);
+    assert(ui.playback_state == PJ_PLAYBACK_STOPPING);
+    assert(pj_ui_handle_aux_long(&ui) == 1);
+    assert(ui.state == PJ_UI_STATE_LISTEN);
+    assert(ui.playback_exit_pending == 1);
+
+    pj_ui_init(&ui);
     ui.state = PJ_UI_STATE_RECORD;
     ui.record_state = PJ_RECORD_ACTIVE;
-    assert(pj_ui_handle_aux_long(&ui) == 1);
+    assert(pj_ui_handle_aux_short(&ui) == 1);
     assert(ui.state == PJ_UI_STATE_HOME);
     assert(ui.record_state == PJ_RECORD_STOPPING);
 }
@@ -1619,6 +1784,15 @@ static void test_note_detail_back_restores_selected_page(void)
     assert(pj_ui_handle_aux_short(&playback) == 1);
     assert(playback.playback_state == PJ_PLAYBACK_ACTIVE);
     assert(pj_ui_handle_aux_long(&playback) == 1);
+    assert(playback.state == PJ_UI_STATE_LISTEN);
+    pj_framebuffer_t returned;
+    pj_framebuffer_t settled;
+    pj_ui_render(&playback, &returned);
+    pj_ui_context_t settled_ui = playback;
+    settled_ui.playback_state = PJ_PLAYBACK_IDLE;
+    settled_ui.playback_exit_pending = 0;
+    pj_ui_render(&settled_ui, &settled);
+    assert(memcmp(&returned, &settled, sizeof(returned)) == 0);
     pj_ui_set_audio_state(&playback, 0, 0);
     assert(playback.state == PJ_UI_STATE_LISTEN);
     assert(playback.note_page == 1 && playback.focus_index == 4);
@@ -1714,6 +1888,75 @@ static void test_text_rendering_is_uppercase_at_the_boundary(void)
     pj_ui_render(&mixed, &mixed_fb);
     pj_ui_render(&upper, &upper_fb);
     assert(memcmp(&mixed_fb, &upper_fb, sizeof(mixed_fb)) == 0);
+}
+
+static void test_audio_note_rows_render_datetime_without_rec_prefix(void)
+{
+    pj_ui_context_t filename;
+    pj_ui_context_t datetime;
+    pj_ui_context_t prefixed;
+    pj_ui_context_t plain;
+    pj_framebuffer_t filename_fb;
+    pj_framebuffer_t datetime_fb;
+    pj_framebuffer_t prefixed_fb;
+    pj_framebuffer_t plain_fb;
+    const char filename_label[][PJ_UI_NOTE_LABEL_LEN] = {
+        "REC 20260715 0833 001",
+    };
+    const char datetime_label[][PJ_UI_NOTE_LABEL_LEN] = {
+        "2026-07-15 08:33",
+    };
+    const char prefixed_label[][PJ_UI_NOTE_LABEL_LEN] = {
+        "REC MORNING IDEA",
+    };
+    const char plain_label[][PJ_UI_NOTE_LABEL_LEN] = {
+        "MORNING IDEA",
+    };
+
+    pj_ui_init(&filename);
+    pj_ui_init(&datetime);
+    pj_ui_init(&prefixed);
+    pj_ui_init(&plain);
+    pj_ui_set_notes(&filename, 1, filename_label);
+    pj_ui_set_notes(&datetime, 1, datetime_label);
+    pj_ui_set_notes(&prefixed, 1, prefixed_label);
+    pj_ui_set_notes(&plain, 1, plain_label);
+    filename.state = datetime.state = prefixed.state = plain.state = PJ_UI_STATE_LISTEN;
+    pj_ui_render(&filename, &filename_fb);
+    pj_ui_render(&datetime, &datetime_fb);
+    pj_ui_render(&prefixed, &prefixed_fb);
+    pj_ui_render(&plain, &plain_fb);
+    assert(memcmp(&filename_fb, &datetime_fb, sizeof(filename_fb)) == 0);
+    assert(memcmp(&prefixed_fb, &plain_fb, sizeof(prefixed_fb)) == 0);
+
+    filename.state = datetime.state = PJ_UI_STATE_READ;
+    pj_ui_render(&filename, &filename_fb);
+    pj_ui_render(&datetime, &datetime_fb);
+    assert(memcmp(&filename_fb, &datetime_fb, sizeof(filename_fb)) != 0);
+}
+
+static void test_alarm_adjustments_are_icon_only(void)
+{
+    const int controls_top = 112;
+    pj_ui_context_t ui;
+    pj_framebuffer_t fb;
+    pj_ui_init(&ui);
+    ui.state = PJ_UI_STATE_ALARM;
+    pj_ui_render(&ui, &fb);
+
+    for (int row = 0; row < 2; row++) {
+        int y = controls_top + row * (PJ_DISPLAY_HEIGHT - controls_top) / 2;
+        int next_y = controls_top +
+            (row + 1) * (PJ_DISPLAY_HEIGHT - controls_top) / 2;
+        assert(count_black_pixels_in_region(&fb, 75, y + 5, 20,
+                                            next_y - y - 10) == 0);
+        assert(count_black_pixels_in_region(&fb, 175, y + 5, 20,
+                                            next_y - y - 10) == 0);
+        assert(count_black_pixels_in_region(&fb, 30, y + 5, 40,
+                                            next_y - y - 10) > 50);
+        assert(count_black_pixels_in_region(&fb, 130, y + 5, 40,
+                                            next_y - y - 10) > 50);
+    }
 }
 
 static void test_compiled_static_art_is_immutable(void)
@@ -1902,6 +2145,9 @@ int main(void)
     test_dirty_lifecycle();
     test_dynamic_updates_force_periodic_full_refresh();
     test_recording_elapsed_projection_is_bounded_and_monotonic_by_seconds();
+    test_time_projection_uses_one_hz_model_granularity();
+    test_time_partial_projection_matches_full_model_render();
+    test_inactive_time_pages_render_their_durable_presets();
     test_partial_render_preserves_outside_region();
     test_record_partial_render_replaces_status_through_bottom_edge();
     test_child_screens_have_no_back_affordance_or_hidden_touch_target();
@@ -1912,6 +2158,8 @@ int main(void)
     test_clock_always_shows_celsius_and_fahrenheit();
     test_settings_labels_stay_inside_quadrant_borders();
     test_text_rendering_is_uppercase_at_the_boundary();
+    test_audio_note_rows_render_datetime_without_rec_prefix();
+    test_alarm_adjustments_are_icon_only();
     test_compiled_static_art_is_immutable();
     test_long_note_label_stays_inside_editorial_row();
     test_note_detail_title_respects_side_margins();

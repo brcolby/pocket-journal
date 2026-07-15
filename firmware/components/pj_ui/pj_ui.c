@@ -687,7 +687,6 @@ static void draw_icon_menu(pj_framebuffer_t *fb, const tile_t *tiles, size_t cou
 
 static void draw_adjustment_controls(pj_framebuffer_t *fb, int top)
 {
-    const char *units[] = {"HR", "HR", "MIN", "MIN"};
     const char *actions[] = {"MINUS", "PLUS", "MINUS", "PLUS"};
     for (int i = 0; i < 4; i++) {
         int column = i % 2;
@@ -697,9 +696,8 @@ static void draw_adjustment_controls(pj_framebuffer_t *fb, int top)
         int y = top + row * (PJ_DISPLAY_HEIGHT - top) / 2;
         int next_y = top + (row + 1) * (PJ_DISPLAY_HEIGHT - top) / 2;
         draw_rect(fb, x, y, next_x - x, next_y - y);
-        draw_icon(fb, actions[i], x + 22, (y + next_y) / 2,
-                  min_int(34, next_y - y - 8));
-        draw_text_center_at(fb, x + 66, (y + next_y) / 2, units[i], 3);
+        draw_icon(fb, actions[i], (x + next_x) / 2, (y + next_y) / 2,
+                  min_int(38, next_y - y - 8));
     }
 }
 
@@ -1006,7 +1004,7 @@ void pj_ui_set_sync_state(pj_ui_context_t *ctx, int pending, int transferred, in
     ctx->sync_transferred = transferred;
     ctx->sync_online = online;
     if (ctx->state == PJ_UI_STATE_SYNC) {
-        mark_partial(ctx, 0, 50, PJ_DISPLAY_WIDTH, 150);
+        mark_partial(ctx, 0, 0, PJ_DISPLAY_WIDTH, PJ_DISPLAY_HEIGHT);
     }
 }
 
@@ -1082,7 +1080,7 @@ void pj_ui_set_audio_state(pj_ui_context_t *ctx, int recording, int playback_act
         if (ctx->state == PJ_UI_STATE_NOTE_DETAIL) {
             restore_selected_note_list(ctx, PJ_UI_STATE_LISTEN);
         } else {
-            set_state(ctx, PJ_UI_STATE_NOTES);
+            mark_full(ctx);
         }
         return;
     }
@@ -1103,6 +1101,9 @@ void pj_ui_set_recording_elapsed(pj_ui_context_t *ctx, uint64_t elapsed_ms)
     }
     uint64_t elapsed_seconds = elapsed_ms / 1000u;
     int seconds = elapsed_seconds > INT_MAX ? INT_MAX : (int)elapsed_seconds;
+    if (ctx->record_state != PJ_RECORD_IDLE && seconds < ctx->recording_seconds) {
+        return;
+    }
     if (ctx->recording_seconds == seconds) {
         return;
     }
@@ -1245,25 +1246,28 @@ static int reset_time_page_and_return(pj_ui_context_t *ctx)
     switch (ctx->state) {
     case PJ_UI_STATE_STOPWATCH:
         command = PJ_UI_TIME_COMMAND_STOPWATCH_RESET;
-        ctx->stopwatch_running = 0;
-        ctx->stopwatch_seconds = 0;
         break;
     case PJ_UI_STATE_TIMER:
         command = PJ_UI_TIME_COMMAND_TIMER_RESET;
-        ctx->timer_running = 0;
-        ctx->timer_seconds = ctx->timer_preset_seconds;
         break;
     case PJ_UI_STATE_INTERVAL:
         command = PJ_UI_TIME_COMMAND_INTERVAL_RESET;
-        ctx->interval_running = 0;
-        ctx->interval_seconds = ctx->interval_preset_seconds;
-        ctx->interval_round = 0;
         break;
     default:
         return 0;
     }
     queue_time_command(ctx, command, 0, 0);
     set_state(ctx, PJ_UI_STATE_TIME);
+    return 1;
+}
+
+static int stop_record_and_return(pj_ui_context_t *ctx)
+{
+    if (ctx->record_state != PJ_RECORD_ACTIVE) {
+        return 0;
+    }
+    ctx->record_state = PJ_RECORD_STOPPING;
+    set_state(ctx, PJ_UI_STATE_HOME);
     return 1;
 }
 
@@ -1277,21 +1281,21 @@ int pj_ui_handle_aux_long(pj_ui_context_t *ctx)
         return reset_time_page_and_return(ctx);
     }
     if (ctx->state == PJ_UI_STATE_RECORD) {
-        if (ctx->record_state != PJ_RECORD_ACTIVE) {
-            return 0;
-        }
-        ctx->record_state = PJ_RECORD_STOPPING;
-        set_state(ctx, PJ_UI_STATE_HOME);
-        return 1;
+        return stop_record_and_return(ctx);
     }
     if ((ctx->state == PJ_UI_STATE_LISTEN || ctx->state == PJ_UI_STATE_NOTE_DETAIL) &&
         ctx->playback_state != PJ_PLAYBACK_IDLE) {
-        if (ctx->playback_state == PJ_PLAYBACK_STOPPING) {
+        if (ctx->playback_state == PJ_PLAYBACK_STOPPING &&
+            ctx->playback_exit_pending) {
             return 0;
         }
         ctx->playback_state = PJ_PLAYBACK_STOPPING;
         ctx->playback_exit_pending = 1;
-        mark_full(ctx);
+        if (ctx->state == PJ_UI_STATE_NOTE_DETAIL) {
+            restore_selected_note_list(ctx, PJ_UI_STATE_LISTEN);
+        } else {
+            set_state(ctx, PJ_UI_STATE_NOTES);
+        }
         return 1;
     }
     if (ctx->state == PJ_UI_STATE_NOTE_DETAIL) {
@@ -1315,6 +1319,9 @@ static int activate_focused_control(pj_ui_context_t *ctx)
         mark_partial(ctx, 0, 0, PJ_DISPLAY_WIDTH, PJ_UI_ALARM_CONTROLS_TOP);
         return 1;
     case PJ_UI_STATE_STOPWATCH:
+        if (ctx->time_command.type != PJ_UI_TIME_COMMAND_NONE) {
+            return 0;
+        }
         queue_time_command(ctx, ctx->focus_index == 1 ?
                            PJ_UI_TIME_COMMAND_STOPWATCH_RESET :
                            (ctx->stopwatch_running ?
@@ -1322,6 +1329,9 @@ static int activate_focused_control(pj_ui_context_t *ctx)
                             PJ_UI_TIME_COMMAND_STOPWATCH_START), 0, 0);
         return 1;
     case PJ_UI_STATE_TIMER:
+        if (ctx->time_command.type != PJ_UI_TIME_COMMAND_NONE) {
+            return 0;
+        }
         if (ctx->focus_index == 0) {
             int seconds = ctx->timer_seconds > 0 ?
                 ctx->timer_seconds : ctx->timer_preset_seconds;
@@ -1333,19 +1343,22 @@ static int activate_focused_control(pj_ui_context_t *ctx)
             queue_time_command(ctx, PJ_UI_TIME_COMMAND_TIMER_RESET, 0, 0);
         } else {
             int delta = ctx->focus_index == 2 ? -30 : 30;
-            ctx->timer_seconds = max_int(30, min_int(PJ_UI_MAX_DURATION_SECONDS,
-                                                     ctx->timer_seconds + delta));
-            ctx->timer_preset_seconds = ctx->timer_seconds;
+            int base = ctx->timer_running ? ctx->timer_seconds : ctx->timer_preset_seconds;
+            int preset = max_int(30, min_int(PJ_UI_MAX_DURATION_SECONDS, base + delta));
             queue_time_command(ctx, ctx->timer_running ?
                                PJ_UI_TIME_COMMAND_TIMER_START :
                                PJ_UI_TIME_COMMAND_TIMER_RESET,
-                               (uint64_t)ctx->timer_seconds * 1000u, 0);
+                               (uint64_t)preset * 1000u, 0);
+            ctx->timer_preset_seconds = preset;
             mark_dynamic_partial(ctx, 0, 0, PJ_DISPLAY_WIDTH,
                                  PJ_UI_TIME_CONTROLS_TOP);
         }
         ctx->focus_idle_ticks = 0;
         return 1;
     case PJ_UI_STATE_INTERVAL:
+        if (ctx->time_command.type != PJ_UI_TIME_COMMAND_NONE) {
+            return 0;
+        }
         if (ctx->focus_index == 0) {
             int seconds = ctx->interval_seconds > 0 ?
                 ctx->interval_seconds : ctx->interval_preset_seconds;
@@ -1358,14 +1371,15 @@ static int activate_focused_control(pj_ui_context_t *ctx)
             queue_time_command(ctx, PJ_UI_TIME_COMMAND_INTERVAL_RESET, 0, 0);
         } else {
             int delta = ctx->focus_index == 2 ? -60 : 60;
-            ctx->interval_seconds = max_int(60, min_int(PJ_UI_MAX_DURATION_SECONDS,
-                                                        ctx->interval_seconds + delta));
-            ctx->interval_preset_seconds = ctx->interval_seconds;
+            int base = ctx->interval_running ?
+                ctx->interval_seconds : ctx->interval_preset_seconds;
+            int preset = max_int(60, min_int(PJ_UI_MAX_DURATION_SECONDS, base + delta));
             queue_time_command(ctx, ctx->interval_running ?
                                PJ_UI_TIME_COMMAND_INTERVAL_START :
                                PJ_UI_TIME_COMMAND_INTERVAL_RESET,
-                               (uint64_t)ctx->interval_seconds * 1000u,
-                               (uint64_t)ctx->interval_preset_seconds * 1000u);
+                               (uint64_t)preset * 1000u,
+                               (uint64_t)preset * 1000u);
+            ctx->interval_preset_seconds = preset;
             mark_dynamic_partial(ctx, 0, 0, PJ_DISPLAY_WIDTH,
                                  PJ_UI_TIME_CONTROLS_TOP);
         }
@@ -1416,16 +1430,24 @@ int pj_ui_handle_aux_short(pj_ui_context_t *ctx)
         ctx->playback_exit_pending = 0;
         mark_full(ctx);
         return 1;
+    case PJ_UI_STATE_RECORD:
+        return stop_record_and_return(ctx);
     case PJ_UI_STATE_ALARM:
         ctx->alarm_on = !ctx->alarm_on;
         mark_partial(ctx, 0, 0, PJ_DISPLAY_WIDTH, PJ_UI_ALARM_CONTROLS_TOP);
         return 1;
     case PJ_UI_STATE_STOPWATCH:
+        if (ctx->time_command.type != PJ_UI_TIME_COMMAND_NONE) {
+            return 0;
+        }
         queue_time_command(ctx, ctx->stopwatch_running ?
                            PJ_UI_TIME_COMMAND_STOPWATCH_PAUSE :
                            PJ_UI_TIME_COMMAND_STOPWATCH_START, 0, 0);
         return 1;
     case PJ_UI_STATE_TIMER: {
+        if (ctx->time_command.type != PJ_UI_TIME_COMMAND_NONE) {
+            return 0;
+        }
         int seconds = ctx->timer_seconds > 0 ?
             ctx->timer_seconds : ctx->timer_preset_seconds;
         queue_time_command(ctx, ctx->timer_running ?
@@ -1436,6 +1458,9 @@ int pj_ui_handle_aux_short(pj_ui_context_t *ctx)
         return 1;
     }
     case PJ_UI_STATE_INTERVAL: {
+        if (ctx->time_command.type != PJ_UI_TIME_COMMAND_NONE) {
+            return 0;
+        }
         int seconds = ctx->interval_seconds > 0 ?
             ctx->interval_seconds : ctx->interval_preset_seconds;
         queue_time_command(ctx, ctx->interval_running ?
@@ -1675,6 +1700,30 @@ static void draw_record(const pj_ui_context_t *ctx, pj_framebuffer_t *fb)
     draw_text_center_at_double(fb, 100, 100, elapsed, 4);
 }
 
+static void audio_note_display_label(char *out, size_t out_size, const char *label)
+{
+    int year = 0;
+    int month = 0;
+    int day = 0;
+    int hour = 0;
+    int minute = 0;
+    int sequence = 0;
+    if (sscanf(label, "REC %4d%2d%2d %2d%2d %d", &year, &month, &day,
+               &hour, &minute, &sequence) == 6 &&
+        year >= 2000 && year <= 2099 && month >= 1 && month <= 12 &&
+        day >= 1 && day <= 31 && hour >= 0 && hour <= 23 &&
+        minute >= 0 && minute <= 59) {
+        (void)sequence;
+        (void)snprintf(out, out_size, "%04d-%02d-%02d %02d:%02d",
+                       year, month, day, hour, minute);
+        return;
+    }
+    while (strncmp(label, "REC ", 4) == 0) {
+        label += 4;
+    }
+    (void)snprintf(out, out_size, "%s", label);
+}
+
 static void draw_notes_list(const pj_ui_context_t *ctx, pj_framebuffer_t *fb, const char *kind)
 {
     if (ctx->note_count <= 0) {
@@ -1688,13 +1737,20 @@ static void draw_notes_list(const pj_ui_context_t *ctx, pj_framebuffer_t *fb, co
         if (note_index >= ctx->note_count) {
             continue;
         }
+        const char *label = ctx->note_labels[note_index][0] != '\0'
+            ? ctx->note_labels[note_index] : "RECORDING";
+        char audio_label[PJ_UI_NOTE_LABEL_LEN];
+        if (strcmp(kind, "AUD") == 0) {
+            audio_note_display_label(audio_label, sizeof(audio_label), label);
+            label = audio_label;
+        }
+        int scale = 4;
+        while (scale > 2 && text_width(label, scale) > 190) {
+            scale--;
+        }
         draw_rect(fb, 0, y, PJ_DISPLAY_WIDTH, next_y - y);
         draw_text_centered_ellipsized(
-            fb, 100, (y + next_y) / 2,
-            ctx->note_labels[note_index][0] != '\0'
-                ? ctx->note_labels[note_index]
-                : "RECORDING",
-            4, 190);
+            fb, 100, (y + next_y) / 2, label, scale, 190);
     }
     draw_rect(fb, 0, PJ_UI_NOTE_PAGER_TOP, PJ_DISPLAY_WIDTH / 2,
               PJ_DISPLAY_HEIGHT - PJ_UI_NOTE_PAGER_TOP);
@@ -1764,33 +1820,43 @@ static void draw_sync(const pj_ui_context_t *ctx, pj_framebuffer_t *fb)
                strcmp(ctx->sync_phase, "pending") == 0) {
         status = "PENDING";
     }
-    draw_text_center_at(fb, 100, 34, status, 4);
-    char text[24];
-    (void)snprintf(text, sizeof(text), "PENDING %d", ctx->sync_pending);
-    draw_text_center_at(fb, 100, 86, text, 3);
-    (void)snprintf(text, sizeof(text), "SENT %d  FAIL %d",
-                   ctx->sync_transferred, ctx->sync_failed);
-    draw_text_center_at(fb, 100, 126, text, 2);
-    if (ctx->sync_error[0] != '\0') {
-        char message[18];
-        size_t i = 0U;
-        for (; i + 1U < sizeof(message) && ctx->sync_error[i] != '\0'; i++) {
-            char ch = ctx->sync_error[i];
-            message[i] = ch >= 'a' && ch <= 'z' ? (char)(ch - 'a' + 'A') : ch;
-        }
-        message[i] = '\0';
-        draw_text_center_at(fb, 100, 171, message, 2);
-    } else if (strcmp(ctx->sync_phase, "auth_failed") == 0) {
-        draw_text_center_at(fb, 100, 171, "AUTH", 2);
+    const char *detail = ctx->sync_online ? "CONNECTED" : "WAITING";
+    if (strcmp(ctx->sync_phase, "auth_failed") == 0) {
+        detail = "AUTH";
     } else if (strcmp(ctx->sync_phase, "protocol_failed") == 0) {
-        draw_text_center_at(fb, 100, 171, "PROTOCOL", 2);
+        detail = "PROTOCOL";
     } else if (strcmp(ctx->sync_phase, "failed") == 0) {
-        draw_text_center_at(fb, 100, 171, "TERMINAL", 2);
+        detail = "TERMINAL";
     } else if (strcmp(ctx->sync_phase, "offline") == 0) {
-        draw_text_center_at(fb, 100, 171, "NETWORK", 2);
-    } else {
-        draw_text_center_at(fb, 100, 171,
-                            ctx->sync_online ? "CONNECTED" : "WAITING", 2);
+        detail = "NETWORK";
+    }
+
+    char pending[24];
+    char sent[24];
+    char failed[24];
+    (void)snprintf(pending, sizeof(pending), "PENDING %d", ctx->sync_pending);
+    (void)snprintf(sent, sizeof(sent), "SENT %d", ctx->sync_transferred);
+    (void)snprintf(failed, sizeof(failed), "FAIL %d", ctx->sync_failed);
+    const char *lines[] = {status, pending, sent, failed, detail};
+    int scale = PJ_FONT_SPACE_MONO_SIZE_COUNT;
+    int band_height = PJ_DISPLAY_HEIGHT / (int)(sizeof(lines) / sizeof(lines[0]));
+    while (scale > 1) {
+        const pj_font_size_t *font = font_size_for_scale(scale);
+        int fits = font->line_height <= band_height - 6;
+        for (size_t i = 0; i < sizeof(lines) / sizeof(lines[0]) && fits; i++) {
+            fits = text_width(lines[i], scale) <= PJ_DISPLAY_WIDTH - 12;
+        }
+        if (fits) {
+            break;
+        }
+        scale--;
+    }
+    for (size_t i = 0; i < sizeof(lines) / sizeof(lines[0]); i++) {
+        int top = (int)i * PJ_DISPLAY_HEIGHT / (int)(sizeof(lines) / sizeof(lines[0]));
+        int bottom = (int)(i + 1u) * PJ_DISPLAY_HEIGHT /
+            (int)(sizeof(lines) / sizeof(lines[0]));
+        draw_text_center_at(fb, PJ_DISPLAY_WIDTH / 2, (top + bottom) / 2,
+                            lines[i], scale);
     }
 }
 
@@ -1883,14 +1949,18 @@ static void render_scene(const pj_ui_context_t *ctx, pj_framebuffer_t *fb)
           draw_icon_controls(fb, actions, 2, PJ_UI_TIME_CONTROLS_TOP, 2); }
         break;
     case PJ_UI_STATE_TIMER:
-        format_duration(text, sizeof(text), ctx->timer_seconds);
+        format_duration(text, sizeof(text),
+                        !ctx->timer_running && ctx->timer_seconds == 0
+                            ? ctx->timer_preset_seconds : ctx->timer_seconds);
         draw_duration_value(fb, 50, text);
         draw_timer_controls(fb, ctx->timer_running ? "PAUSE" : "START");
         break;
     case PJ_UI_STATE_INTERVAL:
         (void)snprintf(text, sizeof(text), "%d", ctx->interval_round);
         draw_text_center_at_double(fb, 100, 20, text, 3);
-        format_duration(text, sizeof(text), ctx->interval_seconds);
+        format_duration(text, sizeof(text),
+                        !ctx->interval_running && ctx->interval_seconds == 0
+                            ? ctx->interval_preset_seconds : ctx->interval_seconds);
         draw_duration_value(fb, 70, text);
         draw_timer_controls(fb, ctx->interval_running ? "PAUSE" : "START");
         break;
