@@ -1,5 +1,6 @@
 #pragma once
 
+#include <stddef.h>
 #include <stdint.h>
 
 #include "pj_ui.h"
@@ -9,6 +10,23 @@ extern "C" {
 #endif
 
 #define PJ_DISPLAY_REFRESH_DEFAULT_PARTIAL_LIMIT 30u
+#define PJ_DISPLAY_PARTIAL_CURRENT_RAM_COMMAND UINT8_C(0x24)
+#define PJ_DISPLAY_PARTIAL_PREVIOUS_RAM_COMMAND UINT8_C(0x26)
+
+typedef int (*pj_display_partial_position_fn)(void *context);
+typedef int (*pj_display_partial_command_fn)(void *context, uint8_t command);
+typedef int (*pj_display_partial_write_fn)(void *context,
+                                           const uint8_t *data,
+                                           size_t length);
+typedef int (*pj_display_partial_activate_fn)(void *context);
+
+typedef struct {
+    void *context;
+    pj_display_partial_position_fn position;
+    pj_display_partial_command_fn command;
+    pj_display_partial_write_fn write;
+    pj_display_partial_activate_fn activate;
+} pj_display_partial_plane_io_t;
 
 typedef enum {
     PJ_DISPLAY_REFRESH_NOOP = 0,
@@ -76,6 +94,10 @@ int pj_display_refresh_complete(pj_display_refresh_policy_t *policy,
                                 int success,
                                 uint32_t latency_us,
                                 uint32_t busy_time_us);
+int pj_display_refresh_commit_partial_planes(
+    const pj_display_partial_plane_io_t *io,
+    const uint8_t *current,
+    size_t length);
 
 #ifdef __cplusplus
 }

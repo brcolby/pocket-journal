@@ -2867,6 +2867,38 @@ static int framebuffer_region_to_epd(const pj_framebuffer_t *fb, const pj_ui_dir
     return bytes_per_row * height;
 }
 
+typedef struct {
+    uint16_t x;
+    uint16_t y;
+} epd_partial_plane_context_t;
+
+static int epd_partial_position(void *opaque)
+{
+    const epd_partial_plane_context_t *context = opaque;
+    return epd_set_cursor(context->x, context->y);
+}
+
+static int epd_partial_command(void *opaque, uint8_t command)
+{
+    (void)opaque;
+    return epd_send_command(command);
+}
+
+static int epd_partial_write(void *opaque, const uint8_t *data, size_t length)
+{
+    (void)opaque;
+    if (length > INT_MAX) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+    return epd_write_bytes(data, (int)length);
+}
+
+static int epd_partial_activate(void *opaque)
+{
+    (void)opaque;
+    return epd_turn_on_display_part();
+}
+
 static esp_err_t epd_refresh_partial(const pj_framebuffer_t *framebuffer,
                                      const pj_display_refresh_plan_t *plan)
 {
@@ -2891,21 +2923,27 @@ static esp_err_t epd_refresh_partial(const pj_framebuffer_t *framebuffer,
     }
     ESP_RETURN_ON_ERROR(epd_prepare_partial(), TAG,
                         "display partial mode preparation failed");
-    ESP_LOGI(TAG, "Display partial refresh x=%d y=%d w=%d h=%d bytes=%d ram=0x24",
+    ESP_LOGI(TAG, "Display partial refresh x=%d y=%d w=%d h=%d bytes=%d ram=0x24->0x26",
              x0, y0, x1 - x0 + 1, y1 - y0 + 1, byte_len);
     ESP_RETURN_ON_ERROR(epd_set_windows((uint16_t)x0, mem_y_start,
                                         (uint16_t)x1, mem_y_end),
                         TAG, "display partial window failed");
-    ESP_RETURN_ON_ERROR(epd_set_cursor((uint16_t)(x0 >> 3), mem_y_start),
-                        TAG, "display partial cursor failed");
-    /* The full/base refresh seeds RAM 0x24 and 0x26. Rewriting 0x26 for
-     * each patch causes global contrast shifts on this panel revision. */
-    ESP_RETURN_ON_ERROR(epd_send_command(0x24), TAG,
-                        "display partial RAM command failed");
-    ESP_RETURN_ON_ERROR(epd_write_bytes(g_epd_buffer, byte_len), TAG,
-                        "display partial RAM transfer failed");
-    ESP_RETURN_ON_ERROR(epd_turn_on_display_part(), TAG,
-                        "display partial activation failed");
+    epd_partial_plane_context_t context = {
+        .x = (uint16_t)(x0 >> 3),
+        .y = mem_y_start,
+    };
+    const pj_display_partial_plane_io_t io = {
+        .context = &context,
+        .position = epd_partial_position,
+        .command = epd_partial_command,
+        .write = epd_partial_write,
+        .activate = epd_partial_activate,
+    };
+    esp_err_t result = (esp_err_t)pj_display_refresh_commit_partial_planes(
+        &io, g_epd_buffer, (size_t)byte_len);
+    if (result != ESP_OK) {
+        return result;
+    }
     return ESP_OK;
 }
 

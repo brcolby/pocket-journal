@@ -74,7 +74,7 @@ static void test_changed_bounds_are_tight_and_byte_aligned(void)
     assert(plan.region.x == 8 && plan.region.y == 10);
     assert(plan.region.width == 16 && plan.region.height == 3);
     assert(plan.changed_pixels == 2);
-    assert(plan.transfer_bytes == 6);
+    assert(plan.transfer_bytes == 12);
 }
 
 static void test_invalid_shadow_and_cadence_promote_to_full(void)
@@ -211,6 +211,162 @@ static void test_partial_refresh_cannot_establish_an_invalid_shadow(void)
     assert(policy.metrics.applied_partial == 0);
 }
 
+typedef enum {
+    TEST_EVENT_POSITION = 1,
+    TEST_EVENT_CURRENT_COMMAND,
+    TEST_EVENT_CURRENT_WRITE,
+    TEST_EVENT_ACTIVATE,
+    TEST_EVENT_PREVIOUS_COMMAND,
+    TEST_EVENT_PREVIOUS_WRITE,
+} test_event_t;
+
+typedef struct {
+    test_event_t events[32];
+    size_t event_count;
+    uint8_t selected_command;
+    uint8_t current_plane[4];
+    uint8_t previous_plane[4];
+    uint8_t activated_current[4];
+    uint8_t activated_previous[4];
+    size_t activation_count;
+    size_t operation_count;
+    size_t fail_operation;
+} fake_partial_controller_t;
+
+static int fake_operation(fake_partial_controller_t *controller)
+{
+    controller->operation_count++;
+    return controller->fail_operation == controller->operation_count ? 73 : 0;
+}
+
+static int fake_position(void *opaque)
+{
+    fake_partial_controller_t *controller = opaque;
+    controller->events[controller->event_count++] = TEST_EVENT_POSITION;
+    return fake_operation(controller);
+}
+
+static int fake_command(void *opaque, uint8_t command)
+{
+    fake_partial_controller_t *controller = opaque;
+    controller->selected_command = command;
+    controller->events[controller->event_count++] =
+        command == PJ_DISPLAY_PARTIAL_CURRENT_RAM_COMMAND ?
+            TEST_EVENT_CURRENT_COMMAND : TEST_EVENT_PREVIOUS_COMMAND;
+    return fake_operation(controller);
+}
+
+static int fake_write(void *opaque, const uint8_t *data, size_t length)
+{
+    fake_partial_controller_t *controller = opaque;
+    assert(length == sizeof(controller->current_plane));
+    if (controller->selected_command == PJ_DISPLAY_PARTIAL_CURRENT_RAM_COMMAND) {
+        controller->events[controller->event_count++] = TEST_EVENT_CURRENT_WRITE;
+        memcpy(controller->current_plane, data, length);
+    } else {
+        assert(controller->selected_command == PJ_DISPLAY_PARTIAL_PREVIOUS_RAM_COMMAND);
+        controller->events[controller->event_count++] = TEST_EVENT_PREVIOUS_WRITE;
+        memcpy(controller->previous_plane, data, length);
+    }
+    return fake_operation(controller);
+}
+
+static int fake_activate(void *opaque)
+{
+    fake_partial_controller_t *controller = opaque;
+    controller->events[controller->event_count++] = TEST_EVENT_ACTIVATE;
+    memcpy(controller->activated_current, controller->current_plane,
+           sizeof(controller->current_plane));
+    memcpy(controller->activated_previous, controller->previous_plane,
+           sizeof(controller->previous_plane));
+    controller->activation_count++;
+    return fake_operation(controller);
+}
+
+static pj_display_partial_plane_io_t fake_io(fake_partial_controller_t *controller)
+{
+    return (pj_display_partial_plane_io_t) {
+        .context = controller,
+        .position = fake_position,
+        .command = fake_command,
+        .write = fake_write,
+        .activate = fake_activate,
+    };
+}
+
+static void assert_partial_event_sequence(const fake_partial_controller_t *controller,
+                                          size_t offset)
+{
+    const test_event_t expected[] = {
+        TEST_EVENT_POSITION,
+        TEST_EVENT_CURRENT_COMMAND,
+        TEST_EVENT_CURRENT_WRITE,
+        TEST_EVENT_ACTIVATE,
+        TEST_EVENT_POSITION,
+        TEST_EVENT_PREVIOUS_COMMAND,
+        TEST_EVENT_PREVIOUS_WRITE,
+    };
+    assert(controller->event_count >= offset + sizeof(expected) / sizeof(expected[0]));
+    assert(memcmp(&controller->events[offset], expected, sizeof(expected)) == 0);
+}
+
+static void test_partial_plane_commit_advances_previous_after_activation(void)
+{
+    fake_partial_controller_t controller;
+    memset(&controller, 0, sizeof(controller));
+    memset(controller.current_plane, 0xff, sizeof(controller.current_plane));
+    memset(controller.previous_plane, 0xff, sizeof(controller.previous_plane));
+    pj_display_partial_plane_io_t io = fake_io(&controller);
+
+    const uint8_t first[] = {0xf0, 0x0f, 0xaa, 0x55};
+    assert(pj_display_refresh_commit_partial_planes(
+               &io, first, sizeof(first)) == 0);
+    assert_partial_event_sequence(&controller, 0);
+    assert(controller.activation_count == 1);
+    assert(memcmp(controller.activated_previous,
+                  (uint8_t[]) {0xff, 0xff, 0xff, 0xff}, sizeof(first)) == 0);
+    assert(memcmp(controller.activated_current, first, sizeof(first)) == 0);
+    assert(memcmp(controller.previous_plane, first, sizeof(first)) == 0);
+
+    const uint8_t second[] = {0x0f, 0xf0, 0x55, 0xaa};
+    assert(pj_display_refresh_commit_partial_planes(
+               &io, second, sizeof(second)) == 0);
+    assert_partial_event_sequence(&controller, 7);
+    assert(controller.activation_count == 2);
+    assert(memcmp(controller.activated_previous, first, sizeof(first)) == 0);
+    assert(memcmp(controller.activated_current, second, sizeof(second)) == 0);
+    assert(memcmp(controller.previous_plane, second, sizeof(second)) == 0);
+}
+
+static void test_partial_plane_commit_fails_before_advancing_previous(void)
+{
+    fake_partial_controller_t controller;
+    memset(&controller, 0, sizeof(controller));
+    memset(controller.previous_plane, 0xa5, sizeof(controller.previous_plane));
+    controller.fail_operation = 4;
+    pj_display_partial_plane_io_t io = fake_io(&controller);
+    const uint8_t current[] = {1, 2, 3, 4};
+
+    assert(pj_display_refresh_commit_partial_planes(
+               &io, current, sizeof(current)) == 73);
+    assert(controller.event_count == 4);
+    assert(controller.events[3] == TEST_EVENT_ACTIVATE);
+    assert(memcmp(controller.previous_plane,
+                  (uint8_t[]) {0xa5, 0xa5, 0xa5, 0xa5}, sizeof(current)) == 0);
+
+    memset(&controller, 0, sizeof(controller));
+    memset(controller.previous_plane, 0x5a, sizeof(controller.previous_plane));
+    controller.fail_operation = 6;
+    io = fake_io(&controller);
+    assert(pj_display_refresh_commit_partial_planes(
+               &io, current, sizeof(current)) == 73);
+    assert(controller.event_count == 6);
+    assert(controller.events[4] == TEST_EVENT_POSITION);
+    assert(controller.events[5] == TEST_EVENT_PREVIOUS_COMMAND);
+    assert(memcmp(controller.previous_plane,
+                  (uint8_t[]) {0x5a, 0x5a, 0x5a, 0x5a}, sizeof(current)) == 0);
+}
+
 int main(void)
 {
     test_region_clips_and_aligns();
@@ -221,6 +377,8 @@ int main(void)
     test_failed_refresh_records_error_without_advancing_cadence();
     test_successful_refresh_atomically_updates_shadow_and_metrics();
     test_partial_refresh_cannot_establish_an_invalid_shadow();
+    test_partial_plane_commit_advances_previous_after_activation();
+    test_partial_plane_commit_fails_before_advancing_previous();
     puts("display refresh tests passed");
     return 0;
 }
