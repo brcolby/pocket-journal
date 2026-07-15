@@ -1010,6 +1010,31 @@ void pj_ui_set_sync_state(pj_ui_context_t *ctx, int pending, int transferred, in
     }
 }
 
+void pj_ui_set_sync_detail(pj_ui_context_t *ctx, const char *phase, int failed,
+                           const char *error, int request_pending)
+{
+    if (ctx == NULL) {
+        return;
+    }
+    failed = failed < 0 ? 0 : failed;
+    request_pending = request_pending != 0;
+    const char *safe_phase = phase == NULL ? "idle" : phase;
+    const char *safe_error = error == NULL ? "" : error;
+    if (ctx->sync_failed == failed &&
+        ctx->sync_request_pending == request_pending &&
+        strcmp(ctx->sync_phase, safe_phase) == 0 &&
+        strcmp(ctx->sync_error, safe_error) == 0) {
+        return;
+    }
+    ctx->sync_failed = failed;
+    ctx->sync_request_pending = request_pending;
+    (void)snprintf(ctx->sync_phase, sizeof(ctx->sync_phase), "%s", safe_phase);
+    (void)snprintf(ctx->sync_error, sizeof(ctx->sync_error), "%s", safe_error);
+    if (ctx->state == PJ_UI_STATE_SYNC) {
+        mark_partial(ctx, 0, 0, PJ_DISPLAY_WIDTH, PJ_DISPLAY_HEIGHT);
+    }
+}
+
 void pj_ui_set_time(pj_ui_context_t *ctx, int hour, int minute, int year, int month, int day)
 {
     if (ctx->hour == hour && ctx->minute == minute && ctx->year == year && ctx->month == month && ctx->day == day) {
@@ -1722,12 +1747,40 @@ static void draw_volume(const pj_ui_context_t *ctx, pj_framebuffer_t *fb)
 
 static void draw_sync(const pj_ui_context_t *ctx, pj_framebuffer_t *fb)
 {
-    char text[20];
+    const char *status = "IDLE";
+    if (strcmp(ctx->sync_phase, "succeeded") == 0) {
+        status = "COMPLETE";
+    } else if (strcmp(ctx->sync_phase, "failed") == 0) {
+        status = ctx->sync_request_pending && !ctx->sync_online ?
+                 "OFFLINE" : "FAILED";
+    } else if (strcmp(ctx->sync_phase, "discovering") == 0 ||
+               strcmp(ctx->sync_phase, "requesting") == 0 ||
+               strcmp(ctx->sync_phase, "running") == 0) {
+        status = "ACTIVE";
+    } else if (ctx->sync_request_pending ||
+               strcmp(ctx->sync_phase, "pending") == 0) {
+        status = "PENDING";
+    }
+    draw_text_center_at(fb, 100, 34, status, 4);
+    char text[24];
     (void)snprintf(text, sizeof(text), "PENDING %d", ctx->sync_pending);
-    draw_text_center_at(fb, 100, 75, text, 4);
-    (void)snprintf(text, sizeof(text), "SENT %d", ctx->sync_transferred);
-    draw_text_center_at(fb, 100, 125, text, 4);
-    draw_text_center_at(fb, 100, 175, ctx->sync_online ? "ONLINE" : "OFFLINE", 4);
+    draw_text_center_at(fb, 100, 86, text, 3);
+    (void)snprintf(text, sizeof(text), "SENT %d  FAIL %d",
+                   ctx->sync_transferred, ctx->sync_failed);
+    draw_text_center_at(fb, 100, 126, text, 2);
+    if (ctx->sync_error[0] != '\0') {
+        char message[18];
+        size_t i = 0U;
+        for (; i + 1U < sizeof(message) && ctx->sync_error[i] != '\0'; i++) {
+            char ch = ctx->sync_error[i];
+            message[i] = ch >= 'a' && ch <= 'z' ? (char)(ch - 'a' + 'A') : ch;
+        }
+        message[i] = '\0';
+        draw_text_center_at(fb, 100, 171, message, 2);
+    } else {
+        draw_text_center_at(fb, 100, 171,
+                            ctx->sync_online ? "CONNECTED" : "WAITING", 2);
+    }
 }
 
 static void format_hms(char *out, size_t out_size, int seconds)

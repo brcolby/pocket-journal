@@ -12,6 +12,11 @@ import sys
 import webbrowser
 
 from .ble import provision_wifi
+from .companion import (
+    DEFAULT_COMPANION_HOST,
+    DEFAULT_COMPANION_PORT,
+    CompanionService,
+)
 from .config import DeviceProfile, load_config, save_config
 from .device import (
     DeviceClient,
@@ -28,7 +33,12 @@ from .operations import DeviceSession
 from .ota import inspect_firmware_bundle, ota_preflight, ota_status, stream_firmware_image, wait_for_ota_result
 from .storage import PartnerStore
 from .sync import sync_device_audio
-from .transcription import FakeTranscriptionBackend, WhisperCppTranscriptionBackend, backend_from_name
+from .transcription import (
+    FakeTranscriptionBackend,
+    TranscriptionBackend,
+    WhisperCppTranscriptionBackend,
+    backend_from_name,
+)
 from .transcription_benchmark import (
     BenchmarkManifestError,
     benchmark_manifest,
@@ -333,19 +343,7 @@ def _sync_session_from_args(args: argparse.Namespace) -> DeviceSession:
 
 def cmd_sync(args: argparse.Namespace) -> int:
     store = PartnerStore(Path(args.data_dir) if args.data_dir else None)
-    try:
-        backend = backend_from_name(
-            args.backend,
-            model_path=getattr(args, "model", None),
-            executable=getattr(args, "whisper_executable", None),
-            threads=getattr(args, "threads", None),
-        )
-    except ValueError as exc:
-        raise DeviceError(str(exc)) from exc
-    if isinstance(backend, WhisperCppTranscriptionBackend):
-        availability = backend.availability()
-        if not availability["available"]:
-            raise DeviceError("; ".join(availability["issues"]))
+    backend = _backend_from_args(args)
     session = _sync_session_from_args(args)
     session.require("audio.sync")
     upload_transcripts = not isinstance(backend, FakeTranscriptionBackend)
@@ -373,6 +371,77 @@ def cmd_sync(args: argparse.Namespace) -> int:
         "dry_run": not upload_transcripts,
     }))
     return 1 if failed_count else 0
+
+
+def _backend_from_args(args: argparse.Namespace) -> TranscriptionBackend:
+    try:
+        backend = backend_from_name(
+            args.backend,
+            model_path=getattr(args, "model", None),
+            executable=getattr(args, "whisper_executable", None),
+            threads=getattr(args, "threads", None),
+        )
+    except ValueError as exc:
+        raise DeviceError(str(exc)) from exc
+    if isinstance(backend, WhisperCppTranscriptionBackend):
+        availability = backend.availability()
+        if not availability["available"]:
+            raise DeviceError("; ".join(availability["issues"]))
+    return backend
+
+
+def _companion_profile_from_args(args: argparse.Namespace) -> DeviceProfile:
+    data_dir = Path(args.data_dir) if args.data_dir else None
+    config = load_config(data_dir)
+    if args.device:
+        profile = config.devices.get(args.device)
+        if profile is None:
+            raise DeviceError(f"paired device {args.device} was not found in partner config")
+        if not profile.token:
+            raise DeviceError(f"paired device {args.device} has no bearer token; provision it again")
+        return profile
+    profiles = [profile for profile in config.devices.values() if profile.token]
+    if len(profiles) == 1:
+        return profiles[0]
+    if not profiles:
+        raise DeviceError("no paired device with a bearer token is configured; provision a device first")
+    raise DeviceError(
+        "multiple paired devices are configured; pass --device: "
+        + ", ".join(sorted(profile.device_id for profile in profiles))
+    )
+
+
+def cmd_companion_serve(args: argparse.Namespace) -> int:
+    if args.backend == "fake":
+        raise DeviceError("the companion listener requires an upload-capable transcription backend")
+    profile = _companion_profile_from_args(args)
+    backend = _backend_from_args(args)
+    data_dir = Path(args.data_dir) if args.data_dir else None
+    try:
+        service = CompanionService(
+            profile,
+            PartnerStore(data_dir),
+            backend,
+            host=args.host,
+            port=args.port,
+            advertise_addresses=args.advertise_address,
+            advertise=not args.no_mdns,
+            usb=not args.no_usb,
+            serial_port=args.serial_port,
+            usb_poll_interval=args.usb_poll_interval,
+        )
+    except (OSError, OverflowError, ValueError) as exc:
+        raise DeviceError(f"companion listener could not start: {exc}") from exc
+    print(
+        f"Pocket Journal companion for {profile.device_id} serving USB-C and LAN on "
+        f"{args.host}:{service.port}",
+        file=sys.stderr,
+    )
+    try:
+        service.serve_forever()
+    except (RuntimeError, ValueError) as exc:
+        raise DeviceError(str(exc)) from exc
+    return 0
 
 
 def _library_from_args(args: argparse.Namespace) -> NoteLibrary:
@@ -758,7 +827,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(
         dest="command",
         required=True,
-        metavar="{provision,discover,device,firmware,sync,library,transcription,settings,recordings}",
+        metavar="{provision,discover,device,firmware,sync,companion,library,transcription,settings,recordings}",
     )
 
     provision = sub.add_parser("provision", help="provision Wi-Fi over USB-C (default) or BLE")
@@ -919,6 +988,41 @@ def build_parser() -> argparse.ArgumentParser:
     sync.add_argument("--reprocess", action="store_true", help="reprocess notes already marked synced")
     sync.add_argument("--data-dir")
     sync.set_defaults(func=cmd_sync)
+
+    companion = sub.add_parser("companion", help="run the USB-C and LAN companion for device-initiated sync")
+    companion_sub = companion.add_subparsers(dest="companion_command", required=True)
+    companion_serve = companion_sub.add_parser(
+        "serve", help="advertise and process authenticated sync requests"
+    )
+    companion_serve.add_argument("--device", help="paired device id; required when config has multiple devices")
+    companion_serve.add_argument("--data-dir")
+    companion_serve.add_argument("--host", default=DEFAULT_COMPANION_HOST)
+    companion_serve.add_argument("--port", type=int, default=DEFAULT_COMPANION_PORT)
+    companion_serve.add_argument(
+        "--serial-port", help="USB-C serial port; auto-detected on each poll when omitted"
+    )
+    companion_serve.add_argument(
+        "--usb-poll-interval", type=float, default=2.0,
+        help="bounded USB-C request poll interval in seconds (0.25 to 60)",
+    )
+    companion_serve.add_argument(
+        "--no-usb", action="store_true", help="disable USB-C polling (diagnostics only)"
+    )
+    companion_serve.add_argument(
+        "--advertise-address",
+        action="append",
+        help="IPv4 address to advertise over mDNS; repeat for multiple interfaces",
+    )
+    companion_serve.add_argument(
+        "--no-mdns", action="store_true", help="listen without mDNS advertisement (diagnostics only)"
+    )
+    companion_serve.add_argument(
+        "--backend", choices=["whisper-cpp", "hf"], default="whisper-cpp"
+    )
+    companion_serve.add_argument("--model", help="local whisper.cpp model path; or set PJ_WHISPER_MODEL")
+    companion_serve.add_argument("--whisper-executable", help="whisper.cpp executable; or set PJ_WHISPER_CPP")
+    companion_serve.add_argument("--threads", type=int)
+    companion_serve.set_defaults(func=cmd_companion_serve)
 
     library = sub.add_parser("library", help="browse and edit the local audio and transcript library")
     library_sub = library.add_subparsers(dest="library_command", required=True)

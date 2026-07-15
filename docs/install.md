@@ -86,6 +86,7 @@ and point the partner at it without an implicit model download:
 pj transcription status --model /models/ggml-base.en-q5_0.bin --digest
 pj transcription benchmark --manifest /path/to/manifest.json --model /models/ggml-base.en-q5_0.bin --output /path/to/report.json
 pj sync --model /models/ggml-base.en-q5_0.bin
+pj companion serve --model /models/ggml-base.en-q5_0.bin
 pj library tui
 pj library serve
 ```

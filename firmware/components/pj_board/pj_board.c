@@ -7617,6 +7617,39 @@ static void serial_print_json(const char *prefix, cJSON *json)
     cJSON_free(encoded);
 }
 
+static int companion_sync_add_json(cJSON *json,
+                                   const pj_companion_sync_state_t *sync)
+{
+    if (json == NULL || sync == NULL) {
+        return 0;
+    }
+    return cJSON_AddBoolToObject(
+               json, "request_pending",
+               pj_companion_sync_state_pending(sync)) != NULL &&
+           cJSON_AddNumberToObject(json, "requested_generation",
+                                   sync->requested_generation) != NULL &&
+           cJSON_AddNumberToObject(json, "acknowledged_generation",
+                                   sync->acknowledged_generation) != NULL &&
+           cJSON_AddNumberToObject(json, "active_generation",
+                                   sync->active_generation) != NULL &&
+           cJSON_AddNumberToObject(
+               json, "claim_generation",
+               pj_companion_sync_state_claim_generation(sync)) != NULL &&
+           cJSON_AddStringToObject(json, "state",
+                                   pj_companion_sync_phase_name(sync->phase)) != NULL &&
+           cJSON_AddStringToObject(
+               json, "transport",
+               pj_companion_sync_transport_name(sync->transport)) != NULL &&
+           cJSON_AddStringToObject(json, "operation_id",
+                                   sync->operation_id) != NULL &&
+           cJSON_AddNumberToObject(json, "pending", sync->pending) != NULL &&
+           cJSON_AddNumberToObject(json, "transferred",
+                                   sync->transferred) != NULL &&
+           cJSON_AddNumberToObject(json, "failed", sync->failed) != NULL &&
+           cJSON_AddBoolToObject(json, "online", sync->online != 0) != NULL &&
+           cJSON_AddStringToObject(json, "error", sync->error) != NULL;
+}
+
 static void serial_print_status(const char *request_id)
 {
     int pending_sync = 0;
@@ -7644,8 +7677,13 @@ static void serial_print_status(const char *request_id)
     cJSON_AddStringToObject(json, "ip", status.ip_addr);
     cJSON_AddNumberToObject(json, "pending_sync", pending_sync);
     cJSON_AddNumberToObject(json, "transferred_sync", transferred_sync);
+    pj_companion_sync_state_t companion_sync;
+    cJSON *companion_json = cJSON_AddObjectToObject(json, "companion_sync");
+    int companion_ok = pj_board_companion_sync_snapshot(&companion_sync) &&
+                       companion_sync_add_json(companion_json,
+                                               &companion_sync);
     storage_wipe_snapshot_t wipe = storage_wipe_snapshot();
-    if (!capabilities_add_json(json, 0) ||
+    if (!companion_ok || !capabilities_add_json(json, 0) ||
         !runtime_identity_add_json(json) ||
         !wipe_status_add_json(json, &wipe.current) ||
         !wipe_history_add_json(json, wipe.history, wipe.history_count) ||
@@ -7803,6 +7841,198 @@ static cJSON *serial_sync_response(const char *command, const char *request_id)
         cJSON_AddStringToObject(json, "request_id", request_id);
     }
     return json;
+}
+
+static int serial_settings_args_exact(const pj_usb_sync_args_t *args,
+                                      const char *const *allowed,
+                                      size_t allowed_count);
+
+static void serial_companion_response(
+    const char *command, const char *request_id,
+    const pj_companion_sync_state_t *sync, const char *claim_result,
+    int replayed)
+{
+    cJSON *json = serial_sync_response(command, request_id);
+    pj_board_status_t status = pj_board_status();
+    if (json == NULL ||
+        cJSON_AddStringToObject(json, "device_id", status.device_id) == NULL ||
+        !companion_sync_add_json(json, sync) ||
+        (claim_result != NULL &&
+         cJSON_AddStringToObject(json, "claim_result", claim_result) == NULL) ||
+        cJSON_AddBoolToObject(json, "replayed", replayed != 0) == NULL) {
+        cJSON_Delete(json);
+        serial_sync_error(command, request_id,
+                          "sync state response allocation failed",
+                          "out_of_memory", 1);
+        return;
+    }
+    serial_print_json("PJ_OK", json);
+    cJSON_Delete(json);
+}
+
+static void serial_companion_status(char *line)
+{
+    const char *command = "PJ_SYNC_STATUS";
+    const char *const allowed[] = {"request_id"};
+    pj_usb_sync_args_t args;
+    if (!pj_usb_sync_parse_args(line, command, &args) ||
+        !serial_settings_args_exact(&args, allowed,
+                                    sizeof(allowed) / sizeof(allowed[0]))) {
+        serial_sync_error(command, NULL, "invalid sync status arguments",
+                          "invalid_arguments", 0);
+        return;
+    }
+    const char *request_id = pj_usb_sync_arg(&args, "request_id");
+    pj_companion_sync_state_t sync;
+    if (!pj_usb_sync_request_id_valid(request_id)) {
+        serial_sync_error(command, request_id, "invalid sync request id",
+                          "invalid_arguments", 0);
+    } else if (!pj_board_companion_sync_snapshot(&sync)) {
+        serial_sync_error(command, request_id, "sync state unavailable",
+                          "sync_state_unavailable", 1);
+    } else {
+        serial_companion_response(command, request_id, &sync, NULL, 0);
+    }
+}
+
+static void serial_companion_claim(char *line)
+{
+    const char *command = "PJ_SYNC_CLAIM";
+    const char *const allowed[] = {
+        "request_id", "generation", "operation_id",
+    };
+    pj_usb_sync_args_t args;
+    if (!pj_usb_sync_parse_args(line, command, &args) ||
+        !serial_settings_args_exact(&args, allowed,
+                                    sizeof(allowed) / sizeof(allowed[0]))) {
+        serial_sync_error(command, NULL, "invalid sync claim arguments",
+                          "invalid_arguments", 0);
+        return;
+    }
+    const char *request_id = pj_usb_sync_arg(&args, "request_id");
+    const char *operation_id = pj_usb_sync_arg(&args, "operation_id");
+    uint32_t generation = 0U;
+    if (!pj_usb_sync_request_id_valid(request_id) || operation_id == NULL ||
+        operation_id[0] == '\0' ||
+        strlen(operation_id) >= PJ_COMPANION_SYNC_OPERATION_ID_BYTES ||
+        !pj_usb_sync_parse_u32(pj_usb_sync_arg(&args, "generation"),
+                               &generation) || generation == 0U) {
+        serial_sync_error(command, request_id, "invalid sync claim arguments",
+                          "invalid_arguments", 0);
+        return;
+    }
+    pj_companion_sync_state_t sync;
+    int result = pj_board_companion_sync_usb_claim(generation, operation_id,
+                                                    &sync);
+    if (result < 0) {
+        serial_sync_error(command, request_id, "sync claim could not be saved",
+                          "sync_store_failed", 1);
+        return;
+    }
+    const char *result_name = "stale";
+    if (result == PJ_COMPANION_SYNC_CLAIM_STARTED) {
+        result_name = "started";
+    } else if (result == PJ_COMPANION_SYNC_CLAIM_ATTACHED) {
+        result_name = "attached";
+    } else if (result == PJ_COMPANION_SYNC_CLAIM_BUSY) {
+        result_name = "busy";
+    }
+    serial_companion_response(command, request_id, &sync, result_name, 0);
+}
+
+static int serial_companion_counts(const pj_usb_sync_args_t *args,
+                                   uint32_t *generation, int *pending,
+                                   int *transferred, int *failed)
+{
+    uint32_t pending_value = 0U;
+    uint32_t transferred_value = 0U;
+    uint32_t failed_value = 0U;
+    return pj_usb_sync_parse_u32(pj_usb_sync_arg(args, "generation"),
+                                 generation) && *generation != 0U &&
+           pj_usb_sync_parse_u32(pj_usb_sync_arg(args, "pending"),
+                                 &pending_value) &&
+           pj_usb_sync_parse_u32(pj_usb_sync_arg(args, "transferred"),
+                                 &transferred_value) &&
+           pj_usb_sync_parse_u32(pj_usb_sync_arg(args, "failed"),
+                                 &failed_value) &&
+           pending_value <= (uint32_t)INT_MAX &&
+           transferred_value <= (uint32_t)INT_MAX &&
+           failed_value <= (uint32_t)INT_MAX &&
+           ((*pending = (int)pending_value),
+            (*transferred = (int)transferred_value),
+            (*failed = (int)failed_value), 1);
+}
+
+static void serial_companion_progress(char *line, const char *command,
+                                      const char *phase, int include_error)
+{
+    const char *const progress_allowed[] = {
+        "request_id", "generation", "operation_id", "pending",
+        "transferred", "failed",
+    };
+    const char *const failure_allowed[] = {
+        "request_id", "generation", "operation_id", "pending",
+        "transferred", "failed", "error_hex",
+    };
+    const char *const *allowed = include_error ? failure_allowed :
+                                 progress_allowed;
+    size_t allowed_count = include_error ?
+        sizeof(failure_allowed) / sizeof(failure_allowed[0]) :
+        sizeof(progress_allowed) / sizeof(progress_allowed[0]);
+    pj_usb_sync_args_t args;
+    if (!pj_usb_sync_parse_args(line, command, &args) ||
+        !serial_settings_args_exact(&args, allowed, allowed_count)) {
+        serial_sync_error(command, NULL, "invalid sync progress arguments",
+                          "invalid_arguments", 0);
+        return;
+    }
+    const char *request_id = pj_usb_sync_arg(&args, "request_id");
+    const char *operation_id = pj_usb_sync_arg(&args, "operation_id");
+    uint32_t generation = 0U;
+    int pending = 0;
+    int transferred = 0;
+    int failed = 0;
+    char error[PJ_COMPANION_SYNC_ERROR_BYTES] = {0};
+    if (!pj_usb_sync_request_id_valid(request_id) || operation_id == NULL ||
+        operation_id[0] == '\0' ||
+        strlen(operation_id) >= PJ_COMPANION_SYNC_OPERATION_ID_BYTES ||
+        !serial_companion_counts(&args, &generation, &pending, &transferred,
+                                 &failed)) {
+        serial_sync_error(command, request_id,
+                          "invalid sync progress arguments",
+                          "invalid_arguments", 0);
+        return;
+    }
+    if (include_error) {
+        size_t decoded = 0U;
+        const char *encoded = pj_usb_sync_arg(&args, "error_hex");
+        if (encoded == NULL ||
+            !pj_usb_sync_hex_decode(encoded, (uint8_t *)error,
+                                    sizeof(error) - 1U, &decoded) ||
+            memchr(error, '\0', decoded) != NULL) {
+            serial_sync_error(command, request_id, "invalid sync error text",
+                              "invalid_arguments", 0);
+            return;
+        }
+        error[decoded] = '\0';
+    }
+    pj_companion_sync_state_t sync;
+    int result = pj_board_companion_sync_usb_progress(
+        generation, operation_id, phase, pending, transferred, failed,
+        error, &sync);
+    if (result < 0) {
+        serial_sync_error(command, request_id,
+                          "sync acknowledgement could not be saved",
+                          "sync_store_failed", 1);
+    } else if (result == PJ_COMPANION_SYNC_APPLY_REJECTED) {
+        serial_sync_error(command, request_id,
+                          "sync generation or claim does not match",
+                          "generation_conflict", 0);
+    } else {
+        serial_companion_response(
+            command, request_id, &sync, NULL,
+            result == PJ_COMPANION_SYNC_APPLY_REPLAY);
+    }
 }
 
 static int serial_sync_audio_id(const char *encoded, char *audio_id,
@@ -8621,7 +8851,17 @@ static void serial_transcript_abort(char *line)
 
 static int serial_try_sync_command(char *line)
 {
-    if (serial_command_prefix(line, "PJ_SETTINGS_GET")) {
+    if (serial_command_prefix(line, "PJ_SYNC_STATUS")) {
+        serial_companion_status(line);
+    } else if (serial_command_prefix(line, "PJ_SYNC_CLAIM")) {
+        serial_companion_claim(line);
+    } else if (serial_command_prefix(line, "PJ_SYNC_PROGRESS")) {
+        serial_companion_progress(line, "PJ_SYNC_PROGRESS", "running", 0);
+    } else if (serial_command_prefix(line, "PJ_SYNC_COMPLETE")) {
+        serial_companion_progress(line, "PJ_SYNC_COMPLETE", "succeeded", 0);
+    } else if (serial_command_prefix(line, "PJ_SYNC_FAIL")) {
+        serial_companion_progress(line, "PJ_SYNC_FAIL", "failed", 1);
+    } else if (serial_command_prefix(line, "PJ_SETTINGS_GET")) {
         serial_settings_get(line);
     } else if (serial_command_prefix(line, "PJ_SETTINGS_SET")) {
         serial_settings_set(line);
@@ -9004,8 +9244,13 @@ static esp_err_t status_handler(httpd_req_t *req)
     cJSON_AddNumberToObject(json, "pending_sync", pending_sync);
     cJSON_AddNumberToObject(json, "transferred_sync", transferred_sync);
     cJSON_AddStringToObject(json, "last_error", g_status.last_error);
+    pj_companion_sync_state_t companion_sync;
+    cJSON *companion_json = cJSON_AddObjectToObject(json, "companion_sync");
+    int companion_ok = pj_board_companion_sync_snapshot(&companion_sync) &&
+                       companion_sync_add_json(companion_json,
+                                               &companion_sync);
     storage_wipe_snapshot_t wipe = storage_wipe_snapshot();
-    if (!capabilities_add_json(json, 1) ||
+    if (!companion_ok || !capabilities_add_json(json, 1) ||
         !runtime_identity_add_json(json) ||
         !wipe_status_add_json(json, &wipe.current) ||
         !wipe_history_add_json(json, wipe.history, wipe.history_count) ||

@@ -13,6 +13,7 @@ import secrets
 import socket
 import subprocess
 import sys
+import threading
 import time
 import unicodedata
 
@@ -79,6 +80,18 @@ SERIAL_PORT_PATTERNS = (
     "/dev/cu.SLAB_USBtoUART*",
     "/dev/cu.wchusbserial*",
 )
+
+_SERIAL_PORT_LOCKS_GUARD = threading.Lock()
+_SERIAL_PORT_LOCKS: dict[str, threading.Lock] = {}
+
+
+def _serial_port_lock(port: str) -> threading.Lock:
+    with _SERIAL_PORT_LOCKS_GUARD:
+        lock = _SERIAL_PORT_LOCKS.get(port)
+        if lock is None:
+            lock = threading.Lock()
+            _SERIAL_PORT_LOCKS[port] = lock
+        return lock
 
 _USB_ROM_DOWNLOAD_MARKERS = (
     "waiting for download",
@@ -305,6 +318,50 @@ def _usb_uint(value: Any, field: str, *, positive: bool = False) -> int:
     if value < (1 if positive else 0):
         raise DeviceError(f"USB command failed: invalid {field}")
     return value
+
+
+def _validated_companion_sync_response(response: dict[str, Any]) -> dict[str, Any]:
+    states = {"idle", "pending", "discovering", "requesting", "running", "succeeded", "failed"}
+    transports = {"none", "lan", "usb"}
+    for field in (
+        "requested_generation", "acknowledged_generation", "active_generation",
+        "claim_generation", "pending", "transferred", "failed",
+    ):
+        _usb_uint(response.get(field), f"sync {field}")
+    requested = response["requested_generation"]
+    acknowledged = response["acknowledged_generation"]
+    active = response["active_generation"]
+    claim = response["claim_generation"]
+    if acknowledged > requested or (active and not acknowledged < active <= requested):
+        raise DeviceError("USB command failed: invalid sync generations")
+    request_pending = response.get("request_pending")
+    online = response.get("online")
+    if not isinstance(request_pending, bool) or not isinstance(online, bool):
+        raise DeviceError("USB command failed: invalid sync state flags")
+    if request_pending != (requested > acknowledged):
+        raise DeviceError("USB command failed: inconsistent sync pending state")
+    expected_claim = active if request_pending and active else requested if request_pending else 0
+    if claim != expected_claim:
+        raise DeviceError("USB command failed: inconsistent sync claim generation")
+    if response.get("state") not in states or response.get("transport") not in transports:
+        raise DeviceError("USB command failed: invalid sync phase or transport")
+    operation_id = response.get("operation_id")
+    if not isinstance(operation_id, str) or len(operation_id) > 64 or any(
+        not (character.isascii() and (character.isalnum() or character in "_-"))
+        for character in operation_id
+    ):
+        raise DeviceError("USB command failed: invalid sync operation id")
+    if request_pending and not operation_id:
+        raise DeviceError("USB command failed: missing sync operation id")
+    error = response.get("error")
+    if not isinstance(error, str) or len(error.encode("utf-8")) > 127 or any(
+        unicodedata.category(character) == "Cc" for character in error
+    ):
+        raise DeviceError("USB command failed: invalid sync error text")
+    replayed = response.get("replayed")
+    if replayed is not None and not isinstance(replayed, bool):
+        raise DeviceError("USB command failed: invalid sync replay state")
+    return response
 
 
 def _usb_sha256(value: Any, field: str, *, required: bool = False) -> str | None:
@@ -571,6 +628,7 @@ class SerialDeviceClient:
         self.port = port
         self.baudrate = baudrate
         self.timeout = timeout
+        self._request_lock = _serial_port_lock(port)
 
     @contextmanager
     def _connection(
@@ -707,6 +765,26 @@ class SerialDeviceClient:
         retry_interval: float | None = None,
         max_attempts: int = 1,
     ) -> dict[str, Any]:
+        with self._request_lock:
+            return self._request_unlocked(
+                command,
+                timeout=timeout,
+                deadline=deadline,
+                request_id=request_id,
+                retry_interval=retry_interval,
+                max_attempts=max_attempts,
+            )
+
+    def _request_unlocked(
+        self,
+        command: str,
+        *,
+        timeout: float | None = None,
+        deadline: float | None = None,
+        request_id: str | None = None,
+        retry_interval: float | None = None,
+        max_attempts: int = 1,
+    ) -> dict[str, Any]:
         try:
             import serial  # type: ignore
         except ImportError as exc:
@@ -749,6 +827,80 @@ class SerialDeviceClient:
 
     def status(self) -> dict[str, Any]:
         return self._request("PJ_STATUS")
+
+    def companion_sync_status(self) -> dict[str, Any]:
+        response = self._request(
+            "PJ_SYNC_STATUS",
+            request_id=_new_request_id(),
+            retry_interval=_USB_READ_RETRY_INTERVAL_SECONDS,
+            max_attempts=_USB_READ_MAX_ATTEMPTS,
+        )
+        return _validated_companion_sync_response(response)
+
+    def companion_sync_claim(self, generation: int, operation_id: str) -> dict[str, Any]:
+        if isinstance(generation, bool) or not 1 <= generation <= 0xFFFFFFFF:
+            raise ValueError("sync generation must be between 1 and 4294967295")
+        if not isinstance(operation_id, str) or not 1 <= len(operation_id) <= 64 or any(
+            not (character.isascii() and (character.isalnum() or character in "_-"))
+            for character in operation_id
+        ):
+            raise ValueError("invalid sync operation id")
+        response = self._request(
+            f"PJ_SYNC_CLAIM generation={generation} operation_id={operation_id}",
+            request_id=_new_request_id(),
+            retry_interval=_USB_READ_RETRY_INTERVAL_SECONDS,
+            max_attempts=_USB_READ_MAX_ATTEMPTS,
+        )
+        result = response.get("claim_result")
+        if result not in {"started", "attached", "busy", "stale"}:
+            raise DeviceError("USB command failed: invalid sync claim result")
+        return _validated_companion_sync_response(response)
+
+    def companion_sync_progress(
+        self,
+        generation: int,
+        operation_id: str,
+        state: str,
+        pending: int,
+        transferred: int,
+        failed: int,
+        error: str = "",
+    ) -> dict[str, Any]:
+        if state not in {"running", "succeeded", "failed"}:
+            raise ValueError("invalid companion sync progress state")
+        if isinstance(generation, bool) or not 1 <= generation <= 0xFFFFFFFF:
+            raise ValueError("sync generation must be between 1 and 4294967295")
+        if not isinstance(operation_id, str) or not 1 <= len(operation_id) <= 64:
+            raise ValueError("invalid sync operation id")
+        for value in (pending, transferred, failed):
+            if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 0x7FFFFFFF:
+                raise ValueError("sync progress counts must be nonnegative 32-bit integers")
+        command_name = {
+            "running": "PJ_SYNC_PROGRESS",
+            "succeeded": "PJ_SYNC_COMPLETE",
+            "failed": "PJ_SYNC_FAIL",
+        }[state]
+        command = (
+            f"{command_name} generation={generation} operation_id={operation_id} "
+            f"pending={pending} transferred={transferred} failed={failed}"
+        )
+        if state == "failed":
+            try:
+                encoded_error = error.encode("utf-8")
+            except (AttributeError, UnicodeEncodeError) as exc:
+                raise ValueError("sync error must be valid UTF-8") from exc
+            if len(encoded_error) > 127 or any(
+                unicodedata.category(character) == "Cc" for character in error
+            ):
+                raise ValueError("sync error must contain at most 127 printable UTF-8 bytes")
+            command += f" error_hex={encoded_error.hex()}"
+        response = self._request(
+            command,
+            request_id=_new_request_id(),
+            retry_interval=_USB_READ_RETRY_INTERVAL_SECONDS,
+            max_attempts=_USB_READ_MAX_ATTEMPTS,
+        )
+        return _validated_companion_sync_response(response)
 
     def get_settings(self) -> dict[str, Any]:
         response = self._request(

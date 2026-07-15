@@ -88,6 +88,29 @@ class FakeBackend:
 
 
 class SyncTests(unittest.TestCase):
+    def test_sync_reports_deterministic_item_progress(self) -> None:
+        with TemporaryDirectory() as tmp:
+            events: list[dict[str, object]] = []
+            sync_device_audio(
+                "pj-test",
+                FakeClient(),
+                PartnerStore(Path(tmp)),
+                FakeBackend(),  # type: ignore[arg-type]
+                progress=events.append,
+            )
+
+        self.assertEqual(events[0], {"event": "listed", "total": 3})
+        self.assertEqual(events[-1], {"event": "complete", "total": 3})
+        self.assertEqual(
+            [(event["audio_id"], event["status"])
+             for event in events if event["event"] == "item_complete"],
+            [
+                ("done.wav", "skipped"),
+                ("legacy-done.wav", "skipped"),
+                ("new.wav", "uploaded"),
+            ],
+        )
+
     def test_sync_persists_verified_identity_and_uploaded_stage(self) -> None:
         with TemporaryDirectory() as tmp:
             client = FakeClient()

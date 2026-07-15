@@ -16,6 +16,8 @@ extern "C" {
 #define PJ_UI_MAX_NOTES 12
 #define PJ_UI_NOTE_LABEL_LEN 96
 #define PJ_UI_FOCUS_TIMEOUT_TICKS 3
+#define PJ_UI_SYNC_PHASE_LEN 16
+#define PJ_UI_SYNC_ERROR_LEN 64
 
 typedef enum {
     PJ_UI_STATE_STATIC = 0,
@@ -116,6 +118,10 @@ typedef struct {
     int sync_pending;
     int sync_transferred;
     int sync_online;
+    int sync_failed;
+    int sync_request_pending;
+    char sync_phase[PJ_UI_SYNC_PHASE_LEN];
+    char sync_error[PJ_UI_SYNC_ERROR_LEN];
     int battery_percent;
     int temperature_c;
     int humidity_percent;
@@ -182,6 +188,8 @@ void pj_ui_set_time_projection(pj_ui_context_t *ctx, const pj_ui_time_projection
 int pj_ui_consume_time_command(pj_ui_context_t *ctx, pj_ui_time_command_t *command);
 int pj_ui_discard_pending_interval_command(pj_ui_context_t *ctx);
 void pj_ui_set_sync_state(pj_ui_context_t *ctx, int pending, int transferred, int online);
+void pj_ui_set_sync_detail(pj_ui_context_t *ctx, const char *phase, int failed,
+                           const char *error, int request_pending);
 int pj_ui_set_home_layout(pj_ui_context_t *ctx, const pj_home_layout_t *layout);
 void pj_ui_restore_default_home(pj_ui_context_t *ctx);
 int pj_ui_tick(pj_ui_context_t *ctx);

@@ -105,6 +105,24 @@ pj transcription status --model /models/ggml-base.en-q5_0.bin --digest
 pj sync --model /models/ggml-base.en-q5_0.bin
 ```
 
+To let the device's Settings **Sync** action initiate that pipeline, keep the
+companion running. USB-C polling is enabled by default, and the same process also
+advertises the authenticated LAN service. It runs each request asynchronously and
+reports conditional generation progress back to firmware:
+
+```sh
+pj companion serve --model /models/ggml-base.en-q5_0.bin
+```
+
+See [Device-Initiated Sync](device-initiated-sync.md) for discovery,
+authentication, retry, and port-selection details. Explicit `pj sync --transport
+usb` remains available and does not require the listener.
+
+The listener opens USB-C only for bounded commands and releases the descriptor
+between its default two-second polls. Use `--serial-port`,
+`--usb-poll-interval`, or diagnostic `--no-usb` as needed. Stop any serial monitor
+while USB servicing is enabled.
+
 The recommended baseline is `ggml-base.en-q5_0.bin`. It is small enough for the
 16 GB, CPU-only product profile, passed the repository benchmark on macOS, and
 keeps runtime packaging independent of PyTorch. See

@@ -256,6 +256,97 @@ class UsbTranscriptUploadTests(unittest.TestCase):
         self.assertEqual(abort_options["max_attempts"], 2)
         self.assertGreater(abort_options["retry_interval"], 0)
 
+
+class UsbCompanionControlTests(unittest.TestCase):
+    @staticmethod
+    def response(**updates):  # type: ignore[no-untyped-def]
+        response = {
+            "device_id": "pj-test",
+            "request_pending": True,
+            "requested_generation": 4,
+            "acknowledged_generation": 3,
+            "active_generation": 0,
+            "claim_generation": 4,
+            "state": "pending",
+            "transport": "none",
+            "operation_id": "pj-test-00000004",
+            "pending": 0,
+            "transferred": 0,
+            "failed": 0,
+            "online": False,
+            "error": "",
+            "replayed": False,
+        }
+        response.update(updates)
+        return response
+
+    def test_status_and_claim_use_retry_safe_bounded_commands(self) -> None:
+        client = SerialDeviceClient("/dev/cu.test")
+        calls: list[tuple[str, dict[str, object]]] = []
+
+        def request(command: str, **kwargs):  # type: ignore[no-untyped-def]
+            calls.append((command, kwargs))
+            if command == "PJ_SYNC_STATUS":
+                return self.response()
+            return self.response(
+                active_generation=4,
+                state="running",
+                transport="usb",
+                online=True,
+                claim_result="started",
+            )
+
+        client._request = request  # type: ignore[method-assign]
+        self.assertEqual(client.companion_sync_status()["claim_generation"], 4)
+        claimed = client.companion_sync_claim(4, "pj-test-00000004")
+        self.assertEqual(claimed["claim_result"], "started")
+        self.assertEqual(calls[0][0], "PJ_SYNC_STATUS")
+        self.assertEqual(
+            calls[1][0],
+            "PJ_SYNC_CLAIM generation=4 operation_id=pj-test-00000004",
+        )
+        for _, options in calls:
+            self.assertIsNotNone(options["request_id"])
+            self.assertGreater(options["retry_interval"], 0)
+            self.assertEqual(options["max_attempts"], 2)
+
+    def test_terminal_commands_ack_exact_generation_and_encode_error(self) -> None:
+        client = SerialDeviceClient("/dev/cu.test")
+        commands: list[str] = []
+
+        def request(command: str, **kwargs):  # type: ignore[no-untyped-def]
+            _ = kwargs
+            commands.append(command)
+            return self.response(
+                request_pending=False,
+                acknowledged_generation=4,
+                claim_generation=0,
+                state="failed" if command.startswith("PJ_SYNC_FAIL") else "succeeded",
+                operation_id="pj-test-00000004",
+                failed=1 if command.startswith("PJ_SYNC_FAIL") else 0,
+                error="noise" if command.startswith("PJ_SYNC_FAIL") else "",
+            )
+
+        client._request = request  # type: ignore[method-assign]
+        client.companion_sync_progress(
+            4, "pj-test-00000004", "succeeded", 0, 2, 0
+        )
+        client.companion_sync_progress(
+            4, "pj-test-00000004", "failed", 1, 1, 1, "noise"
+        )
+        self.assertTrue(commands[0].startswith(
+            "PJ_SYNC_COMPLETE generation=4 operation_id=pj-test-00000004"
+        ))
+        self.assertIn("error_hex=6e6f697365", commands[1])
+
+    def test_status_rejects_inconsistent_generation_state(self) -> None:
+        client = SerialDeviceClient("/dev/cu.test")
+        client._request = lambda *args, **kwargs: self.response(  # type: ignore[method-assign]
+            acknowledged_generation=5
+        )
+        with self.assertRaisesRegex(DeviceError, "invalid sync generations"):
+            client.companion_sync_status()
+
     def test_device_session_advertises_usb_sync_capabilities(self) -> None:
         client = SerialDeviceClient("/dev/cu.test")
         client.status = lambda: {"api_version": 1}  # type: ignore[method-assign]

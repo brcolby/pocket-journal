@@ -63,6 +63,10 @@ static void apply_board_state_effects(pj_ui_state_t previous, pj_ui_state_t curr
         pj_board_refresh_notes(&g_ui);
     }
 
+    if (current == PJ_UI_STATE_SYNC && current != previous) {
+        (void)pj_board_companion_sync_start();
+    }
+
     if (state_is_playback(previous) && !state_is_playback(current)) {
         set_playback_active(0, 0);
     } else if (state_is_playback(current)) {
@@ -131,6 +135,7 @@ void app_main(void)
     pj_ui_wake(&g_ui);
     pj_board_refresh_status(&g_ui);
     pj_board_refresh_time_state(&g_ui);
+    (void)pj_board_companion_sync_resume();
     pj_ui_request_full_refresh(&g_ui);
     int initial_render_ready = render_and_flush_if_dirty(&g_ui);
 
@@ -214,6 +219,10 @@ void app_main(void)
         }
 
         if (pj_board_consume_settings_update(&g_ui)) {
+            render_and_flush_if_dirty(&g_ui);
+        }
+
+        if (pj_board_consume_companion_sync_update(&g_ui)) {
             render_and_flush_if_dirty(&g_ui);
         }
 

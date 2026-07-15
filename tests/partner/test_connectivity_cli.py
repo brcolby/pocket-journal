@@ -310,7 +310,7 @@ class RemovedLegacyCommandTests(unittest.TestCase):
         help_text = cli.build_parser().format_help()
 
         self.assertIn(
-            "{provision,discover,device,firmware,sync,library,transcription,settings,recordings}",
+            "{provision,discover,device,firmware,sync,companion,library,transcription,settings,recordings}",
             help_text,
         )
         for command in ("calendar", "home", "static-art"):

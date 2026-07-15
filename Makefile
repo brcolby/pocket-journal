@@ -28,6 +28,7 @@ USB_SYNC_TEST_BIN := build/test_usb_sync
 OTA_POLICY_TEST_BIN := build/test_ota_policy
 WIFI_STATE_TEST_BIN := build/test_wifi_state
 TIME_SYNC_TEST_BIN := build/test_time_sync
+COMPANION_SYNC_TEST_BIN := build/test_companion_sync
 LVGL_DIR := firmware/managed_components/lvgl__lvgl
 ifneq ($(wildcard $(LVGL_DIR)/src),)
 LVGL_SRCS := $(wildcard $(LVGL_DIR)/src/*.c)
@@ -218,6 +219,12 @@ test-input:
 		tests/board/test_time_sync.c \
 		-o $(TIME_SYNC_TEST_BIN)
 	$(TIME_SYNC_TEST_BIN)
+	$(CC) $(CFLAGS) \
+		-Ifirmware/components/pj_board/include \
+		firmware/components/pj_board/pj_companion_sync.c \
+		tests/board/test_companion_sync.c \
+		-o $(COMPANION_SYNC_TEST_BIN)
+	$(COMPANION_SYNC_TEST_BIN)
 
 test-partner:
 	cd partner && PYTHONPATH=src python -m unittest discover -s ../tests/partner -p 'test_*.py'

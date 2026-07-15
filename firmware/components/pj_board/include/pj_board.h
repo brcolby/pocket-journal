@@ -1,5 +1,6 @@
 #pragma once
 
+#include "pj_companion_sync.h"
 #include "pj_ui.h"
 #include "pj_storage.h"
 #include "pj_time_sync.h"
@@ -116,6 +117,19 @@ int pj_board_playback_toggle_index(int note_index);
 int pj_board_wipe_recordings(pj_ui_context_t *ui);
 int pj_board_storage_recover(void);
 int pj_board_http_start(void);
+/* Creates a durable request and starts or attaches to asynchronous sync. */
+int pj_board_companion_sync_start(void);
+/* Restarts a pending durable request without incrementing its generation. */
+int pj_board_companion_sync_resume(void);
+int pj_board_companion_sync_snapshot(pj_companion_sync_state_t *snapshot);
+int pj_board_companion_sync_usb_claim(
+    uint32_t generation, const char *operation_id,
+    pj_companion_sync_state_t *snapshot);
+int pj_board_companion_sync_usb_progress(
+    uint32_t generation, const char *operation_id, const char *phase,
+    int pending, int transferred, int failed, const char *error,
+    pj_companion_sync_state_t *snapshot);
+int pj_board_consume_companion_sync_update(pj_ui_context_t *ui);
 
 #ifdef __cplusplus
 }

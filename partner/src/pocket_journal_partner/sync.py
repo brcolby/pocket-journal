@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 import hashlib
 import json
 import tempfile
@@ -426,6 +426,7 @@ def sync_device_audio(
     upload_transcripts: bool = True,
     reprocess_synced: bool = False,
     library: NoteLibrary | None = None,
+    progress: Callable[[dict[str, Any]], None] | None = None,
 ) -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
     if isinstance(backend, FakeTranscriptionBackend):
@@ -433,7 +434,17 @@ def sync_device_audio(
     library = library or NoteLibrary(store.root)
     fingerprint = backend.fingerprint()
     with store.workflow_lock(device_id, "__device_sync__"):
-        for item in client.list_audio():
+        items = client.list_audio()
+        if progress is not None:
+            progress({"event": "listed", "total": len(items)})
+        for index, item in enumerate(items):
+            if progress is not None:
+                progress({
+                    "event": "item_started",
+                    "index": index,
+                    "total": len(items),
+                    "audio_id": item.audio_id,
+                })
             with store.workflow_lock(device_id, item.audio_id):
                 result = _sync_audio_item(
                     device_id,
@@ -448,4 +459,14 @@ def sync_device_audio(
                 )
             if result is not None:
                 results.append(result)
+            if progress is not None:
+                progress({
+                    "event": "item_complete",
+                    "index": index,
+                    "total": len(items),
+                    "audio_id": item.audio_id,
+                    "status": "skipped" if result is None else result.get("status", "failed"),
+                })
+        if progress is not None:
+            progress({"event": "complete", "total": len(items)})
     return results
