@@ -436,18 +436,6 @@ class DeviceClient:
             payload["utc_offset_minutes"] = utc_offset_minutes
         return self._request("PUT", "/v1/time", payload)
 
-    def get_home_design(self) -> dict[str, Any]:
-        return self._request("GET", "/v1/home")
-
-    def put_home_design(self, design: dict[str, Any]) -> dict[str, Any] | None:
-        return self._request("PUT", "/v1/home", design)
-
-    def get_static_art(self) -> dict[str, Any]:
-        return self._request("GET", "/v1/static-art")
-
-    def put_static_art(self, art: dict[str, Any]) -> dict[str, Any] | None:
-        return self._request("PUT", "/v1/static-art", art)
-
     def list_audio(self) -> list[AudioItem]:
         payload = self._request("GET", "/v1/audio")
         if not isinstance(payload, dict) or not isinstance(payload.get("audio", []), list):
@@ -521,10 +509,6 @@ class DeviceClient:
 
     def upload_transcript(self, audio_id: str, transcript: dict[str, Any]) -> None:
         self._request("PUT", f"/v1/transcripts/{parse.quote(audio_id, safe='')}", transcript)
-
-    def upload_calendar_today(self, payload: dict[str, Any]) -> None:
-        self._request("PUT", "/v1/calendar/today", payload)
-
 
 class SerialDeviceClient:
     def __init__(self, port: str, baudrate: int = 115200, timeout: float = 6.0) -> None:

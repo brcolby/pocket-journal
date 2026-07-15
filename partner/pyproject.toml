@@ -11,7 +11,6 @@ dependencies = ["esptool>=5.3,<6", "pyserial>=3.5"]
 
 [project.optional-dependencies]
 ble = ["bleak>=0.22", "zeroconf>=0.132"]
-calendar = ["google-api-python-client>=2.130", "google-auth-oauthlib>=1.2"]
 transcription = ["transformers>=4.41", "torch>=2.3", "accelerate>=0.30"]
 # Retained so existing install commands using `.[usb]` continue to work.
 usb = []

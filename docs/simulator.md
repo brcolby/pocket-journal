@@ -81,7 +81,7 @@ The inline bootstrap logger writes to the same endpoint before `src/main.js` loa
 
 - `static`: tap or short-press BOOT/AUX to `time_temp`.
 - `time_temp`: short-press BOOT/AUX or tap to `home`; long-press BOOT/AUX returns to `static`.
-- `home`: configurable firmware tiles for notes, time, and settings by default.
+- `home`: fixed firmware tiles for notes, time, and settings.
 - `notes`: record, listen, read.
 - `time`: alarm, stopwatch, timer, interval.
 - `settings`: three direct rows for volume, light/dark appearance, and 12/24-hour time.

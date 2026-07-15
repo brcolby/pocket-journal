@@ -305,35 +305,23 @@ class AutomaticTimeSyncTests(unittest.TestCase):
         self.assertEqual(serial.put_time.call_count, 2)
 
 
-class CalendarDeprecationTests(unittest.TestCase):
-    def test_primary_help_omits_calendar(self) -> None:
+class RemovedLegacyCommandTests(unittest.TestCase):
+    def test_primary_help_lists_only_supported_commands(self) -> None:
         help_text = cli.build_parser().format_help()
 
-        self.assertNotIn("calendar", help_text)
-
-    def test_calendar_sync_remains_compatible_and_warns(self) -> None:
-        session = SimpleNamespace(
-            device_id="pj-test",
-            client=SimpleNamespace(upload_calendar_today=Mock()),
-            require=Mock(),
-            envelope=lambda result: {"device_id": "pj-test", "transport": "lan", "result": result},
+        self.assertIn(
+            "{provision,discover,device,firmware,sync,library,transcription,settings,recordings}",
+            help_text,
         )
-        with TemporaryDirectory() as tmp:
-            fixture = Path(tmp) / "events.json"
-            fixture.write_text("[]\n", encoding="utf-8")
-            stdout = StringIO()
-            stderr = StringIO()
-            with patch("pocket_journal_partner.cli._lan_session_from_args", return_value=session):
-                with redirect_stdout(stdout), redirect_stderr(stderr):
-                    exit_code = cli.main([
-                        "calendar", "sync", "--device", "pj-test", "--fixture", str(fixture),
-                    ])
+        for command in ("calendar", "home", "static-art"):
+            self.assertNotIn(command, help_text)
 
-        self.assertEqual(exit_code, 0)
-        self.assertIn("deprecated", stderr.getvalue())
-        self.assertIn(cli.CALENDAR_REMOVAL_VERSION, stderr.getvalue())
-        session.client.upload_calendar_today.assert_called_once()
-        self.assertEqual(json.loads(stdout.getvalue())["result"]["uploaded"], 0)
+    def test_removed_commands_are_rejected(self) -> None:
+        parser = cli.build_parser()
+        for command in ("calendar", "home", "static-art"):
+            with self.subTest(command=command), redirect_stderr(StringIO()):
+                with self.assertRaisesRegex(SystemExit, "2"):
+                    parser.parse_args([command])
 
 
 class TransportSelectionTests(unittest.TestCase):

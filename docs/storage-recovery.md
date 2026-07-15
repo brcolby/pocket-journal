@@ -18,8 +18,8 @@ Authenticated `GET /v1/status` includes:
   freeing space, or invoking storage recovery.
 
 `full` is intentionally a write restriction, not a read failure. Valid notes
-remain enumerable and downloadable. Recording, transcript, and static-art
-writes fail before consuming the reserve. A runtime capacity check covers each
+remain enumerable and downloadable. Recording and transcript writes fail before
+consuming the reserve. A runtime capacity check covers each
 next 64 KiB recording interval; an out-of-space capture is removed instead of
 being published as a valid note.
 
@@ -47,7 +47,7 @@ After reinserting or repairing a card, call authenticated
 `POST /v1/storage/recover`. Recovery is rejected with `409 Conflict` while
 recording, playback, or audio processing is active. Otherwise the firmware
 unmounts the existing FAT registration if needed, remounts, performs interrupted
-write cleanup, refreshes capacity, reloads static art, and refreshes notes.
+write cleanup, refreshes capacity, and refreshes notes.
 
 Hardware validation still required:
 

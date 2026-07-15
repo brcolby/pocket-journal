@@ -30,10 +30,6 @@ pj device tone --codec-gp45 0xff
 pj device mic-check --duration-ms 2000
 pj device mic-check --duration-ms 2000 --gain-db 30
 pj recordings wipe --yes
-pj home get
-pj home set --file home.json
-pj static-art get
-pj static-art set --file static-art.pbm
 ```
 
 `pj discover` reports both attached USB serial ports and devices advertised over
@@ -143,13 +139,6 @@ serves audio only by validated library identity. It supports byte ranges for
 normal browser seeking. The terminal UI uses numbered page commands and opens
 audio through the operating system without constructing a shell command.
 
-## Deprecated Calendar Compatibility
-
-`pj calendar sync` remains available to existing automation through partner CLI
-`0.1.x`, emits a warning on every operation, and is omitted from primary help.
-It will be removed in `0.2.0`. Existing users that still need the compatibility
-command can install `.[calendar]` during this window.
-
 ## Data Stored Locally
 
 By default the partner stores data under `~/.pocket-journal`:
@@ -170,56 +159,6 @@ partner data directory.
 Device note metadata is durable under `/sdcard/pj/notes`. Partner sync skips notes already reported as `synced`, so repeated sync runs only transcribe new recordings.
 
 For sandboxed or test runs, pass `--data-dir <path>` to commands that need the paired-device config.
-
-## Home Design JSON
-
-The partner can push up to five home slots:
-
-```json
-{
-  "title": "Pocket Journal",
-  "slots": [
-    {"label": "Notes", "icon": "stylus_note", "state": "notes"},
-    {"label": "Time", "icon": "schedule", "state": "time"},
-    {"label": "Settings", "icon": "settings", "state": "settings"},
-    {"label": "Calendar", "icon": "calendar_month", "state": "calendar"},
-    {"label": "Sync", "icon": "sync", "state": "sync"}
-  ]
-}
-```
-
-Icons use Google Material Symbols names. Firmware should eventually include generated 1-bit glyphs for the selected icon subset.
-
-## Static Art
-
-The resting screen accepts raster art through `pj static-art set`.
-
-Supported inputs:
-
-- `.pbm`: ASCII PBM `P1`, exactly 200x200, no extra dependencies.
-- `.json`: row-encoded device payload.
-- Other raster formats such as `.png` or `.jpg` when Pillow is installed.
-
-Generated default asset:
-
-```text
-assets/static/smiley.pbm
-```
-
-Device payload shape:
-
-```json
-{
-  "width": 200,
-  "height": 200,
-  "encoding": "rows",
-  "rows": [
-    "........................................................................................................................................................................................................"
-  ]
-}
-```
-
-Use 200 rows of 200 pixels. `#`/`1` are black pixels, `.`/`0` are white pixels. The device does not overlay date, time, or navigation text on this screen.
 
 ## Transcription Alternatives
 

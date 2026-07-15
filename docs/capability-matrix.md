@@ -17,10 +17,6 @@ in command output or errors.
 | Time sync | `pj device sync-time [--device ID]` | `PJ_TIME` with optional UTC-offset minutes | `PUT /v1/time` | Physical USB access or bearer token | Time command/endpoint | Yes | Safe to repeat; USB provisioning performs it automatically, persists the host offset, and validates echoed civil time against a host UTC anchor |
 | Read settings | `pj settings get [--device ID]` | No | `GET /v1/settings` | Bearer token | v0 settings endpoint | No | Safe to repeat |
 | Update settings | `pj settings set [--device ID] KEY=VALUE...` | No | `PUT /v1/settings` | Bearer token | v0 settings endpoint | Yes | Safe to retry; updates are atomic values |
-| Read static art | `pj static-art get [--device ID]` | No | `GET /v1/static-art` | Bearer token | v0 static-art endpoint | No | Safe to repeat |
-| Update static art | `pj static-art set [--device ID] --file FILE` | No | `PUT /v1/static-art` | Bearer token | v0 static-art endpoint | Yes | Safe to retry; replaces the complete bitmap |
-| Read home layout | `pj home get [--device ID]` | No | `GET /v1/home` | Bearer token | v0 home endpoint | No | Safe to repeat |
-| Update home layout | `pj home set [--device ID] --file FILE` | No | `PUT /v1/home` | Bearer token | v0 home endpoint | Yes | Safe to retry; replaces the complete layout |
 | List audio | `pj recordings list [--transport usb\|lan]` | Snapshot-paged `PJ_AUDIO_LIST`, one hex-safe item per response | `GET /v1/audio` | Physical USB access or bearer token | USB transfer protocol or v0 audio endpoint | No | Safe to repeat; snapshot changes abort the list |
 | Download audio | `pj recordings download --audio-id ID [--transport usb\|lan]` | Chunked `PJ_AUDIO_READ`, 256 bytes per response | `GET /v1/audio/{id}` | Physical USB access or bearer token | USB transfer protocol or v0 audio endpoint | Writes only the selected local file | USB uses temp-file replace after size, offset, EOF, and digest validation; full sync also validates the WAV structure |
 | Sync audio and transcripts | `pj sync [--transport usb\|lan] [--backend whisper-cpp\|hf\|fake]` | Snapshot list, chunked reads, atomic transcript upload | Audio GET plus transcript PUT | Physical USB access or bearer token | USB transfer protocol or v0 audio/transcript endpoints; selected local backend installed | Yes | Safe after interruption; cached audio/transcripts are reused and firmware skips uploaded notes |
@@ -130,9 +126,3 @@ USB-C serial support is included in the standard partner CLI install. Install op
 pip install -e '.[ble]'
 pip install -e '.[transcription]'
 ```
-
-## Deprecated Compatibility
-
-`pj calendar sync` is hidden from primary help and emits a deprecation warning.
-It remains compatible through `0.1.x` and will be removed in `0.2.0`. Install the
-`calendar` extra only when maintaining existing automation during that window.

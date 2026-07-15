@@ -87,45 +87,6 @@ Reads or atomically updates the persisted settings surface. A PUT may contain an
 `theme` is `light` or `dark`; `volume` is `0` through `10`; alarm time uses a 24-hour stored value; `timer_seconds` is `30` through `86400`; `interval_seconds` is `60` through `86400`; `clock_24h` is boolean; `temperature_unit` is `c` or `f`; and `transcript_font_size` is `2` or `3`. GET also returns the derived `sync_pending` and `sync_transferred` counters. When NVS has no valid stored value, defaults preserve full codec volume (`10`), light mode, a disabled `07:30` alarm, a five-minute timer, a 90-second interval, 24-hour time, Celsius, and the larger transcript font. Firmware settings schema 2 also migrates the former stored 1500-second interval default to 90 seconds.
 
 ```http
-GET /v1/home
-PUT /v1/home
-```
-
-Reads or updates the custom home screen design supplied by the partner app. The device should retain up to four slots.
-
-```json
-{
-  "title": "Pocket Journal",
-  "slots": [
-    {"label": "Notes", "icon": "stylus_note", "state": "notes"},
-    {"label": "Sync", "icon": "sync", "state": "sync"}
-  ]
-}
-```
-
-```http
-GET /v1/static-art
-PUT /v1/static-art
-```
-
-Reads or updates the resting/static screen bitmap. The payload is exactly 200x200, 1-bit, row encoded. `1` or `#` means black pixel; `0` or `.` means white pixel. No text is composited over this image.
-
-```json
-{
-  "width": 200,
-  "height": 200,
-  "encoding": "rows",
-  "rows": [
-    "0000000000..."
-  ]
-}
-```
-
-The `rows` array must contain 200 strings, each 200 characters long.
-
-The partner CLI can build this payload from `.pbm` raster files directly, or from common raster formats such as `.png` when Pillow is installed.
-
-```http
 GET /v1/audio
 GET /v1/audio/{audio_id}
 DELETE /v1/audio
@@ -153,19 +114,13 @@ Lists, downloads, or wipes retained WAV recordings from the TF card. List items 
 
 Poll `GET /v1/status` until the matching operation id reaches `succeeded` or `failed`. A failed operation reports a stable code such as `wipe_incomplete` and a `retryable` boolean. Start requests return `409 Conflict` with a credential-safe `code` when audio or another storage user is active, and `503 Service Unavailable` when storage is unavailable or the worker cannot start.
 
-Recording, playback, directory enumeration, audio downloads, transcript/metadata updates, static-art SD access, storage recovery, and light-sleep admission participate in the same shared/exclusive coordinator. Home layout persistence is NVS-only and does not use the FAT volume. Light sleep is deferred while storage work is active. If a FAT/VFS call does not return, firmware does not delete or cancel the worker task: the worker remains quarantined as the exclusive storage owner, status continues from cached data, and new storage work plus recovery is rejected. Reset the device to recover from a permanently stuck driver call; recovery is allowed only after the worker reaches a terminal state.
+Recording, playback, directory enumeration, audio downloads, transcript/metadata updates, storage recovery, and light-sleep admission participate in the same shared/exclusive coordinator. Light sleep is deferred while storage work is active. If a FAT/VFS call does not return, firmware does not delete or cancel the worker task: the worker remains quarantined as the exclusive storage owner, status continues from cached data, and new storage work plus recovery is rejected. Reset the device to recover from a permanently stuck driver call; recovery is allowed only after the worker reaches a terminal state.
 
 ```http
 PUT /v1/transcripts/{audio_id}
 ```
 
 Uploads a JSON transcription containing non-empty `text` for an existing recording. A successful upload atomically stores the transcript and marks the note synced; the READ view is populated from these transcript records.
-
-```http
-PUT /v1/calendar/today
-```
-
-Uploads normalized events for the current local day.
 
 ```http
 POST /v1/ota
