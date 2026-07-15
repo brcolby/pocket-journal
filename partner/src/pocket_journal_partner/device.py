@@ -97,8 +97,42 @@ USB_MAX_AUDIO_ID_BYTES = 95
 USB_MAX_AUDIO_ITEMS = 10_000
 USB_MAX_TRANSCRIPT_BYTES = 64 * 1024
 USB_SERIAL_LINE_BYTES = 768
+USB_MAX_SETTINGS_BODY_BYTES = 256
 _USB_READ_RETRY_INTERVAL_SECONDS = 1.0
 _USB_READ_MAX_ATTEMPTS = 2
+
+_SETTINGS_INTEGER_RANGES = {
+    "volume": (0, 10),
+    "alarm_hour": (0, 23),
+    "alarm_minute": (0, 59),
+    "timer_seconds": (30, 86400),
+    "interval_seconds": (60, 86400),
+    "transcript_font_size": (2, 3),
+}
+
+
+def _validated_settings_response(response: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(response, dict):
+        raise DeviceError("device returned an invalid settings payload")
+    generation = response.get("generation")
+    if (
+        isinstance(generation, bool)
+        or not isinstance(generation, int)
+        or not 0 <= generation <= 0xFFFFFFFF
+    ):
+        raise DeviceError("device returned an invalid settings generation")
+    for key, (minimum, maximum) in _SETTINGS_INTEGER_RANGES.items():
+        value = response.get(key)
+        if isinstance(value, bool) or not isinstance(value, int) or not minimum <= value <= maximum:
+            raise DeviceError(f"device returned an invalid setting: {key}")
+    if response.get("theme") not in {"light", "dark"}:
+        raise DeviceError("device returned an invalid setting: theme")
+    if response.get("temperature_unit") not in {"c", "f"}:
+        raise DeviceError("device returned an invalid setting: temperature_unit")
+    for key in ("alarm_enabled", "clock_24h"):
+        if not isinstance(response.get(key), bool):
+            raise DeviceError(f"device returned an invalid setting: {key}")
+    return response
 
 
 @dataclass
@@ -419,10 +453,14 @@ class DeviceClient:
         return self._request("GET", "/v1/status")
 
     def get_settings(self) -> dict[str, Any]:
-        return self._request("GET", "/v1/settings")
+        return _validated_settings_response(self._request("GET", "/v1/settings"))
 
-    def put_settings(self, settings: dict[str, Any]) -> dict[str, Any] | None:
-        return self._request("PUT", "/v1/settings", settings)
+    def put_settings(self, settings: dict[str, Any]) -> dict[str, Any]:
+        current = self.get_settings()
+        payload = dict(settings)
+        payload["expected_generation"] = current["generation"]
+        response = self._request("PUT", "/v1/settings", payload)
+        return _validated_settings_response(response)
 
     def get_time(self) -> dict[str, Any]:
         return self._request("GET", "/v1/time")
@@ -711,6 +749,39 @@ class SerialDeviceClient:
 
     def status(self) -> dict[str, Any]:
         return self._request("PJ_STATUS")
+
+    def get_settings(self) -> dict[str, Any]:
+        response = self._request(
+            "PJ_SETTINGS_GET",
+            request_id=_new_request_id(),
+            retry_interval=_USB_READ_RETRY_INTERVAL_SECONDS,
+            max_attempts=_USB_READ_MAX_ATTEMPTS,
+        )
+        return _validated_settings_response(response)
+
+    def put_settings(self, settings: dict[str, Any]) -> dict[str, Any]:
+        current = self.get_settings()
+        payload = json.dumps(
+            settings, ensure_ascii=True, separators=(",", ":"), sort_keys=True,
+        ).encode("ascii")
+        if not payload or len(payload) > USB_MAX_SETTINGS_BODY_BYTES:
+            raise DeviceError(
+                f"settings update exceeds the {USB_MAX_SETTINGS_BODY_BYTES}-byte USB limit"
+            )
+        request_id = _new_request_id()
+        command = (
+            f"PJ_SETTINGS_SET expected_generation={current['generation']} "
+            f"payload_hex={payload.hex()}"
+        )
+        if len(f"{command} request_id={request_id}\n".encode("ascii")) >= USB_SERIAL_LINE_BYTES:
+            raise DeviceError("settings update exceeds the USB command-line limit")
+        response = self._request(
+            command,
+            request_id=request_id,
+            retry_interval=_USB_READ_RETRY_INTERVAL_SECONDS,
+            max_attempts=_USB_READ_MAX_ATTEMPTS,
+        )
+        return _validated_settings_response(response)
 
     def list_audio(self) -> list[AudioItem]:
         items: list[AudioItem] = []

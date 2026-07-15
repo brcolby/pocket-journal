@@ -80,11 +80,12 @@ Reads or atomically updates the persisted settings surface. A PUT may contain an
   "interval_seconds": 90,
   "clock_24h": true,
   "temperature_unit": "c",
-  "transcript_font_size": 3
+  "transcript_font_size": 3,
+  "expected_generation": 12
 }
 ```
 
-`theme` is `light` or `dark`; `volume` is `0` through `10`; alarm time uses a 24-hour stored value; `timer_seconds` is `30` through `86400`; `interval_seconds` is `60` through `86400`; `clock_24h` is boolean; `temperature_unit` is `c` or `f`; and `transcript_font_size` is `2` or `3`. GET also returns the derived `sync_pending` and `sync_transferred` counters. When NVS has no valid stored value, defaults preserve full codec volume (`10`), light mode, a disabled `07:30` alarm, a five-minute timer, a 90-second interval, 24-hour time, Celsius, and the larger transcript font. Firmware settings schema 2 also migrates the former stored 1500-second interval default to 90 seconds.
+`theme` is `light` or `dark`; `volume` is `0` through `10`; alarm time uses a 24-hour stored value; `timer_seconds` is `30` through `86400`; `interval_seconds` is `60` through `86400`; `clock_24h` is boolean; `temperature_unit` is `c` or `f`; and `transcript_font_size` is `2` or `3`. GET also returns the derived `sync_pending` and `sync_transferred` counters plus a monotonic `generation`. The partner includes that value as `expected_generation`; a stale value returns `409 Conflict` without partial mutation. Legacy callers may omit it, but generation pinning is required for conflict-safe writes. When NVS has no valid stored value, defaults preserve full codec volume (`10`), light mode, a disabled `07:30` alarm, a five-minute timer, a 90-second interval, 24-hour time, Celsius, and the larger transcript font. Firmware settings schema 2 also migrates the former stored 1500-second interval default to 90 seconds.
 
 ```http
 GET /v1/audio
@@ -137,6 +138,8 @@ PJ_STATUS [request_id=ID]
 PJ_WIFI_HEX 4c61622057694669 70617373776f7264 746f6b656e
 PJ_TIME 2026 06 20 14 05 -420
 PJ_WIPE_RECORDINGS [request_id=ID]
+PJ_SETTINGS_GET request_id=ID
+PJ_SETTINGS_SET expected_generation=N payload_hex=JSON_HEX request_id=ID
 PJ_AUDIO_LIST cursor=0 snapshot=0 [request_id=ID]
 PJ_AUDIO_READ id_hex=ID offset=0 max_bytes=256 [source_sha256=SHA256] [request_id=ID]
 PJ_TRANSCRIPT_BEGIN id_hex=ID bytes=N sha256=SHA256 request_id=ID
@@ -157,6 +160,14 @@ track daylight-saving transitions; the partner should resend time when the
 host offset changes.
 `PJ_AUDIO_TONE` plays a generated diagnostic tone. Its optional first argument forces the speaker PA GPIO level; `-` keeps the firmware default. Its optional second argument temporarily routes I2S TX data to a DOUT GPIO for board pin-map diagnosis. The named arguments expose the same probes plus temporary audio power GPIO and ES8311 register overrides; the firmware restores the normal route, power level, and register values after the tone.
 `PJ_MIC_CHECK` samples the ES8311 microphone path without creating a note file and returns input statistics: `peak`, `avg_abs`, `clipped`, `near_zero`, `read_errors`, and `silent`. The production recording gain is `42 dB`; use lower diagnostic overrides only when measuring input headroom.
+
+`PJ_SETTINGS_GET` returns the same canonical settings fields and generation as
+the LAN endpoint. `PJ_SETTINGS_SET` carries a non-empty partial update as at most
+256 decoded bytes of compact, hex-encoded JSON and requires the generation read
+immediately before it. Unknown, removed, duplicate, malformed, oversized, or
+stale updates fail without mutation. Retrying the same request id with identical
+generation and payload returns success after a lost acknowledgment; changing the
+content under a reused request id is rejected.
 
 The note-transfer commands are line bounded. All identifiers, filenames, labels,
 timestamps, transcript paths, and binary chunks are lowercase hex encoding of
@@ -196,23 +207,4 @@ does not duplicate or corrupt state.
 
 Responses start with `PJ_OK` or `PJ_ERR` followed by a compact JSON object. Normal ESP-IDF logs may appear on the same serial stream, so clients should scan for those prefixes.
 
-`PJ_STATUS`, `PJ_WIPE_RECORDINGS`, `PJ_AUDIO_LIST`, and `PJ_AUDIO_READ` accept an optional 1-32 character request id containing letters, digits, `.`, `_`, or `-`; the staged transcript commands require one. The partner tags every note-transfer request. Tagged responses include both `command` and `request_id`; clients must reject a response when either differs from the request. The partner CLI retries a lost wipe-start or transfer acknowledgment with the same request id, allowing firmware to return the associated operation. It uses a newly opened, bounded-lifetime serial descriptor for requests and never retains the port while idle. A wipe timeout identifies the still-running operation id so a later status check can determine the outcome.
-
-## Calendar Event Shape
-
-```json
-{
-  "date": "2026-06-06",
-  "events": [
-    {
-      "source_id": "google-event-id",
-      "title": "Design review",
-      "start": "2026-06-06T09:00:00-07:00",
-      "end": "2026-06-06T09:30:00-07:00",
-      "all_day": false,
-      "location": "Office",
-      "updated": "2026-06-05T18:30:00Z"
-    }
-  ]
-}
-```
+`PJ_STATUS`, `PJ_WIPE_RECORDINGS`, `PJ_AUDIO_LIST`, and `PJ_AUDIO_READ` accept an optional 1-32 character request id containing letters, digits, `.`, `_`, or `-`; settings mutations and staged transcript commands require one. The partner tags every mutation and transfer request. Tagged responses include both `command` and `request_id`; clients must reject a response when either differs from the request. The partner CLI retries a lost wipe-start, settings mutation, or transfer acknowledgment with the same request id, allowing firmware to return the associated operation. It uses a newly opened, bounded-lifetime serial descriptor for requests and never retains the port while idle. A wipe timeout identifies the still-running operation id so a later status check can determine the outcome.

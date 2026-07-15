@@ -26,6 +26,7 @@ class FirmwareUsbProtocolFixture:
         self.snapshot = 2_145_301_337
         self.received_lines: list[str] = []
         self.drop_ack = Counter({
+            "PJ_SETTINGS_SET": 1,
             "PJ_TRANSCRIPT_BEGIN": 1,
             "PJ_TRANSCRIPT_WRITE": 1,
             "PJ_TRANSCRIPT_COMMIT": 1,
@@ -38,6 +39,22 @@ class FirmwareUsbProtocolFixture:
         self.upload = bytearray()
         self.last_write: tuple[int, bytes] | None = None
         self.committed = False
+        self.settings: dict[str, object] = {
+            "theme": "light",
+            "volume": 8,
+            "alarm_enabled": False,
+            "alarm_hour": 7,
+            "alarm_minute": 30,
+            "timer_seconds": 300,
+            "interval_seconds": 90,
+            "clock_24h": True,
+            "temperature_unit": "c",
+            "transcript_font_size": 3,
+            "sync_pending": 0,
+            "sync_transferred": 0,
+        }
+        self.settings_generation = 12
+        self.settings_request: tuple[str, int, str] | None = None
 
     @staticmethod
     def _parse(line: str) -> tuple[str, dict[str, str]]:
@@ -80,6 +97,40 @@ class FirmwareUsbProtocolFixture:
             for character in request_id
         ):
             raise AssertionError("host emitted an invalid firmware request id")
+
+        if command == "PJ_SETTINGS_GET":
+            if fields:
+                raise AssertionError(f"unexpected settings read fields: {fields}")
+            return self._response(command, request_id, {
+                **self.settings,
+                "generation": self.settings_generation,
+                "changed": False,
+                "replayed": False,
+            })
+
+        if command == "PJ_SETTINGS_SET":
+            if set(fields) != {"expected_generation", "payload_hex"}:
+                raise AssertionError(f"unexpected settings update fields: {fields}")
+            expected = int(fields["expected_generation"])
+            payload_hex = fields["payload_hex"]
+            replay = self.settings_request == (request_id, expected, payload_hex)
+            if not replay:
+                if self.settings_request is not None and self.settings_request[0] == request_id:
+                    raise AssertionError("host reused a settings request id with different content")
+                if expected != self.settings_generation:
+                    raise AssertionError("host failed to pin the settings generation")
+                update = json.loads(bytes.fromhex(payload_hex).decode("ascii"))
+                if not isinstance(update, dict) or not update:
+                    raise AssertionError("host emitted an invalid settings update")
+                self.settings.update(update)
+                self.settings_generation += 1
+                self.settings_request = (request_id, expected, payload_hex)
+            return self._response(command, request_id, {
+                **self.settings,
+                "generation": self.settings_generation,
+                "changed": not replay,
+                "replayed": replay,
+            })
 
         if command == "PJ_AUDIO_LIST":
             if set(fields) != {"cursor", "snapshot"}:
@@ -274,6 +325,21 @@ class FirmwareFixtureClient(SerialDeviceClient):
 
 
 class FirmwareUsbProtocolParityTests(unittest.TestCase):
+    def test_real_host_parser_matches_firmware_settings_frames_and_replay(self) -> None:
+        fixture = FirmwareUsbProtocolFixture()
+        client = FirmwareFixtureClient(fixture)
+
+        self.assertEqual(client.get_settings()["generation"], 12)
+        updated = client.put_settings({"volume": 9, "theme": "dark"})
+
+        self.assertEqual(updated["generation"], 13)
+        self.assertEqual(updated["volume"], 9)
+        setting_lines = [
+            line for line in fixture.received_lines if line.startswith("PJ_SETTINGS_SET ")
+        ]
+        self.assertEqual(len(setting_lines), 2)
+        self.assertEqual(setting_lines[0], setting_lines[1])
+
     def test_real_host_parser_matches_firmware_list_read_and_upload_frames(self) -> None:
         fixture = FirmwareUsbProtocolFixture()
         client = FirmwareFixtureClient(fixture)

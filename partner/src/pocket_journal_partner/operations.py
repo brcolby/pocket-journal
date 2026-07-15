@@ -35,6 +35,8 @@ class DeviceSession:
             supported = {
                 "status",
                 "time.write",
+                "settings.read",
+                "settings.write",
                 "recordings.delete",
                 "recordings.list",
                 "recordings.download",

@@ -202,6 +202,7 @@
 #define PJ_TRANSCRIPT_DIR "/sdcard/pj/transcripts"
 #define PJ_NOTE_DIR "/sdcard/pj/notes"
 #define PJ_USB_TRANSCRIPT_TEMP_PATH PJ_TRANSCRIPT_DIR "/.usb-upload.tmp"
+#define PJ_USB_SETTINGS_BODY_BYTES 256U
 #define PJ_AUDIO_INITIAL_INDEX_CAPACITY 16U
 #define PJ_AUDIO_MAX_INDEXED_FILES 512U
 #define PJ_AUDIO_COLLECT_STORAGE_BUSY (-1)
@@ -233,6 +234,20 @@ static int g_display_warning_logged;
 static volatile int g_time_update_pending;
 static uint32_t g_time_generation;
 static volatile int g_settings_update_pending;
+
+#ifdef ESP_PLATFORM
+typedef struct {
+    int valid;
+    char request_id[PJ_USB_SYNC_REQUEST_ID_BYTES];
+    uint32_t expected_generation;
+    uint32_t payload_hash;
+    pj_settings_t committed;
+    uint32_t resulting_generation;
+    int changed;
+} pj_usb_settings_replay_t;
+
+static pj_usb_settings_replay_t g_usb_settings_replay;
+#endif
 
 typedef struct {
     int hour;
@@ -7404,6 +7419,80 @@ static int wipe_history_add_json(cJSON *parent,
     return 1;
 }
 
+typedef enum {
+    PJ_SETTINGS_COMMIT_OK = 0,
+    PJ_SETTINGS_COMMIT_INVALID,
+    PJ_SETTINGS_COMMIT_BUSY,
+    PJ_SETTINGS_COMMIT_CONFLICT,
+    PJ_SETTINGS_COMMIT_STORE_FAILED,
+} pj_settings_commit_result_t;
+
+static int settings_parse_update(const cJSON *json, pj_settings_t *settings,
+                                 uint32_t *expected_generation,
+                                 int *has_expected_generation);
+static pj_settings_commit_result_t settings_commit_update(
+    const cJSON *json, int require_expected_generation,
+    uint32_t forced_expected_generation, int use_forced_expected_generation,
+    pj_settings_t *committed, uint32_t *generation, int *changed);
+
+static int settings_snapshot(pj_settings_t *settings, uint32_t *generation)
+{
+    if (settings == NULL || generation == NULL ||
+        !settings_take(portMAX_DELAY)) {
+        return 0;
+    }
+    *settings = g_settings;
+    *generation = g_settings_store.generation;
+    settings_give();
+    return 1;
+}
+
+static int settings_add_json(cJSON *json, const pj_settings_t *settings,
+                             uint32_t generation)
+{
+    if (json == NULL || settings == NULL) {
+        return 0;
+    }
+    int pending_sync = 0;
+    int transferred_sync = 0;
+    collect_sync_counts(&pending_sync, &transferred_sync);
+    return cJSON_AddStringToObject(json, "theme",
+                                   settings->dark_mode ? "dark" : "light") != NULL &&
+           cJSON_AddNumberToObject(json, "volume", settings->volume) != NULL &&
+           cJSON_AddBoolToObject(json, "alarm_enabled",
+                                 settings->alarm_enabled != 0) != NULL &&
+           cJSON_AddNumberToObject(json, "alarm_hour", settings->alarm_hour) != NULL &&
+           cJSON_AddNumberToObject(json, "alarm_minute", settings->alarm_minute) != NULL &&
+           cJSON_AddNumberToObject(json, "timer_seconds", settings->timer_seconds) != NULL &&
+           cJSON_AddNumberToObject(json, "interval_seconds",
+                                   settings->interval_seconds) != NULL &&
+           cJSON_AddBoolToObject(json, "clock_24h", settings->clock_24h != 0) != NULL &&
+           cJSON_AddStringToObject(json, "temperature_unit",
+                                   settings->temperature_fahrenheit ? "f" : "c") != NULL &&
+           cJSON_AddNumberToObject(json, "transcript_font_size",
+                                   settings->transcript_font_size) != NULL &&
+           cJSON_AddNumberToObject(json, "sync_pending", pending_sync) != NULL &&
+           cJSON_AddNumberToObject(json, "sync_transferred", transferred_sync) != NULL &&
+           cJSON_AddNumberToObject(json, "generation", generation) != NULL;
+}
+
+static int capabilities_add_json(cJSON *json)
+{
+    cJSON *capabilities = json == NULL ? NULL :
+        cJSON_AddObjectToObject(json, "capabilities");
+    return capabilities != NULL &&
+           cJSON_AddBoolToObject(capabilities, "status", 1) != NULL &&
+           cJSON_AddBoolToObject(capabilities, "time.write", 1) != NULL &&
+           cJSON_AddBoolToObject(capabilities, "settings.read", 1) != NULL &&
+           cJSON_AddBoolToObject(capabilities, "settings.write", 1) != NULL &&
+           cJSON_AddBoolToObject(capabilities, "recordings.list", 1) != NULL &&
+           cJSON_AddBoolToObject(capabilities, "recordings.download", 1) != NULL &&
+           cJSON_AddBoolToObject(capabilities, "recordings.delete", 1) != NULL &&
+           cJSON_AddBoolToObject(capabilities, "transcripts.write", 1) != NULL &&
+           cJSON_AddBoolToObject(capabilities, "audio.sync", 1) != NULL &&
+           cJSON_AddBoolToObject(capabilities, "wifi.provision", 1) != NULL;
+}
+
 static int serial_request_matches(const char *line, const char *command,
                                   const char **request_id)
 {
@@ -7470,7 +7559,8 @@ static void serial_print_status(const char *request_id)
     cJSON_AddNumberToObject(json, "pending_sync", pending_sync);
     cJSON_AddNumberToObject(json, "transferred_sync", transferred_sync);
     storage_wipe_snapshot_t wipe = storage_wipe_snapshot();
-    if (!runtime_identity_add_json(json) ||
+    if (!capabilities_add_json(json) ||
+        !runtime_identity_add_json(json) ||
         !wipe_status_add_json(json, &wipe.current) ||
         !wipe_history_add_json(json, wipe.history, wipe.history_count) ||
         !connectivity_add_json(json, &status)) {
@@ -7678,6 +7768,166 @@ static int serial_json_add_hex(cJSON *json, const char *key,
     return pj_usb_sync_hex_encode((const uint8_t *)value, size, encoded,
                                   sizeof(encoded)) &&
            cJSON_AddStringToObject(json, key, encoded) != NULL;
+}
+
+static void serial_settings_response(const char *command,
+                                     const char *request_id,
+                                     const pj_settings_t *settings,
+                                     uint32_t generation, int changed,
+                                     int replayed)
+{
+    cJSON *json = serial_sync_response(command, request_id);
+    if (json == NULL || !settings_add_json(json, settings, generation) ||
+        cJSON_AddBoolToObject(json, "changed", changed != 0) == NULL ||
+        cJSON_AddBoolToObject(json, "replayed", replayed != 0) == NULL) {
+        cJSON_Delete(json);
+        serial_sync_error(command, request_id, "settings response allocation failed",
+                          "out_of_memory", 1);
+        return;
+    }
+    serial_print_json("PJ_OK", json);
+    cJSON_Delete(json);
+}
+
+static int serial_settings_args_exact(const pj_usb_sync_args_t *args,
+                                      const char *const *allowed,
+                                      size_t allowed_count)
+{
+    if (args == NULL || args->count != allowed_count) {
+        return 0;
+    }
+    for (size_t i = 0; i < args->count; i++) {
+        int matched = 0;
+        for (size_t j = 0; j < allowed_count; j++) {
+            if (strcmp(args->args[i].key, allowed[j]) == 0) {
+                matched = 1;
+                break;
+            }
+        }
+        if (!matched) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static void serial_settings_get(char *line)
+{
+    const char *command = "PJ_SETTINGS_GET";
+    const char *const allowed[] = {"request_id"};
+    pj_usb_sync_args_t args;
+    if (!pj_usb_sync_parse_args(line, command, &args) ||
+        !serial_settings_args_exact(&args, allowed,
+                                    sizeof(allowed) / sizeof(allowed[0]))) {
+        serial_sync_error(command, NULL, "invalid settings read arguments",
+                          "invalid_arguments", 0);
+        return;
+    }
+    const char *request_id = pj_usb_sync_arg(&args, "request_id");
+    if (!pj_usb_sync_request_id_valid(request_id)) {
+        serial_sync_error(command, request_id, "invalid settings request id",
+                          "invalid_arguments", 0);
+        return;
+    }
+    pj_settings_t settings;
+    uint32_t generation = 0;
+    if (!settings_snapshot(&settings, &generation)) {
+        serial_sync_error(command, request_id, "settings busy", "settings_busy", 1);
+        return;
+    }
+    serial_settings_response(command, request_id, &settings, generation, 0, 0);
+}
+
+static void serial_settings_set(char *line)
+{
+    const char *command = "PJ_SETTINGS_SET";
+    const char *const allowed[] = {
+        "request_id", "expected_generation", "payload_hex",
+    };
+    pj_usb_sync_args_t args;
+    if (!pj_usb_sync_parse_args(line, command, &args) ||
+        !serial_settings_args_exact(&args, allowed,
+                                    sizeof(allowed) / sizeof(allowed[0]))) {
+        serial_sync_error(command, NULL, "invalid settings update arguments",
+                          "invalid_arguments", 0);
+        return;
+    }
+    const char *request_id = pj_usb_sync_arg(&args, "request_id");
+    const char *payload_hex = pj_usb_sync_arg(&args, "payload_hex");
+    uint32_t expected_generation = 0;
+    if (!pj_usb_sync_request_id_valid(request_id) ||
+        !pj_usb_sync_parse_u32(pj_usb_sync_arg(&args, "expected_generation"),
+                               &expected_generation) || payload_hex == NULL) {
+        serial_sync_error(command, request_id, "invalid settings update arguments",
+                          "invalid_arguments", 0);
+        return;
+    }
+    char body[PJ_USB_SETTINGS_BODY_BYTES + 1U];
+    size_t body_size = 0;
+    if (!pj_usb_sync_hex_decode(payload_hex, (uint8_t *)body,
+                                sizeof(body) - 1U, &body_size) ||
+        body_size == 0U || memchr(body, '\0', body_size) != NULL) {
+        serial_sync_error(command, request_id, "invalid settings payload",
+                          "invalid_payload", 0);
+        return;
+    }
+    body[body_size] = '\0';
+    uint32_t payload_hash = pj_usb_sync_snapshot_finish(
+        pj_usb_sync_snapshot_update(0U, body, body_size));
+    if (g_usb_settings_replay.valid &&
+        strcmp(g_usb_settings_replay.request_id, request_id) == 0) {
+        if (g_usb_settings_replay.expected_generation != expected_generation ||
+            g_usb_settings_replay.payload_hash != payload_hash) {
+            serial_sync_error(command, request_id,
+                              "settings request id reused with different content",
+                              "request_id_reused", 0);
+            return;
+        }
+        serial_settings_response(command, request_id,
+                                 &g_usb_settings_replay.committed,
+                                 g_usb_settings_replay.resulting_generation,
+                                 g_usb_settings_replay.changed, 1);
+        return;
+    }
+
+    cJSON *json = cJSON_ParseWithOpts(body, NULL, 1);
+    pj_settings_t committed;
+    uint32_t generation = 0;
+    int changed = 0;
+    pj_settings_commit_result_t result = settings_commit_update(
+        json, 1, expected_generation, 1, &committed, &generation, &changed);
+    cJSON_Delete(json);
+    if (result != PJ_SETTINGS_COMMIT_OK) {
+        const char *message = "unsupported or invalid settings";
+        const char *code = "invalid_settings";
+        int retryable = 0;
+        if (result == PJ_SETTINGS_COMMIT_BUSY) {
+            message = "settings busy";
+            code = "settings_busy";
+            retryable = 1;
+        } else if (result == PJ_SETTINGS_COMMIT_CONFLICT) {
+            message = "settings generation conflict";
+            code = "generation_conflict";
+        } else if (result == PJ_SETTINGS_COMMIT_STORE_FAILED) {
+            message = "settings could not be persisted";
+            code = "settings_store_failed";
+            retryable = 1;
+        }
+        serial_sync_error(command, request_id, message, code, retryable);
+        return;
+    }
+    g_usb_settings_replay = (pj_usb_settings_replay_t) {
+        .valid = 1,
+        .expected_generation = expected_generation,
+        .payload_hash = payload_hash,
+        .committed = committed,
+        .resulting_generation = generation,
+        .changed = changed,
+    };
+    (void)snprintf(g_usb_settings_replay.request_id,
+                   sizeof(g_usb_settings_replay.request_id), "%s", request_id);
+    serial_settings_response(command, request_id, &committed, generation,
+                             changed, 0);
 }
 
 static void serial_audio_list(char *line)
@@ -8285,7 +8535,11 @@ static void serial_transcript_abort(char *line)
 
 static int serial_try_sync_command(char *line)
 {
-    if (serial_command_prefix(line, "PJ_AUDIO_LIST")) {
+    if (serial_command_prefix(line, "PJ_SETTINGS_GET")) {
+        serial_settings_get(line);
+    } else if (serial_command_prefix(line, "PJ_SETTINGS_SET")) {
+        serial_settings_set(line);
+    } else if (serial_command_prefix(line, "PJ_AUDIO_LIST")) {
         serial_audio_list(line);
     } else if (serial_command_prefix(line, "PJ_AUDIO_READ")) {
         serial_audio_read(line);
@@ -8665,7 +8919,8 @@ static esp_err_t status_handler(httpd_req_t *req)
     cJSON_AddNumberToObject(json, "transferred_sync", transferred_sync);
     cJSON_AddStringToObject(json, "last_error", g_status.last_error);
     storage_wipe_snapshot_t wipe = storage_wipe_snapshot();
-    if (!runtime_identity_add_json(json) ||
+    if (!capabilities_add_json(json) ||
+        !runtime_identity_add_json(json) ||
         !wipe_status_add_json(json, &wipe.current) ||
         !wipe_history_add_json(json, wipe.history, wipe.history_count) ||
         !connectivity_add_json(json, &status)) {
@@ -8735,34 +8990,24 @@ static esp_err_t settings_get_handler(httpd_req_t *req)
     if (require_auth(req) != ESP_OK) {
         return ESP_OK;
     }
-    pj_settings_t settings = g_settings;
-    if (settings_take(portMAX_DELAY)) {
-        settings = g_settings;
-        settings_give();
+    pj_settings_t settings;
+    uint32_t generation = 0;
+    cJSON *json = cJSON_CreateObject();
+    if (json == NULL || !settings_snapshot(&settings, &generation) ||
+        !settings_add_json(json, &settings, generation)) {
+        cJSON_Delete(json);
+        httpd_resp_set_status(req, "503 Service Unavailable");
+        return send_json(req, "{\"error\":\"settings unavailable\"}");
     }
-    int pending_sync = 0;
-    int transferred_sync = 0;
-    collect_sync_counts(&pending_sync, &transferred_sync);
-    char json[512];
-    (void)snprintf(json, sizeof(json),
-                   "{\"theme\":\"%s\",\"volume\":%d,\"alarm_enabled\":%s,"
-                   "\"alarm_hour\":%d,\"alarm_minute\":%d,\"timer_seconds\":%d,"
-                   "\"interval_seconds\":%d,\"clock_24h\":%s,"
-                   "\"temperature_unit\":\"%s\",\"transcript_font_size\":%d,"
-                   "\"sync_pending\":%d,\"sync_transferred\":%d}",
-                   settings.dark_mode ? "dark" : "light",
-                   settings.volume,
-                   settings.alarm_enabled ? "true" : "false",
-                   settings.alarm_hour,
-                   settings.alarm_minute,
-                   settings.timer_seconds,
-                   settings.interval_seconds,
-                   settings.clock_24h ? "true" : "false",
-                   settings.temperature_fahrenheit ? "f" : "c",
-                   settings.transcript_font_size,
-                   pending_sync,
-                   transferred_sync);
-    return send_json(req, json);
+    char *encoded = cJSON_PrintUnformatted(json);
+    cJSON_Delete(json);
+    if (encoded == NULL) {
+        httpd_resp_set_status(req, "503 Service Unavailable");
+        return send_json(req, "{\"error\":\"settings encoding failed\"}");
+    }
+    esp_err_t result = send_json(req, encoded);
+    cJSON_free(encoded);
+    return result;
 }
 
 static int json_exact_int(const cJSON *item, int *value)
@@ -8774,17 +9019,45 @@ static int json_exact_int(const cJSON *item, int *value)
     return 1;
 }
 
-static int settings_parse_update(const cJSON *json, pj_settings_t *settings)
+static int json_exact_u32(const cJSON *item, uint32_t *value)
 {
-    if (!cJSON_IsObject(json) || json->child == NULL) {
+    if (!cJSON_IsNumber(item) || item->valuedouble < 0.0 ||
+        item->valuedouble > (double)UINT32_MAX ||
+        item->valuedouble != (double)(uint32_t)item->valuedouble) {
         return 0;
     }
+    *value = (uint32_t)item->valuedouble;
+    return 1;
+}
+
+static int settings_parse_update(const cJSON *json, pj_settings_t *settings,
+                                 uint32_t *expected_generation,
+                                 int *has_expected_generation)
+{
+    if (!cJSON_IsObject(json) || json->child == NULL || settings == NULL ||
+        expected_generation == NULL || has_expected_generation == NULL) {
+        return 0;
+    }
+    int setting_count = 0;
+    *has_expected_generation = 0;
     for (const cJSON *item = json->child; item != NULL; item = item->next) {
         const char *key = item->string;
         if (key == NULL) {
             return 0;
         }
-        if (strcmp(key, "theme") == 0) {
+        for (const cJSON *previous = json->child; previous != item;
+             previous = previous->next) {
+            if (previous->string != NULL && strcmp(previous->string, key) == 0) {
+                return 0;
+            }
+        }
+        if (strcmp(key, "expected_generation") == 0) {
+            if (*has_expected_generation ||
+                !json_exact_u32(item, expected_generation)) {
+                return 0;
+            }
+            *has_expected_generation = 1;
+        } else if (strcmp(key, "theme") == 0) {
             if (!cJSON_IsString(item) || item->valuestring == NULL) {
                 return 0;
             }
@@ -8795,36 +9068,44 @@ static int settings_parse_update(const cJSON *json, pj_settings_t *settings)
             } else {
                 return 0;
             }
+            setting_count++;
         } else if (strcmp(key, "alarm_enabled") == 0) {
             if (!cJSON_IsBool(item)) {
                 return 0;
             }
             settings->alarm_enabled = cJSON_IsTrue(item) ? 1 : 0;
+            setting_count++;
         } else if (strcmp(key, "volume") == 0) {
             if (!json_exact_int(item, &settings->volume)) {
                 return 0;
             }
+            setting_count++;
         } else if (strcmp(key, "alarm_hour") == 0) {
             if (!json_exact_int(item, &settings->alarm_hour)) {
                 return 0;
             }
+            setting_count++;
         } else if (strcmp(key, "alarm_minute") == 0) {
             if (!json_exact_int(item, &settings->alarm_minute)) {
                 return 0;
             }
+            setting_count++;
         } else if (strcmp(key, "timer_seconds") == 0) {
             if (!json_exact_int(item, &settings->timer_seconds)) {
                 return 0;
             }
+            setting_count++;
         } else if (strcmp(key, "interval_seconds") == 0) {
             if (!json_exact_int(item, &settings->interval_seconds)) {
                 return 0;
             }
+            setting_count++;
         } else if (strcmp(key, "clock_24h") == 0) {
             if (!cJSON_IsBool(item)) {
                 return 0;
             }
             settings->clock_24h = cJSON_IsTrue(item) ? 1 : 0;
+            setting_count++;
         } else if (strcmp(key, "temperature_unit") == 0) {
             if (!cJSON_IsString(item) || item->valuestring == NULL) {
                 return 0;
@@ -8836,15 +9117,67 @@ static int settings_parse_update(const cJSON *json, pj_settings_t *settings)
             } else {
                 return 0;
             }
+            setting_count++;
         } else if (strcmp(key, "transcript_font_size") == 0) {
             if (!json_exact_int(item, &settings->transcript_font_size)) {
                 return 0;
             }
+            setting_count++;
         } else {
             return 0;
         }
     }
-    return pj_settings_valid(settings);
+    return setting_count > 0 && pj_settings_valid(settings);
+}
+
+static pj_settings_commit_result_t settings_commit_update(
+    const cJSON *json, int require_expected_generation,
+    uint32_t forced_expected_generation, int use_forced_expected_generation,
+    pj_settings_t *committed, uint32_t *generation, int *changed)
+{
+    if (committed == NULL || generation == NULL || changed == NULL ||
+        !settings_take(portMAX_DELAY)) {
+        return PJ_SETTINGS_COMMIT_BUSY;
+    }
+    pj_settings_t updated = g_settings;
+    uint32_t expected_generation = 0;
+    int has_expected_generation = 0;
+    if (!settings_parse_update(json, &updated, &expected_generation,
+                               &has_expected_generation) ||
+        (use_forced_expected_generation && has_expected_generation &&
+         expected_generation != forced_expected_generation)) {
+        settings_give();
+        return PJ_SETTINGS_COMMIT_INVALID;
+    }
+    if (use_forced_expected_generation) {
+        expected_generation = forced_expected_generation;
+        has_expected_generation = 1;
+    }
+    if ((require_expected_generation && !has_expected_generation) ||
+        (has_expected_generation &&
+         expected_generation != g_settings_store.generation)) {
+        settings_give();
+        return PJ_SETTINGS_COMMIT_CONFLICT;
+    }
+    *changed = memcmp(&updated, &g_settings, sizeof(updated)) != 0;
+    if (*changed) {
+        esp_err_t err = settings_save(&updated);
+        if (err != ESP_OK) {
+            settings_give();
+            return PJ_SETTINGS_COMMIT_STORE_FAILED;
+        }
+        g_settings = updated;
+        g_settings_update_pending = 1;
+    }
+    *committed = g_settings;
+    *generation = g_settings_store.generation;
+    int codec_volume = *changed ? pj_settings_codec_volume(updated.volume) : -1;
+    settings_give();
+    if (*changed) {
+        settings_apply_codec_volume(codec_volume);
+        alert_audio_set_volume(codec_volume);
+    }
+    return PJ_SETTINGS_COMMIT_OK;
 }
 
 static esp_err_t settings_put_handler(httpd_req_t *req)
@@ -8864,36 +9197,45 @@ static esp_err_t settings_put_handler(httpd_req_t *req)
         return send_json(req, "{\"error\":\"invalid settings body\"}");
     }
     cJSON *json = cJSON_ParseWithOpts(body, NULL, 1);
-    if (!settings_take(portMAX_DELAY)) {
-        cJSON_Delete(json);
-        httpd_resp_set_status(req, "503 Service Unavailable");
-        return send_json(req, "{\"error\":\"settings busy\"}");
-    }
-    pj_settings_t updated = g_settings;
-    if (!settings_parse_update(json, &updated)) {
-        cJSON_Delete(json);
-        settings_give();
-        httpd_resp_set_status(req, "400 Bad Request");
-        return send_json(req, "{\"error\":\"unsupported or invalid settings\"}");
-    }
+    pj_settings_t committed;
+    uint32_t generation = 0;
+    int changed = 0;
+    pj_settings_commit_result_t result = settings_commit_update(
+        json, 0, 0, 0, &committed, &generation, &changed);
     cJSON_Delete(json);
-
-    esp_err_t err = settings_save(&updated);
-    int codec_volume = -1;
-    if (err == ESP_OK) {
-        g_settings = updated;
-        codec_volume = pj_settings_codec_volume(updated.volume);
-        g_settings_update_pending = 1;
+    if (result == PJ_SETTINGS_COMMIT_INVALID) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        return send_json(req, "{\"error\":\"unsupported or invalid settings\",\"code\":\"invalid_settings\",\"retryable\":false}");
     }
-    settings_give();
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "HTTP settings save failed: %s", esp_err_to_name(err));
+    if (result == PJ_SETTINGS_COMMIT_CONFLICT) {
+        httpd_resp_set_status(req, "409 Conflict");
+        return send_json(req, "{\"error\":\"settings generation conflict\",\"code\":\"generation_conflict\",\"retryable\":false}");
+    }
+    if (result == PJ_SETTINGS_COMMIT_BUSY) {
+        httpd_resp_set_status(req, "503 Service Unavailable");
+        return send_json(req, "{\"error\":\"settings busy\",\"code\":\"settings_busy\",\"retryable\":true}");
+    }
+    if (result == PJ_SETTINGS_COMMIT_STORE_FAILED) {
+        ESP_LOGW(TAG, "HTTP settings save failed");
         httpd_resp_set_status(req, "500 Internal Server Error");
-        return send_json(req, "{\"error\":\"settings store failed\"}");
+        return send_json(req, "{\"error\":\"settings store failed\",\"code\":\"settings_store_failed\",\"retryable\":true}");
     }
-    settings_apply_codec_volume(codec_volume);
-    alert_audio_set_volume(codec_volume);
-    return settings_get_handler(req);
+    cJSON *response = cJSON_CreateObject();
+    if (response == NULL || !settings_add_json(response, &committed, generation) ||
+        cJSON_AddBoolToObject(response, "changed", changed != 0) == NULL) {
+        cJSON_Delete(response);
+        httpd_resp_set_status(req, "503 Service Unavailable");
+        return send_json(req, "{\"error\":\"settings response allocation failed\"}");
+    }
+    char *encoded = cJSON_PrintUnformatted(response);
+    cJSON_Delete(response);
+    if (encoded == NULL) {
+        httpd_resp_set_status(req, "503 Service Unavailable");
+        return send_json(req, "{\"error\":\"settings response encoding failed\"}");
+    }
+    esp_err_t send_result = send_json(req, encoded);
+    cJSON_free(encoded);
+    return send_result;
 }
 
 static int file_sha256_hex_unlocked(const char *path, char out[65])

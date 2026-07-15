@@ -15,8 +15,8 @@ in command output or errors.
 | USB recovery | `pj device usb-recover [--probe-only]` | Probes `PJ_STATUS` and ESP32-S3 ROM output; attempts an esptool USB-JTAG watchdog reset, then a short RTS fallback | No | Physical USB access | ESP32-S3 USB Serial/JTAG; physical re-enumeration if serial and JTAG are both silent | Resets the device only when the application does not answer | Bounded; reaps the esptool child, releases the port, and leaves DTR/RTS idle |
 | Wi-Fi provisioning | `pj provision ... [--ble \| --serial-port PORT]` | `PJ_WIFI_HEX` (default) | No; BLE is an optional provisioning transport | Physical USB access or encrypted paired BLE; generates a new bearer token | v0 USB command or Pocket Journal BLE GATT service | Yes | Repeating intentionally replaces credentials and token |
 | Time sync | `pj device sync-time [--device ID]` | `PJ_TIME` with optional UTC-offset minutes | `PUT /v1/time` | Physical USB access or bearer token | Time command/endpoint | Yes | Safe to repeat; USB provisioning performs it automatically, persists the host offset, and validates echoed civil time against a host UTC anchor |
-| Read settings | `pj settings get [--device ID]` | No | `GET /v1/settings` | Bearer token | v0 settings endpoint | No | Safe to repeat |
-| Update settings | `pj settings set [--device ID] KEY=VALUE...` | No | `PUT /v1/settings` | Bearer token | v0 settings endpoint | Yes | Safe to retry; updates are atomic values |
+| Read settings | `pj settings get [--transport usb\|lan]` | `PJ_SETTINGS_GET` | `GET /v1/settings` | Physical USB access or bearer token | Generation-aware settings command/endpoint | No | Safe to repeat |
+| Update settings | `pj settings set [--transport usb\|lan] KEY=VALUE...` | `PJ_SETTINGS_SET` with hex-safe JSON | `PUT /v1/settings` | Physical USB access or bearer token | Generation-aware settings command/endpoint | Yes | Atomic; stale generations fail without mutation and lost USB acknowledgments replay safely |
 | List audio | `pj recordings list [--transport usb\|lan]` | Snapshot-paged `PJ_AUDIO_LIST`, one hex-safe item per response | `GET /v1/audio` | Physical USB access or bearer token | USB transfer protocol or v0 audio endpoint | No | Safe to repeat; snapshot changes abort the list |
 | Download audio | `pj recordings download --audio-id ID [--transport usb\|lan]` | Chunked `PJ_AUDIO_READ`, 256 bytes per response | `GET /v1/audio/{id}` | Physical USB access or bearer token | USB transfer protocol or v0 audio endpoint | Writes only the selected local file | USB uses temp-file replace after size, offset, EOF, and digest validation; full sync also validates the WAV structure |
 | Sync audio and transcripts | `pj sync [--transport usb\|lan] [--backend whisper-cpp\|hf\|fake]` | Snapshot list, chunked reads, atomic transcript upload | Audio GET plus transcript PUT | Physical USB access or bearer token | USB transfer protocol or v0 audio/transcript endpoints; selected local backend installed | Yes | Safe after interruption; cached audio/transcripts are reused and firmware skips uploaded notes |
@@ -73,6 +73,13 @@ KiB. Audio reads validate a stable snapshot/source digest and exact offsets.
 Transcript uploads validate declared byte count and SHA-256 before an atomic
 commit; failures trigger a best-effort abort without treating an unknown commit
 outcome as success.
+
+Settings reads return the canonical persisted fields plus a monotonic
+`generation`. Both transports pin that generation for partial updates. The USB
+command hex-encodes at most 256 bytes of compact JSON, rejects unknown or removed
+fields, and replays an identical last request id after a lost acknowledgment;
+reusing an id with different content fails closed. LAN sends the same expected
+generation in the request body and returns `409` on a stale value.
 
 ## Output And Exit Codes
 

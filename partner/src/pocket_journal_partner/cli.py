@@ -461,7 +461,7 @@ def cmd_transcription_status(args: argparse.Namespace) -> int:
 
 
 def cmd_settings_get(args: argparse.Namespace) -> int:
-    session = _lan_session_from_args(args)
+    session = _session_from_args(args)
     session.require("settings.read")
     _print_json(session.envelope(session.client.get_settings()))  # type: ignore[union-attr]
     return 0
@@ -519,7 +519,7 @@ def _parse_settings_assignments(assignments: list[str]) -> dict[str, object]:
 
 def cmd_settings_set(args: argparse.Namespace) -> int:
     settings = _parse_settings_assignments(args.assignments)
-    session = _lan_session_from_args(args)
+    session = _session_from_args(args)
     session.require("settings.write")
     response = session.client.put_settings(settings)  # type: ignore[union-attr]
     _print_json(session.envelope(response or {"updated": settings}))
@@ -888,12 +888,20 @@ def build_parser() -> argparse.ArgumentParser:
     settings_get.add_argument("--base-url")
     settings_get.add_argument("--token", help="override the stored LAN bearer token")
     settings_get.add_argument("--data-dir")
+    settings_get.add_argument("--serial-port", help="USB-C serial port; auto-detected when omitted")
+    settings_get.add_argument("--serial-baud", type=int, default=115200)
+    settings_get.add_argument("--timeout", type=float, default=6.0)
+    settings_get.add_argument("--transport", choices=["auto", "usb", "lan"], default="auto")
     settings_get.set_defaults(func=cmd_settings_get)
     settings_set = settings_sub.add_parser("set")
     settings_set.add_argument("--device", help="paired device id; auto-selected when unambiguous")
     settings_set.add_argument("--base-url")
     settings_set.add_argument("--token", help="override the stored LAN bearer token")
     settings_set.add_argument("--data-dir")
+    settings_set.add_argument("--serial-port", help="USB-C serial port; auto-detected when omitted")
+    settings_set.add_argument("--serial-baud", type=int, default=115200)
+    settings_set.add_argument("--timeout", type=float, default=6.0)
+    settings_set.add_argument("--transport", choices=["auto", "usb", "lan"], default="auto")
     settings_set.add_argument("assignments", nargs="+")
     settings_set.set_defaults(func=cmd_settings_set)
 
