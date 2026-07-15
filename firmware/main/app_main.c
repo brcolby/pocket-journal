@@ -95,6 +95,14 @@ static void handle_board_event(pj_ui_context_t *ui, const pj_board_event_t *even
         sync_ui_audio_from_board(ui);
         handled = pj_ui_handle_aux_double(ui);
         break;
+    case PJ_BOARD_EVENT_POWER:
+        if (pj_ui_current_state(ui) == PJ_UI_STATE_STATIC) {
+            pj_ui_wake(ui);
+        } else {
+            pj_ui_sleep(ui);
+        }
+        handled = 1;
+        break;
     case PJ_BOARD_EVENT_NONE:
     default:
         break;
@@ -146,10 +154,18 @@ void app_main(void)
             }
         }
 
-        if (sleep_pending && pj_board_aux_released()) {
+        if (sleep_pending && pj_board_aux_released() && pj_board_power_released()) {
             sleep_pending = 0;
-            pj_board_enter_sleep();
-            if (pj_board_update_time_state(&g_ui)) {
+            int sleep_result = pj_board_enter_sleep();
+            if (sleep_result > 0) {
+                pj_ui_wake(&g_ui);
+                pj_board_refresh_status(&g_ui);
+                (void)pj_board_update_time_state(&g_ui);
+                render_and_flush_if_dirty(&g_ui);
+            } else if (sleep_result == 0) {
+                sleep_pending = 1;
+            } else {
+                pj_ui_wake(&g_ui);
                 render_and_flush_if_dirty(&g_ui);
             }
         }

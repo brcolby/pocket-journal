@@ -7,6 +7,7 @@ EMCC ?= emcc
 UI_TEST_BIN := build/test_ui_core
 TIME_MODEL_TEST_BIN := build/test_time_model
 AUX_INPUT_TEST_BIN := build/test_aux_input
+POWER_INPUT_TEST_BIN := build/test_power_input
 AUDIO_LEVEL_TEST_BIN := build/test_audio_level
 ALERT_AUDIO_TEST_BIN := build/test_alert_audio
 RECORDING_TEST_BIN := build/test_recording
@@ -77,6 +78,12 @@ test-input:
 		tests/board/test_aux_input.c \
 		-o $(AUX_INPUT_TEST_BIN)
 	$(AUX_INPUT_TEST_BIN)
+	$(CC) $(CFLAGS) \
+		-Ifirmware/components/pj_board/include \
+		firmware/components/pj_board/pj_power_input.c \
+		tests/board/test_power_input.c \
+		-o $(POWER_INPUT_TEST_BIN)
+	$(POWER_INPUT_TEST_BIN)
 	$(CC) $(CFLAGS) \
 		-Ifirmware/components/pj_board/include \
 		firmware/components/pj_board/pj_audio_level.c \

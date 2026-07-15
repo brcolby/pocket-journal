@@ -41,7 +41,8 @@ typedef enum {
     PJ_BOARD_EVENT_TOUCH_TAP,
     PJ_BOARD_EVENT_AUX_SHORT,
     PJ_BOARD_EVENT_AUX_LONG,
-    PJ_BOARD_EVENT_AUX_DOUBLE
+    PJ_BOARD_EVENT_AUX_DOUBLE,
+    PJ_BOARD_EVENT_POWER
 } pj_board_event_type_t;
 
 typedef struct {
@@ -106,7 +107,9 @@ int pj_board_update_time_state(pj_ui_context_t *ui);
 int pj_board_display_framebuffer(const pj_framebuffer_t *fb, const pj_ui_dirty_region_t *dirty);
 int pj_board_poll_event(pj_board_event_t *event);
 int pj_board_aux_released(void);
-void pj_board_enter_sleep(void);
+int pj_board_power_released(void);
+/* Returns 1 after a sleep/wake cycle, 0 when deferred, and -1 on failure. */
+int pj_board_enter_sleep(void);
 int pj_board_record_set_active(int active);
 int pj_board_record_toggle(void);
 int pj_board_playback_set_active(int active, int note_index);

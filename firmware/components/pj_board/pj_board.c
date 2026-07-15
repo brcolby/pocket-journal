@@ -6,6 +6,7 @@
 #include "pj_display_refresh.h"
 #include "pj_home_layout.h"
 #include "pj_note_model.h"
+#include "pj_power_input.h"
 #include "pj_recording.h"
 #include "pj_rtc_wake.h"
 #include "pj_runtime_diagnostics.h"
@@ -305,8 +306,10 @@ static char g_ble_password[PJ_WIFI_PASSWORD_MAX_LEN + 1];
 static char g_ble_token[sizeof(g_status.token)];
 static char g_ble_state[24] = "idle";
 static pj_aux_input_t g_aux_input;
+static pj_power_input_t g_power_input;
 static int g_aux_task_started;
 static int g_aux_released = 1;
+static int g_power_released = 1;
 static int g_touch_task_started;
 static int g_serial_command_task_started;
 static int g_touch_pressed;
@@ -4007,6 +4010,22 @@ static void aux_poll_task(void *arg)
         pj_aux_gesture_t gesture = pj_aux_input_update(&g_aux_input, level, now_ms);
         aux_released_set(pj_aux_input_is_released(&g_aux_input));
 
+        int power_toggle;
+        portENTER_CRITICAL(&g_aux_state_lock);
+        power_toggle = pj_power_input_update(
+            &g_power_input, gpio_get_level(PWR_BUTTON_PIN), now_ms);
+        g_power_released = pj_power_input_is_released(&g_power_input);
+        portEXIT_CRITICAL(&g_aux_state_lock);
+        if (power_toggle) {
+            pj_board_event_t power_event = {
+                .type = PJ_BOARD_EVENT_POWER,
+                .x = 0,
+                .y = 0,
+            };
+            ESP_LOGI(TAG, "PWR press");
+            board_queue_event(&power_event);
+        }
+
         pj_board_event_t event = {
             .type = gesture == PJ_AUX_GESTURE_SHORT ? PJ_BOARD_EVENT_AUX_SHORT :
                     gesture == PJ_AUX_GESTURE_LONG ? PJ_BOARD_EVENT_AUX_LONG :
@@ -4036,10 +4055,16 @@ static esp_err_t aux_task_start(void)
             return ESP_ERR_NO_MEM;
         }
     }
+    ESP_RETURN_ON_ERROR(board_event_queue_ensure(), TAG,
+                        "board event queue allocation failed");
     int level = gpio_get_level(BOOT_BUTTON_PIN);
     uint32_t now_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
     pj_aux_input_init(&g_aux_input, level, now_ms);
     aux_released_set(pj_aux_input_is_released(&g_aux_input));
+    portENTER_CRITICAL(&g_aux_state_lock);
+    pj_power_input_init(&g_power_input, gpio_get_level(PWR_BUTTON_PIN), now_ms);
+    g_power_released = pj_power_input_is_released(&g_power_input);
+    portEXIT_CRITICAL(&g_aux_state_lock);
     if (xTaskCreate(aux_poll_task, "pj-aux", 3072, NULL, 7, NULL) != pdPASS) {
         return ESP_ERR_NO_MEM;
     }
@@ -6630,12 +6655,25 @@ int pj_board_aux_released(void)
 #endif
 }
 
-void pj_board_enter_sleep(void)
+int pj_board_power_released(void)
+{
+#ifdef ESP_PLATFORM
+    int released;
+    portENTER_CRITICAL(&g_aux_state_lock);
+    released = g_power_released;
+    portEXIT_CRITICAL(&g_aux_state_lock);
+    return released;
+#else
+    return 1;
+#endif
+}
+
+int pj_board_enter_sleep(void)
 {
 #ifdef ESP_PLATFORM
     if (!storage_sleep_try_begin()) {
         ESP_LOGI(TAG, "Sleep deferred because storage work is active");
-        return;
+        return 0;
     }
     int rtc_schedule = rtc_wake_sync();
     uint64_t wake_delay_ms = UINT64_MAX;
@@ -6650,7 +6688,7 @@ void pj_board_enter_sleep(void)
     if (wake_delay_ms == 0) {
         ESP_LOGI(TAG, "Sleep deferred because a time alert is due");
         storage_sleep_finish();
-        return;
+        return 0;
     }
     if (wake_delay_ms != UINT64_MAX) {
         esp_err_t err = esp_sleep_enable_timer_wakeup(wake_delay_ms * 1000u);
@@ -6662,7 +6700,7 @@ void pj_board_enter_sleep(void)
             ESP_LOGW(TAG, "Sleep deferred; no scheduled wake source: %s",
                      esp_err_to_name(err));
             storage_sleep_finish();
-            return;
+            return -1;
         } else {
             ESP_LOGW(TAG, "Internal fallback wake unavailable: %s", esp_err_to_name(err));
         }
@@ -6674,15 +6712,15 @@ void pj_board_enter_sleep(void)
         gpio_get_level(RTC_INT_PIN) == 0) {
         ESP_LOGI(TAG, "Sleep deferred because RTC_INT is already active");
         storage_sleep_finish();
-        return;
+        return 0;
     }
     if (g_display_ready) {
         gpio_set_level(EPD_PWR_PIN, 1);
         g_epd_shadow_valid = 0;
         g_epd_partial_ready = 0;
     }
-    ESP_LOGI(TAG, "Entering light sleep; BOOT, RTC_INT, or timer wake the device");
-    esp_err_t sleep_err = gpio_wakeup_enable(BOOT_BUTTON_PIN, GPIO_INTR_LOW_LEVEL);
+    ESP_LOGI(TAG, "Entering light sleep; PWR, RTC_INT, or timer wake the device");
+    esp_err_t sleep_err = gpio_wakeup_enable(PWR_BUTTON_PIN, GPIO_INTR_LOW_LEVEL);
     if (sleep_err == ESP_OK) {
         sleep_err = esp_sleep_enable_gpio_wakeup();
     }
@@ -6693,7 +6731,7 @@ void pj_board_enter_sleep(void)
         gpio_set_level(EPD_PWR_PIN, 0);
         ESP_LOGW(TAG, "Light sleep rejected: %s", esp_err_to_name(sleep_err));
         storage_sleep_finish();
-        return;
+        return -1;
     }
     uint32_t wake_causes = esp_sleep_get_wakeup_causes();
     int timer_wake = (wake_causes & (1u << ESP_SLEEP_WAKEUP_TIMER)) != 0;
@@ -6732,12 +6770,22 @@ void pj_board_enter_sleep(void)
         }
     }
     gpio_set_level(EPD_PWR_PIN, 0);
+    uint32_t now_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
+    portENTER_CRITICAL(&g_aux_state_lock);
+    pj_power_input_init(&g_power_input, gpio_get_level(PWR_BUTTON_PIN), now_ms);
+    g_power_released = pj_power_input_is_released(&g_power_input);
+    portEXIT_CRITICAL(&g_aux_state_lock);
+    battery_refresh_status();
+    shtc3_refresh_status();
     const char *source = rtc_wake ? "RTC_INT" : timer_wake ? "timer" : "GPIO";
     ESP_LOGI(TAG, "Woke from light sleep via %s (RTC flags=0x%02x)%s",
              source, rtc_flags,
              rtc_wake &&
              (rtc_flags & PJ_RTC_WAKE_CONTROL2_AF) == 0 ? " spurious" : "");
     storage_sleep_finish();
+    return 1;
+#else
+    return 1;
 #endif
 }
 
