@@ -32,6 +32,7 @@
 #include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <strings.h>
 #include <sys/stat.h>
@@ -71,6 +72,8 @@
 #include "driver/rtc_io.h"
 #include "driver/sdmmc_host.h"
 #include "driver/spi_master.h"
+#include "driver/usb_serial_jtag.h"
+#include "driver/usb_serial_jtag_vfs.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 #include "freertos/queue.h"
@@ -214,6 +217,8 @@
 #define PJ_AUDIO_COLLECT_NO_MEMORY (-3)
 /* PJ_AUDIO_READ holds 1024 raw bytes plus 2049 hex bytes on this task's stack. */
 #define PJ_SERIAL_COMMAND_TASK_STACK 9216
+#define PJ_SERIAL_RX_BUFFER_BYTES 1024U
+#define PJ_SERIAL_TX_BUFFER_BYTES 4096U
 #define PJ_STORAGE_WIPE_TASK_STACK 4096
 #define PJ_STORAGE_WIPE_BATCH_ENTRIES 64U
 #define PJ_STORAGE_WIPE_MAX_BATCHES 64U
@@ -10091,8 +10096,36 @@ static esp_err_t serial_command_task_start(void)
     if (g_serial_command_task_started) {
         return ESP_OK;
     }
+    int driver_installed_here = 0;
+    if (!usb_serial_jtag_is_driver_installed()) {
+        usb_serial_jtag_driver_config_t config = {
+            .tx_buffer_size = PJ_SERIAL_TX_BUFFER_BYTES,
+            .rx_buffer_size = PJ_SERIAL_RX_BUFFER_BYTES,
+        };
+        esp_err_t err = usb_serial_jtag_driver_install(&config);
+        if (err != ESP_OK) {
+            return err;
+        }
+        driver_installed_here = 1;
+    }
+    int input_flags = fcntl(fileno(stdin), F_GETFL);
+    if (input_flags < 0 ||
+        fcntl(fileno(stdin), F_SETFL, input_flags & ~O_NONBLOCK) < 0) {
+        if (driver_installed_here) {
+            (void)usb_serial_jtag_driver_uninstall();
+        }
+        return ESP_FAIL;
+    }
+    usb_serial_jtag_vfs_use_driver();
     BaseType_t created = xTaskCreate(serial_command_task, "pj-serial", PJ_SERIAL_COMMAND_TASK_STACK, NULL, 3, NULL);
     if (created != pdPASS) {
+        if (driver_installed_here) {
+            usb_serial_jtag_vfs_use_nonblocking();
+        }
+        (void)fcntl(fileno(stdin), F_SETFL, input_flags);
+        if (driver_installed_here) {
+            (void)usb_serial_jtag_driver_uninstall();
+        }
         return ESP_ERR_NO_MEM;
     }
     g_serial_command_task_started = 1;
