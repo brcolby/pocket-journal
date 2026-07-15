@@ -1,5 +1,6 @@
 #include "pj_board.h"
 #include "pj_alert_audio.h"
+#include "pj_audio_lifecycle.h"
 #include "pj_audio_level.h"
 #include "pj_aux_input.h"
 #include "pj_auth.h"
@@ -25,6 +26,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <inttypes.h>
+#include <stdarg.h>
 #ifdef ESP_PLATFORM
 #include <ctype.h>
 #include <dirent.h>
@@ -69,6 +71,7 @@
 #include "driver/sdmmc_host.h"
 #include "driver/spi_master.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/event_groups.h"
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
@@ -233,9 +236,11 @@ static int g_settings_store_ready;
 static esp_err_t g_settings_io_error = ESP_OK;
 #endif
 static int g_display_warning_logged;
-static volatile int g_time_update_pending;
 static uint32_t g_time_generation;
-static volatile int g_settings_update_pending;
+#ifndef ESP_PLATFORM
+static int g_time_update_pending;
+static int g_settings_update_pending;
+#endif
 
 #ifdef ESP_PLATFORM
 typedef struct {
@@ -302,6 +307,12 @@ static SemaphoreHandle_t g_settings_lock;
 static SemaphoreHandle_t g_json_write_lock;
 static SemaphoreHandle_t g_time_transaction_lock;
 static StaticSemaphore_t g_time_transaction_lock_storage;
+static SemaphoreHandle_t g_status_lock;
+static StaticSemaphore_t g_status_lock_storage;
+static SemaphoreHandle_t g_audio_lifecycle_lock;
+static StaticSemaphore_t g_audio_lifecycle_lock_storage;
+static EventGroupHandle_t g_board_update_events;
+static StaticEventGroup_t g_board_update_events_storage;
 static sdmmc_card_t *g_sd_card;
 static DMA_ATTR uint8_t g_epd_buffer[PJ_FRAMEBUFFER_BYTES];
 static DMA_ATTR uint8_t g_epd_lut_buffer[PJ_EPD_LUT_TRANSFER_BYTES];
@@ -353,10 +364,6 @@ static int g_touch_candidate_samples;
 static uint16_t g_touch_candidate_x;
 static uint16_t g_touch_candidate_y;
 static uint8_t g_touch_raw_event;
-static volatile int g_record_stop_requested;
-static volatile int g_playback_stop_requested;
-static volatile int g_audio_state_update_pending;
-static volatile int g_notes_update_pending;
 static TaskHandle_t g_record_task;
 static TaskHandle_t g_audio_process_task;
 static TaskHandle_t g_playback_task;
@@ -375,11 +382,11 @@ static int g_ui_note_transcript_view;
 static char g_wifi_ssid[PJ_WIFI_SSID_MAX_LEN + 1];
 static char g_wifi_password[PJ_WIFI_PASSWORD_MAX_LEN + 1];
 static int g_wifi_credentials_stored;
+static char g_provisioned_token[sizeof(g_status.token)];
 static int g_utc_offset_known;
 static int g_utc_offset_minutes;
 static uint32_t g_record_sequence;
 static portMUX_TYPE g_time_lock = portMUX_INITIALIZER_UNLOCKED;
-static portMUX_TYPE g_audio_state_lock = portMUX_INITIALIZER_UNLOCKED;
 static portMUX_TYPE g_recording_lock = portMUX_INITIALIZER_UNLOCKED;
 static portMUX_TYPE g_storage_coordinator_lock = portMUX_INITIALIZER_UNLOCKED;
 static portMUX_TYPE g_aux_state_lock = portMUX_INITIALIZER_UNLOCKED;
@@ -388,6 +395,7 @@ static uint32_t g_runtime_boot_id;
 static int g_cached_pending_sync;
 static int g_cached_transferred_sync;
 static pj_recording_t g_recording;
+static pj_audio_lifecycle_t g_audio_lifecycle;
 static pj_usb_upload_t g_usb_upload;
 typedef struct {
     char audio_id[PJ_NOTE_FILENAME_LEN];
@@ -407,6 +415,7 @@ static pj_time_clock_anchor_t g_time_clock_anchor;
 static pj_time_controller_t g_time_controller;
 static pj_time_controller_diagnostic_t g_time_last_diagnostic;
 static int g_time_wall_trusted;
+static int g_time_known;
 static pj_rtc_wake_plan_t g_rtc_wake_plan;
 static int g_rtc_ext1_enabled;
 static int g_rtc_wake_hardware_verified;
@@ -476,6 +485,123 @@ static esp_err_t board_event_queue_ensure(void);
 static void board_queue_event(const pj_board_event_t *event);
 
 static pj_alert_audio_t g_alert_audio;
+
+enum {
+    BOARD_UPDATE_TIME = (1U << 0),
+    BOARD_UPDATE_SETTINGS = (1U << 1),
+    BOARD_UPDATE_AUDIO = (1U << 2),
+    BOARD_UPDATE_NOTES = (1U << 3),
+};
+
+/* Task-context only. No ISR path takes these mutexes. */
+static void board_status_take(void)
+{
+    if (g_status_lock != NULL) {
+        (void)xSemaphoreTakeRecursive(g_status_lock, portMAX_DELAY);
+    }
+}
+
+static void board_status_give(void)
+{
+    if (g_status_lock != NULL) {
+        (void)xSemaphoreGiveRecursive(g_status_lock);
+    }
+}
+
+static pj_board_status_t board_status_snapshot_base(void)
+{
+    pj_board_status_t status;
+    board_status_take();
+    status = g_status;
+    board_status_give();
+    return status;
+}
+
+static void board_status_set_error(const char *format, ...)
+{
+    char message[sizeof(g_status.last_error)];
+    va_list args;
+    va_start(args, format);
+    (void)vsnprintf(message, sizeof(message), format, args);
+    va_end(args);
+    board_status_take();
+    (void)snprintf(g_status.last_error, sizeof(g_status.last_error), "%s",
+                   message);
+    board_status_give();
+}
+
+static void board_status_clear_error(void)
+{
+    board_status_take();
+    g_status.last_error[0] = '\0';
+    board_status_give();
+}
+
+typedef enum {
+    BOARD_SERVICE_DISPLAY,
+    BOARD_SERVICE_STORAGE,
+    BOARD_SERVICE_AUDIO,
+    BOARD_SERVICE_BLE,
+    BOARD_SERVICE_WIFI,
+    BOARD_SERVICE_HTTP,
+} board_service_field_t;
+
+static void board_status_set_service(board_service_field_t field,
+                                     pj_board_service_state_t state)
+{
+    board_status_take();
+    switch (field) {
+    case BOARD_SERVICE_DISPLAY: g_status.display = state; break;
+    case BOARD_SERVICE_STORAGE: g_status.storage = state; break;
+    case BOARD_SERVICE_AUDIO: g_status.audio = state; break;
+    case BOARD_SERVICE_BLE: g_status.ble_provisioning = state; break;
+    case BOARD_SERVICE_WIFI: g_status.wifi = state; break;
+    case BOARD_SERVICE_HTTP: g_status.http = state; break;
+    }
+    board_status_give();
+}
+
+static void board_update_publish(EventBits_t bit)
+{
+    if (g_board_update_events != NULL) {
+        (void)xEventGroupSetBits(g_board_update_events, bit);
+    }
+}
+
+static int board_update_pending(EventBits_t bit)
+{
+    return g_board_update_events != NULL &&
+           (xEventGroupGetBits(g_board_update_events) & bit) != 0U;
+}
+
+static int board_update_take(EventBits_t bit)
+{
+    return g_board_update_events != NULL &&
+           (xEventGroupClearBits(g_board_update_events, bit) & bit) != 0U;
+}
+
+static int audio_lifecycle_take(void)
+{
+    return g_audio_lifecycle_lock != NULL &&
+           xSemaphoreTake(g_audio_lifecycle_lock, portMAX_DELAY) == pdTRUE;
+}
+
+static void audio_lifecycle_give(void)
+{
+    if (g_audio_lifecycle_lock != NULL) {
+        xSemaphoreGive(g_audio_lifecycle_lock);
+    }
+}
+
+static int audio_lifecycle_active(void)
+{
+    int active = 1;
+    if (audio_lifecycle_take()) {
+        active = pj_audio_lifecycle_active(&g_audio_lifecycle);
+        audio_lifecycle_give();
+    }
+    return active;
+}
 
 static int storage_shared_try_acquire(void)
 {
@@ -607,14 +733,14 @@ static void storage_sync_counts_snapshot(int *pending, int *transferred)
 
 static void board_audio_state_set(int recording, int playback_active)
 {
-    portENTER_CRITICAL(&g_audio_state_lock);
+    board_status_take();
     if (recording >= 0) {
         g_status.recording = recording;
     }
     if (playback_active >= 0) {
         g_status.playback_active = playback_active;
     }
-    portEXIT_CRITICAL(&g_audio_state_lock);
+    board_status_give();
 }
 
 static int recording_state_start(void)
@@ -623,7 +749,6 @@ static int recording_state_start(void)
     portENTER_CRITICAL(&g_recording_lock);
     started = pj_recording_start(&g_recording, PJ_AUDIO_SAMPLE_RATE,
                                  PJ_AUDIO_CHANNELS, PJ_AUDIO_BITS_PER_SAMPLE);
-    g_status.recording_elapsed_ms = pj_recording_elapsed_ms(&g_recording);
     portEXIT_CRITICAL(&g_recording_lock);
     return started;
 }
@@ -633,7 +758,6 @@ static int recording_state_commit(size_t bytes)
     int committed;
     portENTER_CRITICAL(&g_recording_lock);
     committed = pj_recording_commit(&g_recording, bytes);
-    g_status.recording_elapsed_ms = pj_recording_elapsed_ms(&g_recording);
     portEXIT_CRITICAL(&g_recording_lock);
     return committed;
 }
@@ -670,23 +794,22 @@ static void recording_publish_completion(void)
         return;
     }
     if (succeeded) {
-        g_notes_update_pending = 1;
-    } else if (g_status.last_error[0] == '\0') {
-        (void)snprintf(g_status.last_error, sizeof(g_status.last_error),
-                       "recording failed before a valid note was published");
+        board_update_publish(BOARD_UPDATE_NOTES);
+    } else {
+        pj_board_status_t status = board_status_snapshot_base();
+        if (status.last_error[0] == '\0') {
+            board_status_set_error(
+                "recording failed before a valid note was published");
+        }
     }
 }
 
 static pj_time_activity_t board_time_activity(void)
 {
-    int recording;
-    int playback_active;
-    portENTER_CRITICAL(&g_audio_state_lock);
-    recording = g_status.recording;
-    playback_active = g_status.playback_active;
-    portEXIT_CRITICAL(&g_audio_state_lock);
-    return recording ? PJ_TIME_ACTIVITY_RECORDING :
-           playback_active ? PJ_TIME_ACTIVITY_PLAYBACK : PJ_TIME_ACTIVITY_IDLE;
+    pj_board_status_t status = board_status_snapshot_base();
+    return status.recording ? PJ_TIME_ACTIVITY_RECORDING :
+           status.playback_active ? PJ_TIME_ACTIVITY_PLAYBACK :
+                                    PJ_TIME_ACTIVITY_IDLE;
 }
 typedef struct {
     int pa_level;
@@ -959,9 +1082,10 @@ static int alert_audio_prepare(void *context, uint32_t sample_rate, uint8_t chan
         audio_abort_output("time-alert-prepare-failed");
         g_alert_audio_output_owned = 0;
         xSemaphoreGive(g_audio_lock);
-        (void)snprintf(g_status.last_error, sizeof(g_status.last_error),
-                       "time alert audio prepare failed: %s", esp_err_to_name(err));
-        ESP_LOGW(TAG, "%s", g_status.last_error);
+        board_status_set_error("time alert audio prepare failed: %s",
+                               esp_err_to_name(err));
+        ESP_LOGW(TAG, "Time alert audio prepare failed: %s",
+                 esp_err_to_name(err));
         return 0;
     }
     return 1;
@@ -977,9 +1101,10 @@ static int alert_audio_write(void *context, const int16_t *samples, size_t frame
     int result = esp_codec_dev_write(g_audio_playback_codec, (void *)samples,
                                      (int)(frames * PJ_AUDIO_FRAME_BYTES));
     if (result != ESP_CODEC_DEV_OK) {
-        (void)snprintf(g_status.last_error, sizeof(g_status.last_error),
-                       "time alert audio write failed: %s", esp_err_to_name((esp_err_t)result));
-        ESP_LOGW(TAG, "%s", g_status.last_error);
+        board_status_set_error("time alert audio write failed: %s",
+                               esp_err_to_name((esp_err_t)result));
+        ESP_LOGW(TAG, "Time alert audio write failed: %s",
+                 esp_err_to_name((esp_err_t)result));
         return 0;
     }
     return 1;
@@ -995,9 +1120,10 @@ static int alert_audio_finish(void *context)
     g_alert_audio_output_owned = 0;
     xSemaphoreGive(g_audio_lock);
     if (result != ESP_OK) {
-        (void)snprintf(g_status.last_error, sizeof(g_status.last_error),
-                       "time alert audio cleanup failed: %s", esp_err_to_name(result));
-        ESP_LOGW(TAG, "%s", g_status.last_error);
+        board_status_set_error("time alert audio cleanup failed: %s",
+                               esp_err_to_name(result));
+        ESP_LOGW(TAG, "Time alert audio cleanup failed: %s",
+                 esp_err_to_name(result));
         return 0;
     }
     return 1;
@@ -1024,7 +1150,7 @@ static void alert_audio_publish_ack(uint64_t alert_id)
     portENTER_CRITICAL(&g_alert_audio_intent_lock);
     g_alert_ack_pending = alert_id;
     portEXIT_CRITICAL(&g_alert_audio_intent_lock);
-    g_audio_state_update_pending = 1;
+    board_update_publish(BOARD_UPDATE_AUDIO);
 }
 
 static uint64_t alert_audio_take_ack(void)
@@ -1459,10 +1585,11 @@ static pj_time_sync_publication_t publish_sntp_civil_time_locked(
         civil.hour, civil.minute, civil.year, civil.month, civil.day,
         civil.second);
     if (rtc_err != ESP_OK) {
-        (void)snprintf(g_status.last_error, sizeof(g_status.last_error),
-                       "SNTP time published but RTC persistence failed: %s",
-                       esp_err_to_name(rtc_err));
-        ESP_LOGW(TAG, "%s", g_status.last_error);
+        board_status_set_error(
+            "SNTP time published but RTC persistence failed: %s",
+            esp_err_to_name(rtc_err));
+        ESP_LOGW(TAG, "SNTP RTC persistence failed: %s",
+                 esp_err_to_name(rtc_err));
         return PJ_TIME_SYNC_PUBLICATION_RTC_FAILED;
     }
     return PJ_TIME_SYNC_PUBLICATION_PUBLISHED;
@@ -1693,17 +1820,20 @@ static esp_err_t mdns_start(void)
         return ESP_OK;
     }
     ESP_RETURN_ON_ERROR(mdns_init(), TAG, "mDNS init failed");
-    ESP_RETURN_ON_ERROR(mdns_hostname_set(g_status.device_id), TAG, "mDNS hostname failed");
+    pj_board_status_t status = board_status_snapshot_base();
+    ESP_RETURN_ON_ERROR(mdns_hostname_set(status.device_id), TAG,
+                        "mDNS hostname failed");
     ESP_RETURN_ON_ERROR(mdns_instance_name_set("Pocket Journal"), TAG, "mDNS instance failed");
     mdns_txt_item_t txt[] = {
-        {"device_id", g_status.device_id},
+        {"device_id", status.device_id},
         {"path", "/v1/status"},
     };
-    ESP_RETURN_ON_ERROR(mdns_service_add(g_status.device_id, "_pocket-journal", "_tcp", 80,
+    ESP_RETURN_ON_ERROR(mdns_service_add(status.device_id, "_pocket-journal", "_tcp", 80,
                                          txt, sizeof(txt) / sizeof(txt[0])),
                         TAG, "mDNS service registration failed");
     g_mdns_started = 1;
-    ESP_LOGI(TAG, "mDNS advertised: %s.local _pocket-journal._tcp", g_status.device_id);
+    ESP_LOGI(TAG, "mDNS advertised: %s.local _pocket-journal._tcp",
+             status.device_id);
     return ESP_OK;
 }
 
@@ -1751,12 +1881,16 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
         pj_time_sync_on_network_lost(&g_time_sync_state,
                                      board_monotonic_ms());
         portEXIT_CRITICAL(&g_connectivity_lock);
+        board_status_take();
         g_status.wifi = PJ_BOARD_SERVICE_UNAVAILABLE;
         (void)snprintf(g_status.ip_addr, sizeof(g_status.ip_addr), "0.0.0.0");
         if (!control_disconnect) {
             (void)snprintf(g_status.last_error, sizeof(g_status.last_error),
                            "Wi-Fi %s (reason %u); retry scheduled",
                            pj_wifi_phase_name(failure_phase), reason);
+        }
+        board_status_give();
+        if (!control_disconnect) {
             ESP_LOGW(TAG,
                      "Wi-Fi disconnected: reason=%u phase=%s ap_visible=%d rssi=%d",
                      reason, pj_wifi_phase_name(failure_phase),
@@ -1778,19 +1912,23 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
                                 rssi_dbm, channel);
         pj_time_sync_on_ip(&g_time_sync_state, board_monotonic_ms());
         portEXIT_CRITICAL(&g_connectivity_lock);
+        board_status_take();
         g_status.wifi = PJ_BOARD_SERVICE_READY;
         if (event != NULL) {
             (void)snprintf(g_status.ip_addr, sizeof(g_status.ip_addr), IPSTR,
                            IP2STR(&event->ip_info.ip));
         }
         g_status.last_error[0] = '\0';
+        char ip_addr[sizeof(g_status.ip_addr)];
+        (void)snprintf(ip_addr, sizeof(ip_addr), "%s", g_status.ip_addr);
+        board_status_give();
         ESP_LOGI(TAG, "Wi-Fi connected: ip=%s rssi=%d channel=%u",
-                 g_status.ip_addr, rssi_dbm, channel);
+                 ip_addr, rssi_dbm, channel);
         esp_err_t mdns_err = mdns_start();
         if (mdns_err != ESP_OK) {
-            (void)snprintf(g_status.last_error, sizeof(g_status.last_error),
-                           "mDNS start failed: %s", esp_err_to_name(mdns_err));
-            ESP_LOGW(TAG, "%s", g_status.last_error);
+            board_status_set_error("mDNS start failed: %s",
+                                   esp_err_to_name(mdns_err));
+            ESP_LOGW(TAG, "mDNS start failed: %s", esp_err_to_name(mdns_err));
         }
         return;
     }
@@ -1800,10 +1938,12 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
         pj_time_sync_on_network_lost(&g_time_sync_state,
                                      board_monotonic_ms());
         portEXIT_CRITICAL(&g_connectivity_lock);
+        board_status_take();
         g_status.wifi = PJ_BOARD_SERVICE_UNAVAILABLE;
         (void)snprintf(g_status.ip_addr, sizeof(g_status.ip_addr), "0.0.0.0");
         (void)snprintf(g_status.last_error, sizeof(g_status.last_error),
                        "Wi-Fi lost its DHCP lease; retry scheduled");
+        board_status_give();
     }
 }
 
@@ -1859,9 +1999,11 @@ static esp_err_t wifi_start_or_reconfigure(void)
     portEXIT_CRITICAL(&g_connectivity_lock);
     ESP_RETURN_ON_ERROR(connectivity_runtime_start(), TAG,
                         "connectivity task start failed");
+    board_status_take();
     g_status.wifi = PJ_BOARD_SERVICE_UNAVAILABLE;
     (void)snprintf(g_status.last_error, sizeof(g_status.last_error),
                    "Wi-Fi connecting");
+    board_status_give();
     return ESP_OK;
 }
 
@@ -1870,12 +2012,14 @@ static void wifi_apply_provisioning_status(void)
     if (!g_wifi_credentials_stored) {
         return;
     }
+    board_status_take();
     g_status.ble_provisioning = g_ble_started ? PJ_BOARD_SERVICE_READY :
         PJ_BOARD_SERVICE_UNAVAILABLE;
     if (g_status.wifi != PJ_BOARD_SERVICE_READY) {
         g_status.wifi = PJ_BOARD_SERVICE_UNAVAILABLE;
         (void)snprintf(g_status.last_error, sizeof(g_status.last_error), "Wi-Fi credentials stored");
     }
+    board_status_give();
 }
 
 static int settings_take(TickType_t timeout)
@@ -2280,7 +2424,7 @@ static int provisioned_token_read(char *token, size_t capacity)
     int available = 0;
     portENTER_CRITICAL(&g_credentials_lock);
     available = pj_auth_copy_provisioned_token(
-        g_wifi_credentials_stored, g_status.token, token, capacity);
+        g_wifi_credentials_stored, g_provisioned_token, token, capacity);
     portEXIT_CRITICAL(&g_credentials_lock);
     return available;
 }
@@ -2305,9 +2449,13 @@ static void wifi_load_provisioning(void)
 
     if (have_ssid && have_password && have_token) {
         portENTER_CRITICAL(&g_credentials_lock);
-        (void)snprintf(g_status.token, sizeof(g_status.token), "%s", token);
+        (void)snprintf(g_provisioned_token, sizeof(g_provisioned_token), "%s",
+                       token);
         g_wifi_credentials_stored = 1;
         portEXIT_CRITICAL(&g_credentials_lock);
+        board_status_take();
+        (void)snprintf(g_status.token, sizeof(g_status.token), "%s", token);
+        board_status_give();
         wifi_apply_provisioning_status();
         ESP_LOGI(TAG, "Wi-Fi credentials loaded from NVS");
     }
@@ -2347,9 +2495,13 @@ static esp_err_t wifi_save_provisioning(const char *ssid, const char *password, 
     (void)snprintf(g_wifi_ssid, sizeof(g_wifi_ssid), "%s", ssid);
     (void)snprintf(g_wifi_password, sizeof(g_wifi_password), "%s", password);
     portENTER_CRITICAL(&g_credentials_lock);
-    (void)snprintf(g_status.token, sizeof(g_status.token), "%s", token);
+    (void)snprintf(g_provisioned_token, sizeof(g_provisioned_token), "%s",
+                   token);
     g_wifi_credentials_stored = 1;
     portEXIT_CRITICAL(&g_credentials_lock);
+    board_status_take();
+    (void)snprintf(g_status.token, sizeof(g_status.token), "%s", token);
+    board_status_give();
     wifi_apply_provisioning_status();
     ESP_LOGI(TAG, "Wi-Fi credentials stored from partner provisioning");
     esp_err_t connect_err = wifi_start_or_reconfigure();
@@ -2395,10 +2547,10 @@ static void ble_provision_task(void *arg)
     esp_err_t err = wifi_save_provisioning(args->ssid, args->password, args->token);
     if (err == ESP_OK) {
         (void)snprintf(g_ble_state, sizeof(g_ble_state), "stored");
-        g_status.ble_provisioning = PJ_BOARD_SERVICE_READY;
+        board_status_set_service(BOARD_SERVICE_BLE, PJ_BOARD_SERVICE_READY);
     } else {
         (void)snprintf(g_ble_state, sizeof(g_ble_state), "error-%s", esp_err_to_name(err));
-        g_status.ble_provisioning = PJ_BOARD_SERVICE_ERROR;
+        board_status_set_service(BOARD_SERVICE_BLE, PJ_BOARD_SERVICE_ERROR);
     }
     memset(args, 0, sizeof(*args));
     free(args);
@@ -2432,9 +2584,11 @@ static int ble_provision_access(uint16_t conn_handle, uint16_t attr_handle,
     intptr_t field = (intptr_t)arg;
     if (field == PJ_BLE_FIELD_STATUS && ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR) {
         char json[128];
+        pj_board_status_t status = board_status_snapshot_base();
         int length = snprintf(json, sizeof(json),
                               "{\"device_id\":\"%s\",\"state\":\"%s\",\"wifi\":\"%s\"}",
-                              g_status.device_id, g_ble_state, service_name(g_status.wifi));
+                              status.device_id, g_ble_state,
+                              service_name(status.wifi));
         return os_mbuf_append(ctxt->om, json, (uint16_t)length) == 0 ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
     }
     if (ctxt->op != BLE_GATT_ACCESS_OP_WRITE_CHR) {
@@ -2538,7 +2692,7 @@ static void ble_advertise(void)
         return;
     }
     (void)snprintf(g_ble_state, sizeof(g_ble_state), "advertising");
-    g_status.ble_provisioning = PJ_BOARD_SERVICE_READY;
+    board_status_set_service(BOARD_SERVICE_BLE, PJ_BOARD_SERVICE_READY);
     ESP_LOGI(TAG, "BLE provisioning advertising as %s", name);
 }
 
@@ -2570,7 +2724,7 @@ static int ble_gap_event(struct ble_gap_event *event, void *arg)
 static void ble_on_sync(void)
 {
     if (ble_hs_util_ensure_addr(0) != 0 || ble_hs_id_infer_auto(0, &g_ble_addr_type) != 0) {
-        g_status.ble_provisioning = PJ_BOARD_SERVICE_ERROR;
+        board_status_set_service(BOARD_SERVICE_BLE, PJ_BOARD_SERVICE_ERROR);
         (void)snprintf(g_ble_state, sizeof(g_ble_state), "address-error");
         return;
     }
@@ -2596,7 +2750,8 @@ static esp_err_t ble_provisioning_start(void)
     ble_svc_gap_init();
     ble_svc_gatt_init();
     char name[20];
-    (void)snprintf(name, sizeof(name), "PJ-%.6s", g_status.device_id + 3);
+    pj_board_status_t status = board_status_snapshot_base();
+    (void)snprintf(name, sizeof(name), "PJ-%.6s", status.device_id + 3);
     for (char *cursor = name; *cursor != '\0'; cursor++) {
         *cursor = (char)toupper((unsigned char)*cursor);
     }
@@ -2615,7 +2770,7 @@ static esp_err_t ble_provisioning_start(void)
         return ESP_ERR_NO_MEM;
     }
     g_ble_started = 1;
-    g_status.ble_provisioning = PJ_BOARD_SERVICE_READY;
+    board_status_set_service(BOARD_SERVICE_BLE, PJ_BOARD_SERVICE_READY);
     return ESP_OK;
 }
 
@@ -3065,28 +3220,36 @@ static esp_err_t epd_refresh_full(const pj_framebuffer_t *framebuffer)
 
 static int storage_refresh_capacity(void)
 {
-    if (!g_status.storage_mounted) {
+    pj_board_status_t status = board_status_snapshot_base();
+    if (!status.storage_mounted) {
+        board_status_take();
         g_status.storage_total_bytes = 0;
         g_status.storage_free_bytes = 0;
         g_status.storage_health = PJ_STORAGE_HEALTH_UNMOUNTED;
+        board_status_give();
         return 0;
     }
     uint64_t total_bytes = 0;
     uint64_t free_bytes = 0;
-    esp_err_t err = esp_vfs_fat_info(g_status.storage_path, &total_bytes, &free_bytes);
+    esp_err_t err = esp_vfs_fat_info(status.storage_path, &total_bytes,
+                                     &free_bytes);
     if (err != ESP_OK) {
+        board_status_take();
         g_status.storage_health = PJ_STORAGE_HEALTH_IO_ERROR;
         g_status.storage = PJ_BOARD_SERVICE_ERROR;
         (void)snprintf(g_status.last_error, sizeof(g_status.last_error),
                        "microSD capacity check failed: %s; use storage recovery",
                        esp_err_to_name(err));
+        board_status_give();
         return 0;
     }
+    board_status_take();
     g_status.storage_total_bytes = total_bytes;
     g_status.storage_free_bytes = free_bytes;
     g_status.storage_health = pj_storage_capacity_health(1, 1, total_bytes, free_bytes,
                                                          PJ_STORAGE_RESERVE_BYTES);
     g_status.storage = PJ_BOARD_SERVICE_READY;
+    board_status_give();
     return 1;
 }
 
@@ -3095,14 +3258,18 @@ static int storage_preflight(uint64_t write_bytes, const char *operation)
     if (!storage_refresh_capacity()) {
         return 0;
     }
-    if (!pj_storage_can_write(g_status.storage_free_bytes, write_bytes,
+    pj_board_status_t status = board_status_snapshot_base();
+    if (!pj_storage_can_write(status.storage_free_bytes, write_bytes,
                               PJ_STORAGE_RESERVE_BYTES)) {
+        board_status_take();
         g_status.storage_health = PJ_STORAGE_HEALTH_FULL;
         (void)snprintf(g_status.last_error, sizeof(g_status.last_error),
                        "microSD has insufficient free space for %s; delete or sync notes",
                        operation);
-        ESP_LOGW(TAG, "%s (free=%llu reserve=%llu requested=%llu)", g_status.last_error,
-                 (unsigned long long)g_status.storage_free_bytes,
+        board_status_give();
+        ESP_LOGW(TAG, "microSD has insufficient free space for %s "
+                      "(free=%llu reserve=%llu requested=%llu)", operation,
+                 (unsigned long long)status.storage_free_bytes,
                  (unsigned long long)PJ_STORAGE_RESERVE_BYTES,
                  (unsigned long long)write_bytes);
         return 0;
@@ -3117,10 +3284,13 @@ static int ensure_storage_directory(const char *path)
 
 static esp_err_t storage_init(void)
 {
+    pj_board_status_t status = board_status_snapshot_base();
+    board_status_take();
     g_status.storage_mounted = 0;
     g_status.storage_total_bytes = 0;
     g_status.storage_free_bytes = 0;
     g_status.storage_health = PJ_STORAGE_HEALTH_UNMOUNTED;
+    board_status_give();
     gpio_set_pull_mode(SD_MISO_D0_PIN, GPIO_PULLUP_ONLY);
     gpio_set_pull_mode(SD_MOSI_CMD_PIN, GPIO_PULLUP_ONLY);
     gpio_set_pull_mode(SD_CLK_PIN, GPIO_PULLUP_ONLY);
@@ -3138,19 +3308,24 @@ static esp_err_t storage_init(void)
     slot_config.cmd = SD_MOSI_CMD_PIN;
     slot_config.d0 = SD_MISO_D0_PIN;
 
-    esp_err_t err = esp_vfs_fat_sdmmc_mount(g_status.storage_path, &host, &slot_config, &mount_config, &g_sd_card);
+    esp_err_t err = esp_vfs_fat_sdmmc_mount(status.storage_path, &host,
+                                            &slot_config, &mount_config,
+                                            &g_sd_card);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "microSD mount at %dkHz failed: %s; retrying at identification frequency",
                  host.max_freq_khz, esp_err_to_name(err));
         host.max_freq_khz = SDMMC_FREQ_PROBING;
         g_sd_card = NULL;
-        err = esp_vfs_fat_sdmmc_mount(g_status.storage_path, &host, &slot_config, &mount_config, &g_sd_card);
+        err = esp_vfs_fat_sdmmc_mount(status.storage_path, &host, &slot_config,
+                                      &mount_config, &g_sd_card);
     }
     if (err == ESP_OK && g_sd_card == NULL) {
         err = ESP_FAIL;
     }
     if (err == ESP_OK) {
+        board_status_take();
         g_status.storage_mounted = 1;
+        board_status_give();
         sdmmc_card_print_info(stdout, g_sd_card);
         if (!ensure_storage_directory("/sdcard/pj") ||
             !ensure_storage_directory(PJ_AUDIO_DIR) ||
@@ -3162,7 +3337,9 @@ static esp_err_t storage_init(void)
         } else {
             int recovered = cleanup_storage_artifacts();
             if (recovered > 0) {
+                board_status_take();
                 g_status.storage_recovery_count += (unsigned)recovered;
+                board_status_give();
                 ESP_LOGW(TAG, "Recovered %d interrupted storage artifact(s)", recovered);
                 (void)storage_refresh_capacity();
             }
@@ -3170,17 +3347,20 @@ static esp_err_t storage_init(void)
     }
     if (err != ESP_OK) {
         if (g_sd_card != NULL) {
-            esp_err_t unmount_err = esp_vfs_fat_sdcard_unmount(g_status.storage_path, g_sd_card);
+            esp_err_t unmount_err = esp_vfs_fat_sdcard_unmount(
+                status.storage_path, g_sd_card);
             if (unmount_err != ESP_OK) {
                 ESP_LOGW(TAG, "microSD cleanup unmount failed after initialization error: %s",
                          esp_err_to_name(unmount_err));
             }
             g_sd_card = NULL;
         }
+        board_status_take();
         g_status.storage_mounted = 0;
         g_status.storage_total_bytes = 0;
         g_status.storage_free_bytes = 0;
         g_status.storage_health = PJ_STORAGE_HEALTH_IO_ERROR;
+        board_status_give();
     }
     return err;
 }
@@ -3301,12 +3481,14 @@ static esp_err_t json_write_file_atomic(const char *path, const char *body, size
     if (!storage_shared_try_acquire()) {
         return ESP_ERR_INVALID_STATE;
     }
-    if (g_status.storage != PJ_BOARD_SERVICE_READY) {
+    pj_board_status_t status = board_status_snapshot_base();
+    if (status.storage != PJ_BOARD_SERVICE_READY) {
         storage_shared_release();
         return ESP_ERR_INVALID_STATE;
     }
     if (!storage_preflight(body_size, "JSON update")) {
-        esp_err_t result = g_status.storage_health == PJ_STORAGE_HEALTH_FULL ?
+        status = board_status_snapshot_base();
+        esp_err_t result = status.storage_health == PJ_STORAGE_HEALTH_FULL ?
                            ESP_ERR_NO_MEM : ESP_FAIL;
         storage_shared_release();
         return result;
@@ -3644,7 +3826,9 @@ static void refresh_ui_sync_state(pj_ui_context_t *ui)
     int pending = 0;
     int transferred = 0;
     collect_sync_counts(&pending, &transferred);
-    pj_ui_set_sync_state(ui, pending, transferred, g_status.wifi == PJ_BOARD_SERVICE_READY);
+    pj_board_status_t status = board_status_snapshot_base();
+    pj_ui_set_sync_state(ui, pending, transferred,
+                         status.wifi == PJ_BOARD_SERVICE_READY);
 }
 
 static size_t delete_dir_entries(const char *dir_path, int (*matches)(const char *name),
@@ -3707,12 +3891,12 @@ static void recording_wipe_worker(void *arg)
     size_t notes_deleted = delete_dir_entries(PJ_NOTE_DIR, is_transcript_filename, &incomplete);
 
     if (incomplete) {
-        (void)snprintf(g_status.last_error, sizeof(g_status.last_error),
-                       "recording wipe incomplete");
+        board_status_set_error("recording wipe incomplete");
     } else {
         storage_sync_counts_cache(0, 0);
-        if (strcmp(g_status.last_error, "recording wipe incomplete") == 0) {
-            g_status.last_error[0] = '\0';
+        pj_board_status_t status = board_status_snapshot_base();
+        if (strcmp(status.last_error, "recording wipe incomplete") == 0) {
+            board_status_clear_error();
         }
     }
     ESP_LOGI(TAG, "Wiped recordings: operation=%" PRIu32
@@ -3730,7 +3914,7 @@ static void recording_wipe_worker(void *arg)
 
     g_ui_note_audio_count = 0;
     g_ui_note_transcript_view = 0;
-    g_notes_update_pending = 1;
+    board_update_publish(BOARD_UPDATE_NOTES);
     vTaskDelete(NULL);
 }
 
@@ -3758,12 +3942,12 @@ static pj_wipe_start_result_t recording_wipe_start(const char *request_id,
     if (status == NULL) {
         status = &local_status;
     }
-    int audio_active = g_status.recording || g_record_task != NULL ||
-                       g_audio_process_task != NULL || g_status.playback_active ||
-                       g_playback_task != NULL;
+    int audio_active = audio_lifecycle_active();
+    pj_board_status_t board_status = board_status_snapshot_base();
     portENTER_CRITICAL(&g_storage_coordinator_lock);
     pj_wipe_start_result_t result = pj_storage_wipe_request(
-        &g_storage_coordinator, g_status.storage == PJ_BOARD_SERVICE_READY,
+        &g_storage_coordinator,
+        board_status.storage == PJ_BOARD_SERVICE_READY,
         audio_active, request_id, status);
     portEXIT_CRITICAL(&g_storage_coordinator_lock);
     if (result != PJ_WIPE_START_STARTED) {
@@ -4038,6 +4222,9 @@ static void shtc3_refresh_status(void)
     }
     uint8_t bytes[6] = {0};
     int humidity_valid = 0;
+    int temperature_valid = 0;
+    int temperature_c = 0;
+    int humidity_percent = -1;
     int awake = shtc3_write_cmd(SHTC3_CMD_WAKEUP) == ESP_OK;
     if (awake) {
         vTaskDelay(pdMS_TO_TICKS(50));
@@ -4048,19 +4235,25 @@ static void shtc3_refresh_status(void)
             if (shtc3_crc(bytes, 2) == bytes[2]) {
                 uint16_t raw_temp = ((uint16_t)bytes[0] << 8) | bytes[1];
                 float temp = 175.0f * (float)raw_temp / 65536.0f - 45.0f - 4.0f;
-                g_status.temperature_c = (int)(temp + (temp >= 0 ? 0.5f : -0.5f));
+                temperature_c =
+                    (int)(temp + (temp >= 0 ? 0.5f : -0.5f));
+                temperature_valid = 1;
             }
             if (shtc3_crc(bytes + 3, 2) == bytes[5]) {
                 uint16_t raw_humidity = ((uint16_t)bytes[3] << 8) | bytes[4];
                 int humidity = (int)(100.0f * (float)raw_humidity / 65536.0f + 0.5f);
-                g_status.humidity_percent = humidity < 0 ? 0 : humidity > 100 ? 100 : humidity;
+                humidity_percent = humidity < 0 ? 0 :
+                                   humidity > 100 ? 100 : humidity;
                 humidity_valid = 1;
             }
         }
     }
-    if (!humidity_valid) {
-        g_status.humidity_percent = -1;
+    board_status_take();
+    if (temperature_valid) {
+        g_status.temperature_c = temperature_c;
     }
+    g_status.humidity_percent = humidity_valid ? humidity_percent : -1;
+    board_status_give();
     ESP_ERROR_CHECK_WITHOUT_ABORT(shtc3_write_cmd(SHTC3_CMD_SLEEP));
     i2c_give();
 }
@@ -4404,7 +4597,9 @@ static void battery_refresh_status(void)
     } else if (percent > 100) {
         percent = 100;
     }
+    board_status_take();
     g_status.battery_percent = percent;
+    board_status_give();
 }
 
 static esp_err_t rtc_init(void)
@@ -4514,12 +4709,7 @@ static board_time_snapshot_t board_time_snapshot(void)
     portENTER_CRITICAL(&g_time_lock);
     anchor = g_time_clock_anchor;
     snapshot = (board_time_snapshot_t) {
-        .hour = g_status.hour,
-        .minute = g_status.minute,
-        .year = g_status.year,
-        .month = g_status.month,
-        .day = g_status.day,
-        .time_set = g_status.time_set,
+        .time_set = g_time_known,
         .generation = g_time_generation,
     };
     portEXIT_CRITICAL(&g_time_lock);
@@ -4544,14 +4734,9 @@ static int board_time_publish(int hour, int minute, int year, int month, int day
         return 0;
     }
     portENTER_CRITICAL(&g_time_lock);
-    g_status.hour = hour;
-    g_status.minute = minute;
-    g_status.year = year;
-    g_status.month = month;
-    g_status.day = day;
-    g_status.time_set = 1;
     g_time_clock_anchor = anchor;
     g_time_wall_trusted = trusted != 0;
+    g_time_known = 1;
     g_time_generation++;
     portEXIT_CRITICAL(&g_time_lock);
     return 1;
@@ -4567,7 +4752,7 @@ static int board_time_initialize_unknown(void)
     portENTER_CRITICAL(&g_time_lock);
     g_time_clock_anchor = anchor;
     g_time_wall_trusted = 0;
-    g_status.time_set = 0;
+    g_time_known = 0;
     g_time_generation++;
     portEXIT_CRITICAL(&g_time_lock);
     return 1;
@@ -4590,42 +4775,20 @@ static int board_time_model_clock(pj_time_clock_t *clock)
 
 static void board_time_mark_pending(void)
 {
-    portENTER_CRITICAL(&g_time_lock);
-    g_time_update_pending = 1;
-    portEXIT_CRITICAL(&g_time_lock);
+    board_update_publish(BOARD_UPDATE_TIME);
 }
 
 static int board_time_take_pending(board_time_snapshot_t *snapshot)
 {
-    int pending = 0;
-    pj_time_clock_anchor_t anchor = {0};
-    portENTER_CRITICAL(&g_time_lock);
-    if (g_time_update_pending && g_status.time_set) {
-        anchor = g_time_clock_anchor;
-        *snapshot = (board_time_snapshot_t) {
-            .hour = g_status.hour,
-            .minute = g_status.minute,
-            .year = g_status.year,
-            .month = g_status.month,
-            .day = g_status.day,
-            .time_set = 1,
-            .generation = g_time_generation,
-        };
-        g_time_update_pending = 0;
-        pending = 1;
+    if (!board_update_take(BOARD_UPDATE_TIME)) {
+        return 0;
     }
-    portEXIT_CRITICAL(&g_time_lock);
-    uint64_t now_ms = board_monotonic_ms();
-    pj_time_clock_t clock;
-    if (pending &&
-        pj_time_clock_snapshot(&anchor, 1, now_ms, &clock) &&
-        pj_time_clock_civil_from_day(clock.local_day, &snapshot->year,
-                                     &snapshot->month, &snapshot->day)) {
-        snapshot->hour = (int)(clock.local_second / 3600u);
-        snapshot->minute = (int)(clock.local_second % 3600u / 60u);
-        snapshot->second = (int)(clock.local_second % 60u);
+    board_time_snapshot_t current = board_time_snapshot();
+    if (!current.time_set) {
+        return 0;
     }
-    return pending;
+    *snapshot = current;
+    return 1;
 }
 
 static int rtc_read_status_time_locked(void)
@@ -4828,9 +4991,8 @@ static void time_controller_publish_status(
         break;
     }
     if (message != NULL) {
-        (void)snprintf(g_status.last_error, sizeof(g_status.last_error), "%s",
-                       message);
-        ESP_LOGW(TAG, "%s", g_status.last_error);
+        board_status_set_error("%s", message);
+        ESP_LOGW(TAG, "%s", message);
     }
 }
 
@@ -4936,9 +5098,10 @@ static int rtc_wake_sync(void)
     rtc_sequence_give();
     if (result != PJ_RTC_WAKE_OK) {
         (void)rtc_wake_disarm_board(NULL, 1);
-        (void)snprintf(g_status.last_error, sizeof(g_status.last_error),
-                       "RTC wake setup failed at %s", rtc_wake_result_name(result));
-        ESP_LOGW(TAG, "%s", g_status.last_error);
+        board_status_set_error("RTC wake setup failed at %s",
+                               rtc_wake_result_name(result));
+        ESP_LOGW(TAG, "RTC wake setup failed at %s",
+                 rtc_wake_result_name(result));
         return -1;
     }
     pj_time_clock_t verify_clock;
@@ -4959,9 +5122,10 @@ static int rtc_wake_sync(void)
                                                     ESP_EXT1_WAKEUP_ANY_LOW);
     if (err != ESP_OK) {
         (void)rtc_wake_disarm_board(NULL, 1);
-        (void)snprintf(g_status.last_error, sizeof(g_status.last_error),
-                       "RTC GPIO5 wake setup failed: %s", esp_err_to_name(err));
-        ESP_LOGW(TAG, "%s", g_status.last_error);
+        board_status_set_error("RTC GPIO5 wake setup failed: %s",
+                               esp_err_to_name(err));
+        ESP_LOGW(TAG, "RTC GPIO5 wake setup failed: %s",
+                 esp_err_to_name(err));
         return -1;
     }
     g_rtc_ext1_enabled = 1;
@@ -4978,9 +5142,10 @@ static void rtc_wake_restore(void)
     pj_rtc_wake_plan_t persisted;
     rtc_wake_load_result_t load_result = rtc_wake_plan_load(&persisted);
     if (load_result == RTC_WAKE_LOAD_IO_ERROR) {
-        (void)snprintf(g_status.last_error, sizeof(g_status.last_error),
-                       "RTC wake metadata read failed; persistence left untouched");
-        ESP_LOGW(TAG, "%s", g_status.last_error);
+        board_status_set_error(
+            "RTC wake metadata read failed; persistence left untouched");
+        ESP_LOGW(TAG,
+                 "RTC wake metadata read failed; persistence left untouched");
         if (rtc_sequence_take(pdMS_TO_TICKS(500))) {
             pj_rtc_wake_io_t io = rtc_wake_io();
             io.persist = rtc_wake_plan_preserve;
@@ -4993,9 +5158,10 @@ static void rtc_wake_restore(void)
         return;
     }
     if (load_result == RTC_WAKE_LOAD_INVALID) {
-        (void)snprintf(g_status.last_error, sizeof(g_status.last_error),
-                       "RTC wake metadata was invalid; clearing hardware alarm");
-        ESP_LOGW(TAG, "%s", g_status.last_error);
+        board_status_set_error(
+            "RTC wake metadata was invalid; clearing hardware alarm");
+        ESP_LOGW(TAG,
+                 "RTC wake metadata was invalid; clearing hardware alarm");
         memset(&persisted, 0, sizeof(persisted));
         persisted.version = PJ_RTC_WAKE_PLAN_VERSION;
     }
@@ -5253,13 +5419,17 @@ static void audio_process_task(void *arg)
     int note_ready = audio_process_recording(args);
     free(args);
     if (!note_ready) {
-        (void)snprintf(g_status.last_error, sizeof(g_status.last_error),
-                       "recording post-processing or publication failed");
+        board_status_set_error(
+            "recording post-processing or publication failed");
     }
     recording_state_finish_processing(note_ready);
     recording_publish_completion();
-    g_audio_process_task = NULL;
     record_storage_release();
+    if (audio_lifecycle_take()) {
+        g_audio_process_task = NULL;
+        pj_audio_lifecycle_finish_processing(&g_audio_lifecycle);
+        audio_lifecycle_give();
+    }
     vTaskDelete(NULL);
 }
 
@@ -5407,20 +5577,28 @@ static void record_task_exit(void)
         record_storage_release();
     }
     recording_publish_completion();
-    g_record_task = NULL;
     board_audio_state_set(0, -1);
     alert_audio_set_recording(0);
-    g_audio_state_update_pending = 1;
+    board_update_publish(BOARD_UPDATE_AUDIO);
+    if (audio_lifecycle_take()) {
+        g_record_task = NULL;
+        pj_audio_lifecycle_finish_record(&g_audio_lifecycle);
+        audio_lifecycle_give();
+    }
     vTaskDelete(NULL);
 }
 
 static void playback_task_exit(void)
 {
-    g_playback_task = NULL;
     board_audio_state_set(-1, 0);
     alert_audio_notify();
-    g_audio_state_update_pending = 1;
+    board_update_publish(BOARD_UPDATE_AUDIO);
     playback_storage_release();
+    if (audio_lifecycle_take()) {
+        g_playback_task = NULL;
+        pj_audio_lifecycle_finish_playback(&g_audio_lifecycle);
+        audio_lifecycle_give();
+    }
     vTaskDelete(NULL);
 }
 
@@ -5429,8 +5607,7 @@ static void record_task(void *arg)
     (void)arg;
     if (g_audio_lock == NULL || xSemaphoreTake(g_audio_lock, portMAX_DELAY) != pdTRUE) {
         ESP_LOGE(TAG, "Recording could not acquire audio ownership");
-        (void)snprintf(g_status.last_error, sizeof(g_status.last_error),
-                       "recording could not acquire audio ownership");
+        board_status_set_error("recording could not acquire audio ownership");
         recording_state_finish_capture(0);
         record_task_exit();
         return;
@@ -5453,8 +5630,7 @@ static void record_task(void *arg)
     FILE *file = fopen(temporary_path, "wb+");
     if (file == NULL) {
         ESP_LOGE(TAG, "Recording open failed: %s", temporary_path);
-        (void)snprintf(g_status.last_error, sizeof(g_status.last_error),
-                       "recording file open failed");
+        board_status_set_error("recording file open failed");
         recording_state_finish_capture(0);
         record_task_exit();
         return;
@@ -5463,8 +5639,7 @@ static void record_task(void *arg)
         ESP_LOGE(TAG, "Recording initial WAV header failed: %s", temporary_path);
         fclose(file);
         remove(temporary_path);
-        (void)snprintf(g_status.last_error, sizeof(g_status.last_error),
-                       "recording WAV header creation failed");
+        board_status_set_error("recording WAV header creation failed");
         recording_state_finish_capture(0);
         record_task_exit();
         return;
@@ -5474,8 +5649,7 @@ static void record_task(void *arg)
         ESP_LOGE(TAG, "Recording input gain setup failed: %s", esp_err_to_name((esp_err_t)gain_ret));
         fclose(file);
         remove(temporary_path);
-        (void)snprintf(g_status.last_error, sizeof(g_status.last_error),
-                       "recording input gain setup failed");
+        board_status_set_error("recording input gain setup failed");
         recording_state_finish_capture(0);
         record_task_exit();
         return;
@@ -5487,7 +5661,7 @@ static void record_task(void *arg)
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
     int capture_failed = 0;
-    while (!g_record_stop_requested) {
+    while (ulTaskNotifyTake(pdTRUE, 0) == 0U) {
         int err = esp_codec_dev_read(g_audio_record_codec, stereo, PJ_AUDIO_IO_BUFFER_BYTES);
         if (err != ESP_CODEC_DEV_OK) {
             read_errors++;
@@ -5558,8 +5732,8 @@ static void record_task(void *arg)
     recording_state_finish_capture(finalized);
     if (!finalized) {
         ESP_LOGE(TAG, "Recording finalization failed or produced no audio: %s", temporary_path);
-        (void)snprintf(g_status.last_error, sizeof(g_status.last_error),
-                       "recording capture or WAV finalization failed");
+        board_status_set_error(
+            "recording capture or WAV finalization failed");
         remove(temporary_path);
         record_task_exit();
         return;
@@ -5574,6 +5748,7 @@ static void record_task(void *arg)
 
     audio_process_args_t *process_args = malloc(sizeof(*process_args));
     int note_ready = 0;
+    int processing_started = 0;
     if (process_args != NULL) {
         (void)snprintf(process_args->temporary_path, sizeof(process_args->temporary_path), "%s", temporary_path);
         (void)snprintf(process_args->final_path, sizeof(process_args->final_path), "%s", g_active_recording_path);
@@ -5585,11 +5760,21 @@ static void record_task(void *arg)
         portENTER_CRITICAL(&g_storage_coordinator_lock);
         g_record_storage_processing = 1;
         portEXIT_CRITICAL(&g_storage_coordinator_lock);
-        BaseType_t created = xTaskCreate(audio_process_task, "pj-audio-process",
-                                        PJ_AUDIO_PROCESS_TASK_STACK, process_args, 1,
-                                        &g_audio_process_task);
+        BaseType_t created = pdFAIL;
+        if (audio_lifecycle_take()) {
+            if (pj_audio_lifecycle_begin_processing(&g_audio_lifecycle)) {
+                created = xTaskCreate(audio_process_task, "pj-audio-process",
+                                      PJ_AUDIO_PROCESS_TASK_STACK, process_args,
+                                      1, &g_audio_process_task);
+                processing_started = created == pdPASS;
+                if (created != pdPASS) {
+                    g_audio_process_task = NULL;
+                    pj_audio_lifecycle_cancel_processing(&g_audio_lifecycle);
+                }
+            }
+            audio_lifecycle_give();
+        }
         if (created != pdPASS) {
-            g_audio_process_task = NULL;
             portENTER_CRITICAL(&g_storage_coordinator_lock);
             g_record_storage_processing = 0;
             portEXIT_CRITICAL(&g_storage_coordinator_lock);
@@ -5607,9 +5792,9 @@ static void record_task(void *arg)
                                             data_bytes);
         recording_state_finish_processing(note_ready);
     }
-    if (g_audio_process_task == NULL && !note_ready) {
-        (void)snprintf(g_status.last_error, sizeof(g_status.last_error),
-                       "recording post-processing or publication failed");
+    if (!processing_started && !note_ready) {
+        board_status_set_error(
+            "recording post-processing or publication failed");
     }
     record_task_exit();
 }
@@ -5679,7 +5864,7 @@ static void playback_task(void *arg)
         playback_task_exit();
         return;
     }
-    if (g_playback_stop_requested) {
+    if (ulTaskNotifyTake(pdTRUE, 0) != 0U) {
         xSemaphoreGive(g_audio_lock);
         fclose(file);
         free(mono);
@@ -5698,7 +5883,7 @@ static void playback_task(void *arg)
         playback_task_exit();
         return;
     }
-    while (!g_playback_stop_requested) {
+    while (ulTaskNotifyTake(pdTRUE, 0) == 0U) {
         if (channels == 1) {
             size_t samples = fread(mono, sizeof(int16_t), PJ_AUDIO_IO_BUFFER_BYTES / sizeof(int16_t), file);
             if (samples == 0) {
@@ -5745,8 +5930,7 @@ static esp_err_t audio_play_tone_ms(uint32_t duration_ms, const audio_tone_diag_
     if (!g_audio_ready || g_audio_playback_codec == NULL) {
         return ESP_ERR_INVALID_STATE;
     }
-    if (g_status.recording || g_record_task != NULL || g_status.playback_active ||
-        g_playback_task != NULL || alert_audio_desired()) {
+    if (audio_lifecycle_active() || alert_audio_desired()) {
         return ESP_ERR_INVALID_STATE;
     }
     if (g_audio_lock == NULL ||
@@ -5902,8 +6086,7 @@ static esp_err_t audio_mic_check_ms(uint32_t duration_ms, int gain_db, audio_mic
     if (!g_audio_ready || g_audio_record_codec == NULL || result == NULL) {
         return ESP_ERR_INVALID_STATE;
     }
-    if (g_status.recording || g_record_task != NULL || g_status.playback_active ||
-        g_playback_task != NULL || alert_audio_desired()) {
+    if (audio_lifecycle_active() || alert_audio_desired()) {
         return ESP_ERR_INVALID_STATE;
     }
     if (g_audio_lock == NULL ||
@@ -6046,6 +6229,9 @@ pj_board_profile_t pj_board_default_profile(void)
 
 static void init_default_status(const pj_board_profile_t *profile)
 {
+#ifdef ESP_PLATFORM
+    board_status_take();
+#endif
     memset(&g_status, 0, sizeof(g_status));
     g_status.display = PJ_BOARD_SERVICE_DISABLED;
     g_status.storage = PJ_BOARD_SERVICE_DISABLED;
@@ -6072,14 +6258,32 @@ static void init_default_status(const pj_board_profile_t *profile)
     (void)snprintf(g_status.storage_path, sizeof(g_status.storage_path), "/sdcard");
     (void)snprintf(g_status.last_error, sizeof(g_status.last_error),
                    "BLE/Wi-Fi connect path still requires provisioning integration");
+#ifdef ESP_PLATFORM
+    board_status_give();
+#endif
 }
 
 void pj_board_init(const pj_board_profile_t *profile)
 {
+#ifdef ESP_PLATFORM
+    g_status_lock = xSemaphoreCreateRecursiveMutexStatic(&g_status_lock_storage);
+    g_audio_lifecycle_lock =
+        xSemaphoreCreateMutexStatic(&g_audio_lifecycle_lock_storage);
+    g_board_update_events =
+        xEventGroupCreateStatic(&g_board_update_events_storage);
+    if (g_status_lock == NULL || g_audio_lifecycle_lock == NULL ||
+        g_board_update_events == NULL) {
+        ESP_LOGE(TAG, "Board synchronization primitive initialization failed");
+        return;
+    }
+    pj_audio_lifecycle_init(&g_audio_lifecycle);
+#endif
     init_default_status(profile);
     pj_settings_defaults(&g_settings);
 
 #ifdef ESP_PLATFORM
+    (void)snprintf(g_provisioned_token, sizeof(g_provisioned_token), "%s",
+                   PJ_DEFAULT_TOKEN);
     g_runtime_boot_id = esp_random();
     if (g_runtime_boot_id == 0U) {
         g_runtime_boot_id = 1U;
@@ -6105,9 +6309,9 @@ void pj_board_init(const pj_board_profile_t *profile)
         err = nvs_flash_init();
     }
     if (err != ESP_OK) {
-        g_status.storage = PJ_BOARD_SERVICE_ERROR;
-        (void)snprintf(g_status.last_error, sizeof(g_status.last_error), "NVS init failed: %s", esp_err_to_name(err));
-        ESP_LOGE(TAG, "%s", g_status.last_error);
+        board_status_set_service(BOARD_SERVICE_STORAGE, PJ_BOARD_SERVICE_ERROR);
+        board_status_set_error("NVS init failed: %s", esp_err_to_name(err));
+        ESP_LOGE(TAG, "NVS init failed: %s", esp_err_to_name(err));
         return;
     }
     time_offset_load();
@@ -6124,15 +6328,17 @@ void pj_board_init(const pj_board_profile_t *profile)
         }
     }
     if (settings_err != ESP_OK) {
-        (void)snprintf(g_status.last_error, sizeof(g_status.last_error),
-                       "settings load failed: %s",
-                       esp_err_to_name(settings_err));
-        ESP_LOGW(TAG, "%s; preserving in-memory defaults without writing NVS",
-                 g_status.last_error);
+        board_status_set_error("settings load failed: %s",
+                               esp_err_to_name(settings_err));
+        ESP_LOGW(TAG, "Settings load failed: %s; preserving in-memory defaults "
+                      "without writing NVS",
+                 esp_err_to_name(settings_err));
     }
     uint8_t mac[6] = {0};
     if (esp_read_mac(mac, ESP_MAC_WIFI_STA) == ESP_OK) {
+        board_status_take();
         (void)snprintf(g_status.device_id, sizeof(g_status.device_id), "pj-%02x%02x%02x", mac[3], mac[4], mac[5]);
+        board_status_give();
     }
     wifi_load_provisioning();
     ESP_LOGI(TAG, "Board profile %s, flash %dMB, PSRAM %dMB", profile->name, profile->flash_mb, profile->psram_mb);
@@ -6162,8 +6368,10 @@ void pj_board_init(const pj_board_profile_t *profile)
         }
         if (rtc_init() == ESP_OK) {
             if (rtc_read_status_time()) {
+                board_time_snapshot_t time = board_time_snapshot();
                 ESP_LOGI(TAG, "PCF85063 RTC initialized: %04d-%02d-%02d %02d:%02d",
-                         g_status.year, g_status.month, g_status.day, g_status.hour, g_status.minute);
+                         time.year, time.month, time.day, time.hour,
+                         time.minute);
             } else {
                 ESP_LOGW(TAG,
                          "PCF85063 RTC initialized but time is unknown; waiting for host or SNTP");
@@ -6186,50 +6394,56 @@ void pj_board_init(const pj_board_profile_t *profile)
 
     esp_err_t display_err = display_init();
     if (display_err == ESP_OK) {
-        g_status.display = PJ_BOARD_SERVICE_READY;
+        board_status_set_service(BOARD_SERVICE_DISPLAY, PJ_BOARD_SERVICE_READY);
         ESP_LOGI(TAG, "e-paper display initialized");
     } else {
-        g_status.display = PJ_BOARD_SERVICE_ERROR;
-        (void)snprintf(g_status.last_error, sizeof(g_status.last_error), "display init failed: %s", esp_err_to_name(display_err));
-        ESP_LOGE(TAG, "%s", g_status.last_error);
+        board_status_set_service(BOARD_SERVICE_DISPLAY, PJ_BOARD_SERVICE_ERROR);
+        board_status_set_error("display init failed: %s",
+                               esp_err_to_name(display_err));
+        ESP_LOGE(TAG, "Display init failed: %s", esp_err_to_name(display_err));
     }
 
     esp_err_t storage_err = storage_init();
     if (storage_err == ESP_OK) {
-        g_status.storage = PJ_BOARD_SERVICE_READY;
-        ESP_LOGI(TAG, "microSD mounted at %s", g_status.storage_path);
+        board_status_set_service(BOARD_SERVICE_STORAGE, PJ_BOARD_SERVICE_READY);
+        pj_board_status_t status = board_status_snapshot_base();
+        ESP_LOGI(TAG, "microSD mounted at %s", status.storage_path);
         remove(PJ_USB_TRANSCRIPT_TEMP_PATH);
     } else {
-        g_status.storage = storage_err == ESP_ERR_NOT_FOUND ||
-                           storage_err == ESP_ERR_TIMEOUT ||
-                           storage_err == ESP_ERR_INVALID_RESPONSE ?
-                           PJ_BOARD_SERVICE_UNAVAILABLE : PJ_BOARD_SERVICE_ERROR;
-        (void)snprintf(g_status.last_error, sizeof(g_status.last_error),
-                       "microSD mount failed: %s; check card inserted and FAT32/exFAT formatting",
-                       esp_err_to_name(storage_err));
-        ESP_LOGW(TAG, "%s", g_status.last_error);
+        pj_board_service_state_t storage_state =
+            storage_err == ESP_ERR_NOT_FOUND || storage_err == ESP_ERR_TIMEOUT ||
+            storage_err == ESP_ERR_INVALID_RESPONSE ?
+                PJ_BOARD_SERVICE_UNAVAILABLE : PJ_BOARD_SERVICE_ERROR;
+        board_status_set_service(BOARD_SERVICE_STORAGE, storage_state);
+        board_status_set_error(
+            "microSD mount failed: %s; check card inserted and FAT32/exFAT formatting",
+            esp_err_to_name(storage_err));
+        ESP_LOGW(TAG, "microSD mount failed: %s", esp_err_to_name(storage_err));
     }
     esp_err_t audio_err = audio_init();
     if (audio_err == ESP_OK) {
-        g_status.audio = PJ_BOARD_SERVICE_READY;
+        board_status_set_service(BOARD_SERVICE_AUDIO, PJ_BOARD_SERVICE_READY);
         esp_err_t alert_err = alert_audio_start();
         if (alert_err != ESP_OK) {
-            (void)snprintf(g_status.last_error, sizeof(g_status.last_error),
-                           "time alert audio task failed: %s", esp_err_to_name(alert_err));
-            ESP_LOGW(TAG, "%s", g_status.last_error);
+            board_status_set_error("time alert audio task failed: %s",
+                                   esp_err_to_name(alert_err));
+            ESP_LOGW(TAG, "Time alert audio task failed: %s",
+                     esp_err_to_name(alert_err));
         }
     } else {
-        g_status.audio = PJ_BOARD_SERVICE_ERROR;
-        (void)snprintf(g_status.last_error, sizeof(g_status.last_error),
-                       "audio init failed: %s", esp_err_to_name(audio_err));
-        ESP_LOGW(TAG, "%s", g_status.last_error);
+        board_status_set_service(BOARD_SERVICE_AUDIO, PJ_BOARD_SERVICE_ERROR);
+        board_status_set_error("audio init failed: %s",
+                               esp_err_to_name(audio_err));
+        ESP_LOGW(TAG, "Audio init failed: %s", esp_err_to_name(audio_err));
     }
 
     if (g_wifi_credentials_stored) {
         wifi_apply_provisioning_status();
     } else {
-        g_status.ble_provisioning = PJ_BOARD_SERVICE_UNAVAILABLE;
-        g_status.wifi = PJ_BOARD_SERVICE_UNAVAILABLE;
+        board_status_set_service(BOARD_SERVICE_BLE,
+                                 PJ_BOARD_SERVICE_UNAVAILABLE);
+        board_status_set_service(BOARD_SERVICE_WIFI,
+                                 PJ_BOARD_SERVICE_UNAVAILABLE);
     }
 #else
     (void)profile;
@@ -6240,7 +6454,8 @@ int pj_board_start_services(const pj_board_profile_t *profile)
 {
     int services_ready = 1;
 #ifdef ESP_PLATFORM
-    pj_ota_init(g_status.device_id, provisioned_token_read, profile->name,
+    pj_board_status_t status = board_status_snapshot_base();
+    pj_ota_init(status.device_id, provisioned_token_read, profile->name,
                 ota_mutations_reserve, ota_mutations_release);
 #else
     (void)profile;
@@ -6252,23 +6467,28 @@ int pj_board_start_services(const pj_board_profile_t *profile)
     if (!g_wifi_credentials_stored) {
         esp_err_t ble_err = ble_provisioning_start();
         if (ble_err != ESP_OK) {
-            g_status.ble_provisioning = PJ_BOARD_SERVICE_ERROR;
-            (void)snprintf(g_status.last_error, sizeof(g_status.last_error),
-                           "BLE provisioning start failed: %s", esp_err_to_name(ble_err));
-            ESP_LOGE(TAG, "%s", g_status.last_error);
+            board_status_set_service(BOARD_SERVICE_BLE,
+                                     PJ_BOARD_SERVICE_ERROR);
+            board_status_set_error("BLE provisioning start failed: %s",
+                                   esp_err_to_name(ble_err));
+            ESP_LOGE(TAG, "BLE provisioning start failed: %s",
+                     esp_err_to_name(ble_err));
             services_ready = 0;
         }
     } else {
-        g_status.ble_provisioning = PJ_BOARD_SERVICE_UNAVAILABLE;
+        board_status_set_service(BOARD_SERVICE_BLE,
+                                 PJ_BOARD_SERVICE_UNAVAILABLE);
         ESP_LOGI(TAG, "BLE provisioning skipped because Wi-Fi credentials are stored");
     }
     if (g_wifi_credentials_stored) {
         esp_err_t wifi_err = wifi_start_or_reconfigure();
         if (wifi_err != ESP_OK) {
-            g_status.wifi = PJ_BOARD_SERVICE_ERROR;
-            (void)snprintf(g_status.last_error, sizeof(g_status.last_error),
-                           "Wi-Fi start failed: %s", esp_err_to_name(wifi_err));
-            ESP_LOGE(TAG, "%s", g_status.last_error);
+            board_status_set_service(BOARD_SERVICE_WIFI,
+                                     PJ_BOARD_SERVICE_ERROR);
+            board_status_set_error("Wi-Fi start failed: %s",
+                                   esp_err_to_name(wifi_err));
+            ESP_LOGE(TAG, "Wi-Fi start failed: %s",
+                     esp_err_to_name(wifi_err));
             services_ready = 0;
         }
     }
@@ -6278,9 +6498,10 @@ int pj_board_start_services(const pj_board_profile_t *profile)
                  esp_err_to_name(serial_err));
         services_ready = 0;
     }
+    status = board_status_snapshot_base();
     services_ready = services_ready && g_aux_task_started &&
         (!g_touch_ready || g_touch_task_started) &&
-        (g_status.audio != PJ_BOARD_SERVICE_READY ||
+        (status.audio != PJ_BOARD_SERVICE_READY ||
          g_alert_audio_task != NULL);
 #endif
     return services_ready;
@@ -6289,12 +6510,13 @@ int pj_board_start_services(const pj_board_profile_t *profile)
 void pj_board_confirm_boot_health(int startup_and_ui_ready)
 {
 #ifdef ESP_PLATFORM
+    pj_board_status_t status = pj_board_status();
     pj_ota_confirm_boot_health(
         startup_and_ui_ready &&
-        g_status.display == PJ_BOARD_SERVICE_READY &&
-        g_status.storage != PJ_BOARD_SERVICE_ERROR &&
-        g_status.audio == PJ_BOARD_SERVICE_READY &&
-        g_status.http == PJ_BOARD_SERVICE_READY);
+        status.display == PJ_BOARD_SERVICE_READY &&
+        status.storage != PJ_BOARD_SERVICE_ERROR &&
+        status.audio == PJ_BOARD_SERVICE_READY &&
+        status.http == PJ_BOARD_SERVICE_READY);
 #else
     (void)startup_and_ui_ready;
 #endif
@@ -6303,7 +6525,8 @@ void pj_board_confirm_boot_health(int startup_and_ui_ready)
 pj_board_status_t pj_board_status(void)
 {
 #ifdef ESP_PLATFORM
-    pj_board_status_t status = g_status;
+    /* Each independently owned subsystem contributes one coherent snapshot. */
+    pj_board_status_t status = board_status_snapshot_base();
     portENTER_CRITICAL(&g_recording_lock);
     status.recording_elapsed_ms = pj_recording_elapsed_ms(&g_recording);
     portEXIT_CRITICAL(&g_recording_lock);
@@ -6394,7 +6617,7 @@ int pj_board_store_settings_from_ui(const pj_ui_context_t *ui)
     if (!settings_take(portMAX_DELAY)) {
         return -1;
     }
-    if (g_settings_update_pending) {
+    if (board_update_pending(BOARD_UPDATE_SETTINGS)) {
         settings_give();
         return 0;
     }
@@ -6408,13 +6631,13 @@ int pj_board_store_settings_from_ui(const pj_ui_context_t *ui)
         g_settings = updated;
         codec_volume = pj_settings_codec_volume(updated.volume);
     } else {
-        g_settings_update_pending = 1;
+        board_update_publish(BOARD_UPDATE_SETTINGS);
     }
     settings_give();
     if (err != ESP_OK) {
-        (void)snprintf(g_status.last_error, sizeof(g_status.last_error),
-                       "settings save failed: %s", esp_err_to_name(err));
-        ESP_LOGW(TAG, "%s", g_status.last_error);
+        board_status_set_error("settings save failed: %s",
+                               esp_err_to_name(err));
+        ESP_LOGW(TAG, "Settings save failed: %s", esp_err_to_name(err));
         return -1;
     }
     settings_apply_codec_volume(codec_volume);
@@ -6432,10 +6655,16 @@ int pj_board_store_settings_from_ui(const pj_ui_context_t *ui)
 
 int pj_board_consume_settings_update(pj_ui_context_t *ui)
 {
+#ifdef ESP_PLATFORM
+    if (!board_update_take(BOARD_UPDATE_SETTINGS)) {
+        return 0;
+    }
+#else
     if (!g_settings_update_pending) {
         return 0;
     }
     g_settings_update_pending = 0;
+#endif
     pj_board_refresh_settings(ui);
     pj_board_refresh_time_state(ui);
     return 1;
@@ -6451,7 +6680,8 @@ void pj_board_refresh_status(pj_ui_context_t *ui)
         pj_time_controller_ready(&g_time_controller) && !controller_trusted) {
         board_time_mark_pending();
     }
-    if (g_status.storage_mounted && storage_shared_try_acquire()) {
+    pj_board_status_t before = board_status_snapshot_base();
+    if (before.storage_mounted && storage_shared_try_acquire()) {
         (void)storage_refresh_capacity();
         storage_shared_release();
     }
@@ -6460,11 +6690,11 @@ void pj_board_refresh_status(pj_ui_context_t *ui)
     if (status.time_set) {
         pj_ui_set_time(ui, status.hour, status.minute, status.year, status.month, status.day);
     }
-    pj_ui_set_audio_state(ui, g_status.recording, g_status.playback_active);
-    pj_ui_set_status(ui, g_status.battery_percent, g_status.temperature_c,
-                     g_status.humidity_percent);
+    pj_ui_set_audio_state(ui, status.recording, status.playback_active);
+    pj_ui_set_status(ui, status.battery_percent, status.temperature_c,
+                     status.humidity_percent);
 #ifdef ESP_PLATFORM
-    if (g_status.storage == PJ_BOARD_SERVICE_READY) {
+    if (status.storage == PJ_BOARD_SERVICE_READY) {
         refresh_ui_notes_from_sd(ui);
         refresh_ui_sync_state(ui);
     }
@@ -6474,7 +6704,8 @@ void pj_board_refresh_status(pj_ui_context_t *ui)
 void pj_board_refresh_notes(pj_ui_context_t *ui)
 {
 #ifdef ESP_PLATFORM
-    if (ui != NULL && g_status.storage == PJ_BOARD_SERVICE_READY) {
+    pj_board_status_t status = pj_board_status();
+    if (ui != NULL && status.storage == PJ_BOARD_SERVICE_READY) {
         refresh_ui_notes_from_sd(ui);
         refresh_ui_sync_state(ui);
     }
@@ -6486,11 +6717,11 @@ void pj_board_refresh_notes(pj_ui_context_t *ui)
 int pj_board_consume_audio_update(pj_ui_context_t *ui)
 {
 #ifdef ESP_PLATFORM
-    if (!g_audio_state_update_pending || ui == NULL) {
+    if (ui == NULL || !board_update_take(BOARD_UPDATE_AUDIO)) {
         return 0;
     }
-    g_audio_state_update_pending = 0;
-    pj_ui_set_audio_state(ui, g_status.recording, g_status.playback_active);
+    pj_board_status_t status = pj_board_status();
+    pj_ui_set_audio_state(ui, status.recording, status.playback_active);
     if (time_state_apply_audio_ack()) {
         (void)time_state_project(ui);
     }
@@ -6504,10 +6735,14 @@ int pj_board_consume_audio_update(pj_ui_context_t *ui)
 int pj_board_consume_notes_update(pj_ui_context_t *ui)
 {
 #ifdef ESP_PLATFORM
-    if (!g_notes_update_pending || ui == NULL || g_status.storage != PJ_BOARD_SERVICE_READY) {
+    if (ui == NULL || !board_update_take(BOARD_UPDATE_NOTES)) {
         return 0;
     }
-    g_notes_update_pending = 0;
+    pj_board_status_t status = pj_board_status();
+    if (status.storage != PJ_BOARD_SERVICE_READY) {
+        board_update_publish(BOARD_UPDATE_NOTES);
+        return 0;
+    }
     refresh_ui_notes_from_sd(ui);
     refresh_ui_sync_state(ui);
     return 1;
@@ -6692,7 +6927,8 @@ int pj_board_display_framebuffer(const pj_framebuffer_t *fb, const pj_ui_dirty_r
         }
         g_display_ready = 1;
         g_display_warning_logged = 0;
-        g_status.display = PJ_BOARD_SERVICE_READY;
+        board_status_set_service(BOARD_SERVICE_DISPLAY,
+                                 PJ_BOARD_SERVICE_READY);
         ESP_LOGI(TAG, "Display controller recovered; retrying with full base refresh");
     }
 
@@ -6725,24 +6961,28 @@ int pj_board_display_framebuffer(const pj_framebuffer_t *fb, const pj_ui_dirty_r
                                           0, latency_us, busy_time_us);
         g_epd_partial_ready = 0;
         g_display_ready = 0;
-        g_status.display = PJ_BOARD_SERVICE_ERROR;
-        (void)snprintf(g_status.last_error, sizeof(g_status.last_error),
-                       "display %s refresh failed: %s",
-                       plan.kind == PJ_DISPLAY_REFRESH_PARTIAL ? "partial" : "full",
-                       esp_err_to_name(refresh_err));
+        board_status_set_service(BOARD_SERVICE_DISPLAY,
+                                 PJ_BOARD_SERVICE_ERROR);
+        const char *refresh_kind =
+            plan.kind == PJ_DISPLAY_REFRESH_PARTIAL ? "partial" : "full";
+        board_status_set_error("display %s refresh failed: %s", refresh_kind,
+                               esp_err_to_name(refresh_err));
         size_t dma_free = heap_caps_get_free_size(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
         size_t dma_largest = heap_caps_get_largest_free_block(
             MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
-        ESP_LOGE(TAG, "%s; dma_free=%zu dma_largest=%zu latency_us=%" PRIu32
+        ESP_LOGE(TAG, "Display %s refresh failed: %s; dma_free=%zu "
+                 "dma_largest=%zu latency_us=%" PRIu32
                  " busy_us=%" PRIu32 " errors=%" PRIu64,
-                 g_status.last_error, dma_free, dma_largest, latency_us,
+                 refresh_kind, esp_err_to_name(refresh_err), dma_free,
+                 dma_largest, latency_us,
                  busy_time_us, g_epd_refresh_policy.metrics.errors);
 
         esp_err_t recovery_err = epd_controller_configure();
         if (recovery_err == ESP_OK) {
             g_display_ready = 1;
             g_display_warning_logged = 0;
-            g_status.display = PJ_BOARD_SERVICE_READY;
+            board_status_set_service(BOARD_SERVICE_DISPLAY,
+                                     PJ_BOARD_SERVICE_READY);
             ESP_LOGW(TAG, "Display controller recovered; UI frame remains dirty for full retry");
         } else {
             ESP_LOGE(TAG, "Display controller recovery failed: %s; retry deferred",
@@ -6948,55 +7188,72 @@ int pj_board_record_set_active(int active)
     active = active != 0;
     if (!active) {
 #ifdef ESP_PLATFORM
-        if (!g_status.recording) {
+        if (!audio_lifecycle_take()) {
+            return 0;
+        }
+        pj_audio_stop_result_t stop =
+            pj_audio_lifecycle_request_record_stop(&g_audio_lifecycle);
+        TaskHandle_t task = g_record_task;
+        if (stop == PJ_AUDIO_STOP_SIGNAL_WORKER && task != NULL) {
+            xTaskNotifyGive(task);
+        }
+        audio_lifecycle_give();
+        if (stop == PJ_AUDIO_STOP_INACTIVE) {
             return 1;
         }
-        g_record_stop_requested = 1;
-        recording_state_request_stop();
-        ESP_LOGI(TAG, "Recording stop requested");
+        if (stop == PJ_AUDIO_STOP_SIGNAL_WORKER) {
+            recording_state_request_stop();
+            ESP_LOGI(TAG, "Recording stop requested");
+        }
 #else
         g_status.recording = 0;
 #endif
         return 1;
     }
-    if (g_status.storage != PJ_BOARD_SERVICE_READY || g_status.audio != PJ_BOARD_SERVICE_READY) {
+    pj_board_status_t status = pj_board_status();
+    if (status.storage != PJ_BOARD_SERVICE_READY ||
+        status.audio != PJ_BOARD_SERVICE_READY) {
 #ifdef ESP_PLATFORM
         ESP_LOGW(TAG, "Record command ignored: storage/audio unavailable");
 #endif
         return 0;
     }
 #ifdef ESP_PLATFORM
-    if (g_status.recording) {
+    if (!audio_lifecycle_take()) {
+        return 0;
+    }
+    if (g_audio_lifecycle.record_worker) {
+        audio_lifecycle_give();
         return 1;
     }
-    if (g_status.playback_active || g_playback_task != NULL) {
-        ESP_LOGW(TAG, "Record start ignored: playback active");
-        return 0;
-    }
-    if (g_audio_process_task != NULL) {
-        ESP_LOGW(TAG, "Record start ignored: previous recording still processing");
-        return 0;
-    }
-    if (g_record_task != NULL) {
-        ESP_LOGW(TAG, "Record start ignored: previous recording still stopping");
+    if (!pj_audio_lifecycle_begin_record(&g_audio_lifecycle) ||
+        alert_audio_desired()) {
+        pj_audio_lifecycle_finish_record(&g_audio_lifecycle);
+        audio_lifecycle_give();
+        ESP_LOGW(TAG, "Record start ignored: another audio operation is active");
         return 0;
     }
     if (!record_storage_try_acquire()) {
+        pj_audio_lifecycle_finish_record(&g_audio_lifecycle);
+        audio_lifecycle_give();
         ESP_LOGW(TAG, "Record start ignored: storage maintenance active");
         return 0;
     }
     if (!storage_preflight(PJ_STORAGE_RECORD_START_BYTES, "recording")) {
-        ESP_LOGW(TAG, "Record start ignored: %s", g_status.last_error);
+        pj_board_status_t failed = board_status_snapshot_base();
+        ESP_LOGW(TAG, "Record start ignored: %s", failed.last_error);
         record_storage_release();
+        pj_audio_lifecycle_finish_record(&g_audio_lifecycle);
+        audio_lifecycle_give();
         return 0;
     }
     next_recording_path(g_active_recording_path, sizeof(g_active_recording_path));
-    g_record_stop_requested = 0;
     if (!recording_state_start()) {
         ESP_LOGE(TAG, "Record start failed: invalid lifecycle transition");
-        (void)snprintf(g_status.last_error, sizeof(g_status.last_error),
-                       "recording lifecycle was busy");
+        board_status_set_error("recording lifecycle was busy");
         record_storage_release();
+        pj_audio_lifecycle_finish_record(&g_audio_lifecycle);
+        audio_lifecycle_give();
         return 0;
     }
     alert_audio_set_recording(1);
@@ -7006,15 +7263,17 @@ int pj_board_record_set_active(int active)
         board_audio_state_set(0, -1);
         alert_audio_set_recording(0);
         g_record_task = NULL;
-        (void)snprintf(g_status.last_error, sizeof(g_status.last_error),
-                       "recording task creation failed");
+        pj_audio_lifecycle_finish_record(&g_audio_lifecycle);
+        board_status_set_error("recording task creation failed");
         recording_state_finish_capture(0);
         recording_publish_completion();
         record_storage_release();
+        audio_lifecycle_give();
         ESP_LOGE(TAG, "Record start failed: task create failed");
         return 0;
     }
     ESP_LOGI(TAG, "Recording task queued: %s", g_active_recording_path);
+    audio_lifecycle_give();
 #else
     g_status.recording = 1;
 #endif
@@ -7023,7 +7282,7 @@ int pj_board_record_set_active(int active)
 
 int pj_board_record_toggle(void)
 {
-    return pj_board_record_set_active(!g_status.recording);
+    return pj_board_record_set_active(!pj_board_status().recording);
 }
 
 int pj_board_playback_toggle(void)
@@ -7036,36 +7295,53 @@ int pj_board_playback_set_active(int active, int note_index)
     active = active != 0;
     if (!active) {
 #ifdef ESP_PLATFORM
-        if (!g_status.playback_active) {
+        if (!audio_lifecycle_take()) {
+            return 0;
+        }
+        pj_audio_stop_result_t stop =
+            pj_audio_lifecycle_request_playback_stop(&g_audio_lifecycle);
+        TaskHandle_t task = g_playback_task;
+        if (stop == PJ_AUDIO_STOP_SIGNAL_WORKER && task != NULL) {
+            xTaskNotifyGive(task);
+        }
+        audio_lifecycle_give();
+        if (stop == PJ_AUDIO_STOP_INACTIVE) {
             return 1;
         }
-        g_playback_stop_requested = 1;
-        ESP_LOGI(TAG, "Playback stop requested");
+        if (stop == PJ_AUDIO_STOP_SIGNAL_WORKER) {
+            ESP_LOGI(TAG, "Playback stop requested");
+        }
 #else
         g_status.playback_active = 0;
 #endif
         return 1;
     }
-    if (g_status.storage != PJ_BOARD_SERVICE_READY || g_status.audio != PJ_BOARD_SERVICE_READY) {
+    pj_board_status_t status = pj_board_status();
+    if (status.storage != PJ_BOARD_SERVICE_READY ||
+        status.audio != PJ_BOARD_SERVICE_READY) {
 #ifdef ESP_PLATFORM
         ESP_LOGW(TAG, "Playback command ignored: storage/audio unavailable");
 #endif
         return 0;
     }
 #ifdef ESP_PLATFORM
-    if (g_status.playback_active) {
-        return 1;
-    }
-    if (g_status.recording || g_record_task != NULL || g_audio_process_task != NULL ||
-        alert_audio_desired()) {
-        ESP_LOGW(TAG, "Playback start ignored: recording or audio processing active");
+    if (!audio_lifecycle_take()) {
         return 0;
     }
-    if (g_playback_task != NULL) {
-        ESP_LOGW(TAG, "Playback start ignored: previous playback still stopping");
+    if (g_audio_lifecycle.playback_worker) {
+        audio_lifecycle_give();
+        return 1;
+    }
+    if (!pj_audio_lifecycle_begin_playback(&g_audio_lifecycle) ||
+        alert_audio_desired()) {
+        pj_audio_lifecycle_finish_playback(&g_audio_lifecycle);
+        audio_lifecycle_give();
+        ESP_LOGW(TAG, "Playback start ignored: another audio operation is active");
         return 0;
     }
     if (!playback_storage_try_acquire()) {
+        pj_audio_lifecycle_finish_playback(&g_audio_lifecycle);
+        audio_lifecycle_give();
         ESP_LOGW(TAG, "Playback start ignored: storage maintenance active");
         return 0;
     }
@@ -7076,20 +7352,24 @@ int pj_board_playback_set_active(int active, int note_index)
     if (!audio_filename_for_index(note_index, filename, sizeof(filename))) {
         ESP_LOGW(TAG, "Playback start ignored: WAV index %d unavailable", note_index);
         playback_storage_release();
+        pj_audio_lifecycle_finish_playback(&g_audio_lifecycle);
+        audio_lifecycle_give();
         return 0;
     }
     (void)snprintf(g_active_playback_path, sizeof(g_active_playback_path), PJ_AUDIO_DIR "/%s", filename);
-    g_playback_stop_requested = 0;
     board_audio_state_set(-1, 1);
     BaseType_t created = xTaskCreate(playback_task, "pj-play", PJ_AUDIO_PLAYBACK_TASK_STACK, NULL, 5, &g_playback_task);
     if (created != pdPASS) {
         board_audio_state_set(-1, 0);
         g_playback_task = NULL;
+        pj_audio_lifecycle_finish_playback(&g_audio_lifecycle);
         playback_storage_release();
+        audio_lifecycle_give();
         ESP_LOGE(TAG, "Playback start failed: task create failed");
         return 0;
     }
     ESP_LOGI(TAG, "Playback started: %s", g_active_playback_path);
+    audio_lifecycle_give();
 #else
     (void)note_index;
     g_status.playback_active = 1;
@@ -7099,7 +7379,8 @@ int pj_board_playback_set_active(int active, int note_index)
 
 int pj_board_playback_toggle_index(int note_index)
 {
-    return pj_board_playback_set_active(!g_status.playback_active, note_index);
+    return pj_board_playback_set_active(!pj_board_status().playback_active,
+                                        note_index);
 }
 
 int pj_board_wipe_recordings(pj_ui_context_t *ui)
@@ -7134,25 +7415,26 @@ int pj_board_wipe_recordings(pj_ui_context_t *ui)
 int pj_board_storage_recover(void)
 {
 #ifdef ESP_PLATFORM
-    if (g_status.recording || g_record_task != NULL || g_audio_process_task != NULL ||
-        g_status.playback_active || g_playback_task != NULL) {
-        (void)snprintf(g_status.last_error, sizeof(g_status.last_error),
-                       "storage recovery blocked while audio is active");
+    if (audio_lifecycle_active()) {
+        board_status_set_error(
+            "storage recovery blocked while audio is active");
         return 0;
     }
     portENTER_CRITICAL(&g_storage_coordinator_lock);
     int maintenance_acquired = pj_storage_recovery_try_begin(&g_storage_coordinator);
     portEXIT_CRITICAL(&g_storage_coordinator_lock);
     if (!maintenance_acquired) {
-        (void)snprintf(g_status.last_error, sizeof(g_status.last_error),
-                       "storage recovery blocked by active storage work");
+        board_status_set_error(
+            "storage recovery blocked by active storage work");
         return 0;
     }
+    pj_board_status_t status = board_status_snapshot_base();
     if (g_sd_card != NULL) {
-        esp_err_t unmount_err = esp_vfs_fat_sdcard_unmount(g_status.storage_path, g_sd_card);
+        esp_err_t unmount_err = esp_vfs_fat_sdcard_unmount(status.storage_path,
+                                                          g_sd_card);
         if (unmount_err != ESP_OK) {
-            (void)snprintf(g_status.last_error, sizeof(g_status.last_error),
-                           "microSD unmount failed: %s", esp_err_to_name(unmount_err));
+            board_status_set_error("microSD unmount failed: %s",
+                                   esp_err_to_name(unmount_err));
             portENTER_CRITICAL(&g_storage_coordinator_lock);
             pj_storage_recovery_finish(&g_storage_coordinator);
             portEXIT_CRITICAL(&g_storage_coordinator_lock);
@@ -7160,37 +7442,42 @@ int pj_board_storage_recover(void)
         }
         g_sd_card = NULL;
     }
+    board_status_take();
     g_status.storage_mounted = 0;
     g_status.storage = PJ_BOARD_SERVICE_UNAVAILABLE;
     g_status.storage_health = PJ_STORAGE_HEALTH_UNMOUNTED;
+    board_status_give();
     esp_err_t err = storage_init();
     if (err != ESP_OK) {
-        g_status.storage = PJ_BOARD_SERVICE_ERROR;
-        (void)snprintf(g_status.last_error, sizeof(g_status.last_error),
-                       "microSD recovery failed: %s; check card and filesystem",
-                       esp_err_to_name(err));
+        board_status_set_service(BOARD_SERVICE_STORAGE,
+                                 PJ_BOARD_SERVICE_ERROR);
+        board_status_set_error(
+            "microSD recovery failed: %s; check card and filesystem",
+            esp_err_to_name(err));
         portENTER_CRITICAL(&g_storage_coordinator_lock);
         pj_storage_recovery_finish(&g_storage_coordinator);
         portEXIT_CRITICAL(&g_storage_coordinator_lock);
         return 0;
     }
-    g_status.storage = PJ_BOARD_SERVICE_READY;
-    g_status.last_error[0] = '\0';
+    board_status_set_service(BOARD_SERVICE_STORAGE, PJ_BOARD_SERVICE_READY);
+    board_status_clear_error();
     if (!g_audio_ready) {
         esp_err_t audio_err = audio_init();
         if (audio_err == ESP_OK) {
-            g_status.audio = PJ_BOARD_SERVICE_READY;
+            board_status_set_service(BOARD_SERVICE_AUDIO,
+                                     PJ_BOARD_SERVICE_READY);
         } else {
-            g_status.audio = PJ_BOARD_SERVICE_ERROR;
-            (void)snprintf(g_status.last_error, sizeof(g_status.last_error),
-                           "storage recovered but audio init failed: %s",
-                           esp_err_to_name(audio_err));
+            board_status_set_service(BOARD_SERVICE_AUDIO,
+                                     PJ_BOARD_SERVICE_ERROR);
+            board_status_set_error(
+                "storage recovered but audio init failed: %s",
+                esp_err_to_name(audio_err));
         }
     }
     portENTER_CRITICAL(&g_storage_coordinator_lock);
     pj_storage_recovery_finish(&g_storage_coordinator);
     portEXIT_CRITICAL(&g_storage_coordinator_lock);
-    g_notes_update_pending = 1;
+    board_update_publish(BOARD_UPDATE_NOTES);
     return 1;
 #else
     return 0;
@@ -7324,20 +7611,21 @@ static board_time_update_result_t board_set_time_date(
     esp_err_t err = rtc_write_civil_time(hour, minute, *year, month, day,
                                          second);
     if (err != ESP_OK) {
-        (void)snprintf(g_status.last_error, sizeof(g_status.last_error),
-                       "RTC write failed for %s time update: %s",
-                       source, esp_err_to_name(err));
-        ESP_LOGW(TAG, "%s", g_status.last_error);
+        board_status_set_error("RTC write failed for %s time update: %s",
+                               source, esp_err_to_name(err));
+        ESP_LOGW(TAG, "RTC write failed for %s time update: %s", source,
+                 esp_err_to_name(err));
         time_transaction_give();
         return BOARD_TIME_UPDATE_UNAVAILABLE;
     }
     if (update_utc_offset) {
         esp_err_t offset_err = time_offset_save(utc_offset_minutes);
         if (offset_err != ESP_OK) {
-            (void)snprintf(g_status.last_error, sizeof(g_status.last_error),
-                           "UTC offset persistence failed for %s: %s", source,
-                           esp_err_to_name(offset_err));
-            ESP_LOGW(TAG, "%s", g_status.last_error);
+            board_status_set_error(
+                "UTC offset persistence failed for %s: %s", source,
+                esp_err_to_name(offset_err));
+            ESP_LOGW(TAG, "UTC offset persistence failed for %s: %s", source,
+                     esp_err_to_name(offset_err));
             time_transaction_give();
             return BOARD_TIME_UPDATE_UNAVAILABLE;
         }
@@ -8401,7 +8689,8 @@ static void serial_audio_list(char *line)
                           "invalid_arguments", 0);
         return;
     }
-    if (g_status.storage != PJ_BOARD_SERVICE_READY) {
+    pj_board_status_t status = board_status_snapshot_base();
+    if (status.storage != PJ_BOARD_SERVICE_READY) {
         serial_sync_error(command, request_id, "storage unavailable",
                           "storage_unavailable", 1);
         return;
@@ -8629,7 +8918,8 @@ static int serial_create_upload_file(uint32_t expected_bytes)
     if (!storage_shared_try_acquire()) {
         return 0;
     }
-    int ready = g_status.storage == PJ_BOARD_SERVICE_READY &&
+    pj_board_status_t status = board_status_snapshot_base();
+    int ready = status.storage == PJ_BOARD_SERVICE_READY &&
                 storage_preflight(expected_bytes, "USB transcript upload");
     remove(PJ_USB_TRANSCRIPT_TEMP_PATH);
     FILE *file = ready ? fopen(PJ_USB_TRANSCRIPT_TEMP_PATH, "wb") : NULL;
@@ -8671,7 +8961,8 @@ static void serial_transcript_begin(char *line)
                           "invalid_arguments", 0);
         return;
     }
-    if (g_status.storage != PJ_BOARD_SERVICE_READY) {
+    pj_board_status_t status = board_status_snapshot_base();
+    if (status.storage != PJ_BOARD_SERVICE_READY) {
         serial_sync_error(command, request_id, "storage unavailable",
                           "storage_unavailable", 1);
         return;
@@ -8700,9 +8991,10 @@ static void serial_transcript_begin(char *line)
     if (begin == PJ_USB_UPLOAD_BEGIN_STARTED &&
         !serial_create_upload_file(expected_bytes)) {
         pj_usb_upload_init(&g_usb_upload);
+        pj_board_status_t status = board_status_snapshot_base();
         serial_sync_error(command, request_id,
                           "transcript upload file could not be created",
-                          g_status.storage_health == PJ_STORAGE_HEALTH_FULL ?
+                          status.storage_health == PJ_STORAGE_HEALTH_FULL ?
                               "storage_full" : "storage_io",
                           1);
         return;
@@ -8934,7 +9226,7 @@ static void serial_transcript_commit(char *line)
             ESP_LOGW(TAG, "USB transcript committed but metadata refresh failed");
         }
         pj_usb_upload_mark_committed(&g_usb_upload);
-        g_notes_update_pending = 1;
+        board_update_publish(BOARD_UPDATE_NOTES);
     }
     cJSON *json = serial_sync_response(command, request_id);
     if (json == NULL) {
@@ -9264,7 +9556,9 @@ static void serial_command_task(void *arg)
             }
             esp_err_t err = wifi_save_provisioning(ssid, password, token);
             if (err == ESP_OK) {
-                printf("PJ_OK {\"device_id\":\"%s\",\"wifi\":\"stored\"}\n", g_status.device_id);
+                pj_board_status_t status = board_status_snapshot_base();
+                printf("PJ_OK {\"device_id\":\"%s\",\"wifi\":\"stored\"}\n",
+                       status.device_id);
             } else {
                 printf("PJ_ERR {\"error\":\"wifi provisioning failed: %s\"}\n", esp_err_to_name(err));
             }
@@ -9344,11 +9638,12 @@ static esp_err_t status_handler(httpd_req_t *req)
     int pending_sync = 0;
     int transferred_sync = 0;
     pj_board_status_t status = pj_board_status();
-    if (g_status.storage_mounted && storage_shared_try_acquire()) {
+    if (status.storage_mounted && storage_shared_try_acquire()) {
         (void)storage_refresh_capacity();
         storage_shared_release();
+        status = pj_board_status();
     }
-    if (g_status.storage == PJ_BOARD_SERVICE_READY) {
+    if (status.storage == PJ_BOARD_SERVICE_READY) {
         collect_sync_counts(&pending_sync, &transferred_sync);
     }
     cJSON *json = cJSON_CreateObject();
@@ -9358,38 +9653,44 @@ static esp_err_t status_handler(httpd_req_t *req)
         httpd_resp_set_status(req, "503 Service Unavailable");
         return send_json(req, "{\"error\":\"status allocation failed\"}");
     }
-    cJSON_AddStringToObject(json, "device_id", g_status.device_id);
+    cJSON_AddStringToObject(json, "device_id", status.device_id);
     cJSON_AddStringToObject(json, "firmware_version",
                             esp_app_get_description()->version);
     cJSON_AddStringToObject(json, "board_profile", "waveshare-esp32-s3-touch-epaper-1.54-v2");
-    cJSON_AddStringToObject(json, "display", service_name(g_status.display));
-    cJSON_AddStringToObject(json, "storage", service_name(g_status.storage));
-    cJSON_AddStringToObject(json, "audio", service_name(g_status.audio));
-    cJSON_AddStringToObject(json, "ble_provisioning", service_name(g_status.ble_provisioning));
-    cJSON_AddStringToObject(json, "wifi", service_name(g_status.wifi));
-    cJSON_AddStringToObject(json, "http", service_name(g_status.http));
-    cJSON_AddStringToObject(json, "ip", g_status.ip_addr);
+    cJSON_AddStringToObject(json, "display", service_name(status.display));
+    cJSON_AddStringToObject(json, "storage", service_name(status.storage));
+    cJSON_AddStringToObject(json, "audio", service_name(status.audio));
+    cJSON_AddStringToObject(json, "ble_provisioning",
+                            service_name(status.ble_provisioning));
+    cJSON_AddStringToObject(json, "wifi", service_name(status.wifi));
+    cJSON_AddStringToObject(json, "http", service_name(status.http));
+    cJSON_AddStringToObject(json, "ip", status.ip_addr);
     cJSON_AddBoolToObject(json, "wifi_provisioned", g_wifi_credentials_stored != 0);
-    cJSON_AddNumberToObject(json, "battery_percent", g_status.battery_percent);
-    cJSON_AddNumberToObject(json, "temperature_c", g_status.temperature_c);
-    if (g_status.humidity_percent < 0) {
+    cJSON_AddNumberToObject(json, "battery_percent", status.battery_percent);
+    cJSON_AddNumberToObject(json, "temperature_c", status.temperature_c);
+    if (status.humidity_percent < 0) {
         cJSON_AddNullToObject(json, "humidity_percent");
     } else {
-        cJSON_AddNumberToObject(json, "humidity_percent", g_status.humidity_percent);
+        cJSON_AddNumberToObject(json, "humidity_percent",
+                                status.humidity_percent);
     }
     cJSON_AddNumberToObject(time, "hour", status.hour);
     cJSON_AddNumberToObject(time, "minute", status.minute);
     cJSON_AddNumberToObject(time, "year", status.year);
     cJSON_AddNumberToObject(time, "month", status.month);
     cJSON_AddNumberToObject(time, "day", status.day);
-    cJSON_AddBoolToObject(json, "storage_mounted", g_status.storage_mounted != 0);
-    cJSON_AddStringToObject(json, "storage_health", pj_storage_health_name(g_status.storage_health));
-    cJSON_AddNumberToObject(json, "storage_total_bytes", (double)g_status.storage_total_bytes);
-    cJSON_AddNumberToObject(json, "storage_free_bytes", (double)g_status.storage_free_bytes);
-    cJSON_AddNumberToObject(json, "storage_recovery_count", g_status.storage_recovery_count);
+    cJSON_AddBoolToObject(json, "storage_mounted", status.storage_mounted != 0);
+    cJSON_AddStringToObject(json, "storage_health",
+                            pj_storage_health_name(status.storage_health));
+    cJSON_AddNumberToObject(json, "storage_total_bytes",
+                            (double)status.storage_total_bytes);
+    cJSON_AddNumberToObject(json, "storage_free_bytes",
+                            (double)status.storage_free_bytes);
+    cJSON_AddNumberToObject(json, "storage_recovery_count",
+                            status.storage_recovery_count);
     cJSON_AddNumberToObject(json, "pending_sync", pending_sync);
     cJSON_AddNumberToObject(json, "transferred_sync", transferred_sync);
-    cJSON_AddStringToObject(json, "last_error", g_status.last_error);
+    cJSON_AddStringToObject(json, "last_error", status.last_error);
     pj_companion_sync_state_t companion_sync;
     cJSON *companion_json = cJSON_AddObjectToObject(json, "companion_sync");
     int companion_ok = pj_board_companion_sync_snapshot(&companion_sync) &&
@@ -9757,7 +10058,7 @@ static pj_settings_commit_result_t settings_commit_update(
             return PJ_SETTINGS_COMMIT_STORE_FAILED;
         }
         g_settings = updated;
-        g_settings_update_pending = 1;
+        board_update_publish(BOARD_UPDATE_SETTINGS);
     }
     *committed = g_settings;
     *generation = g_settings_store.generation;
@@ -9892,7 +10193,8 @@ static esp_err_t audio_list_handler(httpd_req_t *req)
     if (require_auth(req) != ESP_OK) {
         return ESP_OK;
     }
-    if (g_status.storage != PJ_BOARD_SERVICE_READY) {
+    pj_board_status_t status = board_status_snapshot_base();
+    if (status.storage != PJ_BOARD_SERVICE_READY) {
         httpd_resp_set_status(req, "503 Service Unavailable");
         return send_json(req, "{\"error\":\"storage unavailable; run storage recovery\"}");
     }
@@ -10024,7 +10326,8 @@ static esp_err_t audio_download_handler(httpd_req_t *req)
     if (require_auth(req) != ESP_OK) {
         return ESP_OK;
     }
-    if (g_status.storage != PJ_BOARD_SERVICE_READY) {
+    pj_board_status_t status = board_status_snapshot_base();
+    if (status.storage != PJ_BOARD_SERVICE_READY) {
         httpd_resp_set_status(req, "503 Service Unavailable");
         return send_json(req, "{\"error\":\"storage unavailable; run storage recovery\"}");
     }
@@ -10073,7 +10376,8 @@ static esp_err_t transcript_put_handler(httpd_req_t *req)
     if (require_auth(req) != ESP_OK) {
         return ESP_OK;
     }
-    if (g_status.storage != PJ_BOARD_SERVICE_READY) {
+    pj_board_status_t status = board_status_snapshot_base();
+    if (status.storage != PJ_BOARD_SERVICE_READY) {
         drain_body(req);
         httpd_resp_set_status(req, "503 Service Unavailable");
         return send_json(req, "{\"error\":\"storage unavailable; run storage recovery\"}");
@@ -10133,7 +10437,9 @@ static esp_err_t transcript_put_handler(httpd_req_t *req)
     transcript_path_for_audio(path, sizeof(path), id + 1);
     esp_err_t write_err = json_write_file_atomic(path, body, (size_t)req->content_len);
     free(body);
-    if (write_err == ESP_ERR_NO_MEM && g_status.storage_health == PJ_STORAGE_HEALTH_FULL) {
+    status = board_status_snapshot_base();
+    if (write_err == ESP_ERR_NO_MEM &&
+        status.storage_health == PJ_STORAGE_HEALTH_FULL) {
         storage_shared_release();
         httpd_resp_set_status(req, "507 Insufficient Storage");
         return send_json(req, "{\"error\":\"insufficient storage for transcript\"}");
@@ -10153,7 +10459,7 @@ static esp_err_t transcript_put_handler(httpd_req_t *req)
         ESP_LOGW(TAG, "Transcript stored but note metadata refresh failed: %s", id + 1);
     }
     storage_shared_release();
-    g_notes_update_pending = 1;
+    board_update_publish(BOARD_UPDATE_NOTES);
     ESP_LOGI(TAG, "Transcript stored and note marked synced: %s", path);
     return send_json(req, "{\"uploaded\":true}");
 }
@@ -10163,8 +10469,7 @@ static esp_err_t storage_recover_handler(httpd_req_t *req)
     if (require_auth(req) != ESP_OK) {
         return ESP_OK;
     }
-    if (g_status.recording || g_record_task != NULL || g_audio_process_task != NULL ||
-        g_status.playback_active || g_playback_task != NULL) {
+    if (audio_lifecycle_active()) {
         httpd_resp_set_status(req, "409 Conflict");
         return send_json(req, "{\"error\":\"storage recovery blocked while audio is active\"}");
     }
@@ -10200,10 +10505,10 @@ int pj_board_http_start(void)
 
     esp_err_t err = network_stack_init();
     if (err != ESP_OK) {
-        g_status.http = PJ_BOARD_SERVICE_ERROR;
-        (void)snprintf(g_status.last_error, sizeof(g_status.last_error),
-                       "network stack init failed: %s", esp_err_to_name(err));
-        ESP_LOGE(TAG, "%s", g_status.last_error);
+        board_status_set_service(BOARD_SERVICE_HTTP, PJ_BOARD_SERVICE_ERROR);
+        board_status_set_error("network stack init failed: %s",
+                               esp_err_to_name(err));
+        ESP_LOGE(TAG, "Network stack init failed: %s", esp_err_to_name(err));
         return 0;
     }
 
@@ -10213,18 +10518,18 @@ int pj_board_http_start(void)
     config.uri_match_fn = httpd_uri_match_wildcard;
     err = httpd_start(&g_http_server, &config);
     if (err != ESP_OK) {
-        g_status.http = PJ_BOARD_SERVICE_ERROR;
-        (void)snprintf(g_status.last_error, sizeof(g_status.last_error), "HTTP start failed: %s", esp_err_to_name(err));
-        ESP_LOGE(TAG, "%s", g_status.last_error);
+        board_status_set_service(BOARD_SERVICE_HTTP, PJ_BOARD_SERVICE_ERROR);
+        board_status_set_error("HTTP start failed: %s", esp_err_to_name(err));
+        ESP_LOGE(TAG, "HTTP start failed: %s", esp_err_to_name(err));
         return 0;
     }
 
 #define REGISTER_URI_OR_FAIL(uri, method, handler) do { \
         err = register_uri(g_http_server, uri, method, handler); \
         if (err != ESP_OK) { \
-            g_status.http = PJ_BOARD_SERVICE_ERROR; \
-            (void)snprintf(g_status.last_error, sizeof(g_status.last_error), \
-                           "HTTP route registration failed for %s: %s", uri, esp_err_to_name(err)); \
+            board_status_set_service(BOARD_SERVICE_HTTP, PJ_BOARD_SERVICE_ERROR); \
+            board_status_set_error("HTTP route registration failed for %s: %s", \
+                                   uri, esp_err_to_name(err)); \
             httpd_stop(g_http_server); \
             g_http_server = NULL; \
             return 0; \
@@ -10243,17 +10548,16 @@ int pj_board_http_start(void)
     REGISTER_URI_OR_FAIL("/v1/transcripts/*", HTTP_PUT, transcript_put_handler);
     err = pj_ota_register_http(g_http_server);
     if (err != ESP_OK) {
-        g_status.http = PJ_BOARD_SERVICE_ERROR;
-        (void)snprintf(g_status.last_error, sizeof(g_status.last_error),
-                       "OTA HTTP route registration failed: %s",
-                       esp_err_to_name(err));
+        board_status_set_service(BOARD_SERVICE_HTTP, PJ_BOARD_SERVICE_ERROR);
+        board_status_set_error("OTA HTTP route registration failed: %s",
+                               esp_err_to_name(err));
         httpd_stop(g_http_server);
         g_http_server = NULL;
         return 0;
     }
 #undef REGISTER_URI_OR_FAIL
 
-    g_status.http = PJ_BOARD_SERVICE_READY;
+    board_status_set_service(BOARD_SERVICE_HTTP, PJ_BOARD_SERVICE_READY);
     ESP_LOGI(TAG, "HTTP API started with bearer authentication enabled");
     return 1;
 #else

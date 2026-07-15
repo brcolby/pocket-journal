@@ -9,6 +9,7 @@ TIME_MODEL_TEST_BIN := build/test_time_model
 AUX_INPUT_TEST_BIN := build/test_aux_input
 POWER_INPUT_TEST_BIN := build/test_power_input
 AUDIO_LEVEL_TEST_BIN := build/test_audio_level
+AUDIO_LIFECYCLE_TEST_BIN := build/test_audio_lifecycle
 ALERT_AUDIO_TEST_BIN := build/test_alert_audio
 RECORDING_TEST_BIN := build/test_recording
 NOTE_MODEL_TEST_BIN := build/test_note_model
@@ -105,6 +106,12 @@ test-input: test-display-worker
 		tests/board/test_audio_level.c \
 		-o $(AUDIO_LEVEL_TEST_BIN)
 	$(AUDIO_LEVEL_TEST_BIN)
+	$(CC) $(CFLAGS) \
+		-Ifirmware/components/pj_board/include \
+		firmware/components/pj_board/pj_audio_lifecycle.c \
+		tests/board/test_audio_lifecycle.c \
+		-o $(AUDIO_LIFECYCLE_TEST_BIN)
+	$(AUDIO_LIFECYCLE_TEST_BIN)
 	$(CC) $(CFLAGS) \
 		-Ifirmware/components/pj_board/include \
 		firmware/components/pj_board/pj_alert_audio.c \
