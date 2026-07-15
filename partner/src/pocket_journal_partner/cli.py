@@ -25,7 +25,7 @@ from .device import (
 from .diagnostics import credential_safe_status, wifi_diagnostics
 from .library import LibraryNote, NoteLibrary
 from .operations import DeviceSession
-from .ota import inspect_firmware_image, ota_preflight, ota_status, stream_firmware_image, wait_for_ota_result
+from .ota import inspect_firmware_bundle, ota_preflight, ota_status, stream_firmware_image, wait_for_ota_result
 from .storage import PartnerStore
 from .sync import sync_device_audio
 from .transcription import FakeTranscriptionBackend, WhisperCppTranscriptionBackend, backend_from_name
@@ -622,13 +622,23 @@ def cmd_firmware_status(args: argparse.Namespace) -> int:
 def cmd_firmware_update(args: argparse.Namespace) -> int:
     session = _lan_session_from_args(args)
     session.require("ota.write", destructive=True)
-    image = inspect_firmware_image(Path(args.file))
-    preflight = ota_preflight(session.client, image)  # type: ignore[arg-type]
+    bundle = inspect_firmware_bundle(
+        Path(args.file),
+        manifest_path=Path(args.manifest) if args.manifest else None,
+        signature_path=Path(args.signature) if args.signature else None,
+    )
+    image = bundle.image
+    preflight = ota_preflight(session.client, bundle)  # type: ignore[arg-type]
+    if preflight.get("device_id") != session.device_id:
+        raise DeviceError("OTA preflight response did not match the selected device")
+    if preflight.get("target_version") != bundle.manifest.version:
+        raise DeviceError("OTA preflight response did not confirm the signed target version")
     if not args.yes:
         if not sys.stdin.isatty():
             raise DeviceError("refusing firmware update without --yes in a non-interactive session")
         answer = input(
-            f"Update {session.device_id} with {image.path.name} ({image.size} bytes)? [y/N] "
+            f"Update {session.device_id} from {preflight.get('running_version', 'unknown')} "
+            f"to {bundle.manifest.version} with {image.path.name} ({image.size} bytes)? [y/N] "
         )
         if answer.strip().lower() not in {"y", "yes"}:
             raise DeviceError("firmware update cancelled")
@@ -641,14 +651,31 @@ def cmd_firmware_update(args: argparse.Namespace) -> int:
             print(f"Uploading firmware: {percent}%", file=sys.stderr)
             last_percent = percent
 
-    upload = stream_firmware_image(session.client, image, progress=report_progress)  # type: ignore[arg-type]
+    upload = stream_firmware_image(
+        session.client,
+        image,
+        upload_id=str(preflight["upload_id"]),
+        progress=report_progress,
+    )  # type: ignore[arg-type]
     _, outcome = wait_for_ota_result(
         session.client,  # type: ignore[arg-type]
         session.device_id,
         timeout=args.reconnect_timeout,
     )
+    if outcome.get("state") == "confirmed" and (
+        outcome.get("running_version") != bundle.manifest.version
+        or outcome.get("target_sha256") != image.sha256
+    ):
+        raise DeviceError("OTA confirmation did not match the signed firmware image")
     _print_json(session.envelope({
         "image": {"path": str(image.path), "size": image.size, "sha256": image.sha256},
+        "manifest": {
+            "project": bundle.manifest.project,
+            "board": bundle.manifest.board,
+            "target": bundle.manifest.target,
+            "version": bundle.manifest.version,
+            "secure_version": bundle.manifest.secure_version,
+        },
         "preflight": preflight,
         "upload": upload,
         "outcome": outcome,
@@ -850,6 +877,14 @@ def build_parser() -> argparse.ArgumentParser:
     firmware_update.add_argument("--token", help="override the stored LAN bearer token")
     firmware_update.add_argument("--data-dir")
     firmware_update.add_argument("--file", required=True)
+    firmware_update.add_argument(
+        "--manifest",
+        help="signed manifest JSON; defaults to <file>.manifest.json",
+    )
+    firmware_update.add_argument(
+        "--signature",
+        help="ECDSA DER signature; defaults to <file>.sig",
+    )
     firmware_update.add_argument("--yes", action="store_true", help="confirm firmware activation")
     firmware_update.add_argument("--reconnect-timeout", type=float, default=90.0)
     firmware_update.set_defaults(func=cmd_firmware_update)

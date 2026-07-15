@@ -5,6 +5,7 @@
 #include "pj_auth.h"
 #include "pj_display_refresh.h"
 #include "pj_note_model.h"
+#include "pj_ota.h"
 #include "pj_power_input.h"
 #include "pj_recording.h"
 #include "pj_rtc_wake.h"
@@ -197,7 +198,7 @@
 #define PJ_AUX_EVENT_QUEUE_DEPTH 4
 #define PJ_TOUCH_STABLE_SAMPLES 2
 #define PJ_TOUCH_MOVE_TOLERANCE 18
-#define PJ_HTTP_MAX_URI_HANDLERS 16
+#define PJ_HTTP_MAX_URI_HANDLERS 20
 #define PJ_AUDIO_DIR "/sdcard/pj/audio"
 #define PJ_TRANSCRIPT_DIR "/sdcard/pj/transcripts"
 #define PJ_NOTE_DIR "/sdcard/pj/notes"
@@ -549,6 +550,22 @@ static void storage_sleep_finish(void)
 {
     portENTER_CRITICAL(&g_storage_coordinator_lock);
     pj_storage_sleep_finish(&g_storage_coordinator);
+    portEXIT_CRITICAL(&g_storage_coordinator_lock);
+}
+
+static int ota_mutations_reserve(void)
+{
+    int acquired;
+    portENTER_CRITICAL(&g_storage_coordinator_lock);
+    acquired = pj_storage_ota_try_begin(&g_storage_coordinator);
+    portEXIT_CRITICAL(&g_storage_coordinator_lock);
+    return acquired;
+}
+
+static void ota_mutations_release(void)
+{
+    portENTER_CRITICAL(&g_storage_coordinator_lock);
+    pj_storage_ota_finish(&g_storage_coordinator);
     portEXIT_CRITICAL(&g_storage_coordinator_lock);
 }
 
@@ -6054,7 +6071,10 @@ void pj_board_init(const pj_board_profile_t *profile)
         ESP_LOGI(TAG, "microSD mounted at %s", g_status.storage_path);
         remove(PJ_USB_TRANSCRIPT_TEMP_PATH);
     } else {
-        g_status.storage = PJ_BOARD_SERVICE_ERROR;
+        g_status.storage = storage_err == ESP_ERR_NOT_FOUND ||
+                           storage_err == ESP_ERR_TIMEOUT ||
+                           storage_err == ESP_ERR_INVALID_RESPONSE ?
+                           PJ_BOARD_SERVICE_UNAVAILABLE : PJ_BOARD_SERVICE_ERROR;
         (void)snprintf(g_status.last_error, sizeof(g_status.last_error),
                        "microSD mount failed: %s; check card inserted and FAT32/exFAT formatting",
                        esp_err_to_name(storage_err));
@@ -6089,7 +6109,12 @@ void pj_board_init(const pj_board_profile_t *profile)
 
 void pj_board_start_services(const pj_board_profile_t *profile)
 {
+#ifdef ESP_PLATFORM
+    pj_ota_init(g_status.device_id, g_status.token, profile->name,
+                ota_mutations_reserve, ota_mutations_release);
+#else
     (void)profile;
+#endif
     (void)pj_board_http_start();
 #ifdef ESP_PLATFORM
     if (!g_wifi_credentials_stored) {
@@ -6114,6 +6139,11 @@ void pj_board_start_services(const pj_board_profile_t *profile)
         }
     }
     ESP_ERROR_CHECK_WITHOUT_ABORT(serial_command_task_start());
+    pj_ota_confirm_boot_health(
+        g_status.display == PJ_BOARD_SERVICE_READY &&
+        g_status.storage != PJ_BOARD_SERVICE_ERROR &&
+        g_status.audio == PJ_BOARD_SERVICE_READY &&
+        g_status.http == PJ_BOARD_SERVICE_READY);
 #endif
 }
 
@@ -7047,7 +7077,9 @@ static esp_err_t require_auth(httpd_req_t *req)
     }
     httpd_resp_set_status(req, "401 Unauthorized");
     httpd_resp_set_hdr(req, "WWW-Authenticate", "Bearer realm=\"pocket-journal\"");
-    return send_json(req, "{\"error\":\"unauthorized\"}");
+    httpd_resp_set_hdr(req, "Connection", "close");
+    (void)send_json(req, "{\"error\":\"unauthorized\"}");
+    return ESP_ERR_INVALID_STATE;
 }
 
 static void drain_body(httpd_req_t *req)
@@ -7477,21 +7509,27 @@ static int settings_add_json(cJSON *json, const pj_settings_t *settings,
            cJSON_AddNumberToObject(json, "generation", generation) != NULL;
 }
 
-static int capabilities_add_json(cJSON *json)
+static int capabilities_add_json(cJSON *json, int include_lan_ota)
 {
     cJSON *capabilities = json == NULL ? NULL :
         cJSON_AddObjectToObject(json, "capabilities");
-    return capabilities != NULL &&
-           cJSON_AddBoolToObject(capabilities, "status", 1) != NULL &&
-           cJSON_AddBoolToObject(capabilities, "time.write", 1) != NULL &&
-           cJSON_AddBoolToObject(capabilities, "settings.read", 1) != NULL &&
-           cJSON_AddBoolToObject(capabilities, "settings.write", 1) != NULL &&
-           cJSON_AddBoolToObject(capabilities, "recordings.list", 1) != NULL &&
-           cJSON_AddBoolToObject(capabilities, "recordings.download", 1) != NULL &&
-           cJSON_AddBoolToObject(capabilities, "recordings.delete", 1) != NULL &&
-           cJSON_AddBoolToObject(capabilities, "transcripts.write", 1) != NULL &&
-           cJSON_AddBoolToObject(capabilities, "audio.sync", 1) != NULL &&
-           cJSON_AddBoolToObject(capabilities, "wifi.provision", 1) != NULL;
+    int valid = capabilities != NULL &&
+                cJSON_AddBoolToObject(capabilities, "status", 1) != NULL &&
+                cJSON_AddBoolToObject(capabilities, "time.write", 1) != NULL &&
+                cJSON_AddBoolToObject(capabilities, "settings.read", 1) != NULL &&
+                cJSON_AddBoolToObject(capabilities, "settings.write", 1) != NULL &&
+                cJSON_AddBoolToObject(capabilities, "recordings.list", 1) != NULL &&
+                cJSON_AddBoolToObject(capabilities, "recordings.download", 1) != NULL &&
+                cJSON_AddBoolToObject(capabilities, "recordings.delete", 1) != NULL &&
+                cJSON_AddBoolToObject(capabilities, "transcripts.write", 1) != NULL &&
+                cJSON_AddBoolToObject(capabilities, "audio.sync", 1) != NULL &&
+                cJSON_AddBoolToObject(capabilities, "wifi.provision", 1) != NULL;
+    if (valid && include_lan_ota) {
+        valid = cJSON_AddBoolToObject(capabilities, "ota.read", 1) != NULL &&
+                cJSON_AddBoolToObject(capabilities, "ota.write",
+                                      pj_ota_write_enabled()) != NULL;
+    }
+    return valid;
 }
 
 static int serial_request_matches(const char *line, const char *command,
@@ -7560,7 +7598,7 @@ static void serial_print_status(const char *request_id)
     cJSON_AddNumberToObject(json, "pending_sync", pending_sync);
     cJSON_AddNumberToObject(json, "transferred_sync", transferred_sync);
     storage_wipe_snapshot_t wipe = storage_wipe_snapshot();
-    if (!capabilities_add_json(json) ||
+    if (!capabilities_add_json(json, 0) ||
         !runtime_identity_add_json(json) ||
         !wipe_status_add_json(json, &wipe.current) ||
         !wipe_history_add_json(json, wipe.history, wipe.history_count) ||
@@ -8920,7 +8958,7 @@ static esp_err_t status_handler(httpd_req_t *req)
     cJSON_AddNumberToObject(json, "transferred_sync", transferred_sync);
     cJSON_AddStringToObject(json, "last_error", g_status.last_error);
     storage_wipe_snapshot_t wipe = storage_wipe_snapshot();
-    if (!capabilities_add_json(json) ||
+    if (!capabilities_add_json(json, 1) ||
         !runtime_identity_add_json(json) ||
         !wipe_status_add_json(json, &wipe.current) ||
         !wipe_history_add_json(json, wipe.history, wipe.history_count) ||
@@ -9620,6 +9658,7 @@ int pj_board_http_start(void)
 
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.max_uri_handlers = PJ_HTTP_MAX_URI_HANDLERS;
+    config.stack_size = 8192;
     config.uri_match_fn = httpd_uri_match_wildcard;
     err = httpd_start(&g_http_server, &config);
     if (err != ESP_OK) {
@@ -9651,6 +9690,16 @@ int pj_board_http_start(void)
     REGISTER_URI_OR_FAIL("/v1/audio", HTTP_DELETE, audio_delete_handler);
     REGISTER_URI_OR_FAIL("/v1/audio/*", HTTP_GET, audio_download_handler);
     REGISTER_URI_OR_FAIL("/v1/transcripts/*", HTTP_PUT, transcript_put_handler);
+    err = pj_ota_register_http(g_http_server);
+    if (err != ESP_OK) {
+        g_status.http = PJ_BOARD_SERVICE_ERROR;
+        (void)snprintf(g_status.last_error, sizeof(g_status.last_error),
+                       "OTA HTTP route registration failed: %s",
+                       esp_err_to_name(err));
+        httpd_stop(g_http_server);
+        g_http_server = NULL;
+        return 0;
+    }
 #undef REGISTER_URI_OR_FAIL
 
     g_status.http = PJ_BOARD_SERVICE_READY;

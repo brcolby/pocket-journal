@@ -21,6 +21,12 @@ static void test_shared_and_maintenance_exclusion(void)
     assert(pj_storage_recovery_try_begin(&coordinator));
     assert(!pj_storage_shared_try_acquire(&coordinator));
     pj_storage_recovery_finish(&coordinator);
+    assert(pj_storage_ota_try_begin(&coordinator));
+    assert(!pj_storage_shared_try_acquire(&coordinator));
+    assert(!pj_storage_sleep_try_begin(&coordinator));
+    assert(pj_storage_wipe_request(&coordinator, 1, 0, NULL, NULL) ==
+           PJ_WIPE_START_STORAGE_BUSY);
+    pj_storage_ota_finish(&coordinator);
     assert(pj_storage_shared_try_acquire(&coordinator));
     pj_storage_shared_release(&coordinator);
 }

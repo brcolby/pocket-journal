@@ -1,0 +1,20 @@
+menu "Pocket Journal OTA"
+
+config PJ_OTA_TRUSTED_PUBLIC_KEY_HEX
+    string "Trusted OTA ECDSA public key (DER SubjectPublicKeyInfo, hex)"
+    default ""
+    help
+        Hex-encoded DER SubjectPublicKeyInfo for the ECDSA signing key trusted
+        by partner-driven OTA. An empty or invalid value intentionally disables
+        OTA activation: preflight fails closed with
+        verification_key_unconfigured. OTA activation also requires ESP-IDF
+        signed-app verification (SECURE_SIGNED_APPS_NO_SECURE_BOOT with update
+        verification, or hardware Secure Boot); without it ota.write remains
+        disabled even when this manifest key is configured.
+
+config PJ_OTA_MAX_IMAGE_BYTES
+    int "Maximum accepted OTA application image size"
+    range 65536 2097152
+    default 2097152
+
+endmenu

@@ -12,6 +12,7 @@ typedef enum {
     PJ_STORAGE_MAINTENANCE_RECORDING_WIPE,
     PJ_STORAGE_MAINTENANCE_RECOVERY,
     PJ_STORAGE_MAINTENANCE_SLEEP,
+    PJ_STORAGE_MAINTENANCE_OTA,
 } pj_storage_maintenance_t;
 
 typedef enum {
@@ -79,6 +80,8 @@ int pj_storage_recovery_try_begin(pj_storage_coordinator_t *coordinator);
 void pj_storage_recovery_finish(pj_storage_coordinator_t *coordinator);
 int pj_storage_sleep_try_begin(pj_storage_coordinator_t *coordinator);
 void pj_storage_sleep_finish(pj_storage_coordinator_t *coordinator);
+int pj_storage_ota_try_begin(pj_storage_coordinator_t *coordinator);
+void pj_storage_ota_finish(pj_storage_coordinator_t *coordinator);
 pj_wipe_status_t pj_storage_wipe_status(const pj_storage_coordinator_t *coordinator);
 size_t pj_storage_wipe_history(const pj_storage_coordinator_t *coordinator,
                                pj_wipe_status_t *statuses, size_t capacity);

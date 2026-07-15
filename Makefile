@@ -25,6 +25,7 @@ RTC_WAKE_TEST_BIN := build/test_rtc_wake
 TIME_CONTROLLER_TEST_BIN := build/test_time_controller
 TRANSCRIPT_UPLOAD_TEST_BIN := build/test_transcript_upload
 USB_SYNC_TEST_BIN := build/test_usb_sync
+OTA_POLICY_TEST_BIN := build/test_ota_policy
 WIFI_STATE_TEST_BIN := build/test_wifi_state
 TIME_SYNC_TEST_BIN := build/test_time_sync
 LVGL_DIR := firmware/managed_components/lvgl__lvgl
@@ -199,6 +200,12 @@ test-input:
 		tests/board/test_usb_sync.c \
 		-o $(USB_SYNC_TEST_BIN)
 	$(USB_SYNC_TEST_BIN)
+	$(CC) $(CFLAGS) \
+		-Ifirmware/components/pj_board/include \
+		firmware/components/pj_board/pj_ota_policy.c \
+		tests/board/test_ota_policy.c \
+		-o $(OTA_POLICY_TEST_BIN)
+	$(OTA_POLICY_TEST_BIN)
 	$(CC) $(CFLAGS) \
 		-Ifirmware/components/pj_board/include \
 		firmware/components/pj_board/pj_wifi_state.c \

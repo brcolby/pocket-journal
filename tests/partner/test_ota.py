@@ -13,7 +13,10 @@ from pocket_journal_partner import cli
 from pocket_journal_partner.device import DeviceClient, DeviceError
 from pocket_journal_partner.operations import DeviceSession
 from pocket_journal_partner.ota import (
+    FirmwareBundle,
     FirmwareImage,
+    FirmwareManifest,
+    inspect_firmware_bundle,
     inspect_firmware_image,
     ota_preflight,
     stream_firmware_image,
@@ -21,11 +24,47 @@ from pocket_journal_partner.ota import (
 )
 
 
+UPLOAD_ID = "0123456789abcdef0123456789abcdef"
+
+
+def esp_image(payload: bytes = b"") -> bytes:
+    image = bytearray(32 + 256)
+    image[0] = 0xE9
+    image[1] = 1
+    image[12:14] = (0x0009).to_bytes(2, "little")
+    image[32:36] = (0xABCD5432).to_bytes(4, "little")
+    image[36:40] = (1).to_bytes(4, "little")
+    image[48:80] = b"2.0.0".ljust(32, b"\0")
+    image[80:112] = b"pocket_journal".ljust(32, b"\0")
+    return bytes(image) + payload
+
+
+def write_bundle(path: Path, payload: bytes = b"image") -> FirmwareBundle:
+    payload = esp_image(payload)
+    path.write_bytes(payload)
+    digest = hashlib.sha256(payload).hexdigest()
+    path.with_suffix(path.suffix + ".manifest.json").write_text(json.dumps({
+        "size": len(payload),
+        "sha256": digest,
+        "project": "pocket_journal",
+        "board": "waveshare-esp32-s3-touch-epaper-1.54-v2",
+        "target": "esp32s3",
+        "version": "2.0.0",
+        "secure_version": 1,
+    }), encoding="utf-8")
+    path.with_suffix(path.suffix + ".sig").write_bytes(b"\x30\x02\x01\x01")
+    return inspect_firmware_bundle(path)
+
+
 class FakeResponse:
     status = 200
 
     def read(self) -> bytes:
-        return b'{"state":"pending_reboot"}'
+        return json.dumps({
+            "state": "pending_reboot",
+            "upload_id": UPLOAD_ID,
+            "sha256": hashlib.sha256(b"x" * 150_000).hexdigest(),
+        }).encode("utf-8")
 
 
 class FakeConnection:
@@ -75,6 +114,54 @@ class OtaTests(unittest.TestCase):
             with self.assertRaisesRegex(DeviceError, "empty"):
                 inspect_firmware_image(root / "empty.bin")
 
+    def test_bundle_binds_image_manifest_and_signature(self) -> None:
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "app.bin"
+            bundle = write_bundle(path, b"signed image")
+            self.assertEqual(bundle.manifest.sha256, bundle.image.sha256)
+            self.assertEqual(
+                bundle.manifest.canonical_bytes(),
+                (
+                    "PJOTA1\n"
+                    f"sha256={bundle.image.sha256}\n"
+                    f"size={bundle.image.size}\nproject=pocket_journal\n"
+                    "board=waveshare-esp32-s3-touch-epaper-1.54-v2\n"
+                    "target=esp32s3\nversion=2.0.0\nsecure_version=1\n"
+                ).encode("ascii"),
+            )
+            path.write_bytes(b"changed")
+            with self.assertRaisesRegex(DeviceError, "size|sha256"):
+                inspect_firmware_bundle(path)
+
+    def test_bundle_fails_closed_without_signature(self) -> None:
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "app.bin"
+            bundle = write_bundle(path)
+            self.assertTrue(bundle.signature)
+            path.with_suffix(path.suffix + ".sig").unlink()
+            with self.assertRaisesRegex(DeviceError, "cannot read firmware signature"):
+                inspect_firmware_bundle(path)
+
+    def test_bundle_rejects_manifest_that_disagrees_with_esp_descriptor(self) -> None:
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "app.bin"
+            write_bundle(path)
+            manifest_path = path.with_suffix(path.suffix + ".manifest.json")
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["version"] = "3.0.0"
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            with self.assertRaisesRegex(DeviceError, "version does not match"):
+                inspect_firmware_bundle(path)
+
+    def test_bundle_rejects_duplicate_manifest_fields(self) -> None:
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "app.bin"
+            write_bundle(path)
+            manifest_path = path.with_suffix(path.suffix + ".manifest.json")
+            manifest_path.write_text('{"size":1,"size":2}', encoding="utf-8")
+            with self.assertRaisesRegex(DeviceError, "not valid JSON"):
+                inspect_firmware_bundle(path)
+
     def test_stream_upload_is_bounded_authenticated_and_reports_progress(self) -> None:
         with TemporaryDirectory() as tmp:
             path = Path(tmp) / "app.bin"
@@ -84,13 +171,19 @@ class OtaTests(unittest.TestCase):
             progress: list[tuple[int, int]] = []
             client = DeviceClient("http://device.local:8080/prefix", "secret", timeout=7)
             with patch("pocket_journal_partner.ota.http.client.HTTPConnection", FakeConnection):
-                result = stream_firmware_image(client, image, progress=lambda sent, total: progress.append((sent, total)))
+                result = stream_firmware_image(
+                    client,
+                    image,
+                    upload_id=UPLOAD_ID,
+                    progress=lambda sent, total: progress.append((sent, total)),
+                )
 
         connection = FakeConnection.instances[0]
         self.assertEqual(connection.init, ("device.local", 8080, 7))
         self.assertEqual(connection.request, ("POST", "/prefix/v1/ota"))
         self.assertEqual(connection.headers["Authorization"], "Bearer secret")
         self.assertEqual(connection.headers["X-PJ-Image-SHA256"], image.sha256)
+        self.assertEqual(connection.headers["X-PJ-Upload-ID"], UPLOAD_ID)
         self.assertEqual(connection.headers["X-PJ-Activate"], "true")
         self.assertTrue(all(len(chunk) <= 64 * 1024 for chunk in connection.sent))
         self.assertEqual(b"".join(connection.sent), payload)
@@ -113,8 +206,33 @@ class OtaTests(unittest.TestCase):
             client = DeviceClient("http://device.local", "not-printed")
             with patch("pocket_journal_partner.ota.http.client.HTTPConnection", Interrupted):
                 with self.assertRaisesRegex(DeviceError, "after 0 of 100000 bytes") as raised:
-                    stream_firmware_image(client, inspect_firmware_image(path))
+                    stream_firmware_image(
+                        client, inspect_firmware_image(path), upload_id=UPLOAD_ID
+                    )
         self.assertNotIn("not-printed", str(raised.exception))
+
+    def test_upload_busy_after_preflight_is_actionable(self) -> None:
+        class BusyResponse(FakeResponse):
+            status = 409
+
+            def read(self) -> bytes:
+                return b'{"error":"OTA upload rejected","code":"ota_busy"}'
+
+        class BusyConnection(FakeConnection):
+            def getresponse(self) -> BusyResponse:
+                return BusyResponse()
+
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "app.bin"
+            path.write_bytes(b"x" * 1024)
+            with patch("pocket_journal_partner.ota.http.client.HTTPConnection", BusyConnection):
+                with self.assertRaisesRegex(DeviceError, "ota_busy") as raised:
+                    stream_firmware_image(
+                        DeviceClient("http://device.local", "token"),
+                        inspect_firmware_image(path),
+                        upload_id=UPLOAD_ID,
+                    )
+        self.assertEqual(getattr(raised.exception, "code", None), "ota_busy")
 
     def test_changed_image_is_rejected_before_response(self) -> None:
         class NoResponse(FakeConnection):
@@ -128,13 +246,47 @@ class OtaTests(unittest.TestCase):
             path.write_bytes(b"other")
             with patch("pocket_journal_partner.ota.http.client.HTTPConnection", NoResponse):
                 with self.assertRaisesRegex(DeviceError, "changed during upload"):
-                    stream_firmware_image(DeviceClient("http://device.local", "token"), image)
+                    stream_firmware_image(
+                        DeviceClient("http://device.local", "token"),
+                        image,
+                        upload_id=UPLOAD_ID,
+                    )
 
     def test_preflight_rejection_is_actionable(self) -> None:
         client = DeviceClient("http://device.local", "token")
         client._request = lambda *args: {"accepted": False, "reason": "project mismatch"}  # type: ignore[method-assign]
+        bundle = FirmwareBundle(
+            FirmwareImage(Path("app.bin"), 3, "a" * 64),
+            FirmwareManifest(
+                3, "a" * 64, "pocket_journal", "board", "esp32s3", "2.0.0", 1
+            ),
+            b"signature",
+        )
         with self.assertRaisesRegex(DeviceError, "project mismatch"):
-            ota_preflight(client, FirmwareImage(Path("app.bin"), 3, "a" * 64))
+            ota_preflight(client, bundle)
+
+    def test_preflight_sends_every_signed_field_and_requires_upload_id(self) -> None:
+        client = DeviceClient("http://device.local", "token")
+        captured: dict[str, object] = {}
+        bundle = FirmwareBundle(
+            FirmwareImage(Path("app.bin"), 3, "a" * 64),
+            FirmwareManifest(
+                3, "a" * 64, "pocket_journal", "board", "esp32s3", "2.0.0", 7
+            ),
+            b"signature",
+        )
+
+        def request(method, path, body):
+            captured.update(body)
+            return {"accepted": True, "upload_id": UPLOAD_ID}
+
+        client._request = request  # type: ignore[method-assign]
+        self.assertEqual(ota_preflight(client, bundle)["upload_id"], UPLOAD_ID)
+        self.assertEqual(captured["secure_version"], 7)
+        self.assertEqual(captured["signature"], b"signature".hex())
+        client._request = lambda *args: {"accepted": True, "upload_id": "bad"}  # type: ignore[method-assign]
+        with self.assertRaisesRegex(DeviceError, "invalid upload id"):
+            ota_preflight(client, bundle)
 
     def test_wait_reconnects_using_exact_discovered_device_id(self) -> None:
         old = DeviceClient("http://old.local", "token")
@@ -144,7 +296,7 @@ class OtaTests(unittest.TestCase):
             calls.append(client.base_url)
             if client.base_url == "http://old.local":
                 raise DeviceError("offline")
-            return {"state": "confirmed", "version": "v2"}
+            return {"device_id": "pj-test", "state": "confirmed", "version": "v2"}
 
         discovered = [{"device_id": "other", "base_url": "http://wrong.local"},
                       {"device_id": "pj-test", "base_url": "http://new.local"}]
@@ -156,15 +308,32 @@ class OtaTests(unittest.TestCase):
         self.assertEqual(outcome["state"], "confirmed")
         self.assertEqual(calls, ["http://old.local", "http://new.local"])
 
+    def test_wait_rejects_status_without_exact_device_id(self) -> None:
+        client = DeviceClient("http://device.local", "token")
+        outcomes = iter([
+            {"state": "confirmed"},
+            {"device_id": "pj-test", "state": "confirmed"},
+        ])
+        with patch("pocket_journal_partner.ota.ota_status", side_effect=lambda _: next(outcomes)):
+            _, outcome = wait_for_ota_result(
+                client,
+                "pj-test",
+                timeout=2,
+                interval=0,
+                discover=lambda: [],
+                sleep=lambda _: None,
+            )
+        self.assertEqual(outcome["device_id"], "pj-test")
+
     def test_cli_requires_yes_noninteractively_before_upload(self) -> None:
         client = DeviceClient("http://device.local", "token")
         client.status = lambda: {"capabilities": {"ota.write": True}}  # type: ignore[method-assign]
         session = DeviceSession("pj-test", client)
         with TemporaryDirectory() as tmp:
             path = Path(tmp) / "app.bin"
-            path.write_bytes(b"image")
+            write_bundle(path)
             with patch("pocket_journal_partner.cli._lan_session_from_args", return_value=session), \
-                 patch("pocket_journal_partner.cli.ota_preflight", return_value={"accepted": True}), \
+                 patch("pocket_journal_partner.cli.ota_preflight", return_value={"accepted": True, "upload_id": UPLOAD_ID, "device_id": "pj-test", "target_version": "2.0.0"}), \
                  patch("pocket_journal_partner.cli.sys.stdin.isatty", return_value=False), \
                  patch("pocket_journal_partner.cli.stream_firmware_image") as upload:
                 stderr = StringIO()
@@ -180,17 +349,18 @@ class OtaTests(unittest.TestCase):
         session = DeviceSession("pj-test", client)
         with TemporaryDirectory() as tmp:
             path = Path(tmp) / "app.bin"
-            path.write_bytes(b"image")
+            bundle = write_bundle(path)
 
-            def upload(_client, image, progress):
+            def upload(_client, image, *, upload_id, progress):
+                self.assertEqual(upload_id, UPLOAD_ID)
                 progress(image.size, image.size)
                 return {"state": "pending_reboot"}
 
             stdout, stderr = StringIO(), StringIO()
             with patch("pocket_journal_partner.cli._lan_session_from_args", return_value=session), \
-                 patch("pocket_journal_partner.cli.ota_preflight", return_value={"accepted": True}), \
+                 patch("pocket_journal_partner.cli.ota_preflight", return_value={"accepted": True, "upload_id": UPLOAD_ID, "device_id": "pj-test", "target_version": "2.0.0"}), \
                  patch("pocket_journal_partner.cli.stream_firmware_image", side_effect=upload), \
-                 patch("pocket_journal_partner.cli.wait_for_ota_result", return_value=(client, {"state": "confirmed"})), \
+                 patch("pocket_journal_partner.cli.wait_for_ota_result", return_value=(client, {"state": "confirmed", "running_version": "2.0.0", "target_sha256": bundle.image.sha256})), \
                  redirect_stdout(stdout), redirect_stderr(stderr):
                 result = cli.main(["firmware", "update", "--device", "pj-test", "--file", str(path), "--yes"])
         self.assertEqual(result, 0)

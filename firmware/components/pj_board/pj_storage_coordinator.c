@@ -179,6 +179,23 @@ void pj_storage_sleep_finish(pj_storage_coordinator_t *coordinator)
     }
 }
 
+int pj_storage_ota_try_begin(pj_storage_coordinator_t *coordinator)
+{
+    if (!pj_storage_idle(coordinator)) {
+        return 0;
+    }
+    coordinator->maintenance = PJ_STORAGE_MAINTENANCE_OTA;
+    return 1;
+}
+
+void pj_storage_ota_finish(pj_storage_coordinator_t *coordinator)
+{
+    if (coordinator != NULL &&
+        coordinator->maintenance == PJ_STORAGE_MAINTENANCE_OTA) {
+        coordinator->maintenance = PJ_STORAGE_MAINTENANCE_NONE;
+    }
+}
+
 pj_wipe_status_t pj_storage_wipe_status(const pj_storage_coordinator_t *coordinator)
 {
     pj_wipe_status_t status = {0};
