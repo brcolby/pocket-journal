@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 import hashlib
 import json
 from pathlib import Path
@@ -15,6 +16,14 @@ from pocket_journal_partner.device import (
     USB_TRANSCRIPT_CHUNK_BYTES,
 )
 from pocket_journal_partner.operations import DeviceSession
+
+
+def use_audio_requests(client, request):  # type: ignore[no-untyped-def]
+    @contextmanager
+    def sequence():  # type: ignore[no-untyped-def]
+        yield request
+
+    client._serial_request_sequence = sequence  # type: ignore[method-assign]
 
 
 class UsbAudioListTests(unittest.TestCase):
@@ -103,7 +112,10 @@ class UsbAudioListTests(unittest.TestCase):
 class UsbAudioReadTests(unittest.TestCase):
     def test_usb_audio_ids_match_firmware_filename_rules(self) -> None:
         client = SerialDeviceClient("/dev/cu.test")
-        client._request = lambda *args, **kwargs: self.fail("invalid id reached device")  # type: ignore[method-assign]
+        use_audio_requests(
+            client,
+            lambda *args, **kwargs: self.fail("invalid id reached device"),
+        )
 
         for audio_id in ("note", "../note.wav", "a" * 92 + ".wav"):
             with self.subTest(audio_id=audio_id):
@@ -135,7 +147,7 @@ class UsbAudioReadTests(unittest.TestCase):
                 "source_sha256": digest,
             }
 
-        client._request = request  # type: ignore[method-assign]
+        use_audio_requests(client, request)
         with TemporaryDirectory() as tmp:
             path = client.download_audio(item, Path(tmp))
             downloaded = path.read_bytes()
@@ -150,13 +162,13 @@ class UsbAudioReadTests(unittest.TestCase):
 
     def test_download_rejects_inconsistent_offset_and_removes_partial(self) -> None:
         client = SerialDeviceClient("/dev/cu.test")
-        client._request = lambda *args, **kwargs: {  # type: ignore[method-assign]
+        use_audio_requests(client, lambda *args, **kwargs: {
             "id_hex": "note.wav".encode().hex(),
             "offset": 1,
             "total_bytes": 1,
             "data_hex": "00",
             "eof": True,
-        }
+        })
         with TemporaryDirectory() as tmp:
             with self.assertRaisesRegex(DeviceError, "offset"):
                 client.download_audio(AudioItem("note.wav", "note.wav", size=1), Path(tmp))
@@ -165,14 +177,14 @@ class UsbAudioReadTests(unittest.TestCase):
     def test_download_rejects_noncanonical_hex_and_removes_partial(self) -> None:
         client = SerialDeviceClient("/dev/cu.test")
         digest = hashlib.sha256(b"\xaf").hexdigest()
-        client._request = lambda *args, **kwargs: {  # type: ignore[method-assign]
+        use_audio_requests(client, lambda *args, **kwargs: {
             "id_hex": "note.wav".encode().hex(),
             "offset": 0,
             "total_bytes": 1,
             "data_hex": "AF",
             "eof": True,
             "source_sha256": digest,
-        }
+        })
         with TemporaryDirectory() as tmp:
             with self.assertRaisesRegex(DeviceError, "invalid audio data chunk"):
                 client.download_audio(AudioItem("note.wav", "note.wav", size=1), Path(tmp))
@@ -180,13 +192,13 @@ class UsbAudioReadTests(unittest.TestCase):
 
     def test_download_requires_a_source_digest(self) -> None:
         client = SerialDeviceClient("/dev/cu.test")
-        client._request = lambda *args, **kwargs: {  # type: ignore[method-assign]
+        use_audio_requests(client, lambda *args, **kwargs: {
             "id_hex": "note.wav".encode().hex(),
             "offset": 0,
             "total_bytes": 1,
             "data_hex": "00",
             "eof": True,
-        }
+        })
         with TemporaryDirectory() as tmp:
             with self.assertRaisesRegex(DeviceError, "source digest"):
                 client.download_audio(AudioItem("note.wav", "note.wav", size=1), Path(tmp))

@@ -3,7 +3,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 from urllib import error, parse, request
 import glob
 import hashlib
@@ -658,6 +658,33 @@ class SerialDeviceClient:
         self.baudrate = baudrate
         self.timeout = timeout
         self._request_lock = _serial_port_lock(port)
+        self._closed = threading.Event()
+        self._active_connection_lock = threading.Lock()
+        self._active_connection: Any | None = None
+
+    def close(self) -> None:
+        """Cancel active I/O and permanently release this client's descriptor."""
+        self._closed.set()
+        with self._active_connection_lock:
+            connection = self._active_connection
+        if connection is None:
+            return
+        for method_name in ("cancel_read", "cancel_write"):
+            method = getattr(connection, method_name, None)
+            if callable(method):
+                try:
+                    method()
+                except (OSError, RuntimeError):
+                    pass
+        try:
+            if connection.is_open:
+                connection.close()
+        except (OSError, RuntimeError):
+            pass
+
+    def _ensure_open(self) -> None:
+        if self._closed.is_set():
+            raise DeviceError(f"USB serial client for {self.port} is closed")
 
     @contextmanager
     def _connection(
@@ -687,9 +714,15 @@ class SerialDeviceClient:
             _idle_serial_control_lines(connection)
             _open_serial_without_modem_control(connection)
             _disable_hangup_on_close(connection)
+            with self._active_connection_lock:
+                self._ensure_open()
+                self._active_connection = connection
             yield connection
         finally:
             if connection is not None:
+                with self._active_connection_lock:
+                    if self._active_connection is connection:
+                        self._active_connection = None
                 if idle_on_close:
                     try:
                         _idle_serial_control_lines(connection)
@@ -794,7 +827,9 @@ class SerialDeviceClient:
         retry_interval: float | None = None,
         max_attempts: int = 1,
     ) -> dict[str, Any]:
+        self._ensure_open()
         with self._request_lock:
+            self._ensure_open()
             return self._request_unlocked(
                 command,
                 timeout=timeout,
@@ -814,6 +849,7 @@ class SerialDeviceClient:
         retry_interval: float | None = None,
         max_attempts: int = 1,
     ) -> dict[str, Any]:
+        self._ensure_open()
         try:
             import serial  # type: ignore
         except ImportError as exc:
@@ -853,6 +889,84 @@ class SerialDeviceClient:
         except (serial.SerialException, OSError) as exc:
             raise DeviceError(f"USB serial connection failed on {self.port}: {exc}") from exc
         raise self._request_timeout(evidence)
+
+    @contextmanager
+    def _serial_request_sequence(
+        self,
+    ) -> Iterator[Callable[..., dict[str, Any]]]:
+        """Yield requests sharing one bounded, exclusively held serial descriptor."""
+        self._ensure_open()
+        try:
+            import serial  # type: ignore
+        except ImportError as exc:
+            raise DeviceError("USB support requires pyserial; reinstall the partner CLI") from exc
+
+        with self._request_lock:
+            self._ensure_open()
+            request_body_started = False
+            try:
+                with self._connection(
+                    serial, read_timeout=min(0.2, max(0.0, self.timeout)),
+                ) as connection:
+                    settle_deadline = time.monotonic() + max(0.0, self.timeout)
+                    remaining = settle_deadline - time.monotonic()
+                    if remaining > 0:
+                        time.sleep(min(0.1, remaining))
+                    self._ensure_open()
+                    connection.reset_input_buffer()
+
+                    def request_command(
+                        command: str,
+                        *,
+                        request_id: str | None = None,
+                        retry_interval: float | None = None,
+                        max_attempts: int = 1,
+                    ) -> dict[str, Any]:
+                        self._ensure_open()
+                        if max_attempts < 1:
+                            raise ValueError("max_attempts must be at least one")
+                        if max_attempts > 1 and (
+                            request_id is None
+                            or retry_interval is None
+                            or retry_interval <= 0
+                        ):
+                            raise ValueError(
+                                "serial retries require a request ID and positive retry interval"
+                            )
+                        evidence = _SerialEvidence()
+                        deadline = time.monotonic() + max(0.0, self.timeout)
+                        try:
+                            response = self._request_on_connection(
+                                connection,
+                                command,
+                                deadline=deadline,
+                                request_id=request_id,
+                                retry_interval=retry_interval,
+                                max_attempts=max_attempts,
+                                evidence=evidence,
+                            )
+                        except (serial.SerialException, OSError) as exc:
+                            if self._closed.is_set():
+                                raise DeviceError(
+                                    f"USB serial transfer on {self.port} was cancelled"
+                                ) from exc
+                            raise DeviceError(
+                                f"USB serial connection failed on {self.port}: {exc}"
+                            ) from exc
+                        if response is None:
+                            raise self._request_timeout(evidence)
+                        return response
+
+                    request_body_started = True
+                    yield request_command
+            except (serial.SerialException, OSError) as exc:
+                if request_body_started and not self._closed.is_set():
+                    raise
+                if self._closed.is_set():
+                    raise DeviceError(
+                        f"USB serial transfer on {self.port} was cancelled"
+                    ) from exc
+                raise DeviceError(f"USB serial connection failed on {self.port}: {exc}") from exc
 
     def status(self) -> dict[str, Any]:
         return self._request("PJ_STATUS")
@@ -1060,66 +1174,67 @@ class SerialDeviceClient:
         digest = hashlib.sha256()
         try:
             with partial.open("wb") as handle:
-                while True:
-                    command = (
-                        f"PJ_AUDIO_READ id_hex={id_hex} offset={offset} "
-                        f"max_bytes={USB_TRANSFER_CHUNK_BYTES}"
-                    )
-                    if source_sha256 is not None:
-                        command += f" source_sha256={source_sha256}"
-                    response = self._request(
-                        command,
-                        request_id=_new_request_id(),
-                        retry_interval=_USB_READ_RETRY_INTERVAL_SECONDS,
-                        max_attempts=_USB_READ_MAX_ATTEMPTS,
-                    )
-                    if response.get("id_hex") != id_hex:
-                        raise DeviceError("USB command failed: audio read id did not match request")
-                    if _usb_uint(response.get("offset"), "audio read offset") != offset:
-                        raise DeviceError("USB command failed: audio read offset did not match request")
-                    response_total = _usb_uint(response.get("total_bytes"), "audio total bytes")
-                    if total_bytes is None:
-                        total_bytes = response_total
-                        if item.size is not None and total_bytes != item.size:
-                            raise DeviceError(
-                                f"USB audio size mismatch: expected {item.size} bytes, got {total_bytes}"
-                            )
-                    elif response_total != total_bytes:
-                        raise DeviceError("USB command failed: audio size changed during transfer")
-                    response_digest = _usb_sha256(
-                        response.get("source_sha256"), "audio source digest", required=True
-                    )
-                    assert response_digest is not None
-                    if source_sha256 is None:
-                        source_sha256 = response_digest
-                    elif response_digest is not None and response_digest != source_sha256:
-                        raise DeviceError("USB command failed: audio digest changed during transfer")
-                    data_hex = response.get("data_hex")
-                    if (
-                        not isinstance(data_hex, str)
-                        or len(data_hex) > USB_TRANSFER_CHUNK_BYTES * 2
-                        or len(data_hex) % 2
-                        or any(character not in "0123456789abcdef" for character in data_hex)
-                    ):
-                        raise DeviceError("USB command failed: invalid audio data chunk")
-                    try:
-                        data = bytes.fromhex(data_hex)
-                    except ValueError as exc:
-                        raise DeviceError("USB command failed: invalid audio data chunk") from exc
-                    eof = response.get("eof")
-                    if not isinstance(eof, bool):
-                        raise DeviceError("USB command failed: invalid audio EOF state")
-                    if not data and not eof:
-                        raise DeviceError("USB command failed: empty audio chunk before EOF")
-                    if offset + len(data) > total_bytes:
-                        raise DeviceError("USB command failed: audio chunk exceeds declared size")
-                    if eof != (offset + len(data) == total_bytes):
-                        raise DeviceError("USB command failed: inconsistent audio EOF state")
-                    handle.write(data)
-                    digest.update(data)
-                    offset += len(data)
-                    if eof:
-                        break
+                with self._serial_request_sequence() as serial_request:
+                    while True:
+                        command = (
+                            f"PJ_AUDIO_READ id_hex={id_hex} offset={offset} "
+                            f"max_bytes={USB_TRANSFER_CHUNK_BYTES}"
+                        )
+                        if source_sha256 is not None:
+                            command += f" source_sha256={source_sha256}"
+                        response = serial_request(
+                            command,
+                            request_id=_new_request_id(),
+                            retry_interval=_USB_READ_RETRY_INTERVAL_SECONDS,
+                            max_attempts=_USB_READ_MAX_ATTEMPTS,
+                        )
+                        if response.get("id_hex") != id_hex:
+                            raise DeviceError("USB command failed: audio read id did not match request")
+                        if _usb_uint(response.get("offset"), "audio read offset") != offset:
+                            raise DeviceError("USB command failed: audio read offset did not match request")
+                        response_total = _usb_uint(response.get("total_bytes"), "audio total bytes")
+                        if total_bytes is None:
+                            total_bytes = response_total
+                            if item.size is not None and total_bytes != item.size:
+                                raise DeviceError(
+                                    f"USB audio size mismatch: expected {item.size} bytes, got {total_bytes}"
+                                )
+                        elif response_total != total_bytes:
+                            raise DeviceError("USB command failed: audio size changed during transfer")
+                        response_digest = _usb_sha256(
+                            response.get("source_sha256"), "audio source digest", required=True
+                        )
+                        assert response_digest is not None
+                        if source_sha256 is None:
+                            source_sha256 = response_digest
+                        elif response_digest is not None and response_digest != source_sha256:
+                            raise DeviceError("USB command failed: audio digest changed during transfer")
+                        data_hex = response.get("data_hex")
+                        if (
+                            not isinstance(data_hex, str)
+                            or len(data_hex) > USB_TRANSFER_CHUNK_BYTES * 2
+                            or len(data_hex) % 2
+                            or any(character not in "0123456789abcdef" for character in data_hex)
+                        ):
+                            raise DeviceError("USB command failed: invalid audio data chunk")
+                        try:
+                            data = bytes.fromhex(data_hex)
+                        except ValueError as exc:
+                            raise DeviceError("USB command failed: invalid audio data chunk") from exc
+                        eof = response.get("eof")
+                        if not isinstance(eof, bool):
+                            raise DeviceError("USB command failed: invalid audio EOF state")
+                        if not data and not eof:
+                            raise DeviceError("USB command failed: empty audio chunk before EOF")
+                        if offset + len(data) > total_bytes:
+                            raise DeviceError("USB command failed: audio chunk exceeds declared size")
+                        if eof != (offset + len(data) == total_bytes):
+                            raise DeviceError("USB command failed: inconsistent audio EOF state")
+                        handle.write(data)
+                        digest.update(data)
+                        offset += len(data)
+                        if eof:
+                            break
                 handle.flush()
                 os.fsync(handle.fileno())
             if source_sha256 is not None and digest.hexdigest() != source_sha256:

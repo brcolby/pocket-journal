@@ -522,6 +522,17 @@ class CompanionJobRegistry:
     def close(self, timeout: float = 30.0) -> bool:
         self._closing.set()
         deadline = time.monotonic() + max(0.0, timeout)
+        with self._lock:
+            jobs = list(self._jobs.values())
+        clients = [
+            job.client for job in jobs
+            if job.client is not None
+            and job.snapshot()["state"] in {"queued", "running"}
+        ]
+        for client in clients:
+            close = getattr(client, "close", None)
+            if callable(close):
+                close()
         while True:
             with self._lock:
                 workers = [worker for worker in self._workers if worker.is_alive()]
@@ -702,6 +713,8 @@ class CompanionUSBPoller:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._closed = False
+        self._client_lock = threading.Lock()
+        self._active_client: SerialDeviceClient | None = None
 
     @staticmethod
     def _reported_state(snapshot: dict[str, Any]) -> str:
@@ -715,6 +728,21 @@ class CompanionUSBPoller:
         if self._closed:
             return None
         client = self.client_factory(port)
+        with self._client_lock:
+            if self._closed:
+                close = getattr(client, "close", None)
+                if callable(close):
+                    close()
+                return None
+            self._active_client = client
+        try:
+            return self._poll_client(client)
+        finally:
+            with self._client_lock:
+                if self._active_client is client:
+                    self._active_client = None
+
+    def _poll_client(self, client: SerialDeviceClient) -> dict[str, Any] | None:
         status = client.companion_sync_status()
         if self._closed:
             return None
@@ -779,11 +807,19 @@ class CompanionUSBPoller:
         )
         self._thread.start()
 
-    def close(self) -> bool:
-        self._closed = True
+    def request_close(self) -> None:
+        with self._client_lock:
+            self._closed = True
+            client = self._active_client
         self._stop.set()
+        close = getattr(client, "close", None)
+        if callable(close):
+            close()
+
+    def close(self, timeout: float = 2.0) -> bool:
+        self.request_close()
         if self._thread is not None:
-            self._thread.join(timeout=self.poll_interval + 8.0)
+            self._thread.join(timeout=max(0.0, timeout))
             if self._thread.is_alive():
                 return False
             self._thread = None
@@ -905,8 +941,10 @@ class CompanionService:
         with self._close_lock:
             if self._closed:
                 return
-            usb_closed = self.usb_poller is None or self.usb_poller.close()
+            if self.usb_poller is not None:
+                self.usb_poller.request_close()
             workers_closed = self.registry.close()
+            usb_closed = self.usb_poller is None or self.usb_poller.close()
             if not usb_closed or not workers_closed:
                 raise RuntimeError(
                     "companion shutdown is incomplete; active USB or sync work is still stopping"

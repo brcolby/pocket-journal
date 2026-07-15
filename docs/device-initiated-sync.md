@@ -25,9 +25,13 @@ pj companion serve --device pj-abcdef
 
 ## USB-C Default
 
-`pj companion serve` polls USB-C every two seconds by default. Each poll resolves
+`pj companion serve` polls USB-C every two seconds by default. Each idle poll resolves
 the port, issues one bounded command, and closes the descriptor; it does not retain
-the serial link between polls. Use `--serial-port PORT` to select a port,
+the serial link between polls. A recording download opens one exclusive descriptor,
+pays the device settle delay once, and reuses that connection for all of the file's
+256-byte chunks. Each chunk keeps its own request id, retry budget, response evidence,
+and command timeout; exact size and digest checks still bound and verify the complete
+transaction. Use `--serial-port PORT` to select a port,
 `--usb-poll-interval SECONDS` to choose a value from 0.25 through 60, or `--no-usb`
 for LAN-only diagnostics. A serial monitor still owns the same exclusive descriptor,
 so close it while the companion is expected to service USB requests.
@@ -35,8 +39,10 @@ so close it while the companion is expected to service USB requests.
 The control plane uses `PJ_SYNC_STATUS`, generation-conditional `PJ_SYNC_CLAIM`,
 and `PJ_SYNC_PROGRESS`, `PJ_SYNC_COMPLETE`, or `PJ_SYNC_FAIL`. Audio transfer and
 transcript upload reuse the bounded `PJ_AUDIO_*` and `PJ_TRANSCRIPT_*` commands.
-Every command opens a short-lived connection. Per-port serialization prevents the
-poller and data plane from opening the device concurrently.
+Per-port serialization prevents the poller and data plane from opening the device
+concurrently. Shutdown first stops new polls, then cancels active serial I/O and
+closes its descriptor before waiting for the sync worker, so an interrupted companion
+does not leave the USB-C link held.
 
 ## Authenticated LAN
 

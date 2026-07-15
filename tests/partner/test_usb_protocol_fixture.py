@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import Counter
+from contextlib import contextmanager
 import hashlib
 import json
 from pathlib import Path
@@ -322,6 +323,31 @@ class FirmwareFixtureClient(SerialDeviceClient):
         if response is None:
             raise AssertionError(f"fixture timed out handling {command}")
         return response
+
+    @contextmanager
+    def _serial_request_sequence(self):  # type: ignore[no-untyped-def]
+        connection = FixtureConnection(self.fixture)
+
+        def request_command(
+            command: str,
+            *,
+            request_id: str | None = None,
+            retry_interval: float | None = None,
+            max_attempts: int = 1,
+        ) -> dict[str, object]:
+            response = self._request_on_connection(
+                connection,
+                command,
+                deadline=time.monotonic() + 0.1,
+                request_id=request_id,
+                retry_interval=0.001 if retry_interval is not None else None,
+                max_attempts=max_attempts,
+            )
+            if response is None:
+                raise AssertionError(f"fixture timed out handling {command}")
+            return response
+
+        yield request_command
 
 
 class FirmwareUsbProtocolParityTests(unittest.TestCase):

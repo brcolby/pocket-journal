@@ -1,14 +1,19 @@
 from __future__ import annotations
 
 from unittest.mock import patch
+import hashlib
+import json
 import os
+from pathlib import Path
 import subprocess
 import sys
+from tempfile import TemporaryDirectory
 import threading
 import tty
 import unittest
 
 from pocket_journal_partner.device import (
+    AudioItem,
     DeviceError,
     DeviceOperationError,
     DeviceOperationTimeout,
@@ -163,6 +168,56 @@ class ResponsesAfterWriteConnection(FakeConnection):
         return written
 
 
+class AudioTransferConnection(FakeConnection):
+    def __init__(self, content: bytes, *, drop_once_at: int | None = None) -> None:
+        super().__init__()
+        self.content = content
+        self.digest = hashlib.sha256(content).hexdigest()
+        self.drop_once_at = drop_once_at
+        self.attempts: dict[int, int] = {}
+
+    def write(self, payload: bytes) -> int:
+        written = super().write(payload)
+        fields = dict(
+            token.split("=", 1) for token in payload.decode("ascii").strip().split()[1:]
+        )
+        offset = int(fields["offset"])
+        self.attempts[offset] = self.attempts.get(offset, 0) + 1
+        if offset == self.drop_once_at and self.attempts[offset] == 1:
+            return written
+        maximum = int(fields["max_bytes"])
+        chunk = self.content[offset:offset + maximum]
+        response = {
+            "command": "PJ_AUDIO_READ",
+            "request_id": fields["request_id"],
+            "id_hex": fields["id_hex"],
+            "offset": offset,
+            "total_bytes": len(self.content),
+            "data_hex": chunk.hex(),
+            "eof": offset + len(chunk) == len(self.content),
+            "source_sha256": self.digest,
+        }
+        self.lines.append(
+            ("PJ_OK " + json.dumps(response, separators=(",", ":")) + "\n").encode("ascii")
+        )
+        return written
+
+
+class BlockingAudioConnection(FakeConnection):
+    def __init__(self) -> None:
+        super().__init__()
+        self.read_started = threading.Event()
+        self.cancelled = threading.Event()
+
+    def readline(self) -> bytes:
+        self.read_started.set()
+        self.cancelled.wait(2)
+        raise FakeSerialException("cancelled")
+
+    def cancel_read(self) -> None:
+        self.cancelled.set()
+
+
 class SteppingClock:
     def __init__(self, step: float = 0.1) -> None:
         self.value = 0.0
@@ -233,6 +288,119 @@ class SerialLifecycleTests(unittest.TestCase):
         self.assertFalse(connection.is_open)
         self.assertTrue(connection.input_reset)
         self.assertEqual(connection.writes, [b"PJ_STATUS\n"])
+
+    def test_audio_download_reuses_one_connection_and_settles_once(self) -> None:
+        content = bytes(index % 251 for index in range(700))
+        connection = AudioTransferConnection(content)
+        serial_module = FakeSerialModule(connection)
+        client = SerialDeviceClient("/dev/cu.test", timeout=1)
+        item = AudioItem(
+            "note.wav", "note.wav", size=len(content),
+            source_sha256=hashlib.sha256(content).hexdigest(),
+        )
+
+        with TemporaryDirectory() as tmp:
+            with patch.dict(sys.modules, {"serial": serial_module}):
+                with patch("pocket_journal_partner.device.time.sleep") as sleep:
+                    path = client.download_audio(item, Path(tmp))
+            self.assertEqual(path.read_bytes(), content)
+
+        self.assertEqual(connection.open_count, 1)
+        self.assertEqual(connection.close_count, 1)
+        self.assertEqual(len(connection.writes), 3)
+        sleep.assert_called_once()
+
+    def test_audio_download_retries_same_request_on_one_connection(self) -> None:
+        content = bytes(index % 251 for index in range(300))
+        connection = AudioTransferConnection(content, drop_once_at=256)
+        serial_module = FakeSerialModule(connection)
+        client = SerialDeviceClient("/dev/cu.test", timeout=2)
+        item = AudioItem(
+            "note.wav", "note.wav", size=len(content),
+            source_sha256=hashlib.sha256(content).hexdigest(),
+        )
+
+        with TemporaryDirectory() as tmp:
+            with patch.dict(sys.modules, {"serial": serial_module}):
+                with patch("pocket_journal_partner.device.time.sleep"):
+                    with patch(
+                        "pocket_journal_partner.device.time.monotonic",
+                        side_effect=SteppingClock(0.2),
+                    ):
+                        path = client.download_audio(item, Path(tmp))
+            self.assertEqual(path.read_bytes(), content)
+
+        retried = [wire for wire in connection.writes if b"offset=256 " in wire]
+        self.assertEqual(len(retried), 2)
+        self.assertEqual(retried[0], retried[1])
+        self.assertEqual(connection.open_count, 1)
+        self.assertEqual(connection.close_count, 1)
+
+    def test_audio_download_interrupt_removes_partial_and_releases_port(self) -> None:
+        connection = FakeConnection([KeyboardInterrupt()])
+        serial_module = FakeSerialModule(connection)
+        client = SerialDeviceClient("/dev/cu.test", timeout=1)
+        item = AudioItem("note.wav", "note.wav", size=1, source_sha256="0" * 64)
+
+        with TemporaryDirectory() as tmp:
+            with patch.dict(sys.modules, {"serial": serial_module}):
+                with patch("pocket_journal_partner.device.time.sleep"):
+                    with self.assertRaises(KeyboardInterrupt):
+                        client.download_audio(item, Path(tmp))
+            self.assertEqual(list(Path(tmp).iterdir()), [])
+
+        self.assertEqual(connection.close_count, 1)
+        self.assertFalse(connection.is_open)
+
+    def test_audio_download_timeout_removes_partial_and_releases_port(self) -> None:
+        connection = FakeConnection()
+        serial_module = FakeSerialModule(connection)
+        client = SerialDeviceClient("/dev/cu.test", timeout=0.1)
+        item = AudioItem("note.wav", "note.wav", size=1, source_sha256="0" * 64)
+
+        with TemporaryDirectory() as tmp:
+            with patch.dict(sys.modules, {"serial": serial_module}):
+                with patch("pocket_journal_partner.device.time.sleep"):
+                    with patch(
+                        "pocket_journal_partner.device.time.monotonic",
+                        side_effect=SteppingClock(0.2),
+                    ):
+                        with self.assertRaises(DeviceRequestTimeout):
+                            client.download_audio(item, Path(tmp))
+            self.assertEqual(list(Path(tmp).iterdir()), [])
+
+        self.assertEqual(connection.close_count, 1)
+        self.assertFalse(connection.is_open)
+
+    def test_close_cancels_active_audio_read_and_releases_port(self) -> None:
+        connection = BlockingAudioConnection()
+        serial_module = FakeSerialModule(connection)
+        client = SerialDeviceClient("/dev/cu.test", timeout=6)
+        item = AudioItem("note.wav", "note.wav", size=1, source_sha256="0" * 64)
+        errors: list[BaseException] = []
+
+        with TemporaryDirectory() as tmp:
+            def download() -> None:
+                try:
+                    client.download_audio(item, Path(tmp))
+                except BaseException as exc:
+                    errors.append(exc)
+
+            with patch.dict(sys.modules, {"serial": serial_module}):
+                with patch("pocket_journal_partner.device.time.sleep"):
+                    worker = threading.Thread(target=download)
+                    worker.start()
+                    self.assertTrue(connection.read_started.wait(1))
+                    client.close()
+                    worker.join(timeout=1)
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(list(Path(tmp).iterdir()), [])
+
+        self.assertEqual(len(errors), 1)
+        self.assertIsInstance(errors[0], DeviceError)
+        self.assertIn("cancelled", str(errors[0]))
+        self.assertEqual(connection.close_count, 1)
+        self.assertFalse(connection.is_open)
 
     def test_posix_connection_clears_hupcl_without_redundant_line_writes(self) -> None:
         connection = TracedConnection([b'PJ_OK {"device_id":"pj-test"}\n'])

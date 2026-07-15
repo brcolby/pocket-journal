@@ -762,6 +762,42 @@ class CompanionTests(unittest.TestCase):
             release.set()
             self.assertTrue(registry.close(timeout=1))
 
+    def test_registry_close_cancels_active_serial_client_before_join(self) -> None:
+        started = threading.Event()
+
+        class CancellableSerial:
+            def __init__(self) -> None:
+                self.cancelled = threading.Event()
+                self.close_calls = 0
+
+            def close(self) -> None:
+                self.close_calls += 1
+                self.cancelled.set()
+
+        serial = CancellableSerial()
+
+        def sync_runner(device_id, client, store, backend, progress):  # type: ignore[no-untyped-def]
+            _ = device_id, store, backend, progress
+            started.set()
+            self.assertTrue(client.cancelled.wait(2))
+            raise DeviceError("serial transfer cancelled")
+
+        with TemporaryDirectory() as tmp:
+            registry = CompanionJobRegistry(
+                DeviceProfile("pj-test", token=self.TOKEN),
+                PartnerStore(Path(tmp)), FakeBackend(),  # type: ignore[arg-type]
+                sync_runner=sync_runner,
+            )
+            registry.start_usb("usb-cancel", 9, 9000, serial)  # type: ignore[arg-type]
+            self.assertTrue(started.wait(1))
+
+            before = time.monotonic()
+            self.assertTrue(registry.close(timeout=1))
+            elapsed = time.monotonic() - before
+
+        self.assertEqual(serial.close_calls, 1)
+        self.assertLess(elapsed, 0.5)
+
     def test_service_close_propagates_incomplete_shutdown_and_can_retry(self) -> None:
         class RetryClose:
             def __init__(self) -> None:
@@ -770,6 +806,9 @@ class CompanionTests(unittest.TestCase):
             def close(self):  # type: ignore[no-untyped-def]
                 self.calls += 1
                 return self.calls > 1
+
+            def request_close(self) -> None:
+                pass
 
         class Closed:
             def close(self):  # type: ignore[no-untyped-def]
