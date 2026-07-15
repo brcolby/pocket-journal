@@ -24,6 +24,7 @@ DISPLAY_WORKER_TEST_BIN := build/test_display_worker
 DISPLAY_REFRESH_TEST_BIN := build/test_display_refresh
 TIME_CIVIL_TEST_BIN := build/test_time_civil
 TIME_CLOCK_TEST_BIN := build/test_time_clock
+TIME_TRANSACTION_TEST_BIN := build/test_time_transaction
 RTC_WAKE_TEST_BIN := build/test_rtc_wake
 TIME_CONTROLLER_TEST_BIN := build/test_time_controller
 TRANSCRIPT_UPLOAD_TEST_BIN := build/test_transcript_upload
@@ -194,6 +195,12 @@ test-input: test-display-worker
 		tests/board/test_time_clock.c \
 		-o $(TIME_CLOCK_TEST_BIN)
 	$(TIME_CLOCK_TEST_BIN)
+	$(CC) $(CFLAGS) \
+		-Ifirmware/components/pj_board/include \
+		firmware/components/pj_board/pj_time_transaction.c \
+		tests/board/test_time_transaction.c \
+		-o $(TIME_TRANSACTION_TEST_BIN)
+	$(TIME_TRANSACTION_TEST_BIN)
 	$(CC) $(CFLAGS) \
 		-Ifirmware/components/pj_board/include \
 		-Ifirmware/components/pj_ui/include \

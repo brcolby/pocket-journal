@@ -18,6 +18,7 @@
 #include "pj_time_clock.h"
 #include "pj_time_controller.h"
 #include "pj_time_sync.h"
+#include "pj_time_transaction.h"
 #include "pj_transcript_upload.h"
 #include "pj_usb_sync.h"
 #include "pj_wifi_state.h"
@@ -273,6 +274,15 @@ typedef enum {
     BOARD_TIME_UPDATE_INVALID,
     BOARD_TIME_UPDATE_YEAR_REQUIRED,
     BOARD_TIME_UPDATE_UNAVAILABLE,
+    BOARD_TIME_UPDATE_RTC_SNAPSHOT_FAILED,
+    BOARD_TIME_UPDATE_OFFSET_PERSIST_FAILED,
+    BOARD_TIME_UPDATE_RTC_WRITE_FAILED,
+    BOARD_TIME_UPDATE_PARTIAL_COMMIT,
+} board_time_update_status_t;
+
+typedef struct {
+    board_time_update_status_t status;
+    uint32_t partial_components;
 } board_time_update_result_t;
 
 static int valid_time_date(int hour, int minute, int year, int month, int day)
@@ -307,6 +317,8 @@ static SemaphoreHandle_t g_settings_lock;
 static SemaphoreHandle_t g_json_write_lock;
 static SemaphoreHandle_t g_time_transaction_lock;
 static StaticSemaphore_t g_time_transaction_lock_storage;
+static SemaphoreHandle_t g_provisioning_lock;
+static StaticSemaphore_t g_provisioning_lock_storage;
 static SemaphoreHandle_t g_status_lock;
 static StaticSemaphore_t g_status_lock_storage;
 static SemaphoreHandle_t g_audio_lifecycle_lock;
@@ -344,7 +356,7 @@ static pj_time_sync_state_t g_time_sync_state;
 static int g_mdns_started;
 static int g_ble_started;
 static uint8_t g_ble_addr_type;
-static TaskHandle_t g_ble_provision_task;
+static int g_ble_provision_active;
 static char g_ble_ssid[PJ_WIFI_SSID_MAX_LEN + 1];
 static char g_ble_password[PJ_WIFI_PASSWORD_MAX_LEN + 1];
 static char g_ble_token[sizeof(g_status.token)];
@@ -429,6 +441,15 @@ typedef struct {
 } sntp_publication_event_t;
 
 typedef struct {
+    pj_time_transaction_result_t transaction;
+    esp_err_t rtc_snapshot_error;
+    esp_err_t offset_store_error;
+    esp_err_t rtc_write_error;
+    esp_err_t rtc_restore_error;
+    esp_err_t offset_restore_error;
+} board_time_commit_result_t;
+
+typedef struct {
     uint64_t alert_id;
     pj_alert_audio_kind_t kind;
     uint8_t volume;
@@ -468,12 +489,16 @@ static int board_time_publish(int hour, int minute, int year, int month, int day
                               int second, uint64_t monotonic_ms, int trusted);
 static board_time_snapshot_t board_time_snapshot(void);
 static void board_time_mark_pending(void);
-static esp_err_t rtc_write_civil_time(int hour, int minute, int year,
-                                      int month, int day, int second);
+static board_time_commit_result_t board_time_commit_locked(
+    int hour, int minute, int year, int month, int day, int second,
+    const pj_time_clock_anchor_t *target_anchor, int anchor_at_rtc_write,
+    int update_utc_offset, int utc_offset_minutes,
+    int publish_time_sync_known);
 static int board_time_model_clock(pj_time_clock_t *clock);
 static int time_state_initialize(void);
 static int time_state_project(pj_ui_context_t *ui);
 static int rtc_wake_sync(void);
+static int rtc_wake_sync_locked(void);
 static pj_rtc_wake_result_t rtc_wake_disarm_board(uint8_t *flags, int force);
 static int settings_codec_volume_snapshot(void);
 static void alert_audio_project(const pj_time_alert_t *alert,
@@ -530,10 +555,88 @@ static void board_status_set_error(const char *format, ...)
     board_status_give();
 }
 
-static void board_status_clear_error(void)
+static void ble_state_set(const char *format, ...)
+{
+    char state[sizeof(g_ble_state)];
+    va_list args;
+    va_start(args, format);
+    (void)vsnprintf(state, sizeof(state), format, args);
+    va_end(args);
+    portENTER_CRITICAL(&g_credentials_lock);
+    (void)snprintf(g_ble_state, sizeof(g_ble_state), "%s", state);
+    portEXIT_CRITICAL(&g_credentials_lock);
+}
+
+static void ble_state_snapshot(char *state, size_t capacity)
+{
+    if (state == NULL || capacity == 0) {
+        return;
+    }
+    portENTER_CRITICAL(&g_credentials_lock);
+    (void)snprintf(state, capacity, "%s", g_ble_state);
+    portEXIT_CRITICAL(&g_credentials_lock);
+}
+
+static int ble_provision_claim(void)
+{
+    int claimed = 0;
+    portENTER_CRITICAL(&g_credentials_lock);
+    if (!g_ble_provision_active) {
+        g_ble_provision_active = 1;
+        claimed = 1;
+    }
+    portEXIT_CRITICAL(&g_credentials_lock);
+    return claimed;
+}
+
+static void ble_provision_release(void)
+{
+    portENTER_CRITICAL(&g_credentials_lock);
+    g_ble_provision_active = 0;
+    portEXIT_CRITICAL(&g_credentials_lock);
+}
+
+static int wifi_credentials_stored_snapshot(void)
+{
+    int stored;
+    portENTER_CRITICAL(&g_credentials_lock);
+    stored = g_wifi_credentials_stored;
+    portEXIT_CRITICAL(&g_credentials_lock);
+    return stored;
+}
+
+static void board_status_set_error_if_empty(const char *message)
 {
     board_status_take();
-    g_status.last_error[0] = '\0';
+    if (g_status.last_error[0] == '\0') {
+        (void)snprintf(g_status.last_error, sizeof(g_status.last_error), "%s",
+                       message);
+    }
+    board_status_give();
+}
+
+static void board_status_clear_error_if_equal(const char *message)
+{
+    board_status_take();
+    if (strcmp(g_status.last_error, message) == 0) {
+        g_status.last_error[0] = '\0';
+    }
+    board_status_give();
+}
+
+static void board_status_clear_error_if_owned(const char *prefix,
+                                              const char *alternate_prefix)
+{
+    board_status_take();
+    int owned = prefix != NULL &&
+        strncmp(g_status.last_error, prefix, strlen(prefix)) == 0;
+    if (!owned && alternate_prefix != NULL) {
+        owned = strncmp(g_status.last_error, alternate_prefix,
+                        strlen(alternate_prefix)) == 0;
+    }
+    if (owned) {
+        g_status.last_error[0] = '\0';
+    }
     board_status_give();
 }
 
@@ -796,11 +899,8 @@ static void recording_publish_completion(void)
     if (succeeded) {
         board_update_publish(BOARD_UPDATE_NOTES);
     } else {
-        pj_board_status_t status = board_status_snapshot_base();
-        if (status.last_error[0] == '\0') {
-            board_status_set_error(
-                "recording failed before a valid note was published");
-        }
+        board_status_set_error_if_empty(
+            "recording failed before a valid note was published");
     }
 }
 
@@ -1511,8 +1611,9 @@ static esp_err_t network_stack_init(void)
 static void connectivity_state_init(void)
 {
     uint64_t now_ms = board_monotonic_ms();
+    int credentials_stored = wifi_credentials_stored_snapshot();
     portENTER_CRITICAL(&g_connectivity_lock);
-    pj_wifi_state_init(&g_wifi_state, g_wifi_credentials_stored, now_ms);
+    pj_wifi_state_init(&g_wifi_state, credentials_stored, now_ms);
     pj_time_sync_init(&g_time_sync_state, g_time_wall_trusted, now_ms);
     g_time_sync_state.utc_offset_known = g_utc_offset_known != 0;
     g_time_sync_state.utc_offset_minutes = (int16_t)g_utc_offset_minutes;
@@ -1559,8 +1660,7 @@ static void time_transaction_give(void)
     }
 }
 
-/* Caller holds g_time_transaction_lock across the offset snapshot, RTC write,
- * and anchor/status publication. */
+/* Caller holds g_time_transaction_lock across RTC durability and publication. */
 static pj_time_sync_publication_t publish_sntp_civil_time_locked(
     int64_t utc_epoch_s, uint64_t anchor_monotonic_ms)
 {
@@ -1575,24 +1675,45 @@ static pj_time_sync_publication_t publish_sntp_civil_time_locked(
     }
 
     pj_time_civil_t civil;
+    pj_time_clock_anchor_t target_anchor;
     if (!pj_time_civil_from_utc(utc_epoch_s, offset_minutes, &civil) ||
-        !board_time_publish(civil.hour, civil.minute, civil.year, civil.month,
-                            civil.day, civil.second, anchor_monotonic_ms, 1)) {
+        !pj_time_clock_anchor_set(
+            &target_anchor, civil.year, civil.month, civil.day, civil.hour,
+            civil.minute, civil.second, anchor_monotonic_ms)) {
         return PJ_TIME_SYNC_PUBLICATION_CIVIL_FAILED;
     }
-    board_time_mark_pending();
-    esp_err_t rtc_err = rtc_write_civil_time(
+
+    board_time_commit_result_t commit = board_time_commit_locked(
         civil.hour, civil.minute, civil.year, civil.month, civil.day,
-        civil.second);
-    if (rtc_err != ESP_OK) {
-        board_status_set_error(
-            "SNTP time published but RTC persistence failed: %s",
-            esp_err_to_name(rtc_err));
-        ESP_LOGW(TAG, "SNTP RTC persistence failed: %s",
-                 esp_err_to_name(rtc_err));
+        civil.second, &target_anchor, 0, 0, 0, 0);
+    switch (commit.transaction.status) {
+    case PJ_TIME_TRANSACTION_OK:
+        return PJ_TIME_SYNC_PUBLICATION_PUBLISHED;
+    case PJ_TIME_TRANSACTION_RTC_SNAPSHOT_FAILED:
+        board_status_set_error("SNTP RTC snapshot failed: %s",
+                               esp_err_to_name(commit.rtc_snapshot_error));
+        ESP_LOGW(TAG, "SNTP RTC snapshot failed: %s",
+                 esp_err_to_name(commit.rtc_snapshot_error));
         return PJ_TIME_SYNC_PUBLICATION_RTC_FAILED;
+    case PJ_TIME_TRANSACTION_RTC_FAILED_ROLLED_BACK:
+        board_status_set_error(
+            "SNTP RTC write failed and was rolled back: %s",
+            esp_err_to_name(commit.rtc_write_error));
+        ESP_LOGW(TAG, "SNTP RTC write failed and was rolled back: %s",
+                 esp_err_to_name(commit.rtc_write_error));
+        return PJ_TIME_SYNC_PUBLICATION_RTC_ROLLED_BACK;
+    case PJ_TIME_TRANSACTION_PARTIAL_COMMIT:
+        board_status_set_error(
+            "SNTP RTC rollback failed; partial components=0x%" PRIx32,
+            commit.transaction.partial_components);
+        ESP_LOGE(TAG, "SNTP RTC rollback failed; partial components=0x%" PRIx32,
+                 commit.transaction.partial_components);
+        return PJ_TIME_SYNC_PUBLICATION_PARTIAL_COMMIT;
+    case PJ_TIME_TRANSACTION_INVALID:
+    case PJ_TIME_TRANSACTION_OFFSET_FAILED_ROLLED_BACK:
+    default:
+        return PJ_TIME_SYNC_PUBLICATION_CIVIL_FAILED;
     }
-    return PJ_TIME_SYNC_PUBLICATION_PUBLISHED;
 }
 
 static void connectivity_sntp_process(const sntp_publication_event_t *event)
@@ -1620,13 +1741,6 @@ static void connectivity_sntp_process(const sntp_publication_event_t *event)
     portENTER_CRITICAL(&g_connectivity_lock);
     old_valid = pj_time_sync_expected_epoch_ms(&g_time_sync_state, now_ms,
                                                 &old_epoch_ms);
-    (void)pj_time_sync_on_success(&g_time_sync_state, (int64_t)tv->tv_sec,
-                                  old_valid, old_epoch_ms, now_ms);
-    if (g_wifi_state.has_ip) {
-        pj_wifi_state_set_last_success_utc(&g_wifi_state,
-                                           (int64_t)tv->tv_sec);
-    }
-    pj_time_sync_correction_t correction = g_time_sync_state.correction;
     portEXIT_CRITICAL(&g_connectivity_lock);
 
     uint64_t fractional_ms = (uint64_t)tv->tv_usec / 1000u;
@@ -1634,7 +1748,14 @@ static void connectivity_sntp_process(const sntp_publication_event_t *event)
     pj_time_sync_publication_t publication = publish_sntp_civil_time_locked(
         (int64_t)tv->tv_sec, anchor_ms);
     portENTER_CRITICAL(&g_connectivity_lock);
+    (void)pj_time_sync_on_success(&g_time_sync_state, (int64_t)tv->tv_sec,
+                                  old_valid, old_epoch_ms, now_ms);
+    if (g_wifi_state.has_ip) {
+        pj_wifi_state_set_last_success_utc(&g_wifi_state,
+                                           (int64_t)tv->tv_sec);
+    }
     pj_time_sync_set_publication(&g_time_sync_state, publication);
+    pj_time_sync_correction_t correction = g_time_sync_state.correction;
     portEXIT_CRITICAL(&g_connectivity_lock);
     time_transaction_give();
     ESP_LOGI(TAG, "SNTP UTC acquired (%s), civil publication=%s",
@@ -1918,7 +2039,9 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
             (void)snprintf(g_status.ip_addr, sizeof(g_status.ip_addr), IPSTR,
                            IP2STR(&event->ip_info.ip));
         }
-        g_status.last_error[0] = '\0';
+        if (strncmp(g_status.last_error, "Wi-Fi ", 6) == 0) {
+            g_status.last_error[0] = '\0';
+        }
         char ip_addr[sizeof(g_status.ip_addr)];
         (void)snprintf(ip_addr, sizeof(ip_addr), "%s", g_status.ip_addr);
         board_status_give();
@@ -1949,9 +2072,15 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
 
 static esp_err_t wifi_apply_config(void)
 {
+    char ssid[sizeof(g_wifi_ssid)];
+    char password[sizeof(g_wifi_password)];
+    portENTER_CRITICAL(&g_credentials_lock);
+    (void)snprintf(ssid, sizeof(ssid), "%s", g_wifi_ssid);
+    (void)snprintf(password, sizeof(password), "%s", g_wifi_password);
+    portEXIT_CRITICAL(&g_credentials_lock);
     wifi_config_t config = {0};
-    memcpy(config.sta.ssid, g_wifi_ssid, strlen(g_wifi_ssid));
-    memcpy(config.sta.password, g_wifi_password, strlen(g_wifi_password));
+    memcpy(config.sta.ssid, ssid, strlen(ssid));
+    memcpy(config.sta.password, password, strlen(password));
     config.sta.scan_method = WIFI_ALL_CHANNEL_SCAN;
     config.sta.sort_method = WIFI_CONNECT_AP_BY_SIGNAL;
     config.sta.threshold.authmode = WIFI_AUTH_OPEN;
@@ -1959,12 +2088,14 @@ static esp_err_t wifi_apply_config(void)
     config.sta.pmf_cfg.required = false;
     config.sta.disable_wpa3_compatible_mode = true;
     config.sta.failure_retry_cnt = 3;
-    return esp_wifi_set_config(WIFI_IF_STA, &config);
+    esp_err_t err = esp_wifi_set_config(WIFI_IF_STA, &config);
+    memset(password, 0, sizeof(password));
+    return err;
 }
 
 static esp_err_t wifi_start_or_reconfigure(void)
 {
-    if (!g_wifi_credentials_stored) {
+    if (!wifi_credentials_stored_snapshot()) {
         return ESP_ERR_INVALID_STATE;
     }
     ESP_RETURN_ON_ERROR(network_stack_init(), TAG, "network stack init failed");
@@ -2009,7 +2140,7 @@ static esp_err_t wifi_start_or_reconfigure(void)
 
 static void wifi_apply_provisioning_status(void)
 {
-    if (!g_wifi_credentials_stored) {
+    if (!wifi_credentials_stored_snapshot()) {
         return;
     }
     board_status_take();
@@ -2381,9 +2512,10 @@ static void time_offset_load(void)
     }
 }
 
-static esp_err_t time_offset_save(int offset_minutes)
+static esp_err_t time_offset_store_state(int known, int offset_minutes)
 {
-    if (!pj_time_utc_offset_valid(offset_minutes)) {
+    if ((known != 0 && known != 1) ||
+        (known && !pj_time_utc_offset_valid(offset_minutes))) {
         return ESP_ERR_INVALID_ARG;
     }
     nvs_handle_t nvs;
@@ -2391,15 +2523,23 @@ static esp_err_t time_offset_save(int offset_minutes)
     if (err != ESP_OK) {
         return err;
     }
-    err = nvs_set_i32(nvs, PJ_NVS_UTC_OFFSET, (int32_t)offset_minutes);
+    err = known
+        ? nvs_set_i32(nvs, PJ_NVS_UTC_OFFSET, (int32_t)offset_minutes)
+        : nvs_erase_key(nvs, PJ_NVS_UTC_OFFSET);
+    if (!known && err == ESP_ERR_NVS_NOT_FOUND) {
+        err = ESP_OK;
+        nvs_close(nvs);
+        return err;
+    }
     if (err == ESP_OK) {
         err = nvs_commit(nvs);
     }
     nvs_close(nvs);
-    if (err != ESP_OK) {
-        return err;
-    }
+    return err;
+}
 
+static void time_offset_publish(int offset_minutes)
+{
     portENTER_CRITICAL(&g_connectivity_lock);
     g_utc_offset_minutes = offset_minutes;
     g_utc_offset_known = 1;
@@ -2413,7 +2553,6 @@ static esp_err_t time_offset_save(int offset_minutes)
     }
     portEXIT_CRITICAL(&g_connectivity_lock);
     ESP_LOGI(TAG, "Fixed UTC offset persisted: %+d minutes", offset_minutes);
-    return ESP_OK;
 }
 
 static int provisioned_token_read(char *token, size_t capacity)
@@ -2471,10 +2610,15 @@ static esp_err_t wifi_save_provisioning(const char *ssid, const char *password, 
         strlen(token) >= sizeof(g_status.token)) {
         return ESP_ERR_INVALID_SIZE;
     }
+    if (g_provisioning_lock == NULL ||
+        xSemaphoreTake(g_provisioning_lock, portMAX_DELAY) != pdTRUE) {
+        return ESP_ERR_INVALID_STATE;
+    }
 
     nvs_handle_t nvs;
     esp_err_t err = nvs_open(PJ_NVS_NAMESPACE, NVS_READWRITE, &nvs);
     if (err != ESP_OK) {
+        xSemaphoreGive(g_provisioning_lock);
         return err;
     }
     err = nvs_set_str(nvs, PJ_NVS_WIFI_SSID, ssid);
@@ -2489,12 +2633,13 @@ static esp_err_t wifi_save_provisioning(const char *ssid, const char *password, 
     }
     nvs_close(nvs);
     if (err != ESP_OK) {
+        xSemaphoreGive(g_provisioning_lock);
         return err;
     }
 
+    portENTER_CRITICAL(&g_credentials_lock);
     (void)snprintf(g_wifi_ssid, sizeof(g_wifi_ssid), "%s", ssid);
     (void)snprintf(g_wifi_password, sizeof(g_wifi_password), "%s", password);
-    portENTER_CRITICAL(&g_credentials_lock);
     (void)snprintf(g_provisioned_token, sizeof(g_provisioned_token), "%s",
                    token);
     g_wifi_credentials_stored = 1;
@@ -2505,6 +2650,7 @@ static esp_err_t wifi_save_provisioning(const char *ssid, const char *password, 
     wifi_apply_provisioning_status();
     ESP_LOGI(TAG, "Wi-Fi credentials stored from partner provisioning");
     esp_err_t connect_err = wifi_start_or_reconfigure();
+    xSemaphoreGive(g_provisioning_lock);
     return connect_err == ESP_ERR_INVALID_STATE ? ESP_OK : connect_err;
 }
 
@@ -2546,15 +2692,15 @@ static void ble_provision_task(void *arg)
     ble_provision_args_t *args = arg;
     esp_err_t err = wifi_save_provisioning(args->ssid, args->password, args->token);
     if (err == ESP_OK) {
-        (void)snprintf(g_ble_state, sizeof(g_ble_state), "stored");
+        ble_state_set("stored");
         board_status_set_service(BOARD_SERVICE_BLE, PJ_BOARD_SERVICE_READY);
     } else {
-        (void)snprintf(g_ble_state, sizeof(g_ble_state), "error-%s", esp_err_to_name(err));
+        ble_state_set("error-%s", esp_err_to_name(err));
         board_status_set_service(BOARD_SERVICE_BLE, PJ_BOARD_SERVICE_ERROR);
     }
     memset(args, 0, sizeof(*args));
     free(args);
-    g_ble_provision_task = NULL;
+    ble_provision_release();
     vTaskDelete(NULL);
 }
 
@@ -2584,10 +2730,12 @@ static int ble_provision_access(uint16_t conn_handle, uint16_t attr_handle,
     intptr_t field = (intptr_t)arg;
     if (field == PJ_BLE_FIELD_STATUS && ctxt->op == BLE_GATT_ACCESS_OP_READ_CHR) {
         char json[128];
+        char ble_state[sizeof(g_ble_state)];
+        ble_state_snapshot(ble_state, sizeof(ble_state));
         pj_board_status_t status = board_status_snapshot_base();
         int length = snprintf(json, sizeof(json),
                               "{\"device_id\":\"%s\",\"state\":\"%s\",\"wifi\":\"%s\"}",
-                              status.device_id, g_ble_state,
+                              status.device_id, ble_state,
                               service_name(status.wifi));
         return os_mbuf_append(ctxt->om, json, (uint16_t)length) == 0 ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
     }
@@ -2595,7 +2743,7 @@ static int ble_provision_access(uint16_t conn_handle, uint16_t attr_handle,
         return BLE_ATT_ERR_WRITE_NOT_PERMITTED;
     }
     if (!ble_connection_encrypted(conn_handle)) {
-        (void)snprintf(g_ble_state, sizeof(g_ble_state), "pairing-required");
+        ble_state_set("pairing-required");
         return BLE_ATT_ERR_INSUFFICIENT_AUTHEN;
     }
     if (field == PJ_BLE_FIELD_SSID) {
@@ -2611,21 +2759,22 @@ static int ble_provision_access(uint16_t conn_handle, uint16_t attr_handle,
         ctxt->om->om_data[0] != 1 || g_ble_ssid[0] == '\0' || g_ble_token[0] == '\0') {
         return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
     }
-    if (g_ble_provision_task != NULL) {
+    if (!ble_provision_claim()) {
         return BLE_ATT_ERR_UNLIKELY;
     }
     ble_provision_args_t *args = malloc(sizeof(*args));
     if (args == NULL) {
+        ble_provision_release();
         return BLE_ATT_ERR_INSUFFICIENT_RES;
     }
     (void)snprintf(args->ssid, sizeof(args->ssid), "%s", g_ble_ssid);
     (void)snprintf(args->password, sizeof(args->password), "%s", g_ble_password);
     (void)snprintf(args->token, sizeof(args->token), "%s", g_ble_token);
-    (void)snprintf(g_ble_state, sizeof(g_ble_state), "applying");
+    ble_state_set("applying");
     if (xTaskCreate(ble_provision_task, "pj-ble-provision", 4096, args, 4,
-                    &g_ble_provision_task) != pdPASS) {
+                    NULL) != pdPASS) {
         free(args);
-        g_ble_provision_task = NULL;
+        ble_provision_release();
         return BLE_ATT_ERR_INSUFFICIENT_RES;
     }
     memset(g_ble_password, 0, sizeof(g_ble_password));
@@ -2691,7 +2840,7 @@ static void ble_advertise(void)
         ESP_LOGE(TAG, "BLE advertising start failed: %d", rc);
         return;
     }
-    (void)snprintf(g_ble_state, sizeof(g_ble_state), "advertising");
+    ble_state_set("advertising");
     board_status_set_service(BOARD_SERVICE_BLE, PJ_BOARD_SERVICE_READY);
     ESP_LOGI(TAG, "BLE provisioning advertising as %s", name);
 }
@@ -2703,16 +2852,16 @@ static int ble_gap_event(struct ble_gap_event *event, void *arg)
         if (event->connect.status != 0) {
             ble_advertise();
         } else {
-            (void)snprintf(g_ble_state, sizeof(g_ble_state), "pairing-required");
+            ble_state_set("pairing-required");
         }
     } else if (event->type == BLE_GAP_EVENT_ENC_CHANGE) {
         struct ble_gap_conn_desc desc;
         if (event->enc_change.status == 0 &&
             ble_gap_conn_find(event->enc_change.conn_handle, &desc) == 0 &&
             desc.sec_state.encrypted) {
-            (void)snprintf(g_ble_state, sizeof(g_ble_state), "paired");
+            ble_state_set("paired");
         } else {
-            (void)snprintf(g_ble_state, sizeof(g_ble_state), "pairing-required");
+            ble_state_set("pairing-required");
         }
     } else if (event->type == BLE_GAP_EVENT_DISCONNECT ||
                event->type == BLE_GAP_EVENT_ADV_COMPLETE) {
@@ -2725,7 +2874,7 @@ static void ble_on_sync(void)
 {
     if (ble_hs_util_ensure_addr(0) != 0 || ble_hs_id_infer_auto(0, &g_ble_addr_type) != 0) {
         board_status_set_service(BOARD_SERVICE_BLE, PJ_BOARD_SERVICE_ERROR);
-        (void)snprintf(g_ble_state, sizeof(g_ble_state), "address-error");
+        ble_state_set("address-error");
         return;
     }
     ble_advertise();
@@ -3894,10 +4043,7 @@ static void recording_wipe_worker(void *arg)
         board_status_set_error("recording wipe incomplete");
     } else {
         storage_sync_counts_cache(0, 0);
-        pj_board_status_t status = board_status_snapshot_base();
-        if (strcmp(status.last_error, "recording wipe incomplete") == 0) {
-            board_status_clear_error();
-        }
+        board_status_clear_error_if_equal("recording wipe incomplete");
     }
     ESP_LOGI(TAG, "Wiped recordings: operation=%" PRIu32
                   " audio=%zu transcripts=%zu metadata=%zu complete=%d stack_hwm=%u",
@@ -4721,6 +4867,8 @@ static board_time_snapshot_t board_time_snapshot(void)
         snapshot.hour = (int)(clock.local_second / 3600u);
         snapshot.minute = (int)(clock.local_second % 3600u / 60u);
         snapshot.second = (int)(clock.local_second % 60u);
+    } else if (snapshot.time_set) {
+        snapshot.time_set = 0;
     }
     return snapshot;
 }
@@ -4740,6 +4888,17 @@ static int board_time_publish(int hour, int minute, int year, int month, int day
     g_time_generation++;
     portEXIT_CRITICAL(&g_time_lock);
     return 1;
+}
+
+static void board_time_publish_prevalidated(
+    const pj_time_clock_anchor_t *anchor, int trusted)
+{
+    portENTER_CRITICAL(&g_time_lock);
+    g_time_clock_anchor = *anchor;
+    g_time_wall_trusted = trusted != 0;
+    g_time_known = 1;
+    g_time_generation++;
+    portEXIT_CRITICAL(&g_time_lock);
 }
 
 static int board_time_initialize_unknown(void)
@@ -4835,8 +4994,55 @@ static int rtc_read_status_time(void)
     return published;
 }
 
-static esp_err_t rtc_write_civil_time(int hour, int minute, int year,
-                                      int month, int day, int second)
+typedef struct {
+    uint8_t control1;
+    uint8_t civil[7];
+} rtc_raw_time_t;
+
+typedef struct {
+    rtc_raw_time_t previous_rtc;
+    pj_time_clock_anchor_t target_anchor;
+    int hour;
+    int minute;
+    int year;
+    int month;
+    int day;
+    int second;
+    int anchor_at_rtc_write;
+    int update_utc_offset;
+    int utc_offset_minutes;
+    int publish_time_sync_known;
+    unsigned offset_store_calls;
+    esp_err_t rtc_snapshot_error;
+    esp_err_t offset_store_error;
+    esp_err_t rtc_write_error;
+    esp_err_t rtc_restore_error;
+    esp_err_t offset_restore_error;
+} board_time_transaction_context_t;
+
+static esp_err_t rtc_snapshot_raw_locked(rtc_raw_time_t *snapshot)
+{
+    if (snapshot == NULL || !g_rtc_ready || g_rtc_dev == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (!i2c_take(pdMS_TO_TICKS(50))) {
+        return ESP_ERR_TIMEOUT;
+    }
+    uint8_t control_register = 0x00;
+    esp_err_t err = i2c_master_transmit_receive(
+        g_rtc_dev, &control_register, 1, &snapshot->control1, 1, 100);
+    if (err == ESP_OK) {
+        uint8_t civil_register = 0x04;
+        err = i2c_master_transmit_receive(
+            g_rtc_dev, &civil_register, 1, snapshot->civil,
+            sizeof(snapshot->civil), 100);
+    }
+    i2c_give();
+    return err;
+}
+
+static esp_err_t rtc_write_civil_time_locked(
+    int hour, int minute, int year, int month, int day, int second)
 {
     if (!g_rtc_ready || g_rtc_dev == NULL ||
         !valid_time_date(hour, minute, year, month, day) ||
@@ -4853,11 +5059,7 @@ static esp_err_t rtc_write_civil_time(int hour, int minute, int year,
         u8_to_bcd((uint8_t)month),
         u8_to_bcd((uint8_t)(year - 2000)),
     };
-    if (!rtc_sequence_take(pdMS_TO_TICKS(200))) {
-        return ESP_ERR_TIMEOUT;
-    }
     if (!i2c_take(pdMS_TO_TICKS(50))) {
-        rtc_sequence_give();
         return ESP_ERR_TIMEOUT;
     }
     esp_err_t err = i2c_master_transmit(g_rtc_dev, data, sizeof(data), 100);
@@ -4866,8 +5068,153 @@ static esp_err_t rtc_write_civil_time(int hour, int minute, int year,
         err = i2c_master_transmit(g_rtc_dev, ctrl, sizeof(ctrl), 100);
     }
     i2c_give();
-    rtc_sequence_give();
     return err;
+}
+
+static esp_err_t rtc_restore_raw_locked(const rtc_raw_time_t *snapshot)
+{
+    if (snapshot == NULL || !g_rtc_ready || g_rtc_dev == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (!i2c_take(pdMS_TO_TICKS(50))) {
+        return ESP_ERR_TIMEOUT;
+    }
+    uint8_t civil[1 + sizeof(snapshot->civil)];
+    civil[0] = 0x04;
+    memcpy(civil + 1, snapshot->civil, sizeof(snapshot->civil));
+    esp_err_t civil_err = i2c_master_transmit(
+        g_rtc_dev, civil, sizeof(civil), 100);
+    uint8_t control[2] = {0x00, snapshot->control1};
+    esp_err_t control_err = i2c_master_transmit(
+        g_rtc_dev, control, sizeof(control), 100);
+    i2c_give();
+    return civil_err != ESP_OK ? civil_err : control_err;
+}
+
+static int board_time_transaction_snapshot_rtc(void *opaque)
+{
+    board_time_transaction_context_t *context = opaque;
+    context->rtc_snapshot_error =
+        rtc_snapshot_raw_locked(&context->previous_rtc);
+    return context->rtc_snapshot_error == ESP_OK;
+}
+
+static int board_time_transaction_store_offset(void *opaque, int known,
+                                               int offset_minutes)
+{
+    board_time_transaction_context_t *context = opaque;
+    esp_err_t err = time_offset_store_state(known, offset_minutes);
+    if (context->offset_store_calls++ == 0) {
+        context->offset_store_error = err;
+    } else {
+        context->offset_restore_error = err;
+    }
+    return err == ESP_OK;
+}
+
+static int board_time_transaction_write_rtc(void *opaque)
+{
+    board_time_transaction_context_t *context = opaque;
+    context->rtc_write_error = rtc_write_civil_time_locked(
+        context->hour, context->minute, context->year, context->month,
+        context->day, context->second);
+    if (context->rtc_write_error == ESP_OK && context->anchor_at_rtc_write) {
+        context->target_anchor.monotonic_ms = board_monotonic_ms();
+    }
+    return context->rtc_write_error == ESP_OK;
+}
+
+static int board_time_transaction_restore_rtc(void *opaque)
+{
+    board_time_transaction_context_t *context = opaque;
+    context->rtc_restore_error =
+        rtc_restore_raw_locked(&context->previous_rtc);
+    return context->rtc_restore_error == ESP_OK;
+}
+
+static void board_time_transaction_publish(void *opaque)
+{
+    board_time_transaction_context_t *context = opaque;
+    if (context->update_utc_offset) {
+        time_offset_publish(context->utc_offset_minutes);
+    }
+    board_time_publish_prevalidated(&context->target_anchor, 1);
+    if (context->publish_time_sync_known) {
+        portENTER_CRITICAL(&g_connectivity_lock);
+        g_time_sync_state.time_known = 1;
+        portEXIT_CRITICAL(&g_connectivity_lock);
+    }
+    board_time_mark_pending();
+}
+
+/* Caller holds g_time_transaction_lock. This is the only path that spans
+ * RTC and UTC-offset durability, and it owns g_rtc_sequence_lock throughout. */
+static board_time_commit_result_t board_time_commit_locked(
+    int hour, int minute, int year, int month, int day, int second,
+    const pj_time_clock_anchor_t *target_anchor, int anchor_at_rtc_write,
+    int update_utc_offset, int utc_offset_minutes,
+    int publish_time_sync_known)
+{
+    board_time_commit_result_t outcome = {0};
+    if (target_anchor == NULL || !target_anchor->valid) {
+        outcome.transaction.status = PJ_TIME_TRANSACTION_INVALID;
+        return outcome;
+    }
+
+    int old_offset_known;
+    int old_offset_minutes;
+    portENTER_CRITICAL(&g_connectivity_lock);
+    old_offset_known = g_utc_offset_known;
+    old_offset_minutes = g_utc_offset_minutes;
+    portEXIT_CRITICAL(&g_connectivity_lock);
+
+    if (!rtc_sequence_take(pdMS_TO_TICKS(500))) {
+        outcome.transaction.status =
+            PJ_TIME_TRANSACTION_RTC_SNAPSHOT_FAILED;
+        outcome.rtc_snapshot_error = ESP_ERR_TIMEOUT;
+        return outcome;
+    }
+
+    board_time_transaction_context_t context = {
+        .target_anchor = *target_anchor,
+        .hour = hour,
+        .minute = minute,
+        .year = year,
+        .month = month,
+        .day = day,
+        .second = second,
+        .anchor_at_rtc_write = anchor_at_rtc_write,
+        .update_utc_offset = update_utc_offset,
+        .utc_offset_minutes = utc_offset_minutes,
+        .publish_time_sync_known = publish_time_sync_known,
+        .rtc_snapshot_error = ESP_OK,
+        .offset_store_error = ESP_OK,
+        .rtc_write_error = ESP_OK,
+        .rtc_restore_error = ESP_OK,
+        .offset_restore_error = ESP_OK,
+    };
+    pj_time_transaction_request_t request = {
+        .update_offset = update_utc_offset,
+        .old_offset_known = old_offset_known,
+        .old_offset_minutes = old_offset_minutes,
+        .new_offset_minutes = utc_offset_minutes,
+    };
+    const pj_time_transaction_ops_t ops = {
+        .context = &context,
+        .snapshot_rtc = board_time_transaction_snapshot_rtc,
+        .store_offset = board_time_transaction_store_offset,
+        .write_rtc = board_time_transaction_write_rtc,
+        .restore_rtc = board_time_transaction_restore_rtc,
+        .publish = board_time_transaction_publish,
+    };
+    outcome.transaction = pj_time_transaction_execute(&request, &ops);
+    rtc_sequence_give();
+    outcome.rtc_snapshot_error = context.rtc_snapshot_error;
+    outcome.offset_store_error = context.offset_store_error;
+    outcome.rtc_write_error = context.rtc_write_error;
+    outcome.rtc_restore_error = context.rtc_restore_error;
+    outcome.offset_restore_error = context.offset_restore_error;
+    return outcome;
 }
 
 static uint32_t time_controller_next_boot_id(void *context)
@@ -4928,13 +5275,20 @@ static pj_time_controller_wake_result_t time_controller_schedule_wake(
     if (g_rtc_wake_metadata_blocked) {
         return PJ_TIME_CONTROLLER_WAKE_ERROR;
     }
+    if (!time_transaction_take()) {
+        return PJ_TIME_CONTROLLER_WAKE_ERROR;
+    }
+    pj_time_controller_wake_result_t outcome;
     if (deadline == NULL) {
-        return rtc_wake_disarm_board(NULL, 0) == PJ_RTC_WAKE_OK
+        outcome = rtc_wake_disarm_board(NULL, 0) == PJ_RTC_WAKE_OK
             ? PJ_TIME_CONTROLLER_WAKE_OK
             : PJ_TIME_CONTROLLER_WAKE_ERROR;
+    } else {
+        outcome = rtc_wake_sync_locked() >= 0 ? PJ_TIME_CONTROLLER_WAKE_OK
+                                              : PJ_TIME_CONTROLLER_WAKE_ERROR;
     }
-    return rtc_wake_sync() >= 0 ? PJ_TIME_CONTROLLER_WAKE_OK
-                                : PJ_TIME_CONTROLLER_WAKE_ERROR;
+    time_transaction_give();
+    return outcome;
 }
 
 static void time_controller_project_media(void *context,
@@ -5059,7 +5413,8 @@ static pj_rtc_wake_result_t rtc_wake_disarm_board(uint8_t *flags, int force)
     return result;
 }
 
-static int rtc_wake_sync(void)
+/* Caller owns g_time_transaction_lock so the plan and RTC share one time basis. */
+static int rtc_wake_sync_locked(void)
 {
     const pj_time_state_t *state = pj_time_controller_state(&g_time_controller);
     if (!g_rtc_ready || state == NULL || g_rtc_wake_metadata_blocked) {
@@ -5135,6 +5490,16 @@ static int rtc_wake_sync(void)
              (unsigned long)plan.target_local_second,
              plan.checkpoint ? " checkpoint" : "");
     return 1;
+}
+
+static int rtc_wake_sync(void)
+{
+    if (!time_transaction_take()) {
+        return -1;
+    }
+    int result = rtc_wake_sync_locked();
+    time_transaction_give();
+    return result;
 }
 
 static void rtc_wake_restore(void)
@@ -6269,10 +6634,12 @@ void pj_board_init(const pj_board_profile_t *profile)
     g_status_lock = xSemaphoreCreateRecursiveMutexStatic(&g_status_lock_storage);
     g_audio_lifecycle_lock =
         xSemaphoreCreateMutexStatic(&g_audio_lifecycle_lock_storage);
+    g_provisioning_lock =
+        xSemaphoreCreateMutexStatic(&g_provisioning_lock_storage);
     g_board_update_events =
         xEventGroupCreateStatic(&g_board_update_events_storage);
     if (g_status_lock == NULL || g_audio_lifecycle_lock == NULL ||
-        g_board_update_events == NULL) {
+        g_provisioning_lock == NULL || g_board_update_events == NULL) {
         ESP_LOGE(TAG, "Board synchronization primitive initialization failed");
         return;
     }
@@ -6437,7 +6804,7 @@ void pj_board_init(const pj_board_profile_t *profile)
         ESP_LOGW(TAG, "Audio init failed: %s", esp_err_to_name(audio_err));
     }
 
-    if (g_wifi_credentials_stored) {
+    if (wifi_credentials_stored_snapshot()) {
         wifi_apply_provisioning_status();
     } else {
         board_status_set_service(BOARD_SERVICE_BLE,
@@ -6464,7 +6831,8 @@ int pj_board_start_services(const pj_board_profile_t *profile)
         services_ready = 0;
     }
 #ifdef ESP_PLATFORM
-    if (!g_wifi_credentials_stored) {
+    int wifi_provisioned = wifi_credentials_stored_snapshot();
+    if (!wifi_provisioned) {
         esp_err_t ble_err = ble_provisioning_start();
         if (ble_err != ESP_OK) {
             board_status_set_service(BOARD_SERVICE_BLE,
@@ -6480,7 +6848,7 @@ int pj_board_start_services(const pj_board_profile_t *profile)
                                  PJ_BOARD_SERVICE_UNAVAILABLE);
         ESP_LOGI(TAG, "BLE provisioning skipped because Wi-Fi credentials are stored");
     }
-    if (g_wifi_credentials_stored) {
+    if (wifi_provisioned) {
         esp_err_t wifi_err = wifi_start_or_reconfigure();
         if (wifi_err != ESP_OK) {
             board_status_set_service(BOARD_SERVICE_WIFI,
@@ -6525,6 +6893,7 @@ void pj_board_confirm_boot_health(int startup_and_ui_ready)
 pj_board_status_t pj_board_status(void)
 {
 #ifdef ESP_PLATFORM
+    int transaction_locked = time_transaction_take();
     /* Each independently owned subsystem contributes one coherent snapshot. */
     pj_board_status_t status = board_status_snapshot_base();
     portENTER_CRITICAL(&g_recording_lock);
@@ -6538,6 +6907,9 @@ pj_board_status_t pj_board_status(void)
     status.day = time.day;
     status.time_set = time.time_set;
     connectivity_state_snapshot(&status.wifi_diagnostics, &status.time_sync);
+    if (transaction_locked) {
+        time_transaction_give();
+    }
     return status;
 #else
     return g_status;
@@ -7068,7 +7440,11 @@ int pj_board_enter_sleep(void)
         ESP_LOGI(TAG, "Sleep deferred because storage work is active");
         return 0;
     }
-    int rtc_schedule = rtc_wake_sync();
+    if (!time_transaction_take()) {
+        storage_sleep_finish();
+        return -1;
+    }
+    int rtc_schedule = rtc_wake_sync_locked();
     uint64_t wake_delay_ms = UINT64_MAX;
     const pj_time_state_t *time_state =
         pj_time_controller_state(&g_time_controller);
@@ -7080,6 +7456,7 @@ int pj_board_enter_sleep(void)
     }
     if (wake_delay_ms == 0) {
         ESP_LOGI(TAG, "Sleep deferred because a time alert is due");
+        time_transaction_give();
         storage_sleep_finish();
         return 0;
     }
@@ -7092,6 +7469,7 @@ int pj_board_enter_sleep(void)
         } else if (rtc_schedule <= 0) {
             ESP_LOGW(TAG, "Sleep deferred; no scheduled wake source: %s",
                      esp_err_to_name(err));
+            time_transaction_give();
             storage_sleep_finish();
             return -1;
         } else {
@@ -7104,6 +7482,7 @@ int pj_board_enter_sleep(void)
     if (g_rtc_wake_plan.state == PJ_RTC_WAKE_ARMED &&
         gpio_get_level(RTC_INT_PIN) == 0) {
         ESP_LOGI(TAG, "Sleep deferred because RTC_INT is already active");
+        time_transaction_give();
         storage_sleep_finish();
         return 0;
     }
@@ -7120,6 +7499,7 @@ int pj_board_enter_sleep(void)
     if (sleep_err == ESP_OK) {
         sleep_err = esp_light_sleep_start();
     }
+    time_transaction_give();
     if (sleep_err != ESP_OK) {
         gpio_set_level(EPD_PWR_PIN, 0);
         ESP_LOGW(TAG, "Light sleep rejected: %s", esp_err_to_name(sleep_err));
@@ -7460,7 +7840,7 @@ int pj_board_storage_recover(void)
         return 0;
     }
     board_status_set_service(BOARD_SERVICE_STORAGE, PJ_BOARD_SERVICE_READY);
-    board_status_clear_error();
+    board_status_clear_error_if_owned("microSD ", "storage recovery ");
     if (!g_audio_ready) {
         esp_err_t audio_err = audio_init();
         if (audio_err == ESP_OK) {
@@ -7586,17 +7966,22 @@ static board_time_update_result_t board_set_time_date(
     int month, int day, int update_utc_offset, int utc_offset_minutes,
     const char *source)
 {
+    board_time_update_result_t result = {
+        .status = BOARD_TIME_UPDATE_INVALID,
+    };
     if (year == NULL || source == NULL) {
-        return BOARD_TIME_UPDATE_INVALID;
+        return result;
     }
     if (!time_transaction_take()) {
-        return BOARD_TIME_UPDATE_UNAVAILABLE;
+        result.status = BOARD_TIME_UPDATE_UNAVAILABLE;
+        return result;
     }
     if (!year_provided) {
         board_time_snapshot_t current = board_time_snapshot();
         if (!current.time_set || current.year < 2024 || current.year > 2099) {
             time_transaction_give();
-            return BOARD_TIME_UPDATE_YEAR_REQUIRED;
+            result.status = BOARD_TIME_UPDATE_YEAR_REQUIRED;
+            return result;
         }
         *year = current.year;
     }
@@ -7606,44 +7991,130 @@ static board_time_update_result_t board_set_time_date(
          !pj_time_utc_offset_valid(utc_offset_minutes))) {
         ESP_LOGE(TAG, "Rejected invalid time/date from %s", source);
         time_transaction_give();
-        return BOARD_TIME_UPDATE_INVALID;
+        return result;
     }
-    esp_err_t err = rtc_write_civil_time(hour, minute, *year, month, day,
-                                         second);
-    if (err != ESP_OK) {
-        board_status_set_error("RTC write failed for %s time update: %s",
-                               source, esp_err_to_name(err));
-        ESP_LOGW(TAG, "RTC write failed for %s time update: %s", source,
-                 esp_err_to_name(err));
-        time_transaction_give();
-        return BOARD_TIME_UPDATE_UNAVAILABLE;
-    }
-    if (update_utc_offset) {
-        esp_err_t offset_err = time_offset_save(utc_offset_minutes);
-        if (offset_err != ESP_OK) {
-            board_status_set_error(
-                "UTC offset persistence failed for %s: %s", source,
-                esp_err_to_name(offset_err));
-            ESP_LOGW(TAG, "UTC offset persistence failed for %s: %s", source,
-                     esp_err_to_name(offset_err));
-            time_transaction_give();
-            return BOARD_TIME_UPDATE_UNAVAILABLE;
-        }
-    }
-    if (!board_time_publish(hour, minute, *year, month, day, second,
-                            board_monotonic_ms(), 1)) {
+
+    pj_time_clock_anchor_t target_anchor;
+    if (!pj_time_clock_anchor_set(&target_anchor, *year, month, day, hour,
+                                  minute, second, 0)) {
         ESP_LOGE(TAG, "Rejected invalid time/date from %s", source);
         time_transaction_give();
-        return BOARD_TIME_UPDATE_INVALID;
+        return result;
     }
-    portENTER_CRITICAL(&g_connectivity_lock);
-    g_time_sync_state.time_known = 1;
-    portEXIT_CRITICAL(&g_connectivity_lock);
-    board_time_mark_pending();
-    ESP_LOGI(TAG, "Time/date updated from %s: %02d:%02d:%02d %04d-%02d-%02d",
-             source, hour, minute, second, *year, month, day);
+
+    board_time_commit_result_t commit = board_time_commit_locked(
+        hour, minute, *year, month, day, second, &target_anchor, 1,
+        update_utc_offset, utc_offset_minutes, 1);
+    result.partial_components = commit.transaction.partial_components;
+    switch (commit.transaction.status) {
+    case PJ_TIME_TRANSACTION_OK:
+        result.status = BOARD_TIME_UPDATE_OK;
+        ESP_LOGI(TAG,
+                 "Time/date updated from %s: %02d:%02d:%02d %04d-%02d-%02d",
+                 source, hour, minute, second, *year, month, day);
+        break;
+    case PJ_TIME_TRANSACTION_RTC_SNAPSHOT_FAILED:
+        result.status = BOARD_TIME_UPDATE_RTC_SNAPSHOT_FAILED;
+        board_status_set_error("RTC snapshot failed for %s time update: %s",
+                               source,
+                               esp_err_to_name(commit.rtc_snapshot_error));
+        ESP_LOGW(TAG, "RTC snapshot failed for %s time update: %s", source,
+                 esp_err_to_name(commit.rtc_snapshot_error));
+        break;
+    case PJ_TIME_TRANSACTION_OFFSET_FAILED_ROLLED_BACK:
+        result.status = BOARD_TIME_UPDATE_OFFSET_PERSIST_FAILED;
+        board_status_set_error(
+            "UTC offset write failed for %s and was rolled back: %s", source,
+            esp_err_to_name(commit.offset_store_error));
+        ESP_LOGW(TAG, "UTC offset write failed for %s and was rolled back: %s",
+                 source, esp_err_to_name(commit.offset_store_error));
+        break;
+    case PJ_TIME_TRANSACTION_RTC_FAILED_ROLLED_BACK:
+        result.status = BOARD_TIME_UPDATE_RTC_WRITE_FAILED;
+        board_status_set_error(
+            "RTC write failed for %s and was rolled back: %s", source,
+            esp_err_to_name(commit.rtc_write_error));
+        ESP_LOGW(TAG, "RTC write failed for %s and was rolled back: %s", source,
+                 esp_err_to_name(commit.rtc_write_error));
+        break;
+    case PJ_TIME_TRANSACTION_PARTIAL_COMMIT:
+        result.status = BOARD_TIME_UPDATE_PARTIAL_COMMIT;
+        board_status_set_error(
+            "%s time rollback failed; partial components=0x%" PRIx32,
+            source, result.partial_components);
+        ESP_LOGE(TAG,
+                 "%s time rollback failed; partial components=0x%" PRIx32
+                 " rtc_restore=%s offset_restore=%s",
+                 source, result.partial_components,
+                 esp_err_to_name(commit.rtc_restore_error),
+                 esp_err_to_name(commit.offset_restore_error));
+        break;
+    case PJ_TIME_TRANSACTION_INVALID:
+    default:
+        result.status = BOARD_TIME_UPDATE_INVALID;
+        break;
+    }
     time_transaction_give();
-    return BOARD_TIME_UPDATE_OK;
+    return result;
+}
+
+typedef struct {
+    const char *code;
+    const char *error;
+    int retryable;
+    int partial_commit;
+} board_time_update_error_fields_t;
+
+static board_time_update_error_fields_t board_time_update_error_fields(
+    const board_time_update_result_t *result)
+{
+    switch (result->status) {
+    case BOARD_TIME_UPDATE_INVALID:
+        return (board_time_update_error_fields_t) {
+            "invalid_time", "invalid civil time or UTC offset", 0, 0};
+    case BOARD_TIME_UPDATE_YEAR_REQUIRED:
+        return (board_time_update_error_fields_t) {
+            "time_year_required",
+            "year is required until device time is initialized", 0, 0};
+    case BOARD_TIME_UPDATE_RTC_SNAPSHOT_FAILED:
+        return (board_time_update_error_fields_t) {
+            "time_rtc_snapshot_failed", "RTC snapshot failed", 1, 0};
+    case BOARD_TIME_UPDATE_OFFSET_PERSIST_FAILED:
+        return (board_time_update_error_fields_t) {
+            "time_offset_persist_failed",
+            "UTC offset persistence failed and was rolled back", 1, 0};
+    case BOARD_TIME_UPDATE_RTC_WRITE_FAILED:
+        return (board_time_update_error_fields_t) {
+            "time_rtc_write_failed", "RTC write failed and was rolled back",
+            1, 0};
+    case BOARD_TIME_UPDATE_PARTIAL_COMMIT:
+        return (board_time_update_error_fields_t) {
+            "time_partial_commit", "time rollback failed", 0, 1};
+    case BOARD_TIME_UPDATE_UNAVAILABLE:
+    default:
+        return (board_time_update_error_fields_t) {
+            "time_unavailable", "time transaction unavailable", 1, 0};
+    }
+}
+
+static void serial_print_time_update_error(
+    const board_time_update_result_t *result)
+{
+    board_time_update_error_fields_t fields =
+        board_time_update_error_fields(result);
+    int rtc_failed = (result->partial_components &
+                      PJ_TIME_TRANSACTION_COMPONENT_RTC) != 0;
+    int offset_failed = (result->partial_components &
+                         PJ_TIME_TRANSACTION_COMPONENT_UTC_OFFSET) != 0;
+    printf("PJ_ERR {\"error\":\"%s\",\"code\":\"%s\","
+           "\"retryable\":%s,\"partial_commit\":%s,"
+           "\"partial_components\":%" PRIu32 ","
+           "\"rtc_rollback_failed\":%s,"
+           "\"utc_offset_rollback_failed\":%s}\n",
+           fields.error, fields.code, fields.retryable ? "true" : "false",
+           fields.partial_commit ? "true" : "false",
+           result->partial_components, rtc_failed ? "true" : "false",
+           offset_failed ? "true" : "false");
 }
 
 static void serial_trim_line(char *line)
@@ -9589,11 +10060,10 @@ static void serial_command_task(void *arg)
                 second >= 0 && second <= 59 &&
                 (!update_utc_offset ||
                  pj_time_utc_offset_valid(utc_offset_minutes))) {
-                if (board_set_time_date(hour, minute, second, &year, 1,
-                                        month, day, update_utc_offset,
-                                        utc_offset_minutes,
-                                        "USB-C partner") ==
-                    BOARD_TIME_UPDATE_OK) {
+                board_time_update_result_t update = board_set_time_date(
+                    hour, minute, second, &year, 1, month, day,
+                    update_utc_offset, utc_offset_minutes, "USB-C partner");
+                if (update.status == BOARD_TIME_UPDATE_OK) {
                     if (update_utc_offset) {
                         printf("PJ_OK {\"hour\":%d,\"minute\":%d,\"second\":%d,\"year\":%d,\"month\":%d,\"day\":%d,\"utc_offset_minutes\":%d}\n",
                                hour, minute, second, year, month, day,
@@ -9603,7 +10073,7 @@ static void serial_command_task(void *arg)
                                hour, minute, second, year, month, day);
                     }
                 } else {
-                    printf("PJ_ERR {\"error\":\"time update could not be persisted to RTC\"}\n");
+                    serial_print_time_update_error(&update);
                 }
             } else {
                 printf("PJ_ERR {\"error\":\"expected PJ_TIME yyyy mm dd hh mm [utc_offset_minutes [second]]\"}\n");
@@ -9638,6 +10108,7 @@ static esp_err_t status_handler(httpd_req_t *req)
     int pending_sync = 0;
     int transferred_sync = 0;
     pj_board_status_t status = pj_board_status();
+    int wifi_provisioned = wifi_credentials_stored_snapshot();
     if (status.storage_mounted && storage_shared_try_acquire()) {
         (void)storage_refresh_capacity();
         storage_shared_release();
@@ -9665,7 +10136,7 @@ static esp_err_t status_handler(httpd_req_t *req)
     cJSON_AddStringToObject(json, "wifi", service_name(status.wifi));
     cJSON_AddStringToObject(json, "http", service_name(status.http));
     cJSON_AddStringToObject(json, "ip", status.ip_addr);
-    cJSON_AddBoolToObject(json, "wifi_provisioned", g_wifi_credentials_stored != 0);
+    cJSON_AddBoolToObject(json, "wifi_provisioned", wifi_provisioned);
     cJSON_AddNumberToObject(json, "battery_percent", status.battery_percent);
     cJSON_AddNumberToObject(json, "temperature_c", status.temperature_c);
     if (status.humidity_percent < 0) {
@@ -9738,6 +10209,44 @@ static esp_err_t time_send_response(httpd_req_t *req,
     esp_err_t result = send_json_object(req, json);
     cJSON_Delete(json);
     return result;
+}
+
+static esp_err_t time_send_update_error(
+    httpd_req_t *req, const board_time_update_result_t *result)
+{
+    board_time_update_error_fields_t fields =
+        board_time_update_error_fields(result);
+    if (result->status == BOARD_TIME_UPDATE_INVALID ||
+        result->status == BOARD_TIME_UPDATE_YEAR_REQUIRED) {
+        httpd_resp_set_status(req, "400 Bad Request");
+    } else if (result->status == BOARD_TIME_UPDATE_PARTIAL_COMMIT) {
+        httpd_resp_set_status(req, "500 Internal Server Error");
+    } else {
+        httpd_resp_set_status(req, "503 Service Unavailable");
+    }
+
+    int rtc_failed = (result->partial_components &
+                      PJ_TIME_TRANSACTION_COMPONENT_RTC) != 0;
+    int offset_failed = (result->partial_components &
+                         PJ_TIME_TRANSACTION_COMPONENT_UTC_OFFSET) != 0;
+    cJSON *json = cJSON_CreateObject();
+    if (json == NULL ||
+        cJSON_AddStringToObject(json, "error", fields.error) == NULL ||
+        cJSON_AddStringToObject(json, "code", fields.code) == NULL ||
+        cJSON_AddBoolToObject(json, "retryable", fields.retryable) == NULL ||
+        cJSON_AddBoolToObject(json, "partial_commit",
+                             fields.partial_commit) == NULL ||
+        cJSON_AddNumberToObject(json, "partial_components",
+                               result->partial_components) == NULL ||
+        cJSON_AddBoolToObject(json, "rtc_rollback_failed", rtc_failed) == NULL ||
+        cJSON_AddBoolToObject(json, "utc_offset_rollback_failed",
+                             offset_failed) == NULL) {
+        cJSON_Delete(json);
+        return send_json(req, "{\"error\":\"time error response allocation failed\"}");
+    }
+    esp_err_t response = send_json_object(req, json);
+    cJSON_Delete(json);
+    return response;
 }
 
 static esp_err_t time_get_handler(httpd_req_t *req)
@@ -9835,13 +10344,12 @@ static esp_err_t time_put_handler(httpd_req_t *req)
         return ESP_OK;
     }
     char body[192];
-    board_time_snapshot_t time = board_time_snapshot();
-    int hour = time.hour;
-    int minute = time.minute;
-    int second = time.second;
-    int year = time.year;
-    int month = time.month;
-    int day = time.day;
+    int hour = 0;
+    int minute = 0;
+    int second = 0;
+    int year = 0;
+    int month = 0;
+    int day = 0;
     int has_year = 0;
     int has_offset = 0;
     int offset_minutes = 0;
@@ -9859,21 +10367,10 @@ static esp_err_t time_put_handler(httpd_req_t *req)
     board_time_update_result_t result = board_set_time_date(
         hour, minute, second, &year, has_year, month, day, has_offset,
         offset_minutes, "HTTP");
-    if (result == BOARD_TIME_UPDATE_YEAR_REQUIRED) {
-        httpd_resp_set_status(req, "400 Bad Request");
-        return send_json(req,
-                         "{\"error\":\"year is required until device time is initialized\"}");
+    if (result.status != BOARD_TIME_UPDATE_OK) {
+        return time_send_update_error(req, &result);
     }
-    if (result == BOARD_TIME_UPDATE_INVALID) {
-        httpd_resp_set_status(req, "400 Bad Request");
-        return send_json(req, "{\"error\":\"invalid civil time or UTC offset\"}");
-    }
-    if (result != BOARD_TIME_UPDATE_OK) {
-        httpd_resp_set_status(req, "503 Service Unavailable");
-        return send_json(req,
-                         "{\"error\":\"time or UTC offset could not be persisted\"}");
-    }
-    time = (board_time_snapshot_t) {
+    board_time_snapshot_t time = {
         .hour = hour,
         .minute = minute,
         .second = second,
