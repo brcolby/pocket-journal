@@ -14,7 +14,6 @@ RECORDING_TEST_BIN := build/test_recording
 NOTE_MODEL_TEST_BIN := build/test_note_model
 AUTH_TEST_BIN := build/test_auth
 SETTINGS_TEST_BIN := build/test_settings
-STATIC_ART_TEST_BIN := build/test_static_art
 HOME_LAYOUT_TEST_BIN := build/test_home_layout
 STORAGE_TEST_BIN := build/test_storage
 STORAGE_COORDINATOR_TEST_BIN := build/test_storage_coordinator
@@ -121,15 +120,6 @@ test-input:
 		tests/board/test_settings.c \
 		-o $(SETTINGS_TEST_BIN)
 	$(SETTINGS_TEST_BIN)
-	$(CC) $(CFLAGS) \
-		-Ifirmware/components/pj_board/include \
-		-Ifirmware/components/pj_ui/include \
-		firmware/components/pj_board/pj_static_art.c \
-		firmware/components/pj_board/pj_static_art_ui.c \
-		firmware/components/pj_ui/pj_default_static_art.c \
-		tests/board/test_static_art.c \
-		-o $(STATIC_ART_TEST_BIN)
-	$(STATIC_ART_TEST_BIN)
 	$(CC) $(CFLAGS) \
 		-Ifirmware/components/pj_ui/include \
 		firmware/components/pj_ui/pj_home_layout.c \

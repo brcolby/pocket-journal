@@ -126,8 +126,6 @@ void app_main(void)
 
     pj_ui_init(&g_ui);
     pj_board_refresh_settings(&g_ui);
-    pj_board_refresh_home_layout(&g_ui);
-    pj_board_refresh_static_art(&g_ui);
     pj_ui_wake(&g_ui);
     pj_board_refresh_status(&g_ui);
     pj_board_refresh_time_state(&g_ui);
@@ -213,14 +211,6 @@ void app_main(void)
         }
 
         if (pj_board_consume_settings_update(&g_ui)) {
-            render_and_flush_if_dirty(&g_ui);
-        }
-
-        if (pj_board_consume_home_layout_update(&g_ui)) {
-            render_and_flush_if_dirty(&g_ui);
-        }
-
-        if (pj_board_consume_static_art_update(&g_ui)) {
             render_and_flush_if_dirty(&g_ui);
         }
 

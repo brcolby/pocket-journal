@@ -4,15 +4,12 @@
 #include "pj_aux_input.h"
 #include "pj_auth.h"
 #include "pj_display_refresh.h"
-#include "pj_home_layout.h"
 #include "pj_note_model.h"
 #include "pj_power_input.h"
 #include "pj_recording.h"
 #include "pj_rtc_wake.h"
 #include "pj_runtime_diagnostics.h"
 #include "pj_settings.h"
-#include "pj_static_art.h"
-#include "pj_static_art_ui.h"
 #include "pj_storage.h"
 #include "pj_storage_coordinator.h"
 #include "pj_time_clock.h"
@@ -112,11 +109,8 @@
 #define PJ_NVS_SETTINGS_SLOT_0 "settings_0"
 #define PJ_NVS_SETTINGS_SLOT_1 "settings_1"
 #define PJ_SETTINGS_VERSION 2
-#define PJ_NVS_STATIC_ART_SLOT "art_slot"
-#define PJ_NVS_HOME_LAYOUT "home_layout"
 #define PJ_NVS_TIME_STATE "time_state"
 #define PJ_NVS_WAKE_PLAN "wake_plan"
-#define PJ_STATIC_ART_SLOT_COUNT 2
 #define PJ_WIFI_SSID_MAX_LEN 32
 #define PJ_WIFI_PASSWORD_MAX_LEN 64
 #define EPD_SPI_NUM SPI2_HOST
@@ -229,16 +223,10 @@ static pj_settings_store_t g_settings_store;
 static int g_settings_store_ready;
 static esp_err_t g_settings_io_error = ESP_OK;
 #endif
-static pj_static_art_t g_static_art;
-static pj_home_layout_t g_home_layout;
-static int g_static_art_valid;
-static int g_static_art_slot = -1;
 static int g_display_warning_logged;
 static volatile int g_time_update_pending;
 static uint32_t g_time_generation;
 static volatile int g_settings_update_pending;
-static volatile int g_static_art_update_pending;
-static volatile int g_home_layout_update_pending;
 
 typedef struct {
     int hour;
@@ -279,8 +267,6 @@ static SemaphoreHandle_t g_i2c_lock;
 static SemaphoreHandle_t g_rtc_sequence_lock;
 static SemaphoreHandle_t g_audio_lock;
 static SemaphoreHandle_t g_settings_lock;
-static SemaphoreHandle_t g_static_art_lock;
-static SemaphoreHandle_t g_home_layout_lock;
 static SemaphoreHandle_t g_json_write_lock;
 static sdmmc_card_t *g_sd_card;
 static DMA_ATTR uint8_t g_epd_buffer[PJ_FRAMEBUFFER_BYTES];
@@ -1745,262 +1731,6 @@ static int settings_codec_volume_snapshot(void)
         settings_give();
     }
     return volume;
-}
-
-static int static_art_take(TickType_t timeout)
-{
-    return g_static_art_lock == NULL || xSemaphoreTake(g_static_art_lock, timeout) == pdTRUE;
-}
-
-static void static_art_give(void)
-{
-    if (g_static_art_lock != NULL) {
-        xSemaphoreGive(g_static_art_lock);
-    }
-}
-
-static int home_layout_take(TickType_t timeout)
-{
-    return g_home_layout_lock == NULL || xSemaphoreTake(g_home_layout_lock, timeout) == pdTRUE;
-}
-
-static void home_layout_give(void)
-{
-    if (g_home_layout_lock != NULL) {
-        xSemaphoreGive(g_home_layout_lock);
-    }
-}
-
-static void home_layout_load(void)
-{
-    pj_home_layout_defaults(&g_home_layout);
-    nvs_handle_t nvs;
-    if (nvs_open(PJ_NVS_NAMESPACE, NVS_READONLY, &nvs) != ESP_OK) {
-        return;
-    }
-    size_t record_size = 0;
-    esp_err_t err = nvs_get_blob(nvs, PJ_NVS_HOME_LAYOUT, NULL, &record_size);
-    if (err == ESP_OK && record_size == PJ_HOME_RECORD_BYTES) {
-        uint8_t *record = malloc(record_size);
-        pj_home_layout_t *loaded = malloc(sizeof(*loaded));
-        int read_ok = record != NULL && loaded != NULL &&
-                      nvs_get_blob(nvs, PJ_NVS_HOME_LAYOUT, record, &record_size) == ESP_OK;
-        if (read_ok && pj_home_layout_decode_or_default(record, record_size, loaded)) {
-            ESP_LOGI(TAG, "Home layout loaded from NVS: title=%s slots=%u",
-                     loaded->title, (unsigned)loaded->slot_count);
-        } else {
-            ESP_LOGW(TAG, "Stored home layout failed record validation; using built-in layout");
-        }
-        if (loaded != NULL) {
-            if (!read_ok) {
-                pj_home_layout_defaults(loaded);
-            }
-            g_home_layout = *loaded;
-        }
-        free(loaded);
-        free(record);
-    } else if (err != ESP_ERR_NVS_NOT_FOUND) {
-        ESP_LOGW(TAG, "Stored home layout has invalid size; using built-in layout");
-    }
-    nvs_close(nvs);
-}
-
-static esp_err_t home_layout_save(const pj_home_layout_t *layout)
-{
-    uint8_t *record = malloc(PJ_HOME_RECORD_BYTES);
-    if (record == NULL) {
-        return ESP_ERR_NO_MEM;
-    }
-    if (pj_home_layout_encode_record(layout, record, PJ_HOME_RECORD_BYTES) != PJ_HOME_RECORD_BYTES) {
-        free(record);
-        return ESP_ERR_INVALID_ARG;
-    }
-    nvs_handle_t nvs;
-    esp_err_t err = nvs_open(PJ_NVS_NAMESPACE, NVS_READWRITE, &nvs);
-    if (err == ESP_OK) {
-        err = nvs_set_blob(nvs, PJ_NVS_HOME_LAYOUT, record, PJ_HOME_RECORD_BYTES);
-        if (err == ESP_OK) {
-            err = nvs_commit(nvs);
-        }
-        nvs_close(nvs);
-    }
-    free(record);
-    return err;
-}
-
-static esp_err_t home_layout_replace(const pj_home_layout_t *layout)
-{
-    pj_home_layout_t canonical;
-    if (!pj_home_layout_canonical_copy(&canonical, layout) || !home_layout_take(portMAX_DELAY)) {
-        return ESP_ERR_INVALID_ARG;
-    }
-    esp_err_t err = home_layout_save(&canonical);
-    if (err == ESP_OK) {
-        g_home_layout = canonical;
-        g_home_layout_update_pending = 1;
-    }
-    home_layout_give();
-    return err;
-}
-
-static void static_art_slot_path(int slot, char *path, size_t path_size)
-{
-    (void)snprintf(path, path_size, "%s/static-art-%d.bin", g_status.storage_path, slot);
-}
-
-static int static_art_read_slot_unlocked(int slot, pj_static_art_t *art)
-{
-    if (slot < 0 || slot >= PJ_STATIC_ART_SLOT_COUNT || art == NULL) {
-        return 0;
-    }
-    char path[64];
-    static_art_slot_path(slot, path, sizeof(path));
-    FILE *file = fopen(path, "rb");
-    if (file == NULL) {
-        return 0;
-    }
-    uint8_t *record = malloc(PJ_STATIC_ART_RECORD_BYTES);
-    if (record == NULL) {
-        fclose(file);
-        return 0;
-    }
-    size_t got = fread(record, 1, PJ_STATIC_ART_RECORD_BYTES, file);
-    int extra = fgetc(file);
-    fclose(file);
-    int valid = got == PJ_STATIC_ART_RECORD_BYTES && extra == EOF &&
-                pj_static_art_decode_record(record, got, art);
-    free(record);
-    return valid;
-}
-
-static void static_art_reset_unlocked(void)
-{
-    memset(&g_static_art, 0, sizeof(g_static_art));
-    g_static_art_valid = 0;
-    g_static_art_slot = -1;
-}
-
-static void static_art_load_from_storage(void)
-{
-    int preferred_slot = -1;
-    nvs_handle_t nvs;
-    if (nvs_open(PJ_NVS_NAMESPACE, NVS_READONLY, &nvs) == ESP_OK) {
-        uint8_t stored_slot = 0;
-        if (nvs_get_u8(nvs, PJ_NVS_STATIC_ART_SLOT, &stored_slot) == ESP_OK &&
-            stored_slot < PJ_STATIC_ART_SLOT_COUNT) {
-            preferred_slot = stored_slot;
-        }
-        nvs_close(nvs);
-    }
-
-    int candidates[PJ_STATIC_ART_SLOT_COUNT] = {
-        preferred_slot,
-        preferred_slot == 0 ? 1 : 0,
-    };
-    if (preferred_slot < 0) {
-        candidates[0] = 0;
-        candidates[1] = 1;
-    }
-    for (int i = 0; i < PJ_STATIC_ART_SLOT_COUNT; i++) {
-        if (static_art_read_slot_unlocked(candidates[i], &g_static_art)) {
-            g_static_art_slot = candidates[i];
-            g_static_art_valid = 1;
-            ESP_LOGI(TAG, "Static art loaded from microSD slot %d", g_static_art_slot);
-            return;
-        }
-    }
-    if (preferred_slot >= 0) {
-        ESP_LOGW(TAG, "Stored static art slots failed record validation");
-    }
-}
-
-static void static_art_load(void)
-{
-    if (!storage_shared_try_acquire()) {
-        return;
-    }
-    static_art_load_from_storage();
-    storage_shared_release();
-}
-
-static esp_err_t static_art_save_unlocked(const pj_static_art_t *art, int *saved_slot)
-{
-    if (g_status.storage != PJ_BOARD_SERVICE_READY) {
-        return ESP_ERR_INVALID_STATE;
-    }
-    if (!storage_preflight(PJ_STATIC_ART_RECORD_BYTES, "static art")) {
-        return g_status.storage_health == PJ_STORAGE_HEALTH_FULL ? ESP_ERR_NO_MEM : ESP_FAIL;
-    }
-    uint8_t *record = malloc(PJ_STATIC_ART_RECORD_BYTES);
-    if (record == NULL) {
-        return ESP_ERR_NO_MEM;
-    }
-    if (pj_static_art_encode_record(art, record, PJ_STATIC_ART_RECORD_BYTES) == 0) {
-        free(record);
-        return ESP_ERR_INVALID_ARG;
-    }
-    int next_slot = g_static_art_slot == 0 ? 1 : 0;
-    char path[64];
-    static_art_slot_path(next_slot, path, sizeof(path));
-    FILE *file = fopen(path, "wb");
-    if (file == NULL) {
-        free(record);
-        return ESP_FAIL;
-    }
-    size_t written = fwrite(record, 1, PJ_STATIC_ART_RECORD_BYTES, file);
-    int write_failed = written != PJ_STATIC_ART_RECORD_BYTES;
-    if (fflush(file) != 0) {
-        write_failed = 1;
-    }
-    if (fsync(fileno(file)) != 0) {
-        write_failed = 1;
-    }
-    if (fclose(file) != 0) {
-        write_failed = 1;
-    }
-    if (write_failed) {
-        remove(path);
-        free(record);
-        return ESP_FAIL;
-    }
-
-    pj_static_art_t *verified = malloc(sizeof(*verified));
-    if (verified == NULL) {
-        free(record);
-        return ESP_ERR_NO_MEM;
-    }
-    if (!static_art_read_slot_unlocked(next_slot, verified) ||
-        memcmp(verified->pixels, art->pixels, sizeof(verified->pixels)) != 0) {
-        free(verified);
-        free(record);
-        return ESP_ERR_INVALID_CRC;
-    }
-    free(verified);
-
-    nvs_handle_t nvs;
-    esp_err_t err = nvs_open(PJ_NVS_NAMESPACE, NVS_READWRITE, &nvs);
-    if (err == ESP_OK) {
-        err = nvs_set_u8(nvs, PJ_NVS_STATIC_ART_SLOT, (uint8_t)next_slot);
-        if (err == ESP_OK) {
-            err = nvs_commit(nvs);
-        }
-        nvs_close(nvs);
-    }
-    if (err == ESP_OK && saved_slot != NULL) {
-        *saved_slot = next_slot;
-    }
-    free(record);
-    return err;
-}
-
-static esp_err_t static_art_save(const pj_static_art_t *art, int *saved_slot)
-{
-    if (!storage_shared_try_acquire()) {
-        return ESP_ERR_INVALID_STATE;
-    }
-    esp_err_t err = static_art_save_unlocked(art, saved_slot);
-    storage_shared_release();
-    return err;
 }
 
 static esp_err_t nvs_read_optional_i32(nvs_handle_t nvs, const char *key,
@@ -6110,7 +5840,6 @@ void pj_board_init(const pj_board_profile_t *profile)
 {
     init_default_status(profile);
     pj_settings_defaults(&g_settings);
-    pj_home_layout_defaults(&g_home_layout);
 
 #ifdef ESP_PLATFORM
     g_runtime_boot_id = esp_random();
@@ -6157,16 +5886,6 @@ void pj_board_init(const pj_board_profile_t *profile)
         ESP_LOGW(TAG, "%s; preserving in-memory defaults without writing NVS",
                  g_status.last_error);
     }
-    g_home_layout_lock = xSemaphoreCreateMutex();
-    if (g_home_layout_lock == NULL) {
-        ESP_LOGW(TAG, "Home layout mutex allocation failed");
-    }
-    home_layout_load();
-    g_static_art_lock = xSemaphoreCreateMutex();
-    if (g_static_art_lock == NULL) {
-        ESP_LOGW(TAG, "Static art mutex allocation failed");
-    }
-
     uint8_t mac[6] = {0};
     if (esp_read_mac(mac, ESP_MAC_WIFI_STA) == ESP_OK) {
         (void)snprintf(g_status.device_id, sizeof(g_status.device_id), "pj-%02x%02x%02x", mac[3], mac[4], mac[5]);
@@ -6243,7 +5962,6 @@ void pj_board_init(const pj_board_profile_t *profile)
         g_status.storage = PJ_BOARD_SERVICE_READY;
         ESP_LOGI(TAG, "microSD mounted at %s", g_status.storage_path);
         remove(PJ_USB_TRANSCRIPT_TEMP_PATH);
-        static_art_load();
     } else {
         g_status.storage = PJ_BOARD_SERVICE_ERROR;
         (void)snprintf(g_status.last_error, sizeof(g_status.last_error),
@@ -6447,46 +6165,6 @@ int pj_board_consume_settings_update(pj_ui_context_t *ui)
     pj_board_refresh_settings(ui);
     pj_board_refresh_time_state(ui);
     return 1;
-}
-
-void pj_board_refresh_static_art(pj_ui_context_t *ui)
-{
-    if (ui == NULL || !static_art_take(portMAX_DELAY)) {
-        return;
-    }
-    pj_static_art_publish_to_ui(ui, g_static_art_valid ? &g_static_art : NULL);
-    static_art_give();
-}
-
-int pj_board_consume_static_art_update(pj_ui_context_t *ui)
-{
-    if (!g_static_art_update_pending || ui == NULL || !static_art_take(portMAX_DELAY)) {
-        return 0;
-    }
-    g_static_art_update_pending = 0;
-    pj_static_art_publish_to_ui(ui, g_static_art_valid ? &g_static_art : NULL);
-    static_art_give();
-    return 1;
-}
-
-void pj_board_refresh_home_layout(pj_ui_context_t *ui)
-{
-    if (ui == NULL || !home_layout_take(portMAX_DELAY)) {
-        return;
-    }
-    (void)pj_ui_set_home_layout(ui, &g_home_layout);
-    home_layout_give();
-}
-
-int pj_board_consume_home_layout_update(pj_ui_context_t *ui)
-{
-    if (!g_home_layout_update_pending || ui == NULL || !home_layout_take(portMAX_DELAY)) {
-        return 0;
-    }
-    g_home_layout_update_pending = 0;
-    int applied = pj_ui_set_home_layout(ui, &g_home_layout);
-    home_layout_give();
-    return applied;
 }
 
 void pj_board_refresh_status(pj_ui_context_t *ui)
@@ -7215,23 +6893,13 @@ int pj_board_storage_recover(void)
         (void)snprintf(g_status.last_error, sizeof(g_status.last_error),
                        "microSD recovery failed: %s; check card and filesystem",
                        esp_err_to_name(err));
-        if (static_art_take(portMAX_DELAY)) {
-            static_art_reset_unlocked();
-            static_art_give();
-        }
         portENTER_CRITICAL(&g_storage_coordinator_lock);
         pj_storage_recovery_finish(&g_storage_coordinator);
         portEXIT_CRITICAL(&g_storage_coordinator_lock);
-        g_static_art_update_pending = 1;
         return 0;
     }
     g_status.storage = PJ_BOARD_SERVICE_READY;
     g_status.last_error[0] = '\0';
-    if (static_art_take(portMAX_DELAY)) {
-        static_art_reset_unlocked();
-        static_art_load_from_storage();
-        static_art_give();
-    }
     if (!g_audio_ready) {
         esp_err_t audio_err = audio_init();
         if (audio_err == ESP_OK) {
@@ -7246,7 +6914,6 @@ int pj_board_storage_recover(void)
     portENTER_CRITICAL(&g_storage_coordinator_lock);
     pj_storage_recovery_finish(&g_storage_coordinator);
     portEXIT_CRITICAL(&g_storage_coordinator_lock);
-    g_static_art_update_pending = 1;
     g_notes_update_pending = 1;
     return 1;
 #else
@@ -8610,18 +8277,6 @@ static void serial_command_task(void *arg)
             fflush(stdout);
             continue;
         }
-        if (strcmp(line, "PJ_HOME_RESET") == 0) {
-            pj_home_layout_t fallback;
-            pj_home_layout_defaults(&fallback);
-            esp_err_t err = home_layout_replace(&fallback);
-            if (err == ESP_OK) {
-                printf("PJ_OK {\"home_reset\":true}\n");
-            } else {
-                printf("PJ_ERR {\"error\":\"home reset failed: %s\"}\n", esp_err_to_name(err));
-            }
-            fflush(stdout);
-            continue;
-        }
         if (strncmp(line, "PJ_AUDIO_TONE", 13) == 0) {
             audio_tone_diag_opts_t tone_opts = {
                 .pa_level = PJ_AUDIO_TONE_DEFAULT_INT,
@@ -9127,345 +8782,6 @@ static esp_err_t settings_put_handler(httpd_req_t *req)
     return settings_get_handler(req);
 }
 
-static esp_err_t home_get_handler(httpd_req_t *req)
-{
-    if (require_auth(req) != ESP_OK) {
-        return ESP_OK;
-    }
-    pj_home_layout_t *layout = malloc(sizeof(*layout));
-    if (layout == NULL || !home_layout_take(portMAX_DELAY)) {
-        free(layout);
-        httpd_resp_set_status(req, "503 Service Unavailable");
-        return send_json(req, "{\"error\":\"home layout busy\"}");
-    }
-    *layout = g_home_layout;
-    home_layout_give();
-
-    cJSON *root = cJSON_CreateObject();
-    cJSON *slots = root == NULL ? NULL : cJSON_AddArrayToObject(root, "slots");
-    if (root != NULL) {
-        cJSON_AddStringToObject(root, "title", layout->title);
-    }
-    for (uint8_t i = 0; slots != NULL && i < layout->slot_count; i++) {
-        cJSON *slot = cJSON_CreateObject();
-        if (slot == NULL || !cJSON_AddItemToArray(slots, slot)) {
-            cJSON_Delete(slot);
-            slots = NULL;
-            break;
-        }
-        cJSON_AddStringToObject(slot, "label", layout->slots[i].label);
-        cJSON_AddStringToObject(slot, "icon", layout->slots[i].icon);
-        cJSON_AddStringToObject(slot, "state", layout->slots[i].destination);
-    }
-    free(layout);
-    char *body = slots == NULL ? NULL : cJSON_PrintUnformatted(root);
-    cJSON_Delete(root);
-    if (body == NULL) {
-        httpd_resp_set_status(req, "503 Service Unavailable");
-        return send_json(req, "{\"error\":\"home layout response out of memory\"}");
-    }
-    esp_err_t err = send_json(req, body);
-    cJSON_free(body);
-    return err;
-}
-
-static int json_has_exact_keys(const cJSON *object, const char *const *keys, size_t key_count)
-{
-    int seen[4] = {0};
-    size_t count = 0;
-    for (const cJSON *item = object == NULL ? NULL : object->child; item != NULL; item = item->next) {
-        size_t index = 0;
-        while (index < key_count && strcmp(item->string, keys[index]) != 0) {
-            index++;
-        }
-        if (index == key_count || seen[index]) {
-            return 0;
-        }
-        seen[index] = 1;
-        count++;
-    }
-    return count == key_count;
-}
-
-static int home_parse_layout(const cJSON *json, pj_home_layout_t *layout, int *reset)
-{
-    static const char *const RESET_KEYS[] = {"reset"};
-    static const char *const ROOT_KEYS[] = {"title", "slots"};
-    static const char *const SLOT_KEYS[] = {"label", "icon", "state"};
-    if (!cJSON_IsObject(json) || layout == NULL || reset == NULL) {
-        return 0;
-    }
-    cJSON *reset_item = cJSON_GetObjectItemCaseSensitive(json, "reset");
-    if (reset_item != NULL) {
-        if (!json_has_exact_keys(json, RESET_KEYS, 1) || !cJSON_IsTrue(reset_item)) {
-            return 0;
-        }
-        pj_home_layout_defaults(layout);
-        *reset = 1;
-        return 1;
-    }
-    if (!json_has_exact_keys(json, ROOT_KEYS, 2)) {
-        return 0;
-    }
-    cJSON *title = cJSON_GetObjectItemCaseSensitive(json, "title");
-    cJSON *slots = cJSON_GetObjectItemCaseSensitive(json, "slots");
-    int slot_count = cJSON_IsArray(slots) ? cJSON_GetArraySize(slots) : 0;
-    if (!cJSON_IsString(title) || title->valuestring == NULL ||
-        slot_count < 1 || slot_count > PJ_HOME_MAX_SLOTS ||
-        strlen(title->valuestring) >= PJ_HOME_TITLE_LEN) {
-        return 0;
-    }
-    memset(layout, 0, sizeof(*layout));
-    (void)snprintf(layout->title, sizeof(layout->title), "%s", title->valuestring);
-    layout->slot_count = (uint8_t)slot_count;
-    for (int i = 0; i < slot_count; i++) {
-        cJSON *slot = cJSON_GetArrayItem(slots, i);
-        if (!cJSON_IsObject(slot) || !json_has_exact_keys(slot, SLOT_KEYS, 3)) {
-            return 0;
-        }
-        cJSON *label = cJSON_GetObjectItemCaseSensitive(slot, "label");
-        cJSON *icon = cJSON_GetObjectItemCaseSensitive(slot, "icon");
-        cJSON *state = cJSON_GetObjectItemCaseSensitive(slot, "state");
-        if (!cJSON_IsString(label) || !cJSON_IsString(icon) || !cJSON_IsString(state) ||
-            label->valuestring == NULL || icon->valuestring == NULL || state->valuestring == NULL ||
-            strlen(label->valuestring) >= PJ_HOME_LABEL_LEN ||
-            strlen(icon->valuestring) >= PJ_HOME_ICON_LEN ||
-            strlen(state->valuestring) >= PJ_HOME_DESTINATION_LEN) {
-            return 0;
-        }
-        (void)snprintf(layout->slots[i].label, sizeof(layout->slots[i].label), "%s", label->valuestring);
-        (void)snprintf(layout->slots[i].icon, sizeof(layout->slots[i].icon), "%s", icon->valuestring);
-        (void)snprintf(layout->slots[i].destination, sizeof(layout->slots[i].destination), "%s", state->valuestring);
-    }
-    *reset = 0;
-    return pj_home_layout_valid(layout);
-}
-
-static esp_err_t home_put_handler(httpd_req_t *req)
-{
-    if (require_auth(req) != ESP_OK) {
-        return ESP_OK;
-    }
-    if (req->content_len <= 0 || req->content_len >= 1024) {
-        drain_body(req);
-        httpd_resp_set_status(req, "400 Bad Request");
-        return send_json(req, "{\"error\":\"invalid home layout body\"}");
-    }
-    char *body = malloc((size_t)req->content_len + 1u);
-    pj_home_layout_t *layout = malloc(sizeof(*layout));
-    if (body == NULL || layout == NULL) {
-        free(layout);
-        free(body);
-        drain_body(req);
-        httpd_resp_set_status(req, "503 Service Unavailable");
-        return send_json(req, "{\"error\":\"home layout update out of memory\"}");
-    }
-    if (!read_body(req, body, (size_t)req->content_len + 1u)) {
-        free(layout);
-        free(body);
-        httpd_resp_set_status(req, "400 Bad Request");
-        return send_json(req, "{\"error\":\"invalid home layout body\"}");
-    }
-    cJSON *json = cJSON_Parse(body);
-    free(body);
-    int reset = 0;
-    if (!home_parse_layout(json, layout, &reset)) {
-        cJSON_Delete(json);
-        free(layout);
-        httpd_resp_set_status(req, "400 Bad Request");
-        return send_json(req, "{\"error\":\"unsupported or invalid home layout\"}");
-    }
-    cJSON_Delete(json);
-    esp_err_t err = home_layout_replace(layout);
-    free(layout);
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "HTTP home layout save failed: %s", esp_err_to_name(err));
-        httpd_resp_set_status(req, "500 Internal Server Error");
-        return send_json(req, "{\"error\":\"home layout store failed\"}");
-    }
-    ESP_LOGI(TAG, "Home layout persisted%s; UI apply queued", reset ? " (built-in reset)" : "");
-    return home_get_handler(req);
-}
-
-static esp_err_t update_ok_handler(httpd_req_t *req)
-{
-    if (require_auth(req) != ESP_OK) {
-        return ESP_OK;
-    }
-    drain_body(req);
-    return send_json(req, "{\"updated\":true}");
-}
-
-static esp_err_t static_art_get_handler(httpd_req_t *req)
-{
-    if (require_auth(req) != ESP_OK) {
-        return ESP_OK;
-    }
-    pj_static_art_t *art = malloc(sizeof(*art));
-    if (art == NULL) {
-        httpd_resp_set_status(req, "503 Service Unavailable");
-        return send_json(req, "{\"error\":\"static art read out of memory\"}");
-    }
-    if (!static_art_take(portMAX_DELAY)) {
-        free(art);
-        httpd_resp_set_status(req, "503 Service Unavailable");
-        return send_json(req, "{\"error\":\"static art store busy\"}");
-    }
-    int valid = g_static_art_valid;
-    if (valid) {
-        *art = g_static_art;
-    }
-    static_art_give();
-    if (!valid) {
-        free(art);
-        httpd_resp_set_status(req, "404 Not Found");
-        return send_json(req, "{\"error\":\"static art not set\"}");
-    }
-
-    httpd_resp_set_type(req, "application/json");
-    esp_err_t err = httpd_resp_sendstr_chunk(req,
-        "{\"width\":200,\"height\":200,\"encoding\":\"rows\",\"rows\":[");
-    char row[PJ_STATIC_ART_WIDTH + 4];
-    for (int y = 0; err == ESP_OK && y < PJ_STATIC_ART_HEIGHT; y++) {
-        size_t offset = 0;
-        if (y > 0) {
-            row[offset++] = ',';
-        }
-        row[offset++] = '\"';
-        for (int x = 0; x < PJ_STATIC_ART_WIDTH; x++) {
-            row[offset++] = pj_static_art_pixel(art, x, y) ? '1' : '0';
-        }
-        row[offset++] = '\"';
-        row[offset] = '\0';
-        err = httpd_resp_sendstr_chunk(req, row);
-    }
-    free(art);
-    if (err == ESP_OK) {
-        err = httpd_resp_sendstr_chunk(req, "]}");
-    }
-    if (err == ESP_OK) {
-        err = httpd_resp_sendstr_chunk(req, NULL);
-    }
-    return err;
-}
-
-static esp_err_t static_art_put_handler(httpd_req_t *req)
-{
-    if (require_auth(req) != ESP_OK) {
-        return ESP_OK;
-    }
-    if (req->content_len <= 0) {
-        httpd_resp_set_status(req, "400 Bad Request");
-        return send_json(req, "{\"error\":\"static art body is required\"}");
-    }
-    if (req->content_len > 65536) {
-        drain_body(req);
-        httpd_resp_set_status(req, "413 Payload Too Large");
-        return send_json(req, "{\"error\":\"static art body exceeds 65536 bytes\"}");
-    }
-
-    char *body = malloc((size_t)req->content_len + 1u);
-    if (body == NULL) {
-        drain_body(req);
-        httpd_resp_set_status(req, "503 Service Unavailable");
-        return send_json(req, "{\"error\":\"static art parse out of memory\"}");
-    }
-    if (!read_body(req, body, (size_t)req->content_len + 1u)) {
-        free(body);
-        httpd_resp_set_status(req, "400 Bad Request");
-        return send_json(req, "{\"error\":\"incomplete static art body\"}");
-    }
-    cJSON *json = cJSON_Parse(body);
-    free(body);
-    if (!cJSON_IsObject(json)) {
-        cJSON_Delete(json);
-        httpd_resp_set_status(req, "400 Bad Request");
-        return send_json(req, "{\"error\":\"static art body must be a JSON object\"}");
-    }
-
-    cJSON *width = cJSON_GetObjectItemCaseSensitive(json, "width");
-    cJSON *height = cJSON_GetObjectItemCaseSensitive(json, "height");
-    cJSON *encoding = cJSON_GetObjectItemCaseSensitive(json, "encoding");
-    cJSON *rows_json = cJSON_GetObjectItemCaseSensitive(json, "rows");
-    const char **rows = calloc(PJ_STATIC_ART_HEIGHT, sizeof(*rows));
-    pj_static_art_t *art = malloc(sizeof(*art));
-    if (rows == NULL || art == NULL) {
-        free(rows);
-        free(art);
-        cJSON_Delete(json);
-        httpd_resp_set_status(req, "503 Service Unavailable");
-        return send_json(req, "{\"error\":\"static art validation out of memory\"}");
-    }
-    size_t row_count = cJSON_IsArray(rows_json) ? (size_t)cJSON_GetArraySize(rows_json) : 0;
-    int rows_are_strings = row_count == PJ_STATIC_ART_HEIGHT;
-    for (int i = 0; rows_are_strings && i < PJ_STATIC_ART_HEIGHT; i++) {
-        cJSON *row = cJSON_GetArrayItem(rows_json, i);
-        rows_are_strings = cJSON_IsString(row) && row->valuestring != NULL;
-        rows[i] = rows_are_strings ? row->valuestring : NULL;
-    }
-
-    char validation_error[96];
-    int width_value = cJSON_IsNumber(width) && width->valuedouble == PJ_STATIC_ART_WIDTH ?
-        PJ_STATIC_ART_WIDTH : 0;
-    int height_value = cJSON_IsNumber(height) && height->valuedouble == PJ_STATIC_ART_HEIGHT ?
-        PJ_STATIC_ART_HEIGHT : 0;
-    int parsed = rows_are_strings &&
-        pj_static_art_from_rows(width_value,
-                                height_value,
-                                cJSON_IsString(encoding) ? encoding->valuestring : NULL,
-                                rows, row_count, art, validation_error, sizeof(validation_error));
-    if (!rows_are_strings) {
-        (void)snprintf(validation_error, sizeof(validation_error),
-                       row_count == PJ_STATIC_ART_HEIGHT ?
-                       "each row must be a string" : "rows must contain exactly 200 strings");
-    }
-    free(rows);
-    cJSON_Delete(json);
-    if (!parsed) {
-        char encoded_error[128];
-        (void)snprintf(encoded_error, sizeof(encoded_error), "{\"error\":\"%s\"}", validation_error);
-        free(art);
-        httpd_resp_set_status(req, "400 Bad Request");
-        return send_json(req, encoded_error);
-    }
-
-    if (!static_art_take(portMAX_DELAY)) {
-        free(art);
-        httpd_resp_set_status(req, "503 Service Unavailable");
-        return send_json(req, "{\"error\":\"static art store busy\"}");
-    }
-    int saved_slot = -1;
-    esp_err_t err = static_art_save(art, &saved_slot);
-    if (err == ESP_OK) {
-        g_static_art = *art;
-        g_static_art_valid = 1;
-        g_static_art_slot = saved_slot;
-        g_static_art_update_pending = 1;
-    }
-    static_art_give();
-    free(art);
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "Static art save failed: %s", esp_err_to_name(err));
-        if (err == ESP_ERR_INVALID_STATE) {
-            if (g_status.storage == PJ_BOARD_SERVICE_READY) {
-                httpd_resp_set_status(req, "409 Conflict");
-                return send_json(req,
-                                 "{\"error\":\"storage maintenance active\","
-                                 "\"code\":\"storage_busy\",\"retryable\":true}");
-            }
-            httpd_resp_set_status(req, "503 Service Unavailable");
-            return send_json(req, "{\"error\":\"storage unavailable; run storage recovery\"}");
-        }
-        if (err == ESP_ERR_NO_MEM && g_status.storage_health == PJ_STORAGE_HEALTH_FULL) {
-            httpd_resp_set_status(req, "507 Insufficient Storage");
-            return send_json(req, "{\"error\":\"insufficient storage for static art\"}");
-        }
-        httpd_resp_set_status(req, "500 Internal Server Error");
-        return send_json(req, "{\"error\":\"static art store failed\"}");
-    }
-    return send_json(req, "{\"updated\":true}");
-}
-
 static int file_sha256_hex_unlocked(const char *path, char out[65])
 {
     uint8_t buffer[1024];
@@ -9866,15 +9182,10 @@ int pj_board_http_start(void)
     REGISTER_URI_OR_FAIL("/v1/time", HTTP_PUT, time_put_handler);
     REGISTER_URI_OR_FAIL("/v1/settings", HTTP_GET, settings_get_handler);
     REGISTER_URI_OR_FAIL("/v1/settings", HTTP_PUT, settings_put_handler);
-    REGISTER_URI_OR_FAIL("/v1/home", HTTP_GET, home_get_handler);
-    REGISTER_URI_OR_FAIL("/v1/home", HTTP_PUT, home_put_handler);
-    REGISTER_URI_OR_FAIL("/v1/static-art", HTTP_GET, static_art_get_handler);
-    REGISTER_URI_OR_FAIL("/v1/static-art", HTTP_PUT, static_art_put_handler);
     REGISTER_URI_OR_FAIL("/v1/audio", HTTP_GET, audio_list_handler);
     REGISTER_URI_OR_FAIL("/v1/audio", HTTP_DELETE, audio_delete_handler);
     REGISTER_URI_OR_FAIL("/v1/audio/*", HTTP_GET, audio_download_handler);
     REGISTER_URI_OR_FAIL("/v1/transcripts/*", HTTP_PUT, transcript_put_handler);
-    REGISTER_URI_OR_FAIL("/v1/calendar/today", HTTP_PUT, update_ok_handler);
 #undef REGISTER_URI_OR_FAIL
 
     g_status.http = PJ_BOARD_SERVICE_READY;
