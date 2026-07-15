@@ -224,3 +224,36 @@ void pj_display_refresh_apply_shadow(pj_framebuffer_t *shadow,
         memcpy(&shadow->pixels[offset], &framebuffer->pixels[offset], width_bytes);
     }
 }
+
+int pj_display_refresh_complete(pj_display_refresh_policy_t *policy,
+                                pj_framebuffer_t *shadow,
+                                int *shadow_valid,
+                                const pj_framebuffer_t *framebuffer,
+                                const pj_display_refresh_plan_t *plan,
+                                int success,
+                                uint32_t latency_us,
+                                uint32_t busy_time_us)
+{
+    if (policy == NULL || shadow_valid == NULL || plan == NULL) {
+        return 0;
+    }
+
+    if (success && plan->kind != PJ_DISPLAY_REFRESH_NOOP &&
+        (shadow == NULL || framebuffer == NULL ||
+         (plan->kind == PJ_DISPLAY_REFRESH_PARTIAL && !*shadow_valid))) {
+        success = 0;
+    }
+    pj_display_refresh_record(policy, plan, success, latency_us, busy_time_us);
+    if (!success) {
+        *shadow_valid = 0;
+        return 0;
+    }
+    if (plan->kind == PJ_DISPLAY_REFRESH_NOOP) {
+        return 1;
+    }
+    pj_display_refresh_apply_shadow(shadow, framebuffer, plan);
+    if (plan->kind == PJ_DISPLAY_REFRESH_FULL) {
+        *shadow_valid = 1;
+    }
+    return 1;
+}

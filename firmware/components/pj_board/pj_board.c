@@ -39,6 +39,7 @@
 
 #ifdef ESP_PLATFORM
 #include "esp_check.h"
+#include "esp_attr.h"
 #include "esp_adc/adc_cali.h"
 #include "esp_adc/adc_cali_scheme.h"
 #include "esp_adc/adc_oneshot.h"
@@ -49,8 +50,10 @@
 #include "esp_codec_dev.h"
 #include "esp_codec_dev_defaults.h"
 #include "esp_http_server.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_mac.h"
+#include "esp_memory_utils.h"
 #include "esp_netif.h"
 #include "esp_netif_sntp.h"
 #include "esp_sleep.h"
@@ -117,6 +120,9 @@
 #define PJ_WIFI_PASSWORD_MAX_LEN 64
 #define EPD_SPI_NUM SPI2_HOST
 #define PJ_EPD_SPI_CLOCK_HZ (20 * 1000 * 1000)
+#define PJ_EPD_BUSY_TIMEOUT_US (10 * 1000 * 1000)
+#define PJ_EPD_BUSY_POLL_TICKS 1
+#define PJ_EPD_LUT_TRANSFER_BYTES 153
 #define ESP32_I2C_DEV_NUM I2C_NUM_0
 #define EPD_DC_PIN GPIO_NUM_10
 #define EPD_CS_PIN GPIO_NUM_11
@@ -275,11 +281,13 @@ static SemaphoreHandle_t g_static_art_lock;
 static SemaphoreHandle_t g_home_layout_lock;
 static SemaphoreHandle_t g_json_write_lock;
 static sdmmc_card_t *g_sd_card;
-static uint8_t g_epd_buffer[PJ_FRAMEBUFFER_BYTES];
+static DMA_ATTR uint8_t g_epd_buffer[PJ_FRAMEBUFFER_BYTES];
+static DMA_ATTR uint8_t g_epd_lut_buffer[PJ_EPD_LUT_TRANSFER_BYTES];
 static pj_framebuffer_t g_epd_shadow_fb;
 static int g_display_ready;
 static int g_epd_shadow_valid;
 static int g_epd_partial_ready;
+static uint32_t g_epd_refresh_busy_us;
 static pj_display_refresh_policy_t g_epd_refresh_policy;
 static int g_i2c_ready;
 static int g_touch_ready;
@@ -1286,8 +1294,9 @@ static esp_err_t epd_spi_byte(uint8_t data)
 {
     spi_transaction_t transaction = {
         .length = 8,
-        .tx_buffer = &data,
+        .flags = SPI_TRANS_USE_TXDATA | SPI_TRANS_DMA_BUFFER_ALIGN_MANUAL,
     };
+    transaction.tx_data[0] = data;
     return spi_device_polling_transmit(g_epd_spi, &transaction);
 }
 
@@ -2632,125 +2641,218 @@ static esp_err_t ble_provisioning_start(void)
 
 static esp_err_t epd_write_bytes(const uint8_t *data, int len)
 {
+    if (data == NULL || len <= 0 || !esp_ptr_dma_capable(data) ||
+        ((uintptr_t)data & (sizeof(uint32_t) - 1u)) != 0u) {
+        return ESP_ERR_INVALID_ARG;
+    }
     spi_transaction_t transaction = {
         .length = (size_t)len * 8u,
         .tx_buffer = data,
+        .flags = SPI_TRANS_DMA_BUFFER_ALIGN_MANUAL,
     };
-    gpio_set_level(EPD_DC_PIN, 1);
-    gpio_set_level(EPD_CS_PIN, 0);
-    esp_err_t err = spi_device_polling_transmit(g_epd_spi, &transaction);
-    gpio_set_level(EPD_CS_PIN, 1);
-    return err;
+    ESP_RETURN_ON_ERROR(gpio_set_level(EPD_DC_PIN, 1), TAG,
+                        "display data select failed");
+    ESP_RETURN_ON_ERROR(gpio_set_level(EPD_CS_PIN, 0), TAG,
+                        "display chip select failed");
+    esp_err_t transmit_err = spi_device_polling_transmit(g_epd_spi, &transaction);
+    esp_err_t deselect_err = gpio_set_level(EPD_CS_PIN, 1);
+    return transmit_err != ESP_OK ? transmit_err : deselect_err;
+}
+
+static esp_err_t epd_write_byte(int data_mode, uint8_t value)
+{
+    ESP_RETURN_ON_ERROR(gpio_set_level(EPD_DC_PIN, data_mode), TAG,
+                        "display byte mode select failed");
+    ESP_RETURN_ON_ERROR(gpio_set_level(EPD_CS_PIN, 0), TAG,
+                        "display chip select failed");
+    esp_err_t transmit_err = epd_spi_byte(value);
+    esp_err_t deselect_err = gpio_set_level(EPD_CS_PIN, 1);
+    return transmit_err != ESP_OK ? transmit_err : deselect_err;
 }
 
 static esp_err_t epd_send_command(uint8_t command)
 {
-    gpio_set_level(EPD_DC_PIN, 0);
-    gpio_set_level(EPD_CS_PIN, 0);
-    esp_err_t err = epd_spi_byte(command);
-    gpio_set_level(EPD_CS_PIN, 1);
-    return err;
+    return epd_write_byte(0, command);
 }
 
 static esp_err_t epd_send_data(uint8_t data)
 {
-    gpio_set_level(EPD_DC_PIN, 1);
-    gpio_set_level(EPD_CS_PIN, 0);
-    esp_err_t err = epd_spi_byte(data);
-    gpio_set_level(EPD_CS_PIN, 1);
-    return err;
+    return epd_write_byte(1, data);
 }
 
-static void epd_wait_busy(void)
+static void epd_record_busy_time(int64_t elapsed_us)
 {
-    int guard = 0;
-    while (gpio_get_level(EPD_BUSY_PIN) == 1 && guard < 2000) {
-        vTaskDelay(pdMS_TO_TICKS(5));
-        guard++;
+    if (elapsed_us <= 0) {
+        return;
+    }
+    uint32_t elapsed = elapsed_us > UINT32_MAX ? UINT32_MAX : (uint32_t)elapsed_us;
+    if (UINT32_MAX - g_epd_refresh_busy_us < elapsed) {
+        g_epd_refresh_busy_us = UINT32_MAX;
+    } else {
+        g_epd_refresh_busy_us += elapsed;
     }
 }
 
-static void epd_set_windows(uint16_t x_start, uint16_t y_start, uint16_t x_end, uint16_t y_end)
+static esp_err_t epd_wait_busy(void)
 {
-    ESP_ERROR_CHECK_WITHOUT_ABORT(epd_send_command(0x44));
-    ESP_ERROR_CHECK_WITHOUT_ABORT(epd_send_data((x_start >> 3) & 0xFF));
-    ESP_ERROR_CHECK_WITHOUT_ABORT(epd_send_data((x_end >> 3) & 0xFF));
-
-    ESP_ERROR_CHECK_WITHOUT_ABORT(epd_send_command(0x45));
-    ESP_ERROR_CHECK_WITHOUT_ABORT(epd_send_data(y_start & 0xFF));
-    ESP_ERROR_CHECK_WITHOUT_ABORT(epd_send_data((y_start >> 8) & 0xFF));
-    ESP_ERROR_CHECK_WITHOUT_ABORT(epd_send_data(y_end & 0xFF));
-    ESP_ERROR_CHECK_WITHOUT_ABORT(epd_send_data((y_end >> 8) & 0xFF));
+    int64_t started_us = esp_timer_get_time();
+    while (gpio_get_level(EPD_BUSY_PIN) == 1) {
+        int64_t elapsed_us = esp_timer_get_time() - started_us;
+        if (elapsed_us >= PJ_EPD_BUSY_TIMEOUT_US) {
+            epd_record_busy_time(elapsed_us);
+            return ESP_ERR_TIMEOUT;
+        }
+        vTaskDelay(PJ_EPD_BUSY_POLL_TICKS);
+    }
+    epd_record_busy_time(esp_timer_get_time() - started_us);
+    return ESP_OK;
 }
 
-static void epd_set_cursor(uint16_t x_start, uint16_t y_start)
+static esp_err_t epd_set_windows(uint16_t x_start, uint16_t y_start,
+                                 uint16_t x_end, uint16_t y_end)
 {
-    ESP_ERROR_CHECK_WITHOUT_ABORT(epd_send_command(0x4E));
-    ESP_ERROR_CHECK_WITHOUT_ABORT(epd_send_data(x_start & 0xFF));
-    ESP_ERROR_CHECK_WITHOUT_ABORT(epd_send_command(0x4F));
-    ESP_ERROR_CHECK_WITHOUT_ABORT(epd_send_data(y_start & 0xFF));
-    ESP_ERROR_CHECK_WITHOUT_ABORT(epd_send_data((y_start >> 8) & 0xFF));
-    epd_wait_busy();
+    ESP_RETURN_ON_ERROR(epd_send_command(0x44), TAG, "display X window command failed");
+    ESP_RETURN_ON_ERROR(epd_send_data((x_start >> 3) & 0xFF), TAG,
+                        "display X window start failed");
+    ESP_RETURN_ON_ERROR(epd_send_data((x_end >> 3) & 0xFF), TAG,
+                        "display X window end failed");
+    ESP_RETURN_ON_ERROR(epd_send_command(0x45), TAG, "display Y window command failed");
+    ESP_RETURN_ON_ERROR(epd_send_data(y_start & 0xFF), TAG,
+                        "display Y window start low failed");
+    ESP_RETURN_ON_ERROR(epd_send_data((y_start >> 8) & 0xFF), TAG,
+                        "display Y window start high failed");
+    ESP_RETURN_ON_ERROR(epd_send_data(y_end & 0xFF), TAG,
+                        "display Y window end low failed");
+    ESP_RETURN_ON_ERROR(epd_send_data((y_end >> 8) & 0xFF), TAG,
+                        "display Y window end high failed");
+    return ESP_OK;
 }
 
-static void epd_set_lut(const uint8_t *lut)
+static esp_err_t epd_set_cursor(uint16_t x_start, uint16_t y_start)
 {
-    ESP_ERROR_CHECK_WITHOUT_ABORT(epd_send_command(0x32));
-    ESP_ERROR_CHECK_WITHOUT_ABORT(epd_write_bytes(lut, 153));
-    epd_wait_busy();
-
-    ESP_ERROR_CHECK_WITHOUT_ABORT(epd_send_command(0x3F));
-    ESP_ERROR_CHECK_WITHOUT_ABORT(epd_send_data(lut[153]));
-    ESP_ERROR_CHECK_WITHOUT_ABORT(epd_send_command(0x03));
-    ESP_ERROR_CHECK_WITHOUT_ABORT(epd_send_data(lut[154]));
-    ESP_ERROR_CHECK_WITHOUT_ABORT(epd_send_command(0x04));
-    ESP_ERROR_CHECK_WITHOUT_ABORT(epd_send_data(lut[155]));
-    ESP_ERROR_CHECK_WITHOUT_ABORT(epd_send_data(lut[156]));
-    ESP_ERROR_CHECK_WITHOUT_ABORT(epd_send_data(lut[157]));
-    ESP_ERROR_CHECK_WITHOUT_ABORT(epd_send_command(0x2C));
-    ESP_ERROR_CHECK_WITHOUT_ABORT(epd_send_data(lut[158]));
+    ESP_RETURN_ON_ERROR(epd_send_command(0x4E), TAG, "display X cursor command failed");
+    ESP_RETURN_ON_ERROR(epd_send_data(x_start & 0xFF), TAG, "display X cursor failed");
+    ESP_RETURN_ON_ERROR(epd_send_command(0x4F), TAG, "display Y cursor command failed");
+    ESP_RETURN_ON_ERROR(epd_send_data(y_start & 0xFF), TAG,
+                        "display Y cursor low failed");
+    ESP_RETURN_ON_ERROR(epd_send_data((y_start >> 8) & 0xFF), TAG,
+                        "display Y cursor high failed");
+    return epd_wait_busy();
 }
 
-static void epd_turn_on_display(void)
+static esp_err_t epd_set_lut(const uint8_t *lut)
 {
-    ESP_ERROR_CHECK_WITHOUT_ABORT(epd_send_command(0x22));
-    ESP_ERROR_CHECK_WITHOUT_ABORT(epd_send_data(0xC7));
-    ESP_ERROR_CHECK_WITHOUT_ABORT(epd_send_command(0x20));
-    epd_wait_busy();
+    if (lut == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    memcpy(g_epd_lut_buffer, lut, PJ_EPD_LUT_TRANSFER_BYTES);
+    ESP_RETURN_ON_ERROR(epd_send_command(0x32), TAG, "display LUT command failed");
+    ESP_RETURN_ON_ERROR(epd_write_bytes(g_epd_lut_buffer, PJ_EPD_LUT_TRANSFER_BYTES),
+                        TAG, "display LUT transfer failed");
+    ESP_RETURN_ON_ERROR(epd_wait_busy(), TAG, "display LUT busy timeout");
+
+    ESP_RETURN_ON_ERROR(epd_send_command(0x3F), TAG, "display LUT gate command failed");
+    ESP_RETURN_ON_ERROR(epd_send_data(lut[153]), TAG, "display LUT gate data failed");
+    ESP_RETURN_ON_ERROR(epd_send_command(0x03), TAG, "display LUT voltage command failed");
+    ESP_RETURN_ON_ERROR(epd_send_data(lut[154]), TAG, "display LUT voltage data failed");
+    ESP_RETURN_ON_ERROR(epd_send_command(0x04), TAG, "display LUT source command failed");
+    ESP_RETURN_ON_ERROR(epd_send_data(lut[155]), TAG, "display LUT source data 0 failed");
+    ESP_RETURN_ON_ERROR(epd_send_data(lut[156]), TAG, "display LUT source data 1 failed");
+    ESP_RETURN_ON_ERROR(epd_send_data(lut[157]), TAG, "display LUT source data 2 failed");
+    ESP_RETURN_ON_ERROR(epd_send_command(0x2C), TAG, "display LUT VCOM command failed");
+    ESP_RETURN_ON_ERROR(epd_send_data(lut[158]), TAG, "display LUT VCOM data failed");
+    return ESP_OK;
 }
 
-static void epd_turn_on_display_part(void)
+static esp_err_t epd_turn_on_display(void)
 {
-    ESP_ERROR_CHECK_WITHOUT_ABORT(epd_send_command(0x22));
-    ESP_ERROR_CHECK_WITHOUT_ABORT(epd_send_data(0xCF));
-    ESP_ERROR_CHECK_WITHOUT_ABORT(epd_send_command(0x20));
-    epd_wait_busy();
+    ESP_RETURN_ON_ERROR(epd_send_command(0x22), TAG, "display control command failed");
+    ESP_RETURN_ON_ERROR(epd_send_data(0xC7), TAG, "display control data failed");
+    ESP_RETURN_ON_ERROR(epd_send_command(0x20), TAG, "display activate command failed");
+    return epd_wait_busy();
 }
 
-static void epd_prepare_partial(void)
+static esp_err_t epd_turn_on_display_part(void)
+{
+    ESP_RETURN_ON_ERROR(epd_send_command(0x22), TAG,
+                        "display partial control command failed");
+    ESP_RETURN_ON_ERROR(epd_send_data(0xCF), TAG, "display partial control data failed");
+    ESP_RETURN_ON_ERROR(epd_send_command(0x20), TAG,
+                        "display partial activate command failed");
+    return epd_wait_busy();
+}
+
+static esp_err_t epd_prepare_partial(void)
 {
     if (g_epd_partial_ready) {
-        return;
+        return ESP_OK;
     }
 
     ESP_LOGI(TAG, "Display partial mode init");
-    ESP_ERROR_CHECK_WITHOUT_ABORT(epd_send_command(0x11));
-    ESP_ERROR_CHECK_WITHOUT_ABORT(epd_send_data(0x01));
-    epd_set_lut(WF_PARTIAL_1IN54);
-    ESP_ERROR_CHECK_WITHOUT_ABORT(epd_send_command(0x37));
-    ESP_ERROR_CHECK_WITHOUT_ABORT(epd_send_data(0x00));
-    ESP_ERROR_CHECK_WITHOUT_ABORT(epd_send_data(0x00));
-    ESP_ERROR_CHECK_WITHOUT_ABORT(epd_send_data(0x00));
-    ESP_ERROR_CHECK_WITHOUT_ABORT(epd_send_data(0x00));
-    ESP_ERROR_CHECK_WITHOUT_ABORT(epd_send_data(0x00));
-    ESP_ERROR_CHECK_WITHOUT_ABORT(epd_send_data(0x40));
-    ESP_ERROR_CHECK_WITHOUT_ABORT(epd_send_data(0x00));
-    ESP_ERROR_CHECK_WITHOUT_ABORT(epd_send_data(0x00));
-    ESP_ERROR_CHECK_WITHOUT_ABORT(epd_send_data(0x00));
-    ESP_ERROR_CHECK_WITHOUT_ABORT(epd_send_data(0x00));
-    ESP_ERROR_CHECK_WITHOUT_ABORT(epd_send_command(0x3C));
-    ESP_ERROR_CHECK_WITHOUT_ABORT(epd_send_data(0x80));
+    ESP_RETURN_ON_ERROR(epd_send_command(0x11), TAG,
+                        "display partial data-entry command failed");
+    ESP_RETURN_ON_ERROR(epd_send_data(0x01), TAG,
+                        "display partial data-entry mode failed");
+    ESP_RETURN_ON_ERROR(epd_set_lut(WF_PARTIAL_1IN54), TAG,
+                        "display partial LUT setup failed");
+    ESP_RETURN_ON_ERROR(epd_send_command(0x37), TAG,
+                        "display partial option command failed");
+    const uint8_t partial_options[] = {0x00, 0x00, 0x00, 0x00, 0x00,
+                                       0x40, 0x00, 0x00, 0x00, 0x00};
+    for (size_t i = 0; i < sizeof(partial_options); i++) {
+        ESP_RETURN_ON_ERROR(epd_send_data(partial_options[i]), TAG,
+                            "display partial option data failed");
+    }
+    ESP_RETURN_ON_ERROR(epd_send_command(0x3C), TAG,
+                        "display partial border command failed");
+    ESP_RETURN_ON_ERROR(epd_send_data(0x80), TAG,
+                        "display partial border data failed");
     g_epd_partial_ready = 1;
+    return ESP_OK;
+}
+
+static esp_err_t epd_controller_configure(void)
+{
+    g_epd_partial_ready = 0;
+    g_epd_refresh_busy_us = 0;
+
+    ESP_RETURN_ON_ERROR(gpio_set_level(EPD_CS_PIN, 1), TAG,
+                        "display deselect during reset failed");
+    ESP_RETURN_ON_ERROR(gpio_set_level(EPD_RST_PIN, 1), TAG,
+                        "display reset high failed");
+    vTaskDelay(pdMS_TO_TICKS(50));
+    ESP_RETURN_ON_ERROR(gpio_set_level(EPD_RST_PIN, 0), TAG,
+                        "display reset low failed");
+    vTaskDelay(pdMS_TO_TICKS(20));
+    ESP_RETURN_ON_ERROR(gpio_set_level(EPD_RST_PIN, 1), TAG,
+                        "display reset release failed");
+    vTaskDelay(pdMS_TO_TICKS(50));
+
+    ESP_RETURN_ON_ERROR(epd_wait_busy(), TAG, "display reset busy timeout");
+    ESP_RETURN_ON_ERROR(epd_send_command(0x12), TAG, "display soft reset failed");
+    ESP_RETURN_ON_ERROR(epd_wait_busy(), TAG, "display soft reset busy timeout");
+    ESP_RETURN_ON_ERROR(epd_send_command(0x01), TAG, "display driver output command failed");
+    ESP_RETURN_ON_ERROR(epd_send_data(0xC7), TAG, "display driver output low failed");
+    ESP_RETURN_ON_ERROR(epd_send_data(0x00), TAG, "display driver output high failed");
+    ESP_RETURN_ON_ERROR(epd_send_data(0x01), TAG, "display driver direction failed");
+    ESP_RETURN_ON_ERROR(epd_send_command(0x11), TAG, "display data-entry command failed");
+    ESP_RETURN_ON_ERROR(epd_send_data(0x01), TAG, "display data-entry mode failed");
+    ESP_RETURN_ON_ERROR(epd_set_windows(0, PJ_DISPLAY_WIDTH - 1,
+                                        PJ_DISPLAY_HEIGHT - 1, 0),
+                        TAG, "display base window failed");
+    ESP_RETURN_ON_ERROR(epd_send_command(0x3C), TAG, "display border command failed");
+    ESP_RETURN_ON_ERROR(epd_send_data(0x01), TAG, "display border data failed");
+    ESP_RETURN_ON_ERROR(epd_send_command(0x18), TAG, "display temperature command failed");
+    ESP_RETURN_ON_ERROR(epd_send_data(0x80), TAG, "display temperature data failed");
+    ESP_RETURN_ON_ERROR(epd_send_command(0x22), TAG, "display load control command failed");
+    ESP_RETURN_ON_ERROR(epd_send_data(0xB1), TAG, "display load control data failed");
+    ESP_RETURN_ON_ERROR(epd_send_command(0x20), TAG, "display load activate failed");
+    ESP_RETURN_ON_ERROR(epd_wait_busy(), TAG, "display load busy timeout");
+    ESP_RETURN_ON_ERROR(epd_set_cursor(0, PJ_DISPLAY_HEIGHT - 1), TAG,
+                        "display base cursor failed");
+    ESP_RETURN_ON_ERROR(epd_set_lut(WF_FULL_1IN54), TAG,
+                        "display full LUT setup failed");
+    return ESP_OK;
 }
 
 static esp_err_t display_init(void)
@@ -2798,34 +2900,11 @@ static esp_err_t display_init(void)
     }
     ESP_RETURN_ON_ERROR(spi_bus_add_device(EPD_SPI_NUM, &devcfg, &g_epd_spi), TAG, "display spi add device failed");
 
-    gpio_set_level(EPD_CS_PIN, 1);
-    gpio_set_level(EPD_RST_PIN, 1);
-    vTaskDelay(pdMS_TO_TICKS(50));
-    gpio_set_level(EPD_RST_PIN, 0);
-    vTaskDelay(pdMS_TO_TICKS(20));
-    gpio_set_level(EPD_RST_PIN, 1);
-    vTaskDelay(pdMS_TO_TICKS(50));
-
-    epd_wait_busy();
-    ESP_ERROR_CHECK_WITHOUT_ABORT(epd_send_command(0x12));
-    epd_wait_busy();
-    ESP_ERROR_CHECK_WITHOUT_ABORT(epd_send_command(0x01));
-    ESP_ERROR_CHECK_WITHOUT_ABORT(epd_send_data(0xC7));
-    ESP_ERROR_CHECK_WITHOUT_ABORT(epd_send_data(0x00));
-    ESP_ERROR_CHECK_WITHOUT_ABORT(epd_send_data(0x01));
-    ESP_ERROR_CHECK_WITHOUT_ABORT(epd_send_command(0x11));
-    ESP_ERROR_CHECK_WITHOUT_ABORT(epd_send_data(0x01));
-    epd_set_windows(0, PJ_DISPLAY_WIDTH - 1, PJ_DISPLAY_HEIGHT - 1, 0);
-    ESP_ERROR_CHECK_WITHOUT_ABORT(epd_send_command(0x3C));
-    ESP_ERROR_CHECK_WITHOUT_ABORT(epd_send_data(0x01));
-    ESP_ERROR_CHECK_WITHOUT_ABORT(epd_send_command(0x18));
-    ESP_ERROR_CHECK_WITHOUT_ABORT(epd_send_data(0x80));
-    ESP_ERROR_CHECK_WITHOUT_ABORT(epd_send_command(0x22));
-    ESP_ERROR_CHECK_WITHOUT_ABORT(epd_send_data(0xB1));
-    ESP_ERROR_CHECK_WITHOUT_ABORT(epd_send_command(0x20));
-    epd_set_cursor(0, PJ_DISPLAY_HEIGHT - 1);
-    epd_wait_busy();
-    epd_set_lut(WF_FULL_1IN54);
+    if (!esp_ptr_dma_capable(g_epd_buffer) || !esp_ptr_dma_capable(g_epd_lut_buffer)) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    ESP_RETURN_ON_ERROR(epd_controller_configure(), TAG,
+                        "display controller configure failed");
 
     g_display_ready = 1;
     return ESP_OK;
@@ -2889,6 +2968,81 @@ static int framebuffer_region_to_epd(const pj_framebuffer_t *fb, const pj_ui_dir
     *x1_out = x1;
     *y1_out = y1;
     return bytes_per_row * height;
+}
+
+static esp_err_t epd_refresh_partial(const pj_framebuffer_t *framebuffer,
+                                     const pj_display_refresh_plan_t *plan)
+{
+    int x0 = 0;
+    int y0 = 0;
+    int x1 = 0;
+    int y1 = 0;
+    int byte_len = framebuffer_region_to_epd(framebuffer, &plan->region,
+                                             &x0, &y0, &x1, &y1);
+    if (byte_len <= 0) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    uint16_t mem_y_start = (uint16_t)(PJ_DISPLAY_HEIGHT - 1 - y0);
+    uint16_t mem_y_end = (uint16_t)(PJ_DISPLAY_HEIGHT - 1 - y1);
+    if (!g_epd_partial_ready) {
+        ESP_RETURN_ON_ERROR(epd_set_windows((uint16_t)x0, mem_y_start,
+                                            (uint16_t)x1, mem_y_end),
+                            TAG, "display partial pre-window failed");
+        ESP_RETURN_ON_ERROR(epd_set_cursor((uint16_t)(x0 >> 3), mem_y_start),
+                            TAG, "display partial pre-cursor failed");
+    }
+    ESP_RETURN_ON_ERROR(epd_prepare_partial(), TAG,
+                        "display partial mode preparation failed");
+    ESP_LOGI(TAG, "Display partial refresh x=%d y=%d w=%d h=%d bytes=%d ram=0x24",
+             x0, y0, x1 - x0 + 1, y1 - y0 + 1, byte_len);
+    ESP_RETURN_ON_ERROR(epd_set_windows((uint16_t)x0, mem_y_start,
+                                        (uint16_t)x1, mem_y_end),
+                        TAG, "display partial window failed");
+    ESP_RETURN_ON_ERROR(epd_set_cursor((uint16_t)(x0 >> 3), mem_y_start),
+                        TAG, "display partial cursor failed");
+    /* The full/base refresh seeds RAM 0x24 and 0x26. Rewriting 0x26 for
+     * each patch causes global contrast shifts on this panel revision. */
+    ESP_RETURN_ON_ERROR(epd_send_command(0x24), TAG,
+                        "display partial RAM command failed");
+    ESP_RETURN_ON_ERROR(epd_write_bytes(g_epd_buffer, byte_len), TAG,
+                        "display partial RAM transfer failed");
+    ESP_RETURN_ON_ERROR(epd_turn_on_display_part(), TAG,
+                        "display partial activation failed");
+    return ESP_OK;
+}
+
+static esp_err_t epd_refresh_full(const pj_framebuffer_t *framebuffer)
+{
+    g_epd_partial_ready = 0;
+    ESP_RETURN_ON_ERROR(epd_set_lut(WF_FULL_1IN54), TAG,
+                        "display full LUT preparation failed");
+    ESP_RETURN_ON_ERROR(epd_send_command(0x11), TAG,
+                        "display full data-entry command failed");
+    ESP_RETURN_ON_ERROR(epd_send_data(0x01), TAG,
+                        "display full data-entry mode failed");
+    ESP_RETURN_ON_ERROR(epd_send_command(0x3C), TAG,
+                        "display full border command failed");
+    ESP_RETURN_ON_ERROR(epd_send_data(0x01), TAG,
+                        "display full border data failed");
+    framebuffer_to_epd(framebuffer);
+    ESP_RETURN_ON_ERROR(epd_set_windows(0, PJ_DISPLAY_WIDTH - 1,
+                                        PJ_DISPLAY_HEIGHT - 1, 0),
+                        TAG, "display full window failed");
+    ESP_RETURN_ON_ERROR(epd_set_cursor(0, PJ_DISPLAY_HEIGHT - 1), TAG,
+                        "display full cursor 0x24 failed");
+    ESP_RETURN_ON_ERROR(epd_send_command(0x24), TAG,
+                        "display full RAM 0x24 command failed");
+    ESP_RETURN_ON_ERROR(epd_write_bytes(g_epd_buffer, PJ_FRAMEBUFFER_BYTES), TAG,
+                        "display full RAM 0x24 transfer failed");
+    ESP_RETURN_ON_ERROR(epd_set_cursor(0, PJ_DISPLAY_HEIGHT - 1), TAG,
+                        "display full cursor 0x26 failed");
+    ESP_RETURN_ON_ERROR(epd_send_command(0x26), TAG,
+                        "display full RAM 0x26 command failed");
+    ESP_RETURN_ON_ERROR(epd_write_bytes(g_epd_buffer, PJ_FRAMEBUFFER_BYTES), TAG,
+                        "display full RAM 0x26 transfer failed");
+    ESP_RETURN_ON_ERROR(epd_turn_on_display(), TAG, "display full activation failed");
+    return ESP_OK;
 }
 
 static int storage_refresh_capacity(void)
@@ -6551,87 +6705,95 @@ int pj_board_update_time_state(pj_ui_context_t *ui)
 int pj_board_display_framebuffer(const pj_framebuffer_t *fb, const pj_ui_dirty_region_t *dirty)
 {
 #ifdef ESP_PLATFORM
-    if (fb == NULL || !g_display_ready || g_epd_spi == NULL) {
+    if (fb == NULL || g_epd_spi == NULL) {
         if (!g_display_warning_logged) {
             ESP_LOGW(TAG, "Display refresh skipped: display not initialized");
             g_display_warning_logged = 1;
         }
         return 0;
     }
+    if (!g_display_ready) {
+        esp_err_t recovery_err = epd_controller_configure();
+        if (recovery_err != ESP_OK) {
+            if (!g_display_warning_logged) {
+                ESP_LOGE(TAG, "Display recovery retry failed: %s",
+                         esp_err_to_name(recovery_err));
+                g_display_warning_logged = 1;
+            }
+            return 0;
+        }
+        g_display_ready = 1;
+        g_display_warning_logged = 0;
+        g_status.display = PJ_BOARD_SERVICE_READY;
+        ESP_LOGI(TAG, "Display controller recovered; retrying with full base refresh");
+    }
+
     int64_t refresh_started_us = esp_timer_get_time();
+    g_epd_refresh_busy_us = 0;
     pj_display_refresh_plan_t plan = pj_display_refresh_plan(
         &g_epd_refresh_policy, fb, &g_epd_shadow_fb, g_epd_shadow_valid, dirty);
     if (plan.kind == PJ_DISPLAY_REFRESH_NOOP) {
-        pj_display_refresh_record(&g_epd_refresh_policy, &plan, 1, 0, 0);
+        (void)pj_display_refresh_complete(&g_epd_refresh_policy, &g_epd_shadow_fb,
+                                          &g_epd_shadow_valid, fb, &plan,
+                                          1, 0, 0);
         ESP_LOGI(TAG, "Display refresh no-op requests=%" PRIu64 " noops=%" PRIu64,
                  g_epd_refresh_policy.metrics.requests,
                  g_epd_refresh_policy.metrics.noops);
         return 1;
     }
+    esp_err_t refresh_err;
     if (plan.kind == PJ_DISPLAY_REFRESH_PARTIAL) {
-        int x0 = 0;
-        int y0 = 0;
-        int x1 = 0;
-        int y1 = 0;
-        int byte_len = framebuffer_region_to_epd(fb, &plan.region, &x0, &y0, &x1, &y1);
-        if (byte_len > 0) {
-            uint16_t mem_y_start = (uint16_t)(PJ_DISPLAY_HEIGHT - 1 - y0);
-            uint16_t mem_y_end = (uint16_t)(PJ_DISPLAY_HEIGHT - 1 - y1);
-            if (!g_epd_partial_ready) {
-                epd_set_windows((uint16_t)x0, mem_y_start, (uint16_t)x1, mem_y_end);
-                epd_set_cursor((uint16_t)(x0 >> 3), mem_y_start);
-            }
-            epd_prepare_partial();
-            ESP_LOGI(TAG, "Display partial refresh x=%d y=%d w=%d h=%d bytes=%d ram=0x24",
-                     x0, y0, x1 - x0 + 1, y1 - y0 + 1, byte_len);
-            epd_set_windows((uint16_t)x0, mem_y_start, (uint16_t)x1, mem_y_end);
-            epd_set_cursor((uint16_t)(x0 >> 3), mem_y_start);
-            /* Waveshare's 1.54 V2 partial path writes only the new RAM plane here.
-             * The full/base refresh seeds both 0x24 and 0x26; rewriting 0x26 per
-             * patch causes global contrast shifts on this panel.
-             */
-            ESP_ERROR_CHECK_WITHOUT_ABORT(epd_send_command(0x24));
-            ESP_ERROR_CHECK_WITHOUT_ABORT(epd_write_bytes(g_epd_buffer, byte_len));
-            epd_turn_on_display_part();
-            pj_display_refresh_apply_shadow(&g_epd_shadow_fb, fb, &plan);
-            uint32_t latency_us = (uint32_t)(esp_timer_get_time() - refresh_started_us);
-            pj_display_refresh_record(&g_epd_refresh_policy, &plan, 1, latency_us, 0);
-            ESP_LOGI(TAG, "Display metrics full=%" PRIu64 " partial=%" PRIu64
-                     " noop=%" PRIu64 " changed=%" PRIu32 " latency_us=%" PRIu32,
-                     g_epd_refresh_policy.metrics.applied_full,
-                     g_epd_refresh_policy.metrics.applied_partial,
-                     g_epd_refresh_policy.metrics.noops,
-                     plan.changed_pixels, latency_us);
-            return 1;
-        }
+        refresh_err = epd_refresh_partial(fb, &plan);
+    } else {
+        ESP_LOGI(TAG, "Display full refresh%s",
+                 plan.promoted_to_full ? " (partial cadence)" : "");
+        refresh_err = epd_refresh_full(fb);
     }
-    ESP_LOGI(TAG, "Display full refresh%s",
-             plan.promoted_to_full ? " (partial cadence)" : "");
-    g_epd_partial_ready = 0;
-    epd_set_lut(WF_FULL_1IN54);
-    ESP_ERROR_CHECK_WITHOUT_ABORT(epd_send_command(0x11));
-    ESP_ERROR_CHECK_WITHOUT_ABORT(epd_send_data(0x01));
-    ESP_ERROR_CHECK_WITHOUT_ABORT(epd_send_command(0x3C));
-    ESP_ERROR_CHECK_WITHOUT_ABORT(epd_send_data(0x01));
-    framebuffer_to_epd(fb);
-    epd_set_windows(0, PJ_DISPLAY_WIDTH - 1, PJ_DISPLAY_HEIGHT - 1, 0);
-    epd_set_cursor(0, PJ_DISPLAY_HEIGHT - 1);
-    ESP_ERROR_CHECK_WITHOUT_ABORT(epd_send_command(0x24));
-    ESP_ERROR_CHECK_WITHOUT_ABORT(epd_write_bytes(g_epd_buffer, PJ_FRAMEBUFFER_BYTES));
-    epd_set_cursor(0, PJ_DISPLAY_HEIGHT - 1);
-    ESP_ERROR_CHECK_WITHOUT_ABORT(epd_send_command(0x26));
-    ESP_ERROR_CHECK_WITHOUT_ABORT(epd_write_bytes(g_epd_buffer, PJ_FRAMEBUFFER_BYTES));
-    epd_turn_on_display();
-    pj_display_refresh_apply_shadow(&g_epd_shadow_fb, fb, &plan);
-    g_epd_shadow_valid = 1;
     uint32_t latency_us = (uint32_t)(esp_timer_get_time() - refresh_started_us);
-    pj_display_refresh_record(&g_epd_refresh_policy, &plan, 1, latency_us, 0);
+    uint32_t busy_time_us = g_epd_refresh_busy_us;
+    if (refresh_err != ESP_OK) {
+        (void)pj_display_refresh_complete(&g_epd_refresh_policy, &g_epd_shadow_fb,
+                                          &g_epd_shadow_valid, fb, &plan,
+                                          0, latency_us, busy_time_us);
+        g_epd_partial_ready = 0;
+        g_display_ready = 0;
+        g_status.display = PJ_BOARD_SERVICE_ERROR;
+        (void)snprintf(g_status.last_error, sizeof(g_status.last_error),
+                       "display %s refresh failed: %s",
+                       plan.kind == PJ_DISPLAY_REFRESH_PARTIAL ? "partial" : "full",
+                       esp_err_to_name(refresh_err));
+        size_t dma_free = heap_caps_get_free_size(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+        size_t dma_largest = heap_caps_get_largest_free_block(
+            MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+        ESP_LOGE(TAG, "%s; dma_free=%zu dma_largest=%zu latency_us=%" PRIu32
+                 " busy_us=%" PRIu32 " errors=%" PRIu64,
+                 g_status.last_error, dma_free, dma_largest, latency_us,
+                 busy_time_us, g_epd_refresh_policy.metrics.errors);
+
+        esp_err_t recovery_err = epd_controller_configure();
+        if (recovery_err == ESP_OK) {
+            g_display_ready = 1;
+            g_display_warning_logged = 0;
+            g_status.display = PJ_BOARD_SERVICE_READY;
+            ESP_LOGW(TAG, "Display controller recovered; UI frame remains dirty for full retry");
+        } else {
+            ESP_LOGE(TAG, "Display controller recovery failed: %s; retry deferred",
+                     esp_err_to_name(recovery_err));
+        }
+        return 0;
+    }
+
+    (void)pj_display_refresh_complete(&g_epd_refresh_policy, &g_epd_shadow_fb,
+                                      &g_epd_shadow_valid, fb, &plan,
+                                      1, latency_us, busy_time_us);
     ESP_LOGI(TAG, "Display metrics full=%" PRIu64 " partial=%" PRIu64
-             " noop=%" PRIu64 " changed=%" PRIu32 " latency_us=%" PRIu32,
+             " noop=%" PRIu64 " errors=%" PRIu64 " changed=%" PRIu32
+             " latency_us=%" PRIu32 " busy_us=%" PRIu32,
              g_epd_refresh_policy.metrics.applied_full,
              g_epd_refresh_policy.metrics.applied_partial,
              g_epd_refresh_policy.metrics.noops,
-             plan.changed_pixels, latency_us);
+             g_epd_refresh_policy.metrics.errors,
+             plan.changed_pixels, latency_us, busy_time_us);
     return 1;
 #else
     (void)fb;

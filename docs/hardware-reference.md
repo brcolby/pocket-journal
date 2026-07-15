@@ -109,15 +109,23 @@ Important constraints from the panel datasheet:
   ghosting tests on the shipping enclosure and temperature range.
 - The refresh planner clips dirty regions to the panel, byte-aligns partial X
   bounds, tightens transfers to pixels that differ from the current driver
-  driver shadow, and suppresses byte-identical partial updates. It promotes the
+  shadow, and suppresses byte-identical partial updates. It promotes the
   30th successful partial update to a full refresh until hardware testing
   establishes a board-profile cadence. The driver logs cumulative full,
-  partial, and no-op counts plus changed pixels and total update latency.
+  partial, no-op, and error counts plus changed pixels, total update latency,
+  and BUSY time.
 - A partial update copies only its planned transfer region into the panel
   shadow. Pixels outside the invalidated region remain unchanged in the shadow,
   so an incomplete dirty-region declaration cannot hide a later required
-  update. BUSY timeout and SPI error propagation must be completed before the
-  driver shadow can be treated as controller-confirmed state.
+  update. The shadow and successful-refresh metrics advance together only after
+  every SPI operation and the final BUSY wait succeed. Any failure invalidates
+  the shadow and partial-mode state, resets and reconfigures the controller, and
+  leaves the UI frame dirty so the next attempt is a full base refresh.
+- Single-byte transactions use the SPI descriptor's inline data. Waveform LUT
+  data is copied from flash into a dedicated 4-byte-aligned DMA buffer, and the
+  framebuffer is also DMA-resident. Display transactions disable the SPI
+  driver's automatic bounce-buffer allocation; an invalid future buffer fails
+  explicitly instead of consuming a private DMA allocation during a refresh.
 - A display update is not complete until BUSY deasserts. Do not cut `EPD3V3`,
   reset the controller, or start another update during master activation.
 - Command `0x10` with data `0x01` enters panel deep sleep. BUSY then remains

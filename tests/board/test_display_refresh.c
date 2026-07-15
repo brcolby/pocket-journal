@@ -125,6 +125,10 @@ static void test_failed_refresh_records_error_without_advancing_cadence(void)
     pj_display_refresh_policy_t policy;
     pj_display_refresh_policy_init(&policy, 30);
     policy.partial_since_full = 4;
+    pj_framebuffer_t framebuffer = {0};
+    pj_framebuffer_t shadow = {0};
+    int shadow_valid = 1;
+    set_pixel(&framebuffer, 1, 0);
     const pj_display_refresh_plan_t plan = {
         .kind = PJ_DISPLAY_REFRESH_PARTIAL,
         .region = {.x = 0, .y = 0, .width = 8, .height = 2, .partial = 1},
@@ -132,11 +136,79 @@ static void test_failed_refresh_records_error_without_advancing_cadence(void)
         .changed_pixels = 1,
         .transfer_bytes = 2,
     };
-    pj_display_refresh_record(&policy, &plan, 0, 200, 100);
+    assert(!pj_display_refresh_complete(&policy, &shadow, &shadow_valid,
+                                        &framebuffer, &plan, 0, 200, 100));
     assert(policy.metrics.errors == 1);
     assert(policy.metrics.applied_partial == 0);
     assert(policy.metrics.transfer_bytes == 0);
     assert(policy.partial_since_full == 0);
+    assert(!shadow_valid);
+    assert(!get_pixel(&shadow, 1, 0));
+}
+
+static void test_successful_refresh_atomically_updates_shadow_and_metrics(void)
+{
+    pj_display_refresh_policy_t policy;
+    pj_display_refresh_policy_init(&policy, 30);
+    pj_framebuffer_t framebuffer = {0};
+    pj_framebuffer_t shadow = {0};
+    int shadow_valid = 1;
+    set_pixel(&framebuffer, 1, 0);
+    const pj_display_refresh_plan_t partial = {
+        .kind = PJ_DISPLAY_REFRESH_PARTIAL,
+        .region = {.x = 0, .y = 0, .width = 8, .height = 2, .partial = 1},
+        .requested_area = 16,
+        .changed_pixels = 1,
+        .transfer_bytes = 2,
+        .requested_partial = 1,
+    };
+    assert(pj_display_refresh_complete(&policy, &shadow, &shadow_valid,
+                                       &framebuffer, &partial, 1, 200, 100));
+    assert(shadow_valid);
+    assert(get_pixel(&shadow, 1, 0));
+    assert(policy.metrics.applied_partial == 1);
+    assert(policy.metrics.transfer_bytes == 2);
+    assert(policy.metrics.busy_time_us == 100);
+
+    memset(&framebuffer, 0, sizeof(framebuffer));
+    const pj_display_refresh_plan_t full = {
+        .kind = PJ_DISPLAY_REFRESH_FULL,
+        .region = {.x = 0, .y = 0, .width = PJ_DISPLAY_WIDTH,
+                   .height = PJ_DISPLAY_HEIGHT, .partial = 0},
+        .requested_area = PJ_DISPLAY_WIDTH * PJ_DISPLAY_HEIGHT,
+        .changed_pixels = 1,
+        .transfer_bytes = PJ_FRAMEBUFFER_BYTES * 2,
+    };
+    shadow_valid = 0;
+    assert(pj_display_refresh_complete(&policy, &shadow, &shadow_valid,
+                                       &framebuffer, &full, 1, 400, 300));
+    assert(shadow_valid);
+    assert(!get_pixel(&shadow, 1, 0));
+    assert(policy.metrics.applied_full == 1);
+}
+
+static void test_partial_refresh_cannot_establish_an_invalid_shadow(void)
+{
+    pj_display_refresh_policy_t policy;
+    pj_display_refresh_policy_init(&policy, 30);
+    pj_framebuffer_t framebuffer = {0};
+    pj_framebuffer_t shadow = {0};
+    int shadow_valid = 0;
+    set_pixel(&framebuffer, 1, 0);
+    const pj_display_refresh_plan_t partial = {
+        .kind = PJ_DISPLAY_REFRESH_PARTIAL,
+        .region = {.x = 0, .y = 0, .width = 8, .height = 2, .partial = 1},
+        .requested_area = 16,
+        .changed_pixels = 1,
+        .transfer_bytes = 2,
+        .requested_partial = 1,
+    };
+    assert(!pj_display_refresh_complete(&policy, &shadow, &shadow_valid,
+                                        &framebuffer, &partial, 1, 200, 100));
+    assert(!shadow_valid);
+    assert(!get_pixel(&shadow, 1, 0));
+    assert(policy.metrics.errors == 1);
+    assert(policy.metrics.applied_partial == 0);
 }
 
 int main(void)
@@ -147,6 +219,8 @@ int main(void)
     test_invalid_shadow_and_cadence_promote_to_full();
     test_partial_shadow_copy_does_not_hide_out_of_region_change();
     test_failed_refresh_records_error_without_advancing_cadence();
+    test_successful_refresh_atomically_updates_shadow_and_metrics();
+    test_partial_refresh_cannot_establish_an_invalid_shadow();
     puts("display refresh tests passed");
     return 0;
 }

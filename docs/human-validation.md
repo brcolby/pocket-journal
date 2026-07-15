@@ -203,10 +203,11 @@ complete. Restore the `human` labels only when one exact firmware build is ready
 
 - **Controls, display, and recording:** `pocket-journal-2ji`,
   `pocket-journal-d8j`, `pocket-journal-nz5`, `pocket-journal-e43`,
-  `pocket-journal-te0`, and `pocket-journal-jjt` wait on the current input,
-  refresh, Timer, interval, and recording fixes. The next batch should cover
-  physical legibility, touch edges, held AUX, playback and recording Back,
-  three-note paging, repeated partial refresh, ghosting, and sleep/wake recovery.
+  `pocket-journal-te0`, `pocket-journal-jjt`, and `pocket-journal-1vc` wait on
+  the current input, refresh, Timer, interval, and recording fixes. The next
+  batch should cover physical legibility, touch edges, held AUX, playback and
+  recording Back, three-note paging, repeated partial refresh without SPI DMA
+  allocation errors, ghosting, and sleep/wake or display-error recovery.
 - **Settings, LAN APIs, and storage:** `pocket-journal-wsl`,
   `pocket-journal-aw7`, `pocket-journal-3ie`, `pocket-journal-bmz`,
   `pocket-journal-lhl`, and `pocket-journal-pc3` wait on working

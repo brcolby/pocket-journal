@@ -68,6 +68,14 @@ void pj_display_refresh_record(pj_display_refresh_policy_t *policy,
 void pj_display_refresh_apply_shadow(pj_framebuffer_t *shadow,
                                      const pj_framebuffer_t *framebuffer,
                                      const pj_display_refresh_plan_t *plan);
+int pj_display_refresh_complete(pj_display_refresh_policy_t *policy,
+                                pj_framebuffer_t *shadow,
+                                int *shadow_valid,
+                                const pj_framebuffer_t *framebuffer,
+                                const pj_display_refresh_plan_t *plan,
+                                int success,
+                                uint32_t latency_us,
+                                uint32_t busy_time_us);
 
 #ifdef __cplusplus
 }
