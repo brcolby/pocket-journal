@@ -158,6 +158,9 @@ static void test_status_names(void)
     assert(strcmp(pj_time_sync_publication_name(
                       PJ_TIME_SYNC_PUBLICATION_TIMEZONE_REQUIRED),
                   "timezone_required") == 0);
+    assert(strcmp(pj_time_sync_publication_name(
+                      PJ_TIME_SYNC_PUBLICATION_CIVIL_FAILED),
+                  "civil_failed") == 0);
     assert(strcmp(pj_time_sync_correction_name(
                       PJ_TIME_SYNC_CORRECTION_STEP_FORWARD),
                   "step_forward") == 0);

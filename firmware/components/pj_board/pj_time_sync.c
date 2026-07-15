@@ -246,6 +246,7 @@ const char *pj_time_sync_publication_name(pj_time_sync_publication_t publication
     case PJ_TIME_SYNC_PUBLICATION_TIMEZONE_REQUIRED: return "timezone_required";
     case PJ_TIME_SYNC_PUBLICATION_PUBLISHED: return "published";
     case PJ_TIME_SYNC_PUBLICATION_RTC_FAILED: return "rtc_failed";
+    case PJ_TIME_SYNC_PUBLICATION_CIVIL_FAILED: return "civil_failed";
     default: return "not_ready";
     }
 }

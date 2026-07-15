@@ -175,13 +175,20 @@ The firmware also accepts a small line protocol on the USB Serial/JTAG console f
 ```text
 PJ_STATUS [request_id=ID]
 PJ_WIFI_HEX 4c61622057694669 70617373776f7264 746f6b656e
-PJ_TIME 2026 06 20 14 05
+PJ_TIME 2026 06 20 14 05 -420
 PJ_WIPE_RECORDINGS [request_id=ID]
 PJ_AUDIO_TONE [0|1|-] [dout_gpio] [pa=0|1|-] [dout=gpio] [pwr=0|1|-] [gpio44=0x00..0xff] [gp45=0x00..0xff]
 PJ_MIC_CHECK [duration_ms] [ms=1..10000] [gain_db=0..42]
 ```
 
 `PJ_WIFI_HEX` stores hex-encoded UTF-8 `ssid`, `password`, and bearer-token strings in NVS. It intentionally does not echo credentials back over serial.
+`PJ_TIME` and its `PJ_SET_TIME` alias accept an optional sixth fixed UTC-offset
+field in minutes, from `-840` through `840`. When supplied, firmware persists
+the offset and uses it to project later background SNTP UTC results into the
+local civil clock and PCF85063 RTC. The legacy five-field form remains valid
+and leaves any saved offset unchanged. A fixed offset does not automatically
+track daylight-saving transitions; the partner should resend time when the
+host offset changes.
 `PJ_AUDIO_TONE` plays a generated diagnostic tone. Its optional first argument forces the speaker PA GPIO level; `-` keeps the firmware default. Its optional second argument temporarily routes I2S TX data to a DOUT GPIO for board pin-map diagnosis. The named arguments expose the same probes plus temporary audio power GPIO and ES8311 register overrides; the firmware restores the normal route, power level, and register values after the tone.
 `PJ_MIC_CHECK` samples the ES8311 microphone path without creating a note file and returns input statistics: `peak`, `avg_abs`, `clipped`, `near_zero`, `read_errors`, and `silent`. The production recording gain is `42 dB`; use lower diagnostic overrides only when measuring input headroom.
 

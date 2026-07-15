@@ -128,8 +128,13 @@ included in the next identified firmware build.
   volume-zero, sound-quality, and PA-idle judgment remains.
 - **Automatic time:** `pocket-journal-223` validates minute-precision host
   local/UTC anchors during USB provisioning and emits a structured retry
-  command without reprovisioning or rotating the saved token. Background SNTP
-  remains `pocket-journal-2f2` after connectivity works.
+  command without reprovisioning or rotating the saved token.
+  `pocket-journal-2f2` now persists the host's bounded fixed UTC offset,
+  projects successful background SNTP UTC through that offset, publishes the
+  correction through the time-controller pending path, and persists the local
+  civil result to the RTC. The next batch should confirm fresh-boot automatic
+  correction after Wi-Fi obtains an IP and truthful `published` or
+  `rtc_failed` status.
 
 Software-only closures in this batch do not need hardware repetition:
 `pocket-journal-1dx`, `pocket-journal-cf4`, `pocket-journal-1qk`,

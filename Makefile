@@ -19,6 +19,7 @@ STORAGE_TEST_BIN := build/test_storage
 STORAGE_COORDINATOR_TEST_BIN := build/test_storage_coordinator
 RUNTIME_DIAGNOSTICS_TEST_BIN := build/test_runtime_diagnostics
 DISPLAY_REFRESH_TEST_BIN := build/test_display_refresh
+TIME_CIVIL_TEST_BIN := build/test_time_civil
 TIME_CLOCK_TEST_BIN := build/test_time_clock
 RTC_WAKE_TEST_BIN := build/test_rtc_wake
 TIME_CONTROLLER_TEST_BIN := build/test_time_controller
@@ -152,6 +153,12 @@ test-input:
 		tests/board/test_display_refresh.c \
 		-o $(DISPLAY_REFRESH_TEST_BIN)
 	$(DISPLAY_REFRESH_TEST_BIN)
+	$(CC) $(CFLAGS) \
+		-Ifirmware/components/pj_board/include \
+		firmware/components/pj_board/pj_time_civil.c \
+		tests/board/test_time_civil.c \
+		-o $(TIME_CIVIL_TEST_BIN)
+	$(TIME_CIVIL_TEST_BIN)
 	$(CC) $(CFLAGS) \
 		-Ifirmware/components/pj_board/include \
 		-Ifirmware/components/pj_ui/include \

@@ -32,6 +32,7 @@ typedef enum {
     PJ_TIME_SYNC_PUBLICATION_TIMEZONE_REQUIRED,
     PJ_TIME_SYNC_PUBLICATION_PUBLISHED,
     PJ_TIME_SYNC_PUBLICATION_RTC_FAILED,
+    PJ_TIME_SYNC_PUBLICATION_CIVIL_FAILED,
 } pj_time_sync_publication_t;
 
 typedef enum {
@@ -54,6 +55,8 @@ typedef struct {
     pj_time_sync_correction_t correction;
     uint8_t has_ip;
     uint8_t time_known;
+    uint8_t utc_offset_known;
+    int16_t utc_offset_minutes;
     uint32_t attempt_count;
     uint32_t backoff_ms;
     uint64_t next_attempt_ms;

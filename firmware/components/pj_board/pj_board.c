@@ -12,6 +12,7 @@
 #include "pj_settings.h"
 #include "pj_storage.h"
 #include "pj_storage_coordinator.h"
+#include "pj_time_civil.h"
 #include "pj_time_clock.h"
 #include "pj_time_controller.h"
 #include "pj_time_sync.h"
@@ -111,6 +112,7 @@
 #define PJ_SETTINGS_VERSION 2
 #define PJ_NVS_TIME_STATE "time_state"
 #define PJ_NVS_WAKE_PLAN "wake_plan"
+#define PJ_NVS_UTC_OFFSET "utc_offset"
 #define PJ_WIFI_SSID_MAX_LEN 32
 #define PJ_WIFI_PASSWORD_MAX_LEN 64
 #define EPD_SPI_NUM SPI2_HOST
@@ -338,6 +340,8 @@ static int g_ui_note_transcript_view;
 static char g_wifi_ssid[PJ_WIFI_SSID_MAX_LEN + 1];
 static char g_wifi_password[PJ_WIFI_PASSWORD_MAX_LEN + 1];
 static int g_wifi_credentials_stored;
+static int g_utc_offset_known;
+static int g_utc_offset_minutes;
 static uint32_t g_record_sequence;
 static portMUX_TYPE g_time_lock = portMUX_INITIALIZER_UNLOCKED;
 static portMUX_TYPE g_audio_state_lock = portMUX_INITIALIZER_UNLOCKED;
@@ -406,12 +410,16 @@ static uint64_t g_interval_alert_ack_pending;
 static uint32_t g_alert_audio_stop_completed_generation;
 static interval_reset_state_t g_interval_reset;
 
-static esp_err_t rtc_write_status_time(void);
 static uint64_t board_monotonic_ms(void);
 static esp_err_t connectivity_runtime_start(void);
 static void connectivity_state_init(void);
 static void connectivity_state_snapshot(pj_wifi_state_t *wifi,
                                         pj_time_sync_state_t *time_sync);
+static int board_time_publish(int hour, int minute, int year, int month, int day,
+                              int second, uint64_t monotonic_ms, int trusted);
+static void board_time_mark_pending(void);
+static esp_err_t rtc_write_civil_time(int hour, int minute, int year,
+                                      int month, int day, int second);
 static int board_time_model_clock(pj_time_clock_t *clock);
 static int time_state_initialize(void);
 static int time_state_project(pj_ui_context_t *ui);
@@ -1325,6 +1333,8 @@ static void connectivity_state_init(void)
     portENTER_CRITICAL(&g_connectivity_lock);
     pj_wifi_state_init(&g_wifi_state, g_wifi_credentials_stored, now_ms);
     pj_time_sync_init(&g_time_sync_state, g_time_wall_trusted, now_ms);
+    g_time_sync_state.utc_offset_known = g_utc_offset_known != 0;
+    g_time_sync_state.utc_offset_minutes = (int16_t)g_utc_offset_minutes;
     g_connectivity_state_initialized = 1;
     portEXIT_CRITICAL(&g_connectivity_lock);
 }
@@ -1355,9 +1365,41 @@ static int format_utc_time(int64_t epoch_s, char *out, size_t out_size)
     return strftime(out, out_size, "%Y-%m-%dT%H:%M:%SZ", &utc) != 0;
 }
 
-/* LwIP provides this hook as weak. Validate the UTC response before allowing
- * it to replace POSIX system time. Local civil/RTC publication stays gated
- * until the product has an explicit timezone rule. */
+static pj_time_sync_publication_t publish_sntp_civil_time(int64_t utc_epoch_s,
+                                                          uint64_t now_ms)
+{
+    int offset_known;
+    int offset_minutes;
+    portENTER_CRITICAL(&g_connectivity_lock);
+    offset_known = g_utc_offset_known;
+    offset_minutes = g_utc_offset_minutes;
+    portEXIT_CRITICAL(&g_connectivity_lock);
+    if (!offset_known) {
+        return PJ_TIME_SYNC_PUBLICATION_TIMEZONE_REQUIRED;
+    }
+
+    pj_time_civil_t civil;
+    if (!pj_time_civil_from_utc(utc_epoch_s, offset_minutes, &civil) ||
+        !board_time_publish(civil.hour, civil.minute, civil.year, civil.month,
+                            civil.day, civil.second, now_ms, 1)) {
+        return PJ_TIME_SYNC_PUBLICATION_CIVIL_FAILED;
+    }
+    board_time_mark_pending();
+    esp_err_t rtc_err = rtc_write_civil_time(
+        civil.hour, civil.minute, civil.year, civil.month, civil.day,
+        civil.second);
+    if (rtc_err != ESP_OK) {
+        (void)snprintf(g_status.last_error, sizeof(g_status.last_error),
+                       "SNTP time published but RTC persistence failed: %s",
+                       esp_err_to_name(rtc_err));
+        ESP_LOGW(TAG, "%s", g_status.last_error);
+        return PJ_TIME_SYNC_PUBLICATION_RTC_FAILED;
+    }
+    return PJ_TIME_SYNC_PUBLICATION_PUBLISHED;
+}
+
+/* LwIP provides this hook as weak. Validate UTC before publishing it to the
+ * POSIX clock and projecting it through the configured fixed offset. */
 void sntp_sync_time(struct timeval *tv)
 {
     uint64_t now_ms = board_monotonic_ms();
@@ -1396,10 +1438,16 @@ void sntp_sync_time(struct timeval *tv)
     }
     pj_time_sync_correction_t correction = g_time_sync_state.correction;
     portEXIT_CRITICAL(&g_connectivity_lock);
+
+    pj_time_sync_publication_t publication = publish_sntp_civil_time(
+        (int64_t)tv->tv_sec, now_ms);
+    portENTER_CRITICAL(&g_connectivity_lock);
+    pj_time_sync_set_publication(&g_time_sync_state, publication);
+    portEXIT_CRITICAL(&g_connectivity_lock);
     esp_sntp_set_sync_status(SNTP_SYNC_STATUS_COMPLETED);
-    ESP_LOGI(TAG,
-             "SNTP UTC acquired (%s); local civil/RTC publication awaits timezone policy",
-             pj_time_sync_correction_name(correction));
+    ESP_LOGI(TAG, "SNTP UTC acquired (%s), civil publication=%s",
+             pj_time_sync_correction_name(correction),
+             pj_time_sync_publication_name(publication));
 }
 
 static esp_err_t connectivity_sntp_ensure_initialized(void)
@@ -2048,6 +2096,61 @@ static void settings_apply_codec_volume(int codec_volume)
     if (result != ESP_CODEC_DEV_OK) {
         ESP_LOGW(TAG, "Codec volume update failed: %s", esp_err_to_name((esp_err_t)result));
     }
+}
+
+static void time_offset_load(void)
+{
+    nvs_handle_t nvs;
+    if (nvs_open(PJ_NVS_NAMESPACE, NVS_READONLY, &nvs) != ESP_OK) {
+        return;
+    }
+    int32_t stored = 0;
+    esp_err_t err = nvs_get_i32(nvs, PJ_NVS_UTC_OFFSET, &stored);
+    nvs_close(nvs);
+    if (err == ESP_OK && pj_time_utc_offset_valid((int)stored)) {
+        g_utc_offset_minutes = (int)stored;
+        g_utc_offset_known = 1;
+        ESP_LOGI(TAG, "Fixed UTC offset loaded from NVS: %+d minutes",
+                 g_utc_offset_minutes);
+    } else if (err == ESP_OK) {
+        ESP_LOGW(TAG, "Ignoring invalid fixed UTC offset in NVS: %" PRId32,
+                 stored);
+    }
+}
+
+static esp_err_t time_offset_save(int offset_minutes)
+{
+    if (!pj_time_utc_offset_valid(offset_minutes)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    nvs_handle_t nvs;
+    esp_err_t err = nvs_open(PJ_NVS_NAMESPACE, NVS_READWRITE, &nvs);
+    if (err != ESP_OK) {
+        return err;
+    }
+    err = nvs_set_i32(nvs, PJ_NVS_UTC_OFFSET, (int32_t)offset_minutes);
+    if (err == ESP_OK) {
+        err = nvs_commit(nvs);
+    }
+    nvs_close(nvs);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    portENTER_CRITICAL(&g_connectivity_lock);
+    g_utc_offset_minutes = offset_minutes;
+    g_utc_offset_known = 1;
+    if (g_connectivity_state_initialized) {
+        g_time_sync_state.utc_offset_known = 1;
+        g_time_sync_state.utc_offset_minutes = (int16_t)offset_minutes;
+        if (g_time_sync_state.publication ==
+            PJ_TIME_SYNC_PUBLICATION_TIMEZONE_REQUIRED) {
+            g_time_sync_state.publication = PJ_TIME_SYNC_PUBLICATION_NOT_READY;
+        }
+    }
+    portEXIT_CRITICAL(&g_connectivity_lock);
+    ESP_LOGI(TAG, "Fixed UTC offset persisted: %+d minutes", offset_minutes);
+    return ESP_OK;
 }
 
 static void wifi_load_provisioning(void)
@@ -4240,6 +4343,22 @@ static int board_time_publish(int hour, int minute, int year, int month, int day
     return 1;
 }
 
+static int board_time_initialize_unknown(void)
+{
+    pj_time_clock_anchor_t anchor;
+    if (!pj_time_clock_anchor_set(&anchor, 2024, 1, 1, 0, 0, 0,
+                                  board_monotonic_ms())) {
+        return 0;
+    }
+    portENTER_CRITICAL(&g_time_lock);
+    g_time_clock_anchor = anchor;
+    g_time_wall_trusted = 0;
+    g_status.time_set = 0;
+    g_time_generation++;
+    portEXIT_CRITICAL(&g_time_lock);
+    return 1;
+}
+
 static int board_time_model_clock_for_boot(uint32_t boot_id,
                                            pj_time_clock_t *clock)
 {
@@ -4350,16 +4469,6 @@ static esp_err_t rtc_write_civil_time(int hour, int minute, int year,
     i2c_give();
     rtc_sequence_give();
     return err;
-}
-
-static esp_err_t rtc_write_status_time(void)
-{
-    board_time_snapshot_t time = board_time_snapshot();
-    if (!time.time_set) {
-        return ESP_ERR_INVALID_STATE;
-    }
-    return rtc_write_civil_time(time.hour, time.minute, time.year,
-                                time.month, time.day, 0);
 }
 
 static uint32_t time_controller_next_boot_id(void *context)
@@ -5701,51 +5810,6 @@ pj_board_profile_t pj_board_default_profile(void)
     return profile;
 }
 
-static int build_month_from_name(const char *month)
-{
-    static const char *names[] = {
-        "Jan", "Feb", "Mar", "Apr", "May", "Jun",
-        "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-    };
-    for (int i = 0; i < 12; i++) {
-        if (strncmp(month, names[i], 3) == 0) {
-            return i + 1;
-        }
-    }
-    return 0;
-}
-
-static int set_status_time_from_build(void)
-{
-    char month_name[4] = {0};
-    int day = 0;
-    int year = 0;
-    int hour = 0;
-    int minute = 0;
-    int second = 0;
-    if (sscanf(__DATE__, "%3s %d %d", month_name, &day, &year) != 3 ||
-        sscanf(__TIME__, "%d:%d:%d", &hour, &minute, &second) != 3) {
-        return 0;
-    }
-    int month = build_month_from_name(month_name);
-    if (!valid_time_date(hour, minute, year, month, day) ||
-        second < 0 || second > 59) {
-        return 0;
-    }
-#ifdef ESP_PLATFORM
-    return board_time_publish(hour, minute, year, month, day, second,
-                              board_monotonic_ms(), 0);
-#else
-    g_status.hour = hour;
-    g_status.minute = minute;
-    g_status.year = year;
-    g_status.month = month;
-    g_status.day = day;
-    g_status.time_set = 1;
-    return 1;
-#endif
-}
-
 static void init_default_status(const pj_board_profile_t *profile)
 {
     memset(&g_status, 0, sizeof(g_status));
@@ -5759,7 +5823,7 @@ static void init_default_status(const pj_board_profile_t *profile)
     g_status.temperature_c = 22;
     g_status.humidity_percent = -1;
 #ifdef ESP_PLATFORM
-    (void)board_time_publish(9, 41, 2026, 6, 6, 0, board_monotonic_ms(), 0);
+    (void)board_time_initialize_unknown();
 #else
     g_status.hour = 9;
     g_status.minute = 41;
@@ -5768,7 +5832,6 @@ static void init_default_status(const pj_board_profile_t *profile)
     g_status.day = 6;
     g_status.time_set = 1;
 #endif
-    (void)set_status_time_from_build();
     (void)snprintf(g_status.device_id, sizeof(g_status.device_id), "pj-%s", profile->sku);
     (void)snprintf(g_status.token, sizeof(g_status.token), "%s", PJ_DEFAULT_TOKEN);
     (void)snprintf(g_status.ip_addr, sizeof(g_status.ip_addr), "0.0.0.0");
@@ -5867,6 +5930,7 @@ void pj_board_init(const pj_board_profile_t *profile)
         ESP_LOGE(TAG, "%s", g_status.last_error);
         return;
     }
+    time_offset_load();
 
     g_settings_lock = xSemaphoreCreateMutex();
     if (g_settings_lock == NULL) {
@@ -5921,15 +5985,8 @@ void pj_board_init(const pj_board_profile_t *profile)
                 ESP_LOGI(TAG, "PCF85063 RTC initialized: %04d-%02d-%02d %02d:%02d",
                          g_status.year, g_status.month, g_status.day, g_status.hour, g_status.minute);
             } else {
-                ESP_LOGW(TAG, "PCF85063 RTC initialized but time is not set; using firmware build time %04d-%02d-%02d %02d:%02d",
-                         g_status.year, g_status.month, g_status.day, g_status.hour, g_status.minute);
-                esp_err_t write_err = rtc_write_status_time();
-                ESP_ERROR_CHECK_WITHOUT_ABORT(write_err);
-                if (write_err == ESP_OK) {
-                    portENTER_CRITICAL(&g_time_lock);
-                    g_time_wall_trusted = 1;
-                    portEXIT_CRITICAL(&g_time_lock);
-                }
+                ESP_LOGW(TAG,
+                         "PCF85063 RTC initialized but time is unknown; waiting for host or SNTP");
             }
         } else {
             ESP_LOGW(TAG, "PCF85063 RTC init failed");
@@ -7032,11 +7089,24 @@ static int json_int_field(const char *json, const char *field, int *value)
 }
 
 static int board_set_time_date(int hour, int minute, int year, int month, int day,
+                               int update_utc_offset, int utc_offset_minutes,
                                const char *source)
 {
-    if (!valid_time_date(hour, minute, year, month, day)) {
+    if (!valid_time_date(hour, minute, year, month, day) ||
+        (update_utc_offset &&
+         !pj_time_utc_offset_valid(utc_offset_minutes))) {
         ESP_LOGE(TAG, "Rejected invalid time/date from %s", source);
         return 0;
+    }
+    if (update_utc_offset) {
+        esp_err_t offset_err = time_offset_save(utc_offset_minutes);
+        if (offset_err != ESP_OK) {
+            (void)snprintf(g_status.last_error, sizeof(g_status.last_error),
+                           "UTC offset persistence failed for %s: %s", source,
+                           esp_err_to_name(offset_err));
+            ESP_LOGW(TAG, "%s", g_status.last_error);
+            return 0;
+        }
     }
     esp_err_t err = rtc_write_civil_time(hour, minute, year, month, day, 0);
     if (err != ESP_OK) {
@@ -7235,7 +7305,15 @@ static int connectivity_add_json(cJSON *json, const pj_board_status_t *status)
     cJSON_AddStringToObject(time_sync, "correction",
                             pj_time_sync_correction_name(sync_state->correction));
     cJSON_AddStringToObject(time_sync, "system_clock", "utc");
-    cJSON_AddStringToObject(time_sync, "civil_time_semantics", "local");
+    cJSON_AddStringToObject(
+        time_sync, "civil_time_semantics",
+        sync_state->utc_offset_known ? "fixed_utc_offset" : "unconfigured");
+    if (sync_state->utc_offset_known) {
+        cJSON_AddNumberToObject(time_sync, "utc_offset_minutes",
+                                sync_state->utc_offset_minutes);
+    } else {
+        cJSON_AddNullToObject(time_sync, "utc_offset_minutes");
+    }
     cJSON_AddStringToObject(time_sync, "server", "pool.ntp.org");
     cJSON_AddBoolToObject(time_sync, "has_ip", sync_state->has_ip != 0);
     cJSON_AddNumberToObject(time_sync, "attempt_count",
@@ -8462,17 +8540,33 @@ static void serial_command_task(void *arg)
             int day = 0;
             int hour = 0;
             int minute = 0;
-            if (sscanf(time_payload, "%d %d %d %d %d", &year, &month, &day, &hour, &minute) == 5 &&
-                valid_time_date(hour, minute, year, month, day)) {
+            int utc_offset_minutes = 0;
+            char extra = '\0';
+            int fields = sscanf(time_payload, "%d %d %d %d %d %d %c",
+                                &year, &month, &day, &hour, &minute,
+                                &utc_offset_minutes, &extra);
+            int update_utc_offset = fields == 6;
+            if ((fields == 5 || fields == 6) &&
+                valid_time_date(hour, minute, year, month, day) &&
+                (!update_utc_offset ||
+                 pj_time_utc_offset_valid(utc_offset_minutes))) {
                 if (board_set_time_date(hour, minute, year, month, day,
+                                        update_utc_offset,
+                                        utc_offset_minutes,
                                         "USB-C partner")) {
-                    printf("PJ_OK {\"hour\":%d,\"minute\":%d,\"year\":%d,\"month\":%d,\"day\":%d}\n",
-                           hour, minute, year, month, day);
+                    if (update_utc_offset) {
+                        printf("PJ_OK {\"hour\":%d,\"minute\":%d,\"year\":%d,\"month\":%d,\"day\":%d,\"utc_offset_minutes\":%d}\n",
+                               hour, minute, year, month, day,
+                               utc_offset_minutes);
+                    } else {
+                        printf("PJ_OK {\"hour\":%d,\"minute\":%d,\"year\":%d,\"month\":%d,\"day\":%d}\n",
+                               hour, minute, year, month, day);
+                    }
                 } else {
                     printf("PJ_ERR {\"error\":\"time update could not be persisted to RTC\"}\n");
                 }
             } else {
-                printf("PJ_ERR {\"error\":\"expected PJ_TIME yyyy mm dd hh mm\"}\n");
+                printf("PJ_ERR {\"error\":\"expected PJ_TIME yyyy mm dd hh mm [utc_offset_minutes]\"}\n");
             }
             fflush(stdout);
             continue;
@@ -8608,7 +8702,7 @@ static esp_err_t time_put_handler(httpd_req_t *req)
         httpd_resp_set_status(req, "400 Bad Request");
         return send_json(req, "{\"error\":\"expected hour/minute/month/day integers; optional year\"}");
     }
-    if (!board_set_time_date(hour, minute, year, month, day, "HTTP")) {
+    if (!board_set_time_date(hour, minute, year, month, day, 0, 0, "HTTP")) {
         httpd_resp_set_status(req, "503 Service Unavailable");
         return send_json(req,
                          "{\"error\":\"time update could not be persisted to RTC\"}");
