@@ -540,6 +540,7 @@ window.pocketJournalSimulator = {
   bootShort: () => handleAuxShort("debug aux"),
   bootLong: () => handleAuxLong("debug aux long"),
   bootDouble: () => handleAuxDouble("debug aux double"),
+  tap: (x, y) => dispatchFirmware("debug tap", () => api.touchTap(x, y), true),
   reset: resetSimulator,
   state: () => stateLabel(),
   action: () => actionLine.textContent,

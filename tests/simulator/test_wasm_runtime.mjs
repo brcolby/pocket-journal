@@ -70,7 +70,7 @@ assert.equal(api.pj_sim_aux_double(), 1);
 assertRendered("record");
 assert.equal(api.pj_sim_record_state(), 1);
 api.pj_sim_set_audio_state(1, 0);
-assert.equal(api.pj_sim_aux_short(), 1);
+assert.equal(api.pj_sim_aux_long(), 1);
 assertRendered("home");
 assert.equal(api.pj_sim_record_state(), 2);
 api.pj_sim_set_audio_state(1, 0);
@@ -113,7 +113,7 @@ assertRendered("notes");
 assert.equal(api.pj_sim_touch_tap(100, 100), 1);
 assertRendered("listen");
 
-assert.equal(api.pj_sim_aux_short(), 1);
+assert.equal(api.pj_sim_touch_tap(100, 25), 1);
 assert.equal(api.pj_sim_aux_double(), 0);
 assertRendered("note_detail");
 
@@ -171,6 +171,8 @@ assertRendered("time_temp");
 
 api.pj_sim_reset();
 api.pj_sim_wake();
+assert.equal(api.pj_sim_aux_long(), 1);
+assertRendered("time_temp");
 const timeTempWithoutIntervalAlert = framebufferSnapshot();
 api.pj_sim_set_alert_detail(3, 101, 1);
 assert.deepEqual(framebufferSnapshot(), timeTempWithoutIntervalAlert,
@@ -193,7 +195,7 @@ assertRendered("time");
 assert.equal(api.pj_sim_touch_tap(150, 70), 1);
 assertRendered("stopwatch");
 assert.equal(api.pj_sim_aux_short(), 1);
-assert.equal(api.pj_sim_aux_double(), 1);
+assert.equal(api.pj_sim_aux_double(), 0);
 assertRendered("stopwatch");
 
 class BrowserEventTarget {
@@ -305,7 +307,7 @@ assert.equal(simulator.state(), "static");
 elements.get("#viewPicker").value = "listen";
 elements.get("#openViewButton").emit("click");
 assert.equal(simulator.state(), "listen");
-simulator.bootShort();
+simulator.tap(100, 25);
 assert.equal(simulator.state(), "note_detail");
 simulator.bootShort();
 assert.equal(simulator.audioState().playback, 1);
@@ -314,7 +316,7 @@ assert.equal(simulator.audioState().playback, 0, "pause is acknowledged by the s
 simulator.bootLong();
 assert.equal(simulator.state(), "listen", "AUX long navigates back after pausing playback");
 
-simulator.bootShort();
+simulator.tap(100, 25);
 assert.equal(simulator.state(), "note_detail");
 simulator.bootShort();
 assert.equal(simulator.audioState().playback, 1);
