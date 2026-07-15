@@ -36,6 +36,10 @@ class DeviceSession:
                 "status",
                 "time.write",
                 "recordings.delete",
+                "recordings.list",
+                "recordings.download",
+                "transcripts.write",
+                "audio.sync",
                 "diagnostics.tone",
                 "diagnostics.microphone",
                 "wifi.provision",
@@ -55,8 +59,6 @@ class DeviceSession:
 
     def list_recordings(self) -> list[AudioItem]:
         self.require("recordings.list")
-        if not isinstance(self.client, DeviceClient):
-            raise DeviceError("recordings.list is not supported over USB-C; use LAN/Wi-Fi")
         return self.client.list_audio()
 
 

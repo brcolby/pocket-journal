@@ -14,6 +14,7 @@ import unittest
 
 from pocket_journal_partner import cli
 from pocket_journal_partner.device import AudioItem, DeviceHTTPError
+from pocket_journal_partner.library import NoteLibrary, stable_note_id
 from pocket_journal_partner.storage import PartnerStore
 from pocket_journal_partner.sync import DEVICE_TRANSCRIPT_MAX_BYTES, sync_device_audio
 from pocket_journal_partner.transcription import FakeTranscriptionBackend
@@ -95,6 +96,7 @@ class SyncTests(unittest.TestCase):
             results = sync_device_audio("pj-test", client, store, backend)  # type: ignore[arg-type]
             job = store.load_job("pj-test", "new.wav")
             transcript = store.load_transcript("pj-test", "new.wav")
+            library_note = NoteLibrary(Path(tmp)).get(stable_note_id("pj-test", "new.wav"))
 
         self.assertEqual(client.downloaded, ["new.wav"])
         self.assertEqual(client.uploaded, ["new.wav"])
@@ -104,6 +106,10 @@ class SyncTests(unittest.TestCase):
         self.assertEqual(job["attempt_count"], 1)  # type: ignore[index]
         self.assertEqual(job["source"]["sha256"], results[0]["source_sha256"])  # type: ignore[index]
         self.assertEqual(transcript["sync"]["source"], job["source"])  # type: ignore[index]
+        self.assertIsNotNone(library_note)
+        self.assertEqual(library_note.transcript_text, "transcript")  # type: ignore[union-attr]
+        self.assertIsNotNone(library_note.audio_path)  # type: ignore[union-attr]
+        self.assertTrue(library_note.device_synced)  # type: ignore[union-attr]
         self.assertEqual(transcript["sync"]["cache_key"], job["cache_key"])  # type: ignore[index]
         self.assertNotIn("sync", client.upload_payloads[0])
         self.assertLessEqual(
@@ -539,7 +545,7 @@ class SyncTests(unittest.TestCase):
             data_dir=None, backend="fake", reprocess=False
         )
         stdout = StringIO()
-        with patch("pocket_journal_partner.cli._lan_session_from_args", return_value=FakeSession()):
+        with patch("pocket_journal_partner.cli._sync_session_from_args", return_value=FakeSession()):
             with patch("pocket_journal_partner.cli.sync_device_audio", return_value=results):
                 with redirect_stdout(stdout):
                     exit_code = cli.cmd_sync(args)

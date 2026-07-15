@@ -7,7 +7,9 @@ import argparse
 import asyncio
 import json
 import secrets
+import sqlite3
 import sys
+import webbrowser
 
 from .ble import provision_wifi
 from .calendar import calendar_payload_for_day
@@ -18,15 +20,19 @@ from .device import (
     SerialDeviceClient,
     SerialPortNotFound,
     discover_mdns,
+    discover_serial_ports,
     resolve_serial_port,
 )
 from .diagnostics import credential_safe_status, wifi_diagnostics
 from .home_design import normalize_home_design
+from .library import LibraryNote, NoteLibrary
 from .operations import DeviceSession
 from .ota import inspect_firmware_image, ota_preflight, ota_status, stream_firmware_image, wait_for_ota_result
 from .storage import PartnerStore
 from .sync import sync_device_audio
-from .transcription import FakeTranscriptionBackend, backend_from_name
+from .transcription import FakeTranscriptionBackend, WhisperCppTranscriptionBackend, backend_from_name
+from .tui import run_tui
+from .web import DEFAULT_HOST, DEFAULT_PORT, create_server
 
 
 USB_PROVISIONING_TOKEN_BYTES = 16
@@ -64,8 +70,16 @@ def _sync_time_from_host(
         expected["month"],
         expected["day"],
         expected["year"],
+        int(offset_seconds // 60),
     )
-    if not isinstance(response, dict) or any(response.get(key) != value for key, value in expected.items()):
+    if (
+        not isinstance(response, dict)
+        or any(response.get(key) != value for key, value in expected.items())
+        or (
+            "utc_offset_minutes" in response
+            and response.get("utc_offset_minutes") != int(offset_seconds // 60)
+        )
+    ):
         raise DeviceError(f"device time sync could not be validated; run '{TIME_SYNC_RETRY_COMMAND}' to retry")
     return {
         "state": "synced",
@@ -153,7 +167,15 @@ def cmd_provision(args: argparse.Namespace) -> int:
 
 def cmd_discover(args: argparse.Namespace) -> int:
     _ = args
-    _print_json({"devices": discover_mdns()})
+    lan = [{**device, "transport": "lan"} for device in discover_mdns()]
+    usb_ports = discover_serial_ports()
+    usb = [{"transport": "usb", "port": port} for port in usb_ports]
+    _print_json({
+        "devices": usb + lan,
+        "count": len(usb) + len(lan),
+        "usb_ports": usb_ports,
+        "lan_devices": lan,
+    })
     return 0
 
 
@@ -253,7 +275,15 @@ def _client_from_args(args: argparse.Namespace) -> tuple[str, DeviceClient]:
 
 
 def _control_client_from_args(args: argparse.Namespace):
+    transport = getattr(args, "transport", "auto")
     serial_port = getattr(args, "serial_port", None)
+    network_requested = any(getattr(args, name, None) for name in ("device", "base_url", "token"))
+    if transport == "lan":
+        if serial_port:
+            raise DeviceError("--serial-port cannot be used with --transport lan")
+        return _client_from_args(args)
+    if transport == "usb" and network_requested:
+        raise DeviceError("--device, --base-url, and --token cannot be used with --transport usb")
     if serial_port:
         resolved_port = resolve_serial_port(serial_port)
         return "usb", SerialDeviceClient(
@@ -261,11 +291,13 @@ def _control_client_from_args(args: argparse.Namespace):
             baudrate=getattr(args, "serial_baud", 115200),
             timeout=getattr(args, "timeout", 6.0),
         )
-    if any(getattr(args, name, None) for name in ("device", "base_url", "token")):
+    if network_requested:
         return _client_from_args(args)
     try:
         resolved_port = resolve_serial_port()
     except SerialPortNotFound:
+        if transport == "usb":
+            raise
         return _client_from_args(args)
     return "usb", SerialDeviceClient(
         resolved_port,
@@ -284,20 +316,48 @@ def _lan_session_from_args(args: argparse.Namespace) -> DeviceSession:
     return DeviceSession(device_id, client)
 
 
+def _sync_session_from_args(args: argparse.Namespace) -> DeviceSession:
+    if getattr(args, "transport", "auto") == "lan":
+        return _lan_session_from_args(args)
+    session = _session_from_args(args)
+    if isinstance(session.client, SerialDeviceClient):
+        status = session.status()
+        device_id = status.get("device_id")
+        if not isinstance(device_id, str) or not device_id or len(device_id) > 160:
+            raise DeviceError("USB status did not provide a stable device id for local sync")
+        return DeviceSession(device_id, session.client)
+    return session
+
+
 def cmd_sync(args: argparse.Namespace) -> int:
     store = PartnerStore(Path(args.data_dir) if args.data_dir else None)
-    backend = backend_from_name(args.backend)
-    session = _lan_session_from_args(args)
+    try:
+        backend = backend_from_name(
+            args.backend,
+            model_path=getattr(args, "model", None),
+            executable=getattr(args, "whisper_executable", None),
+            threads=getattr(args, "threads", None),
+        )
+    except ValueError as exc:
+        raise DeviceError(str(exc)) from exc
+    if isinstance(backend, WhisperCppTranscriptionBackend):
+        availability = backend.availability()
+        if not availability["available"]:
+            raise DeviceError("; ".join(availability["issues"]))
+    session = _sync_session_from_args(args)
     session.require("audio.sync")
     upload_transcripts = not isinstance(backend, FakeTranscriptionBackend)
-    results = sync_device_audio(
-        session.device_id,
-        session.client,
-        store,
-        backend,  # type: ignore[arg-type]
-        upload_transcripts=upload_transcripts,
-        reprocess_synced=getattr(args, "reprocess", False),
-    )
+    try:
+        results = sync_device_audio(
+            session.device_id,
+            session.client,
+            store,
+            backend,  # type: ignore[arg-type]
+            upload_transcripts=upload_transcripts,
+            reprocess_synced=getattr(args, "reprocess", False),
+        )
+    except RuntimeError as exc:
+        raise DeviceError(str(exc)) from exc
     uploaded_count = sum(result.get("status") == "uploaded" for result in results)
     failed_count = sum(result.get("status") == "failed" for result in results)
     transcribed_count = sum(result.get("status") == "transcribed" for result in results)
@@ -311,6 +371,96 @@ def cmd_sync(args: argparse.Namespace) -> int:
         "dry_run": not upload_transcripts,
     }))
     return 1 if failed_count else 0
+
+
+def _library_from_args(args: argparse.Namespace) -> NoteLibrary:
+    store = PartnerStore(Path(args.data_dir) if getattr(args, "data_dir", None) else None)
+    try:
+        library = NoteLibrary(store.root)
+        library.import_partner_store(store)
+    except (OSError, RuntimeError, sqlite3.Error) as exc:
+        raise DeviceError(f"local note library is unavailable: {exc}") from exc
+    return library
+
+
+def _library_note_payload(note: LibraryNote, *, include_transcript: bool) -> dict[str, Any]:
+    payload = note.as_dict()
+    if not include_transcript:
+        payload.pop("transcript", None)
+    return payload
+
+
+def cmd_library_list(args: argparse.Namespace) -> int:
+    library = _library_from_args(args)
+    try:
+        notes = library.list_notes(limit=args.limit, offset=args.offset, search=args.search)
+        total = library.count(search=args.search)
+    except (ValueError, sqlite3.Error) as exc:
+        raise DeviceError(str(exc)) from exc
+    _print_json({
+        "schema_version": library.schema_version(),
+        "notes": [_library_note_payload(note, include_transcript=False) for note in notes],
+        "count": len(notes),
+        "total": total,
+        "offset": args.offset,
+    })
+    return 0
+
+
+def cmd_library_show(args: argparse.Namespace) -> int:
+    note = _library_from_args(args).get(args.note_id)
+    if note is None:
+        raise DeviceError(f"local note not found: {args.note_id}")
+    _print_json(_library_note_payload(note, include_transcript=True))
+    return 0
+
+
+def cmd_library_title(args: argparse.Namespace) -> int:
+    library = _library_from_args(args)
+    try:
+        note = library.update_title(args.note_id, args.title)
+    except KeyError as exc:
+        raise DeviceError(f"local note not found: {args.note_id}") from exc
+    except (OSError, ValueError, sqlite3.Error) as exc:
+        raise DeviceError(str(exc)) from exc
+    _print_json(_library_note_payload(note, include_transcript=False))
+    return 0
+
+
+def cmd_library_tui(args: argparse.Namespace) -> int:
+    return run_tui(_library_from_args(args))
+
+
+def cmd_library_serve(args: argparse.Namespace) -> int:
+    try:
+        server = create_server(_library_from_args(args), args.host, args.port)
+    except (OSError, ValueError) as exc:
+        raise DeviceError(str(exc)) from exc
+    host, port = server.server_address[:2]
+    url_host = f"[{host}]" if ":" in host else host
+    url = f"http://{url_host}:{port}/"
+    print(f"Pocket Journal library: {url}", file=sys.stderr)
+    if not args.no_open:
+        webbrowser.open(url)
+    try:
+        server.serve_forever(poll_interval=0.25)
+    finally:
+        server.server_close()
+    return 0
+
+
+def cmd_transcription_status(args: argparse.Namespace) -> int:
+    try:
+        backend = WhisperCppTranscriptionBackend(
+            model_path=args.model,
+            executable=args.whisper_executable,
+            threads=args.threads,
+        )
+    except ValueError as exc:
+        raise DeviceError(str(exc)) from exc
+    status = backend.availability(digest=args.digest)
+    _print_json(status)
+    return 0 if status["available"] else 1
 
 
 def cmd_calendar_sync(args: argparse.Namespace) -> int:
@@ -507,20 +657,19 @@ def _audio_item_payload(item) -> dict[str, object]:
 
 
 def cmd_recordings_list(args: argparse.Namespace) -> int:
-    session = _lan_session_from_args(args)
+    session = _session_from_args(args)
     items = [_audio_item_payload(item) for item in session.list_recordings()]
     _print_json(session.envelope({"recordings": items, "count": len(items)}))
     return 0
 
 
 def cmd_recordings_download(args: argparse.Namespace) -> int:
-    session = _lan_session_from_args(args)
+    session = _session_from_args(args)
     items = session.list_recordings()
     item = next((candidate for candidate in items if candidate.audio_id == args.audio_id), None)
     if item is None:
         raise DeviceError(f"recording not found: {args.audio_id}")
-    if not isinstance(session.client, DeviceClient):
-        raise DeviceError("recordings.download is not supported over USB-C; use LAN/Wi-Fi")
+    session.require("recordings.download")
     target_dir = Path(args.output_dir) if args.output_dir else Path.cwd()
     path = session.client.download_audio(item, target_dir)
     _print_json(session.envelope({"audio_id": item.audio_id, "path": str(path)}))
@@ -679,7 +828,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(
         dest="command",
         required=True,
-        metavar="{provision,discover,device,firmware,sync,settings,recordings,home,static-art}",
+        metavar="{provision,discover,device,firmware,sync,library,transcription,settings,recordings,home,static-art}",
     )
 
     provision = sub.add_parser("provision", help="provision Wi-Fi over USB-C (default) or BLE")
@@ -696,7 +845,7 @@ def build_parser() -> argparse.ArgumentParser:
     provision.add_argument("--mock", action="store_true", help="simulate BLE provisioning; requires --ble")
     provision.set_defaults(func=cmd_provision)
 
-    discover = sub.add_parser("discover", help="discover Pocket Journal devices on LAN")
+    discover = sub.add_parser("discover", help="discover Pocket Journal devices over USB-C and LAN")
     discover.set_defaults(func=cmd_discover)
 
     device = sub.add_parser("device", help="device maintenance commands")
@@ -709,6 +858,7 @@ def build_parser() -> argparse.ArgumentParser:
     device_status.add_argument("--serial-port", help="USB-C serial port; auto-detected when omitted")
     device_status.add_argument("--serial-baud", type=int, default=115200)
     device_status.add_argument("--timeout", type=float, default=6.0)
+    device_status.add_argument("--transport", choices=["auto", "usb", "lan"], default="auto")
     device_status.set_defaults(func=cmd_device_status)
     device_stop_interval = device_sub.add_parser(
         "stop-interval",
@@ -732,6 +882,7 @@ def build_parser() -> argparse.ArgumentParser:
     device_wifi.add_argument("--serial-port", help="USB-C serial port; auto-detected when omitted")
     device_wifi.add_argument("--serial-baud", type=int, default=115200)
     device_wifi.add_argument("--timeout", type=float, default=6.0)
+    device_wifi.add_argument("--transport", choices=["auto", "usb", "lan"], default="auto")
     device_wifi.set_defaults(func=cmd_device_wifi_diagnostics)
     device_sync_time = device_sub.add_parser("sync-time", help="set device time from this computer")
     device_sync_time.add_argument("--device", help="paired device id for Wi-Fi HTTP; optional for USB-C")
@@ -741,6 +892,7 @@ def build_parser() -> argparse.ArgumentParser:
     device_sync_time.add_argument("--serial-port", help="USB-C serial port, such as /dev/cu.usbmodem1101; auto-detected when omitted")
     device_sync_time.add_argument("--serial-baud", type=int, default=115200)
     device_sync_time.add_argument("--timeout", type=float, default=6.0)
+    device_sync_time.add_argument("--transport", choices=["auto", "usb", "lan"], default="auto")
     device_sync_time.set_defaults(func=cmd_device_sync_time)
     device_tone = device_sub.add_parser("tone", help="play a USB-C audio diagnostic tone")
     device_tone.add_argument("--device", help="optional label for output")
@@ -805,10 +957,68 @@ def build_parser() -> argparse.ArgumentParser:
     sync.add_argument("--device", help="paired device id; auto-selected when unambiguous")
     sync.add_argument("--base-url")
     sync.add_argument("--token", help="override the stored LAN bearer token")
-    sync.add_argument("--backend", choices=["fake", "hf"], default="hf")
+    sync.add_argument("--serial-port", help="USB-C serial port; auto-detected when omitted")
+    sync.add_argument("--serial-baud", type=int, default=115200)
+    sync.add_argument("--timeout", type=float, default=20.0)
+    sync.add_argument(
+        "--transport",
+        choices=["auto", "lan", "usb"],
+        default="auto",
+        help="sync transport; auto prefers an unambiguous USB-C device and falls back to LAN",
+    )
+    sync.add_argument(
+        "--backend",
+        choices=["whisper-cpp", "hf", "fake"],
+        default="whisper-cpp",
+        help="local transcription runtime (default: whisper-cpp)",
+    )
+    sync.add_argument("--model", help="local whisper.cpp GGML/GGUF model path; or set PJ_WHISPER_MODEL")
+    sync.add_argument(
+        "--whisper-executable",
+        help="whisper.cpp CLI executable; or set PJ_WHISPER_CPP",
+    )
+    sync.add_argument("--threads", type=int, help="CPU threads for whisper.cpp")
     sync.add_argument("--reprocess", action="store_true", help="reprocess notes already marked synced")
     sync.add_argument("--data-dir")
     sync.set_defaults(func=cmd_sync)
+
+    library = sub.add_parser("library", help="browse and edit the local audio and transcript library")
+    library_sub = library.add_subparsers(dest="library_command", required=True)
+    library_list = library_sub.add_parser("list", help="list locally synced notes")
+    library_list.add_argument("--data-dir")
+    library_list.add_argument("--limit", type=int, default=100)
+    library_list.add_argument("--offset", type=int, default=0)
+    library_list.add_argument("--search")
+    library_list.set_defaults(func=cmd_library_list)
+    library_show = library_sub.add_parser("show", help="show one local note and its transcript")
+    library_show.add_argument("note_id")
+    library_show.add_argument("--data-dir")
+    library_show.set_defaults(func=cmd_library_show)
+    library_title = library_sub.add_parser("title", help="edit a local note title")
+    library_title.add_argument("note_id")
+    library_title.add_argument("title")
+    library_title.add_argument("--data-dir")
+    library_title.set_defaults(func=cmd_library_title)
+    library_tui = library_sub.add_parser("tui", help="open the terminal note browser")
+    library_tui.add_argument("--data-dir")
+    library_tui.set_defaults(func=cmd_library_tui)
+    library_serve = library_sub.add_parser("serve", help="open the loopback-only note web UI")
+    library_serve.add_argument("--data-dir")
+    library_serve.add_argument("--host", default=DEFAULT_HOST, help="loopback bind address")
+    library_serve.add_argument("--port", type=int, default=DEFAULT_PORT)
+    library_serve.add_argument("--no-open", action="store_true", help="do not open a browser")
+    library_serve.set_defaults(func=cmd_library_serve)
+
+    transcription = sub.add_parser("transcription", help="inspect local transcription availability")
+    transcription_sub = transcription.add_subparsers(dest="transcription_command", required=True)
+    transcription_status = transcription_sub.add_parser(
+        "status", help="check the recommended CPU-only whisper.cpp backend"
+    )
+    transcription_status.add_argument("--model", help="local model path; or set PJ_WHISPER_MODEL")
+    transcription_status.add_argument("--whisper-executable", help="whisper.cpp executable; or set PJ_WHISPER_CPP")
+    transcription_status.add_argument("--threads", type=int)
+    transcription_status.add_argument("--digest", action="store_true", help="compute the model SHA-256")
+    transcription_status.set_defaults(func=cmd_transcription_status)
 
     # Kept parseable for one compatibility window, but omitted from primary help.
     calendar = sub.add_parser("calendar")
@@ -839,17 +1049,25 @@ def build_parser() -> argparse.ArgumentParser:
 
     recordings = sub.add_parser("recordings", help="recording maintenance commands")
     recordings_sub = recordings.add_subparsers(dest="recordings_command", required=True)
-    recordings_list = recordings_sub.add_parser("list", help="list retained recordings over LAN/Wi-Fi")
-    recordings_list.add_argument("--device", help="paired device id; auto-selected when unambiguous")
+    recordings_list = recordings_sub.add_parser("list", help="list retained recordings over USB-C or LAN/Wi-Fi")
+    recordings_list.add_argument("--device", help="paired device id for LAN/Wi-Fi")
     recordings_list.add_argument("--base-url")
     recordings_list.add_argument("--token", help="override the stored LAN bearer token")
     recordings_list.add_argument("--data-dir")
+    recordings_list.add_argument("--serial-port", help="USB-C serial port; auto-detected when omitted")
+    recordings_list.add_argument("--serial-baud", type=int, default=115200)
+    recordings_list.add_argument("--timeout", type=float, default=20.0)
+    recordings_list.add_argument("--transport", choices=["auto", "usb", "lan"], default="auto")
     recordings_list.set_defaults(func=cmd_recordings_list)
-    recordings_download = recordings_sub.add_parser("download", help="download one recording over LAN/Wi-Fi")
-    recordings_download.add_argument("--device", help="paired device id; auto-selected when unambiguous")
+    recordings_download = recordings_sub.add_parser("download", help="download one recording over USB-C or LAN/Wi-Fi")
+    recordings_download.add_argument("--device", help="paired device id for LAN/Wi-Fi")
     recordings_download.add_argument("--base-url")
     recordings_download.add_argument("--token", help="override the stored LAN bearer token")
     recordings_download.add_argument("--data-dir")
+    recordings_download.add_argument("--serial-port", help="USB-C serial port; auto-detected when omitted")
+    recordings_download.add_argument("--serial-baud", type=int, default=115200)
+    recordings_download.add_argument("--timeout", type=float, default=20.0)
+    recordings_download.add_argument("--transport", choices=["auto", "usb", "lan"], default="auto")
     recordings_download.add_argument("--audio-id", required=True)
     recordings_download.add_argument("--output-dir")
     recordings_download.set_defaults(func=cmd_recordings_download)
@@ -861,6 +1079,7 @@ def build_parser() -> argparse.ArgumentParser:
     recordings_wipe.add_argument("--serial-port", help="USB-C serial port, such as /dev/cu.usbmodem1101; auto-detected when omitted")
     recordings_wipe.add_argument("--serial-baud", type=int, default=115200)
     recordings_wipe.add_argument("--timeout", type=float, default=6.0)
+    recordings_wipe.add_argument("--transport", choices=["auto", "usb", "lan"], default="auto")
     recordings_wipe.add_argument("--yes", action="store_true", help="confirm deletion of all device recordings")
     recordings_wipe.set_defaults(func=cmd_recordings_wipe)
 
@@ -906,6 +1125,9 @@ def main(argv: list[str] | None = None) -> int:
         return args.func(args)
     except DeviceError as exc:
         print(f"pj: error: {exc}", file=sys.stderr)
+        return 1
+    except sqlite3.Error as exc:
+        print(f"pj: error: local note library failed: {exc}", file=sys.stderr)
         return 1
     except KeyboardInterrupt:
         return 130

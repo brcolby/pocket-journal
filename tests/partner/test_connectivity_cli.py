@@ -117,6 +117,19 @@ class DeviceDiscoveryTests(unittest.TestCase):
         self.assertEqual(device_id, "pj-lan")
         self.assertIsInstance(client, DeviceClient)
 
+    def test_explicit_usb_transport_does_not_fall_back_to_lan(self) -> None:
+        with TemporaryDirectory() as tmp:
+            _write_config(tmp, DeviceProfile("pj-lan", "http://192.0.2.9", "paired-token"))
+            args = cli.build_parser().parse_args([
+                "device", "status", "--transport", "usb", "--data-dir", tmp,
+            ])
+            with patch(
+                "pocket_journal_partner.cli.resolve_serial_port",
+                side_effect=SerialPortNotFound("no USB-C device found"),
+            ):
+                with self.assertRaisesRegex(SerialPortNotFound, "no USB-C"):
+                    cli._control_client_from_args(args)
+
     def test_ambiguous_usb_ports_do_not_silently_fall_back_to_lan(self) -> None:
         with TemporaryDirectory() as tmp:
             _write_config(tmp, DeviceProfile("pj-lan", "http://192.0.2.10", "paired-token"))
@@ -143,7 +156,7 @@ class AutomaticTimeSyncTests(unittest.TestCase):
 
         result = cli._sync_time_from_host(client, local)
 
-        client.put_time.assert_called_once_with(8, 42, 7, 14, 2026)
+        client.put_time.assert_called_once_with(8, 42, 7, 14, 2026, -420)
         self.assertEqual(result["state"], "synced")
         self.assertTrue(result["validated"])
         self.assertEqual(result["precision_seconds"], 60)
@@ -172,6 +185,21 @@ class AutomaticTimeSyncTests(unittest.TestCase):
         with self.assertRaisesRegex(DeviceError, "could not be validated"):
             cli._sync_time_from_host(client, local)
 
+    def test_sync_rejects_a_mismatched_echoed_utc_offset(self) -> None:
+        local = datetime(2026, 7, 14, 8, 42, tzinfo=timezone(timedelta(hours=-7)))
+        client = Mock(spec=SerialDeviceClient)
+        client.put_time.return_value = {
+            "hour": 8,
+            "minute": 42,
+            "year": 2026,
+            "month": 7,
+            "day": 14,
+            "utc_offset_minutes": 0,
+        }
+
+        with self.assertRaisesRegex(DeviceError, "could not be validated"):
+            cli._sync_time_from_host(client, local)
+
     def test_sync_reanchors_stale_and_already_valid_clocks_without_a_preflight_read(self) -> None:
         local = datetime(2026, 7, 14, 8, 42, tzinfo=timezone.utc)
         for reported_time in (
@@ -193,18 +221,19 @@ class AutomaticTimeSyncTests(unittest.TestCase):
 
                 self.assertEqual(result["state"], "synced")
                 client.get_time.assert_not_called()
-                client.put_time.assert_called_once_with(8, 42, 7, 14, 2026)
+                client.put_time.assert_called_once_with(8, 42, 7, 14, 2026, 0)
 
     def test_usb_provisioning_syncs_time_automatically(self) -> None:
         with TemporaryDirectory() as tmp:
             serial = Mock(spec=SerialDeviceClient)
             serial.provision_wifi.return_value = {"device_id": "pj-usb"}
-            serial.put_time.side_effect = lambda hour, minute, month, day, year: {
+            serial.put_time.side_effect = lambda hour, minute, month, day, year, utc_offset: {
                 "hour": hour,
                 "minute": minute,
                 "year": year,
                 "month": month,
                 "day": day,
+                "utc_offset_minutes": utc_offset,
             }
             stdout = StringIO()
             with patch("pocket_journal_partner.cli.resolve_serial_port", return_value="/dev/cu.test"):
@@ -305,6 +334,62 @@ class CalendarDeprecationTests(unittest.TestCase):
         self.assertIn(cli.CALENDAR_REMOVAL_VERSION, stderr.getvalue())
         session.client.upload_calendar_today.assert_called_once()
         self.assertEqual(json.loads(stdout.getvalue())["result"]["uploaded"], 0)
+
+
+class TransportSelectionTests(unittest.TestCase):
+    def test_discover_reports_usb_and_lan_without_opening_usb(self) -> None:
+        stdout = StringIO()
+        with patch("pocket_journal_partner.cli.discover_serial_ports", return_value=["/dev/cu.test"]):
+            with patch("pocket_journal_partner.cli.discover_mdns", return_value=[{
+                "device_id": "pj-lan", "base_url": "http://192.0.2.4"
+            }]):
+                with redirect_stdout(stdout):
+                    self.assertEqual(cli.main(["discover"]), 0)
+
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(payload["count"], 2)
+        self.assertEqual(payload["devices"][0], {"transport": "usb", "port": "/dev/cu.test"})
+        self.assertEqual(payload["devices"][1]["transport"], "lan")
+
+    def test_explicit_lan_transport_never_probes_usb(self) -> None:
+        with TemporaryDirectory() as tmp:
+            _write_config(tmp, DeviceProfile("pj-lan", "http://192.0.2.9", "paired-token"))
+            args = cli.build_parser().parse_args([
+                "device", "status", "--transport", "lan", "--data-dir", tmp,
+            ])
+            with patch("pocket_journal_partner.cli.resolve_serial_port") as resolve:
+                device_id, client = cli._control_client_from_args(args)
+
+        self.assertEqual(device_id, "pj-lan")
+        self.assertIsInstance(client, DeviceClient)
+        resolve.assert_not_called()
+
+    def test_explicit_usb_transport_rejects_network_credentials(self) -> None:
+        args = cli.build_parser().parse_args([
+            "device", "status", "--transport", "usb", "--base-url", "http://device",
+            "--token", "secret",
+        ])
+
+        with self.assertRaisesRegex(DeviceError, "cannot be used"):
+            cli._control_client_from_args(args)
+
+    def test_sync_defaults_to_cpu_only_whisper_cpp_and_identifies_usb_device(self) -> None:
+        args = cli.build_parser().parse_args(["sync", "--transport", "usb"])
+        client = Mock(spec=SerialDeviceClient)
+        client.status.return_value = {"api_version": 1, "device_id": "pj-usb"}
+
+        self.assertEqual(args.backend, "whisper-cpp")
+        with patch(
+            "pocket_journal_partner.cli._session_from_args",
+            return_value=SimpleNamespace(
+                device_id="usb",
+                client=client,
+                status=lambda: client.status(),
+            ),
+        ):
+            session = cli._sync_session_from_args(args)
+        self.assertEqual(session.device_id, "pj-usb")
+        self.assertIs(session.client, client)
 
 
 class UsbRecoveryCliTests(unittest.TestCase):

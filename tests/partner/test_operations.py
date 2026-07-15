@@ -38,12 +38,14 @@ class OperationsTests(unittest.TestCase):
         with self.assertRaisesRegex(DeviceError, "does not support capability"):
             session.list_recordings()
 
-    def test_usb_rejects_lan_only_capability_before_io(self) -> None:
-        session = DeviceSession("pj-test", SerialDeviceClient("/dev/null"))
-        with patch.object(SerialDeviceClient, "status") as status:
-            with self.assertRaisesRegex(DeviceError, "not supported over USB-C"):
-                session.list_recordings()
-        status.assert_not_called()
+    def test_usb_supports_bounded_recording_list_capability(self) -> None:
+        client = SerialDeviceClient("/dev/null")
+        client.status = lambda: {"api_version": 1}  # type: ignore[method-assign]
+        client.list_audio = lambda: [AudioItem("rec.wav", "rec.wav")]  # type: ignore[method-assign]
+
+        items = DeviceSession("pj-test", client).list_recordings()
+
+        self.assertEqual(items[0].audio_id, "rec.wav")
 
     def test_list_recordings_runs_status_preflight(self) -> None:
         client = DeviceClient("http://device.local", "token")
@@ -77,7 +79,7 @@ class OperationsTests(unittest.TestCase):
         client.status = lambda: {"capabilities": {"recordings.list": False}}  # type: ignore[method-assign]
         session = DeviceSession("pj-test", client)
         stderr = StringIO()
-        with patch("pocket_journal_partner.cli._lan_session_from_args", return_value=session):
+        with patch("pocket_journal_partner.cli._session_from_args", return_value=session):
             with redirect_stderr(stderr):
                 exit_code = cli.main(["recordings", "list", "--device", "pj-test"])
 

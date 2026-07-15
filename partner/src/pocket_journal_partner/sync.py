@@ -7,7 +7,8 @@ import hashlib
 import json
 import tempfile
 
-from .device import DeviceClient, DeviceHTTPError
+from .device import DeviceClient, DeviceHTTPError, SerialDeviceClient
+from .library import NoteLibrary
 from .storage import PartnerStore
 from .transcript_payload import DEVICE_TRANSCRIPT_MAX_BYTES, build_device_transcript_payload
 from .transcription import FakeTranscriptionBackend, TranscriptionBackend, inspect_wav
@@ -148,7 +149,7 @@ def _verified_cached_source(
 
 
 def _download_and_inspect(
-    client: DeviceClient,
+    client: DeviceClient | SerialDeviceClient,
     store: PartnerStore,
     device_id: str,
     item: Any,
@@ -280,8 +281,9 @@ def _cached_permanent_failure(
     }
 def _sync_audio_item(
     device_id: str,
-    client: DeviceClient,
+    client: DeviceClient | SerialDeviceClient,
     store: PartnerStore,
+    library: NoteLibrary,
     backend: TranscriptionBackend,
     fingerprint: dict[str, Any],
     item: Any,
@@ -289,8 +291,19 @@ def _sync_audio_item(
     reprocess_synced: bool = False,
 ) -> dict[str, Any] | None:
     job = _new_job(device_id, item.audio_id, item.filename)
-    operation = "load_state"
+    operation = "index_note"
     try:
+        note = library.upsert_discovered(
+            device_id,
+            item.audio_id,
+            item.filename,
+            label=getattr(item, "label", None),
+            source_sha256=getattr(item, "source_sha256", None),
+            created_at=getattr(item, "created_at", None),
+            duration_ms=getattr(item, "duration_ms", None),
+            device_synced=bool(item.synced or item.transcript_uploaded),
+        )
+        operation = "load_state"
         completed_job = store.load_job(device_id, item.audio_id)
         if item.synced or item.transcript_uploaded:
             completed_transcript = store.load_transcript(device_id, item.audio_id)
@@ -306,8 +319,18 @@ def _sync_audio_item(
                 and cached_source == completed_source
                 and _transcript_matches(completed_transcript, cached_source, fingerprint)
             ):
+                job = completed_job
                 completed_job["last_error"] = None
                 _save_job(store, device_id, item.audio_id, completed_job)
+                cached_path = store.audio_path(device_id, item.audio_id, item.filename)
+                if cached_path.is_file():
+                    library.attach_audio(
+                        note.note_id,
+                        cached_path,
+                        source_sha256=cached_source.get("sha256"),
+                    )
+                assert completed_transcript is not None
+                library.attach_transcript(note.note_id, completed_transcript)
                 return None
             if not reprocess_synced and not isinstance(completed_job, dict):
                 return None
@@ -339,6 +362,8 @@ def _sync_audio_item(
         job["source"] = source
         job["cache_key"] = _cache_key(source, fingerprint)
         _save_job(store, device_id, item.audio_id, job)
+        operation = "index_audio"
+        library.attach_audio(note.note_id, audio_path, source_sha256=source["sha256"])
 
         operation = "transcribe"
         job["transcription_fingerprint"] = fingerprint
@@ -348,6 +373,8 @@ def _sync_audio_item(
             store.save_transcript(device_id, item.audio_id, transcript)
         job["stage"] = "transcribed"
         _save_job(store, device_id, item.audio_id, job)
+        operation = "index_transcript"
+        library.attach_transcript(note.note_id, transcript)
 
         if upload_transcripts:
             operation = "prepare_upload"
@@ -359,6 +386,17 @@ def _sync_audio_item(
             job["stage"] = "transcribed"
         job["last_error"] = None
         _save_job(store, device_id, item.audio_id, job)
+        operation = "index_note"
+        library.upsert_discovered(
+            device_id,
+            item.audio_id,
+            item.filename,
+            label=getattr(item, "label", None),
+            source_sha256=source["sha256"],
+            created_at=getattr(item, "created_at", None),
+            duration_ms=getattr(item, "duration_ms", None),
+            device_synced=upload_transcripts,
+        )
 
         entry = {
             "device_id": device_id,
@@ -381,16 +419,18 @@ def _sync_audio_item(
 
 def sync_device_audio(
     device_id: str,
-    client: DeviceClient,
+    client: DeviceClient | SerialDeviceClient,
     store: PartnerStore,
     backend: TranscriptionBackend,
     *,
     upload_transcripts: bool = True,
     reprocess_synced: bool = False,
+    library: NoteLibrary | None = None,
 ) -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
     if isinstance(backend, FakeTranscriptionBackend):
         upload_transcripts = False
+    library = library or NoteLibrary(store.root)
     fingerprint = backend.fingerprint()
     with store.workflow_lock(device_id, "__device_sync__"):
         for item in client.list_audio():
@@ -399,6 +439,7 @@ def sync_device_audio(
                     device_id,
                     client,
                     store,
+                    library,
                     backend,
                     fingerprint,
                     item,

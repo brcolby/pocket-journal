@@ -5,8 +5,12 @@ from datetime import datetime, timezone
 import hashlib
 from importlib import metadata
 import json
+import os
 from pathlib import Path
+import shutil
 import struct
+import subprocess
+import tempfile
 from typing import Any, Mapping
 
 MODEL_ID = "distil-whisper/distil-large-v3.5"
@@ -18,6 +22,10 @@ MODEL_ARTIFACT_DIGEST_UNAVAILABLE_REASON = (
     "no canonical SHA-256 exists for the multi-file Hugging Face snapshot; "
     "model_revision pins its immutable contents"
 )
+WHISPER_CPP_DEFAULT_MODEL = "ggml-base.en.bin"
+WHISPER_CPP_MODEL_ENV = "PJ_WHISPER_MODEL"
+WHISPER_CPP_EXECUTABLE_ENV = "PJ_WHISPER_CPP"
+WHISPER_CPP_MAX_MODEL_BYTES = 2 * 1024 * 1024 * 1024
 
 
 def inspect_wav(path: Path) -> dict[str, Any]:
@@ -219,9 +227,201 @@ class HuggingFaceTranscriptionBackend(TranscriptionBackend):
         }
 
 
-def backend_from_name(name: str) -> TranscriptionBackend:
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _whisper_cpp_text(payload: Any) -> tuple[str, list[dict[str, Any]]]:
+    if not isinstance(payload, dict):
+        raise RuntimeError("whisper.cpp returned invalid JSON")
+    segments: list[dict[str, Any]] = []
+    raw_segments = payload.get("transcription")
+    if not isinstance(raw_segments, list):
+        raw_segments = payload.get("segments")
+    if isinstance(raw_segments, list):
+        for raw in raw_segments:
+            if not isinstance(raw, dict) or not isinstance(raw.get("text"), str):
+                continue
+            segment: dict[str, Any] = {"text": raw["text"].strip()}
+            timestamps = raw.get("timestamps")
+            if isinstance(timestamps, dict):
+                if isinstance(timestamps.get("from"), str):
+                    segment["start"] = timestamps["from"]
+                if isinstance(timestamps.get("to"), str):
+                    segment["end"] = timestamps["to"]
+            for source, target in (("t0", "start_ms"), ("t1", "end_ms")):
+                value = raw.get(source)
+                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                    segment[target] = int(value * 10)
+            if segment["text"]:
+                segments.append(segment)
+    text = " ".join(segment["text"] for segment in segments).strip()
+    if not text and isinstance(payload.get("text"), str):
+        text = payload["text"].strip()
+    if not text:
+        raise RuntimeError("whisper.cpp returned an empty transcript")
+    return text, segments
+
+
+class WhisperCppTranscriptionBackend(TranscriptionBackend):
+    """CPU-first whisper.cpp backend with an explicitly supplied local model."""
+
+    def __init__(
+        self,
+        model_path: Path | str | None = None,
+        executable: str | None = None,
+        *,
+        language: str = "en",
+        threads: int | None = None,
+    ) -> None:
+        configured_model = model_path or os.environ.get(WHISPER_CPP_MODEL_ENV)
+        self.model_path = Path(configured_model).expanduser() if configured_model else None
+        self.executable_name = executable or os.environ.get(WHISPER_CPP_EXECUTABLE_ENV) or "whisper-cli"
+        self.executable = shutil.which(self.executable_name)
+        self.language = language
+        self.threads = threads
+        if threads is not None and threads <= 0:
+            raise ValueError("whisper.cpp thread count must be positive")
+
+    def availability(self, *, digest: bool = False) -> dict[str, Any]:
+        issues: list[str] = []
+        if self.executable is None:
+            issues.append(
+                f"whisper.cpp executable {self.executable_name!r} was not found on PATH; "
+                f"set {WHISPER_CPP_EXECUTABLE_ENV} or pass --whisper-executable"
+            )
+        model_size = None
+        model_digest = None
+        if self.model_path is None:
+            issues.append(
+                f"no whisper.cpp model configured; set {WHISPER_CPP_MODEL_ENV} or pass --model "
+                f"(recommended: {WHISPER_CPP_DEFAULT_MODEL})"
+            )
+        elif not self.model_path.is_file():
+            issues.append(f"whisper.cpp model does not exist: {self.model_path}")
+        else:
+            model_size = self.model_path.stat().st_size
+            if model_size > WHISPER_CPP_MAX_MODEL_BYTES:
+                issues.append(
+                    "whisper.cpp model exceeds the 2 GiB partner guardrail; use base.en or small.en "
+                    "for the <=16 GB CPU profile"
+                )
+            if digest:
+                model_digest = _sha256_file(self.model_path)
+        return {
+            "backend": "whisper-cpp",
+            "available": not issues,
+            "cpu_only": True,
+            "cloud_required": False,
+            "recommended_model": WHISPER_CPP_DEFAULT_MODEL,
+            "executable": self.executable,
+            "model_path": str(self.model_path) if self.model_path is not None else None,
+            "model_bytes": model_size,
+            "model_sha256": model_digest,
+            "issues": issues,
+        }
+
+    def _require_available(self) -> tuple[str, Path]:
+        status = self.availability()
+        if not status["available"]:
+            raise RuntimeError("; ".join(status["issues"]))
+        assert self.executable is not None
+        assert self.model_path is not None
+        return self.executable, self.model_path
+
+    def fingerprint(self) -> dict[str, Any]:
+        executable, model_path = self._require_available()
+        return {
+            "backend": "whisper-cpp",
+            "runtime": "whisper.cpp",
+            "runtime_executable": str(Path(executable).resolve()),
+            "runtime_artifact_sha256": _sha256_file(Path(executable).resolve()),
+            "model_id": model_path.name,
+            "model_artifact": {
+                "algorithm": "sha256",
+                "digest": _sha256_file(model_path),
+                "bytes": model_path.stat().st_size,
+                "status": "verified",
+            },
+            "decoding_parameters": {
+                "language": self.language,
+                "threads": self.threads,
+                "cpu_only": True,
+            },
+        }
+
+    def transcribe(self, audio_path: Path) -> dict[str, Any]:
+        executable, model_path = self._require_available()
+        with tempfile.TemporaryDirectory(prefix="pj-whisper-") as temporary:
+            output_prefix = Path(temporary) / "transcript"
+            command = [
+                executable,
+                "-m",
+                str(model_path),
+                "-f",
+                str(audio_path),
+                "-l",
+                self.language,
+                "-oj",
+                "-of",
+                str(output_prefix),
+                "--no-prints",
+            ]
+            if self.threads is not None:
+                command.extend(("-t", str(self.threads)))
+            completed = subprocess.run(
+                command,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=24 * 60 * 60,
+                check=False,
+            )
+            if completed.returncode != 0:
+                detail = completed.stderr.strip().splitlines()[-1] if completed.stderr.strip() else "no diagnostic"
+                raise RuntimeError(
+                    f"whisper.cpp exited with status {completed.returncode}: {detail[:300]}"
+                )
+            output_path = output_prefix.with_suffix(".json")
+            try:
+                payload = json.loads(output_path.read_text(encoding="utf-8"))
+            except FileNotFoundError as exc:
+                raise RuntimeError("whisper.cpp did not create its JSON transcript") from exc
+            except (UnicodeError, json.JSONDecodeError) as exc:
+                raise RuntimeError("whisper.cpp created an invalid JSON transcript") from exc
+        text, segments = _whisper_cpp_text(payload)
+        result: dict[str, Any] = {
+            "model": model_path.name,
+            "runtime": "whisper.cpp",
+            "audio_file": audio_path.name,
+            "text": text,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "language": self.language,
+        }
+        if segments:
+            result["segments"] = segments
+        return result
+
+def backend_from_name(
+    name: str,
+    *,
+    model_path: Path | str | None = None,
+    executable: str | None = None,
+    threads: int | None = None,
+) -> TranscriptionBackend:
     if name == "fake":
         return FakeTranscriptionBackend()
     if name == "hf":
         return HuggingFaceTranscriptionBackend()
+    if name == "whisper-cpp":
+        return WhisperCppTranscriptionBackend(
+            model_path=model_path,
+            executable=executable,
+            threads=threads,
+        )
     raise ValueError(f"unknown transcription backend: {name}")

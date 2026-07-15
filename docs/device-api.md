@@ -45,7 +45,11 @@ GET /v1/time
 PUT /v1/time
 ```
 
-Reads or updates the local time/date shown on the time/temp screen. The v0 firmware accepts integer `hour`, `minute`, `month`, and `day` fields, plus optional `year` for weekday calculation.
+Reads or updates the local time/date shown on the time/temp screen. The firmware
+accepts integer `hour`, `minute`, `month`, and `day` fields, plus optional `year`
+for weekday calculation and `utc_offset_minutes` from `-840` through `840` for
+projecting SNTP UTC into the same local civil time and RTC basis. Omitting the
+offset preserves compatibility with older callers.
 
 ```json
 {
@@ -53,7 +57,8 @@ Reads or updates the local time/date shown on the time/temp screen. The v0 firmw
   "minute": 5,
   "year": 2026,
   "month": 6,
-  "day": 19
+  "day": 19,
+  "utc_offset_minutes": -420
 }
 ```
 
@@ -177,6 +182,12 @@ PJ_STATUS [request_id=ID]
 PJ_WIFI_HEX 4c61622057694669 70617373776f7264 746f6b656e
 PJ_TIME 2026 06 20 14 05 -420
 PJ_WIPE_RECORDINGS [request_id=ID]
+PJ_AUDIO_LIST cursor=0 snapshot=0 [request_id=ID]
+PJ_AUDIO_READ id_hex=ID offset=0 max_bytes=256 [source_sha256=SHA256] [request_id=ID]
+PJ_TRANSCRIPT_BEGIN id_hex=ID bytes=N sha256=SHA256 [request_id=ID]
+PJ_TRANSCRIPT_WRITE upload_id=ID offset=N data_hex=DATA [request_id=ID]
+PJ_TRANSCRIPT_COMMIT upload_id=ID sha256=SHA256 [request_id=ID]
+PJ_TRANSCRIPT_ABORT upload_id=ID [request_id=ID]
 PJ_AUDIO_TONE [0|1|-] [dout_gpio] [pa=0|1|-] [dout=gpio] [pwr=0|1|-] [gpio44=0x00..0xff] [gp45=0x00..0xff]
 PJ_MIC_CHECK [duration_ms] [ms=1..10000] [gain_db=0..42]
 ```
@@ -192,9 +203,41 @@ host offset changes.
 `PJ_AUDIO_TONE` plays a generated diagnostic tone. Its optional first argument forces the speaker PA GPIO level; `-` keeps the firmware default. Its optional second argument temporarily routes I2S TX data to a DOUT GPIO for board pin-map diagnosis. The named arguments expose the same probes plus temporary audio power GPIO and ES8311 register overrides; the firmware restores the normal route, power level, and register values after the tone.
 `PJ_MIC_CHECK` samples the ES8311 microphone path without creating a note file and returns input statistics: `peak`, `avg_abs`, `clipped`, `near_zero`, `read_errors`, and `silent`. The production recording gain is `42 dB`; use lower diagnostic overrides only when measuring input headroom.
 
+The note-transfer commands are line bounded. All identifiers, filenames, labels,
+timestamps, transcript paths, and binary chunks are lowercase hex encoding of
+their UTF-8/raw bytes. Identifiers and filenames decode to at most 160 bytes;
+each audio-read chunk is at most 256 bytes, each transcript-write chunk is at
+most 192 bytes, and a transcript is at most 65536 bytes. The smaller write bound
+keeps the hex-encoded command plus a 32-character request id below the client's
+conservative 512-byte compatibility envelope. Current firmware may accept a
+256-byte write chunk, but the partner emits at most 192 bytes.
+
+`PJ_AUDIO_LIST` returns one item at a time. The first request uses `snapshot=0`;
+the response creates a positive snapshot id. Every subsequent request echoes it.
+A response has `snapshot`, `cursor`, `next_cursor`, `done`, and, unless `done` is
+true, one `item` with `audio_id_hex`, `filename_hex`, optional `label_hex`,
+`created_at_hex`, `transcript_path_hex`, `size`, `data_bytes`, `duration_ms`,
+`source_sha256`, `synced`, and `transcript_uploaded`. The firmware returns a
+retryable `list_changed` error instead of mixing generations.
+
+`PJ_AUDIO_READ` returns `id_hex`, `offset`, `total_bytes`, `data_hex`, `eof`, and
+the required source SHA-256. The response offset must equal the requested
+offset, total length and digest remain invariant across chunks, and EOF is true
+exactly when the returned bytes end at `total_bytes`. When supplied, the request
+digest rejects a recording that changed after listing.
+
+Transcript upload is a staged transaction. `PJ_TRANSCRIPT_BEGIN` returns a
+positive `upload_id`, `offset: 0`, and `accepted: true`. Each write returns that
+id plus its exact `next_offset`. Commit succeeds only when byte count and SHA-256
+match the begin declaration, then atomically replaces the transcript and marks
+the associated note synced; it returns `committed: true` and `bytes`. Abort is
+safe to repeat. Begin, repeated identical writes, commit, and abort must be
+idempotent for the same request/upload identity so a lost serial acknowledgment
+does not duplicate or corrupt state.
+
 Responses start with `PJ_OK` or `PJ_ERR` followed by a compact JSON object. Normal ESP-IDF logs may appear on the same serial stream, so clients should scan for those prefixes.
 
-`PJ_STATUS` and `PJ_WIPE_RECORDINGS` accept an optional 1-32 character request id containing letters, digits, `.`, `_`, or `-`. Tagged responses include both `command` and `request_id`; clients must reject a response when either differs from the request. The partner CLI retries a lost wipe-start acknowledgment with the same request id, allowing firmware to return the associated operation even after a fast wipe has completed. It uses a fresh request id and a newly opened, bounded-lifetime serial descriptor for every status poll. A CLI timeout identifies the still-running operation id so a later status check can determine the outcome.
+`PJ_STATUS`, `PJ_WIPE_RECORDINGS`, and all note-transfer commands accept an optional 1-32 character request id containing letters, digits, `.`, `_`, or `-`. Tagged responses include both `command` and `request_id`; clients must reject a response when either differs from the request. The partner CLI retries a lost wipe-start or transfer acknowledgment with the same request id, allowing firmware to return the associated operation. It uses a newly opened, bounded-lifetime serial descriptor for requests and never retains the port while idle. A wipe timeout identifies the still-running operation id so a later status check can determine the outcome.
 
 ## Calendar Event Shape
 

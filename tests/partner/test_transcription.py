@@ -6,7 +6,7 @@ from pathlib import Path
 import struct
 import sys
 from tempfile import TemporaryDirectory
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -15,6 +15,9 @@ from pocket_journal_partner.transcription import (
     HuggingFaceTranscriptionBackend,
     MODEL_REVISION,
     MODEL_ARTIFACT_DIGEST_UNAVAILABLE_REASON,
+    WHISPER_CPP_DEFAULT_MODEL,
+    WhisperCppTranscriptionBackend,
+    backend_from_name,
     inspect_wav,
 )
 
@@ -223,6 +226,81 @@ class TranscriptionTests(unittest.TestCase):
                 )
             ],
         )
+
+    def test_whisper_cpp_availability_is_explicit_without_downloading(self) -> None:
+        backend = WhisperCppTranscriptionBackend(
+            model_path="/missing/model.bin",
+            executable="definitely-missing-whisper-cli",
+        )
+
+        status = backend.availability()
+
+        self.assertFalse(status["available"])
+        self.assertTrue(status["cpu_only"])
+        self.assertFalse(status["cloud_required"])
+        self.assertEqual(status["recommended_model"], WHISPER_CPP_DEFAULT_MODEL)
+        self.assertEqual(len(status["issues"]), 2)
+
+    def test_whisper_cpp_fingerprint_pins_local_model_bytes(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            executable = root / "whisper-cli"
+            executable.write_text("#!/bin/sh\n", encoding="utf-8")
+            executable.chmod(0o755)
+            model = root / WHISPER_CPP_DEFAULT_MODEL
+            model.write_bytes(b"local-open-weights")
+            backend = WhisperCppTranscriptionBackend(model, str(executable), threads=2)
+
+            fingerprint = backend.fingerprint()
+
+        self.assertEqual(fingerprint["backend"], "whisper-cpp")
+        self.assertEqual(fingerprint["model_id"], WHISPER_CPP_DEFAULT_MODEL)
+        self.assertEqual(
+            fingerprint["model_artifact"]["digest"],
+            hashlib.sha256(b"local-open-weights").hexdigest(),
+        )
+        self.assertEqual(
+            fingerprint["runtime_artifact_sha256"],
+            hashlib.sha256(b"#!/bin/sh\n").hexdigest(),
+        )
+        self.assertEqual(fingerprint["decoding_parameters"]["threads"], 2)
+        self.assertTrue(fingerprint["decoding_parameters"]["cpu_only"])
+
+    def test_whisper_cpp_transcribes_json_segments_without_a_shell(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            executable = root / "whisper-cli"
+            executable.write_text("#!/bin/sh\n", encoding="utf-8")
+            executable.chmod(0o755)
+            model = root / WHISPER_CPP_DEFAULT_MODEL
+            model.write_bytes(b"model")
+            audio = root / "audio.wav"
+            audio.write_bytes(pcm_wav())
+            backend = WhisperCppTranscriptionBackend(model, str(executable))
+
+            def run(command, **kwargs):  # type: ignore[no-untyped-def]
+                self.assertIsInstance(command, list)
+                self.assertNotIn("shell", kwargs)
+                output = Path(command[command.index("-of") + 1]).with_suffix(".json")
+                output.write_text(json.dumps({
+                    "transcription": [
+                        {"text": " Hello", "timestamps": {"from": "00:00:00.000", "to": "00:00:01.000"}},
+                        {"text": " world"},
+                    ]
+                }), encoding="utf-8")
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+            with patch("pocket_journal_partner.transcription.subprocess.run", side_effect=run):
+                result = backend.transcribe(audio)
+
+        self.assertEqual(result["text"], "Hello world")
+        self.assertEqual(result["language"], "en")
+        self.assertEqual(len(result["segments"]), 2)
+
+    def test_backend_factory_selects_whisper_cpp(self) -> None:
+        backend = backend_from_name("whisper-cpp", model_path="model.bin")
+
+        self.assertIsInstance(backend, WhisperCppTranscriptionBackend)
 
 
 if __name__ == "__main__":

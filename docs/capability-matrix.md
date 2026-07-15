@@ -9,26 +9,28 @@ in command output or errors.
 
 | Capability | CLI command | USB-C | LAN/Wi-Fi | Authentication | Firmware/API prerequisite | Mutable | Retry/idempotency |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| Device discovery | `pj discover` | No | Yes, mDNS | None for discovery; API remains authenticated | `_pocket-journal._tcp` advertisement | No | Safe to repeat |
+| Device discovery | `pj discover` | Enumerates candidate serial ports without opening them | Yes, mDNS | None for discovery; API remains authenticated | USB CDC/JTAG enumeration or `_pocket-journal._tcp` advertisement | No | Safe to repeat |
 | Device status | `pj device status [--device ID]` | `PJ_STATUS` | `GET /v1/status` | Physical USB access or bearer token | v0 status command/endpoint | No | Safe to repeat |
 | Wi-Fi diagnostics | `pj device wifi-diagnostics [--device ID]` | Normalizes `PJ_STATUS` | Normalizes `GET /v1/status` | Physical USB access or bearer token | Structured fields are used when firmware advertises them; older status is classified conservatively | No | Safe to repeat; output is credential-safe |
 | USB recovery | `pj device usb-recover [--probe-only]` | Probes `PJ_STATUS` and ESP32-S3 ROM output; attempts an esptool USB-JTAG watchdog reset, then a short RTS fallback | No | Physical USB access | ESP32-S3 USB Serial/JTAG; physical re-enumeration if serial and JTAG are both silent | Resets the device only when the application does not answer | Bounded; reaps the esptool child, releases the port, and leaves DTR/RTS idle |
 | Wi-Fi provisioning | `pj provision ... [--ble \| --serial-port PORT]` | `PJ_WIFI_HEX` (default) | No; BLE is an optional provisioning transport | Physical USB access or encrypted paired BLE; generates a new bearer token | v0 USB command or Pocket Journal BLE GATT service | Yes | Repeating intentionally replaces credentials and token |
-| Time sync | `pj device sync-time [--device ID]` | `PJ_TIME` | `PUT /v1/time` | Physical USB access or bearer token | v0 time command/endpoint | Yes | Safe to repeat; USB provisioning performs it automatically and validates the echoed civil time against a host UTC anchor |
+| Time sync | `pj device sync-time [--device ID]` | `PJ_TIME` with optional UTC-offset minutes | `PUT /v1/time` | Physical USB access or bearer token | Time command/endpoint | Yes | Safe to repeat; USB provisioning performs it automatically, persists the host offset, and validates echoed civil time against a host UTC anchor |
 | Read settings | `pj settings get [--device ID]` | No | `GET /v1/settings` | Bearer token | v0 settings endpoint | No | Safe to repeat |
 | Update settings | `pj settings set [--device ID] KEY=VALUE...` | No | `PUT /v1/settings` | Bearer token | v0 settings endpoint | Yes | Safe to retry; updates are atomic values |
 | Read static art | `pj static-art get [--device ID]` | No | `GET /v1/static-art` | Bearer token | v0 static-art endpoint | No | Safe to repeat |
 | Update static art | `pj static-art set [--device ID] --file FILE` | No | `PUT /v1/static-art` | Bearer token | v0 static-art endpoint | Yes | Safe to retry; replaces the complete bitmap |
 | Read home layout | `pj home get [--device ID]` | No | `GET /v1/home` | Bearer token | v0 home endpoint | No | Safe to repeat |
 | Update home layout | `pj home set [--device ID] --file FILE` | No | `PUT /v1/home` | Bearer token | v0 home endpoint | Yes | Safe to retry; replaces the complete layout |
-| List audio | `pj recordings list [--device ID]` | No | `GET /v1/audio` | Bearer token | v0 audio endpoint | No | Safe to repeat |
-| Download audio | `pj recordings download [--device ID] --audio-id ID [--output-dir DIR]` | No | `GET /v1/audio/{id}` | Bearer token | v0 audio endpoint | Writes only the selected local file | Safe to retry; replaces the same local filename |
-| Sync audio and transcripts | `pj sync [--device ID] [--backend hf\|fake]` | No | Audio GET plus transcript PUT | Bearer token | v0 audio and transcript endpoints; selected transcription backend installed | Yes | Safe after interruption; cached audio/transcripts are reused and firmware skips uploaded notes |
-| Upload transcript | Performed by `pj sync` | No | `PUT /v1/transcripts/{id}` | Bearer token | v0 transcript endpoint and an existing recording | Yes | Safe to retry for the same recording |
+| List audio | `pj recordings list [--transport usb\|lan]` | Snapshot-paged `PJ_AUDIO_LIST`, one hex-safe item per response | `GET /v1/audio` | Physical USB access or bearer token | USB transfer protocol or v0 audio endpoint | No | Safe to repeat; snapshot changes abort the list |
+| Download audio | `pj recordings download --audio-id ID [--transport usb\|lan]` | Chunked `PJ_AUDIO_READ`, 256 bytes per response | `GET /v1/audio/{id}` | Physical USB access or bearer token | USB transfer protocol or v0 audio endpoint | Writes only the selected local file | USB uses temp-file replace after size, offset, EOF, and digest validation; full sync also validates the WAV structure |
+| Sync audio and transcripts | `pj sync [--transport usb\|lan] [--backend whisper-cpp\|hf\|fake]` | Snapshot list, chunked reads, atomic transcript upload | Audio GET plus transcript PUT | Physical USB access or bearer token | USB transfer protocol or v0 audio/transcript endpoints; selected local backend installed | Yes | Safe after interruption; cached audio/transcripts are reused and firmware skips uploaded notes |
+| Upload transcript | Performed by `pj sync` | `PJ_TRANSCRIPT_BEGIN/WRITE/COMMIT`, with best-effort abort | `PUT /v1/transcripts/{id}` | Physical USB access or bearer token | USB transfer protocol or v0 transcript endpoint and an existing recording | Yes | Digest-verified atomic commit; request-tagged chunks and commit are idempotent |
 | Delete recordings | `pj recordings wipe [--device ID] --yes` | Tagged `PJ_WIPE_RECORDINGS` start plus `PJ_STATUS` polls | `DELETE /v1/audio` plus `GET /v1/status` polls | Physical USB access or bearer token | Async wipe operation status | Yes, destructive | Requires `--yes`; concurrent starts attach to one operation; terminal counts and retryability are reported |
 | Speaker diagnostic | `pj device tone ...` | `PJ_AUDIO_TONE` | No | Physical USB access | v0 diagnostic command | Temporarily changes diagnostic routing | Safe to repeat; firmware restores temporary overrides |
 | Microphone diagnostic | `pj device mic-check ...` | `PJ_MIC_CHECK` | No | Physical USB access | v0 diagnostic command | No retained recording | Safe to repeat |
-| OTA firmware update | None | Not implemented | Reserved `POST /v1/ota`; not production-ready | Not applicable | Rollback and version verification are required first | Yes | Undefined; CLI intentionally refuses by having no command |
+| OTA firmware update | `pj firmware status/update` | No | Versioned OTA status and image stream | Bearer token plus explicit `--yes` activation | Rollback/version verification firmware | Yes | Preflight, digest verification, reconnect, and confirmed/rollback outcome |
+| Local note library | `pj library list/show/title` | Not a device operation | Not a device operation | Local user account | SQLite schema migrations | Local title only | Stable `(device_id, audio_id)` identity; imports legacy jobs idempotently |
+| Terminal/browser library | `pj library tui/serve` | Not a device operation | Loopback HTTP only | Local user account plus per-process CSRF token for writes | Local library | Local title only | Browser audio uses validated identities and byte ranges; non-loopback binds and DNS-rebinding host headers are refused |
 
 ## Transport Selection
 
@@ -65,6 +67,16 @@ mutations, honors a firmware `capabilities` advertisement when present, and reje
 an explicit incompatible `api_version`. Current v0 firmware does not advertise
 these optional fields, so the versioned `/v1` contract remains the compatibility
 baseline.
+
+USB note transfers never place arbitrary UTF-8 or binary bytes directly on a
+console line. Identifiers and payload chunks are hex encoded, identifiers are
+bounded to 160 UTF-8 bytes, audio chunks are bounded to 256 bytes, transcript
+chunks are bounded to 192 bytes,
+lists return at most one item per response, and transcripts are limited to 64
+KiB. Audio reads validate a stable snapshot/source digest and exact offsets.
+Transcript uploads validate declared byte count and SHA-256 before an atomic
+commit; failures trigger a best-effort abort without treating an unknown commit
+outcome as success.
 
 ## Output And Exit Codes
 
@@ -105,7 +117,10 @@ pj device sync-time
 pj settings set volume=8 theme=dark
 pj recordings list
 pj recordings download --audio-id rec-001.wav --output-dir ./audio
-pj sync --backend hf
+pj transcription status --model /models/ggml-base.en.bin
+pj sync --model /models/ggml-base.en.bin
+pj library tui
+pj library serve
 pj recordings wipe --yes
 ```
 

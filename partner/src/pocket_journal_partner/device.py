@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any, Iterator
 from urllib import error, parse, request
 import glob
+import hashlib
 import json
 import os
 import secrets
@@ -13,6 +14,7 @@ import socket
 import subprocess
 import sys
 import time
+import unicodedata
 
 
 class DeviceError(RuntimeError):
@@ -88,6 +90,13 @@ _WIPE_STATES = {"idle", "queued", "running", "succeeded", "failed"}
 _WIPE_START_RETRY_INTERVAL_SECONDS = 1.5
 _WIPE_START_MAX_ATTEMPTS = 3
 _USB_RESET_MARKERS = ("esp-rom:", "rst:0x")
+USB_TRANSFER_CHUNK_BYTES = 256
+USB_TRANSCRIPT_CHUNK_BYTES = 192
+USB_MAX_TEXT_BYTES = 160
+USB_MAX_AUDIO_ITEMS = 10_000
+USB_MAX_TRANSCRIPT_BYTES = 64 * 1024
+_USB_READ_RETRY_INTERVAL_SECONDS = 1.0
+_USB_READ_MAX_ATTEMPTS = 2
 
 
 @dataclass
@@ -199,6 +208,63 @@ def _recording_wipe_result(operation: dict[str, Any]) -> dict[str, Any]:
 
 def _new_request_id() -> str:
     return secrets.token_hex(8)
+
+
+def _usb_hex_text(value: Any, field: str, *, required: bool = True) -> str | None:
+    if value is None and not required:
+        return None
+    if not isinstance(value, str) or len(value) > USB_MAX_TEXT_BYTES * 2:
+        raise DeviceError(f"USB command failed: invalid {field}")
+    if len(value) % 2 or any(character not in "0123456789abcdef" for character in value):
+        raise DeviceError(f"USB command failed: invalid {field}")
+    try:
+        raw = bytes.fromhex(value)
+        decoded = raw.decode("utf-8")
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise DeviceError(f"USB command failed: invalid {field}") from exc
+    if any(unicodedata.category(character) == "Cc" for character in decoded):
+        raise DeviceError(f"USB command failed: invalid {field}")
+    if not decoded:
+        if required:
+            raise DeviceError(f"USB command failed: invalid {field}")
+        return None
+    return decoded
+
+
+def _usb_encode_text(value: str, field: str) -> str:
+    try:
+        raw = value.encode("utf-8")
+    except (AttributeError, UnicodeEncodeError) as exc:
+        raise DeviceError(f"{field} must be valid UTF-8 text for USB-C transfer") from exc
+    if (
+        not raw
+        or len(raw) > USB_MAX_TEXT_BYTES
+        or any(unicodedata.category(character) == "Cc" for character in value)
+    ):
+        raise DeviceError(
+            f"{field} must contain between 1 and {USB_MAX_TEXT_BYTES} UTF-8 bytes for USB-C transfer"
+        )
+    return raw.hex()
+
+
+def _usb_uint(value: Any, field: str, *, positive: bool = False) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise DeviceError(f"USB command failed: invalid {field}")
+    if value < (1 if positive else 0):
+        raise DeviceError(f"USB command failed: invalid {field}")
+    return value
+
+
+def _usb_sha256(value: Any, field: str, *, required: bool = False) -> str | None:
+    if value is None and not required:
+        return None
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise DeviceError(f"USB command failed: invalid {field}")
+    return value
 
 
 def _looks_like_usb_serial_port(device: str) -> bool:
@@ -343,7 +409,15 @@ class DeviceClient:
     def get_time(self) -> dict[str, Any]:
         return self._request("GET", "/v1/time")
 
-    def put_time(self, hour: int, minute: int, month: int, day: int, year: int | None = None) -> dict[str, Any] | None:
+    def put_time(
+        self,
+        hour: int,
+        minute: int,
+        month: int,
+        day: int,
+        year: int | None = None,
+        utc_offset_minutes: int | None = None,
+    ) -> dict[str, Any] | None:
         payload = {
             "hour": hour,
             "minute": minute,
@@ -352,6 +426,14 @@ class DeviceClient:
         }
         if year is not None:
             payload["year"] = year
+        if utc_offset_minutes is not None:
+            if (
+                isinstance(utc_offset_minutes, bool)
+                or not isinstance(utc_offset_minutes, int)
+                or not -840 <= utc_offset_minutes <= 840
+            ):
+                raise DeviceError("UTC offset must be between -840 and 840 minutes")
+            payload["utc_offset_minutes"] = utc_offset_minutes
         return self._request("PUT", "/v1/time", payload)
 
     def get_home_design(self) -> dict[str, Any]:
@@ -628,6 +710,234 @@ class SerialDeviceClient:
     def status(self) -> dict[str, Any]:
         return self._request("PJ_STATUS")
 
+    def list_audio(self) -> list[AudioItem]:
+        items: list[AudioItem] = []
+        seen_ids: set[str] = set()
+        cursor = 0
+        snapshot = 0
+        while True:
+            response = self._request(
+                f"PJ_AUDIO_LIST cursor={cursor} snapshot={snapshot}",
+                request_id=_new_request_id(),
+                retry_interval=_USB_READ_RETRY_INTERVAL_SECONDS,
+                max_attempts=_USB_READ_MAX_ATTEMPTS,
+            )
+            response_cursor = _usb_uint(response.get("cursor"), "audio list cursor")
+            response_snapshot = _usb_uint(
+                response.get("snapshot"), "audio list snapshot", positive=True
+            )
+            if response_cursor != cursor:
+                raise DeviceError("USB command failed: audio list cursor did not match request")
+            if snapshot not in {0, response_snapshot}:
+                raise DeviceError("USB command failed: audio list snapshot changed during transfer")
+            snapshot = response_snapshot
+            done = response.get("done")
+            if not isinstance(done, bool):
+                raise DeviceError("USB command failed: invalid audio list completion state")
+            raw_item = response.get("item")
+            if done:
+                if raw_item is not None:
+                    raise DeviceError("USB command failed: completed audio list contained an item")
+                return items
+            if not isinstance(raw_item, dict):
+                raise DeviceError("USB command failed: audio list item is missing")
+            audio_id = _usb_hex_text(raw_item.get("audio_id_hex"), "audio id")
+            filename = _usb_hex_text(raw_item.get("filename_hex"), "audio filename")
+            assert audio_id is not None and filename is not None
+            if audio_id in seen_ids:
+                raise DeviceError("USB command failed: audio list returned a duplicate id")
+            if Path(filename).name != filename or filename in {".", ".."}:
+                raise DeviceError("USB command failed: invalid audio filename")
+            seen_ids.add(audio_id)
+            if len(items) >= USB_MAX_AUDIO_ITEMS:
+                raise DeviceError(
+                    f"USB command failed: audio list exceeds {USB_MAX_AUDIO_ITEMS} items"
+                )
+
+            def optional_uint(field: str) -> int | None:
+                value = raw_item.get(field)
+                return None if value is None else _usb_uint(value, field)
+
+            label = _usb_hex_text(raw_item.get("label_hex"), "audio label", required=False)
+            created_at = _usb_hex_text(
+                raw_item.get("created_at_hex"), "audio creation time", required=False
+            )
+            transcript_path = _usb_hex_text(
+                raw_item.get("transcript_path_hex"), "transcript path", required=False
+            )
+            source_sha256 = _usb_sha256(
+                raw_item.get("source_sha256"), "audio source digest"
+            )
+            synced = raw_item.get("synced", False)
+            transcript_uploaded = raw_item.get("transcript_uploaded", False)
+            if not isinstance(synced, bool) or not isinstance(transcript_uploaded, bool):
+                raise DeviceError("USB command failed: invalid audio sync state")
+            items.append(AudioItem(
+                audio_id=audio_id,
+                filename=filename,
+                label=label,
+                size=optional_uint("size"),
+                data_bytes=optional_uint("data_bytes"),
+                source_sha256=source_sha256,
+                created_at=created_at,
+                duration_ms=optional_uint("duration_ms"),
+                synced=synced,
+                transcript_uploaded=transcript_uploaded,
+                transcript_path=transcript_path,
+            ))
+            next_cursor = _usb_uint(response.get("next_cursor"), "next audio list cursor")
+            if next_cursor <= cursor:
+                raise DeviceError("USB command failed: audio list cursor did not advance")
+            cursor = next_cursor
+
+    def download_audio(self, item: AudioItem, target_dir: Path) -> Path:
+        id_hex = _usb_encode_text(item.audio_id, "audio id")
+        filename = Path(item.filename).name
+        if not filename or filename in {".", ".."} or filename != item.filename:
+            raise DeviceError(f"device returned an invalid filename for audio {item.audio_id!r}")
+        target_dir.mkdir(parents=True, exist_ok=True)
+        path = target_dir / filename
+        partial = path.with_name(f".{path.name}.part")
+        offset = 0
+        total_bytes: int | None = None
+        source_sha256 = item.source_sha256
+        digest = hashlib.sha256()
+        try:
+            with partial.open("wb") as handle:
+                while True:
+                    command = (
+                        f"PJ_AUDIO_READ id_hex={id_hex} offset={offset} "
+                        f"max_bytes={USB_TRANSFER_CHUNK_BYTES}"
+                    )
+                    if source_sha256 is not None:
+                        command += f" source_sha256={source_sha256}"
+                    response = self._request(
+                        command,
+                        request_id=_new_request_id(),
+                        retry_interval=_USB_READ_RETRY_INTERVAL_SECONDS,
+                        max_attempts=_USB_READ_MAX_ATTEMPTS,
+                    )
+                    if response.get("id_hex") != id_hex:
+                        raise DeviceError("USB command failed: audio read id did not match request")
+                    if _usb_uint(response.get("offset"), "audio read offset") != offset:
+                        raise DeviceError("USB command failed: audio read offset did not match request")
+                    response_total = _usb_uint(response.get("total_bytes"), "audio total bytes")
+                    if total_bytes is None:
+                        total_bytes = response_total
+                        if item.size is not None and total_bytes != item.size:
+                            raise DeviceError(
+                                f"USB audio size mismatch: expected {item.size} bytes, got {total_bytes}"
+                            )
+                    elif response_total != total_bytes:
+                        raise DeviceError("USB command failed: audio size changed during transfer")
+                    response_digest = _usb_sha256(
+                        response.get("source_sha256"), "audio source digest", required=True
+                    )
+                    assert response_digest is not None
+                    if source_sha256 is None:
+                        source_sha256 = response_digest
+                    elif response_digest is not None and response_digest != source_sha256:
+                        raise DeviceError("USB command failed: audio digest changed during transfer")
+                    data_hex = response.get("data_hex")
+                    if (
+                        not isinstance(data_hex, str)
+                        or len(data_hex) > USB_TRANSFER_CHUNK_BYTES * 2
+                        or len(data_hex) % 2
+                        or any(character not in "0123456789abcdef" for character in data_hex)
+                    ):
+                        raise DeviceError("USB command failed: invalid audio data chunk")
+                    try:
+                        data = bytes.fromhex(data_hex)
+                    except ValueError as exc:
+                        raise DeviceError("USB command failed: invalid audio data chunk") from exc
+                    eof = response.get("eof")
+                    if not isinstance(eof, bool):
+                        raise DeviceError("USB command failed: invalid audio EOF state")
+                    if not data and not eof:
+                        raise DeviceError("USB command failed: empty audio chunk before EOF")
+                    if offset + len(data) > total_bytes:
+                        raise DeviceError("USB command failed: audio chunk exceeds declared size")
+                    if eof != (offset + len(data) == total_bytes):
+                        raise DeviceError("USB command failed: inconsistent audio EOF state")
+                    handle.write(data)
+                    digest.update(data)
+                    offset += len(data)
+                    if eof:
+                        break
+                handle.flush()
+                os.fsync(handle.fileno())
+            if source_sha256 is not None and digest.hexdigest() != source_sha256:
+                raise DeviceError("USB audio digest verification failed")
+            partial.replace(path)
+            return path
+        finally:
+            if partial.exists():
+                partial.unlink()
+
+    def upload_transcript(self, audio_id: str, transcript: dict[str, Any]) -> None:
+        id_hex = _usb_encode_text(audio_id, "audio id")
+        try:
+            payload = json.dumps(
+                transcript,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+                allow_nan=False,
+            ).encode("utf-8")
+        except (TypeError, ValueError) as exc:
+            raise DeviceError("transcript is not valid JSON") from exc
+        if not payload or len(payload) > USB_MAX_TRANSCRIPT_BYTES:
+            raise DeviceError(
+                f"transcript must contain between 1 and {USB_MAX_TRANSCRIPT_BYTES} bytes"
+            )
+        payload_sha256 = hashlib.sha256(payload).hexdigest()
+        begin = self._request(
+            f"PJ_TRANSCRIPT_BEGIN id_hex={id_hex} bytes={len(payload)} sha256={payload_sha256}",
+            request_id=_new_request_id(),
+            retry_interval=_USB_READ_RETRY_INTERVAL_SECONDS,
+            max_attempts=_USB_READ_MAX_ATTEMPTS,
+        )
+        upload_id = _usb_uint(begin.get("upload_id"), "transcript upload id", positive=True)
+        try:
+            if begin.get("accepted") is not True or _usb_uint(begin.get("offset"), "upload offset") != 0:
+                raise DeviceError("USB command failed: transcript upload was not accepted")
+            offset = 0
+            while offset < len(payload):
+                chunk = payload[offset : offset + USB_TRANSCRIPT_CHUNK_BYTES]
+                response = self._request(
+                    f"PJ_TRANSCRIPT_WRITE upload_id={upload_id} offset={offset} data_hex={chunk.hex()}",
+                    request_id=_new_request_id(),
+                    retry_interval=_USB_READ_RETRY_INTERVAL_SECONDS,
+                    max_attempts=_USB_READ_MAX_ATTEMPTS,
+                )
+                if _usb_uint(response.get("upload_id"), "transcript upload id", positive=True) != upload_id:
+                    raise DeviceError("USB command failed: transcript upload id changed")
+                next_offset = _usb_uint(response.get("next_offset"), "transcript next offset")
+                if next_offset != offset + len(chunk):
+                    raise DeviceError("USB command failed: transcript upload offset did not advance")
+                offset = next_offset
+            committed = self._request(
+                f"PJ_TRANSCRIPT_COMMIT upload_id={upload_id} sha256={payload_sha256}",
+                request_id=_new_request_id(),
+                retry_interval=_USB_READ_RETRY_INTERVAL_SECONDS,
+                max_attempts=_USB_READ_MAX_ATTEMPTS,
+            )
+            if (
+                _usb_uint(committed.get("upload_id"), "transcript upload id", positive=True) != upload_id
+                or committed.get("committed") is not True
+                or _usb_uint(committed.get("bytes"), "transcript byte count") != len(payload)
+            ):
+                raise DeviceError("USB command failed: transcript commit was not confirmed")
+        except (Exception, KeyboardInterrupt):
+            try:
+                self._request(
+                    f"PJ_TRANSCRIPT_ABORT upload_id={upload_id}",
+                    request_id=_new_request_id(),
+                )
+            except Exception:
+                pass
+            raise
+
     def reset_interval(self) -> dict[str, Any]:
         response = self._request(
             "PJ_INTERVAL_RESET",
@@ -637,10 +947,27 @@ class SerialDeviceClient:
             raise DeviceError("USB command failed: interval reset was not confirmed")
         return response
 
-    def put_time(self, hour: int, minute: int, month: int, day: int, year: int | None = None) -> dict[str, Any]:
+    def put_time(
+        self,
+        hour: int,
+        minute: int,
+        month: int,
+        day: int,
+        year: int | None = None,
+        utc_offset_minutes: int | None = None,
+    ) -> dict[str, Any]:
         if year is None:
             raise DeviceError("USB time sync requires a year")
-        return self._request(f"PJ_TIME {year} {month} {day} {hour} {minute}")
+        command = f"PJ_TIME {year} {month} {day} {hour} {minute}"
+        if utc_offset_minutes is not None:
+            if (
+                isinstance(utc_offset_minutes, bool)
+                or not isinstance(utc_offset_minutes, int)
+                or not -840 <= utc_offset_minutes <= 840
+            ):
+                raise DeviceError("UTC offset must be between -840 and 840 minutes")
+            command += f" {utc_offset_minutes}"
+        return self._request(command)
 
     def _wipe_operation_lost(
         self,
