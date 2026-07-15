@@ -12,6 +12,7 @@ extern "C" {
 #define PJ_OTA_BOARD_LEN 80U
 #define PJ_OTA_UPLOAD_ID_LEN 32U
 #define PJ_OTA_CANONICAL_MAX 512U
+#define PJ_OTA_FAILURE_RETRY_LIMIT 6U
 
 typedef struct {
     uint64_t size;
@@ -150,6 +151,7 @@ typedef enum {
     PJ_OTA_RECORD_PENDING_REBOOT,
     PJ_OTA_RECORD_TESTING,
     PJ_OTA_RECORD_CONFIRMED,
+    PJ_OTA_RECORD_FAILED_HEALTH,
     PJ_OTA_RECORD_ROLLBACK_REQUESTED,
     PJ_OTA_RECORD_ROLLED_BACK,
     PJ_OTA_RECORD_FAILED,
@@ -169,6 +171,17 @@ typedef struct {
 } pj_ota_boot_inputs_t;
 
 pj_ota_boot_state_t pj_ota_boot_evaluate(const pj_ota_boot_inputs_t *inputs);
+
+typedef struct {
+    int active;
+    int write_terminal_marker;
+    int attempt_rollback;
+} pj_ota_failure_retry_plan_t;
+
+pj_ota_failure_retry_plan_t pj_ota_failure_retry_plan(
+    int terminal_marker_persisted,
+    int rollback_possible,
+    unsigned attempts_completed);
 
 #ifdef __cplusplus
 }

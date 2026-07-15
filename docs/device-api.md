@@ -187,14 +187,19 @@ fails, the already-armed task still restarts the device. The exclusive mutation
 lease therefore remains held from verified activation until reset.
 
 Activation records the exact target partition address/subtype as well as version
-and digest. On reboot, both version and running partition must match, and only a
-persisted `pending_reboot`/`testing` record can enter health confirmation. A
-`confirmed` record requires an already-valid image; failed, rollback, or unknown
-records never promote an image. Firmware is confirmed only after required
-services/tasks, UI initialization, and the first display flush succeed;
-otherwise ESP-IDF rollback is requested. LAN OTA authentication reads the
-current provisioned token for every request and fails closed before
-provisioning.
+and digest. On reboot, both version and running partition must match. Before
+health can be accepted, `pending_reboot` is durably changed to `testing`; a
+reboot that finds `testing` plus IDF `PENDING_VERIFY` treats the prior health
+attempt as interrupted and forces rollback. Firmware is confirmed only after
+required services/tasks, UI initialization, and the first display flush
+succeed. A torn post-health NVS write is reconciled only when the exact image is
+already IDF `VALID` and the durable record is nonterminal. `failed_health`,
+rollback, failed, and unknown records never promote an image, even if a later
+boot appears healthy. Terminal-marker writes and rollback failures use bounded,
+backed-off retries; NVS is not rewritten after the marker first persists. LAN
+OTA preflight and upload remain blocked while verification or terminal recovery
+is unresolved. Authentication reads the current provisioned token for every
+request and fails closed before provisioning.
 
 ## USB-C Partner Commands
 

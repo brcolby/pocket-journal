@@ -167,6 +167,7 @@ static void test_activation_health_reset_and_factory_migration(void)
     boot.running_partition_matches_target = 1;
     boot.running_pending_verify = 1;
     assert(pj_ota_boot_evaluate(&boot) == PJ_OTA_BOOT_TESTING);
+    boot.record_state = PJ_OTA_RECORD_TESTING;
     boot.health_checked = 1;
     boot.health_ok = 1;
     assert(pj_ota_boot_evaluate(&boot) == PJ_OTA_BOOT_CONFIRMED);
@@ -189,6 +190,8 @@ static void test_persisted_state_boot_matrix(void)
            PJ_OTA_RECORD_PENDING_REBOOT);
     assert(pj_ota_record_state_parse("testing") == PJ_OTA_RECORD_TESTING);
     assert(pj_ota_record_state_parse("confirmed") == PJ_OTA_RECORD_CONFIRMED);
+    assert(pj_ota_record_state_parse("failed_health") ==
+           PJ_OTA_RECORD_FAILED_HEALTH);
     assert(pj_ota_record_state_parse("rollback_requested") ==
            PJ_OTA_RECORD_ROLLBACK_REQUESTED);
     assert(pj_ota_record_state_parse("rolled_back") ==
@@ -206,6 +209,7 @@ static void test_persisted_state_boot_matrix(void)
     const pj_ota_record_state_t rejected[] = {
         PJ_OTA_RECORD_INVALID,
         PJ_OTA_RECORD_CONFIRMED,
+        PJ_OTA_RECORD_FAILED_HEALTH,
         PJ_OTA_RECORD_ROLLBACK_REQUESTED,
         PJ_OTA_RECORD_ROLLED_BACK,
         PJ_OTA_RECORD_FAILED,
@@ -228,7 +232,107 @@ static void test_persisted_state_boot_matrix(void)
     boot.record_state = PJ_OTA_RECORD_CONFIRMED;
     assert(pj_ota_boot_evaluate(&boot) == PJ_OTA_BOOT_CONFIRMED);
     boot.record_state = PJ_OTA_RECORD_PENDING_REBOOT;
+    assert(pj_ota_boot_evaluate(&boot) == PJ_OTA_BOOT_CONFIRMED);
+}
+
+static void test_failed_health_is_irrevocable_across_failures(void)
+{
+    pj_ota_boot_inputs_t boot = {
+        .update_recorded = 1,
+        .record_state = PJ_OTA_RECORD_TESTING,
+        .running_version_matches_target = 1,
+        .running_partition_matches_target = 1,
+        .running_pending_verify = 1,
+    };
+
+    /* NVS failed-health write fails: durable testing means reboot cannot confirm. */
     assert(pj_ota_boot_evaluate(&boot) == PJ_OTA_BOOT_FAILED);
+    boot.record_state = PJ_OTA_RECORD_FAILED_HEALTH;
+    boot.health_checked = 1;
+    boot.health_ok = 1;
+    assert(pj_ota_boot_evaluate(&boot) == PJ_OTA_BOOT_FAILED);
+
+    /* A later healthy observation cannot override failed health. */
+    boot.rollback_possible = 1;
+    assert(pj_ota_boot_evaluate(&boot) ==
+           PJ_OTA_BOOT_ROLLBACK_REQUIRED);
+
+    /* A failed rollback call leaves the same durable marker for the next boot. */
+    boot.health_checked = 0;
+    boot.health_ok = 0;
+    assert(pj_ota_boot_evaluate(&boot) == PJ_OTA_BOOT_FAILED);
+    boot.health_checked = 1;
+    assert(pj_ota_boot_evaluate(&boot) ==
+           PJ_OTA_BOOT_ROLLBACK_REQUIRED);
+}
+
+static void test_torn_confirmation_reconciles_only_nonfailed_records(void)
+{
+    pj_ota_boot_inputs_t boot = {
+        .update_recorded = 1,
+        .record_state = PJ_OTA_RECORD_TESTING,
+        .running_version_matches_target = 1,
+        .running_partition_matches_target = 1,
+        .running_pending_verify = 0,
+    };
+
+    /* IDF VALID proves mark-valid completed after health; the NVS write tore. */
+    assert(pj_ota_boot_evaluate(&boot) == PJ_OTA_BOOT_CONFIRMED);
+    boot.record_state = PJ_OTA_RECORD_CONFIRMED;
+    assert(pj_ota_boot_evaluate(&boot) == PJ_OTA_BOOT_CONFIRMED);
+    boot.record_state = PJ_OTA_RECORD_PENDING_REBOOT;
+    assert(pj_ota_boot_evaluate(&boot) == PJ_OTA_BOOT_CONFIRMED);
+
+    boot.record_state = PJ_OTA_RECORD_FAILED_HEALTH;
+    assert(pj_ota_boot_evaluate(&boot) == PJ_OTA_BOOT_FAILED);
+    boot.record_state = PJ_OTA_RECORD_ROLLBACK_REQUESTED;
+    assert(pj_ota_boot_evaluate(&boot) == PJ_OTA_BOOT_FAILED);
+}
+
+static void test_failure_retry_plan_bounds_nvs_writes(void)
+{
+    pj_ota_failure_retry_plan_t plan =
+        pj_ota_failure_retry_plan(0, 0, 0U);
+    assert(plan.active && plan.write_terminal_marker &&
+           !plan.attempt_rollback);
+
+    plan = pj_ota_failure_retry_plan(1, 0, 0U);
+    assert(!plan.active && !plan.write_terminal_marker &&
+           !plan.attempt_rollback);
+
+    plan = pj_ota_failure_retry_plan(1, 1, 0U);
+    assert(plan.active && !plan.write_terminal_marker &&
+           plan.attempt_rollback);
+
+    unsigned writes = 0U;
+    int marker_persisted = 0;
+    for (unsigned attempt = 0U; attempt < PJ_OTA_FAILURE_RETRY_LIMIT;
+         attempt++) {
+        plan = pj_ota_failure_retry_plan(marker_persisted, 0, attempt);
+        if (!plan.active) {
+            break;
+        }
+        if (plan.write_terminal_marker) {
+            writes++;
+            marker_persisted = attempt == 2U;
+        }
+    }
+    assert(writes == 3U);
+    plan = pj_ota_failure_retry_plan(marker_persisted, 0, 3U);
+    assert(!plan.active); /* No NVS writes after the first success. */
+
+    plan = pj_ota_failure_retry_plan(
+        0, 1, PJ_OTA_FAILURE_RETRY_LIMIT);
+    assert(!plan.active); /* Persistent faults are bounded. */
+
+    writes = 0U;
+    for (unsigned attempt = 0U; attempt < PJ_OTA_FAILURE_RETRY_LIMIT;
+         attempt++) {
+        plan = pj_ota_failure_retry_plan(0, 0, attempt);
+        assert(plan.active && plan.write_terminal_marker);
+        writes++;
+    }
+    assert(writes == PJ_OTA_FAILURE_RETRY_LIMIT);
 }
 
 int main(void)
@@ -239,6 +343,9 @@ int main(void)
     test_mutation_reservation_is_request_owned();
     test_activation_health_reset_and_factory_migration();
     test_persisted_state_boot_matrix();
+    test_failed_health_is_irrevocable_across_failures();
+    test_torn_confirmation_reconciles_only_nonfailed_records();
+    test_failure_retry_plan_bounds_nvs_writes();
     puts("OTA policy tests passed");
     return 0;
 }

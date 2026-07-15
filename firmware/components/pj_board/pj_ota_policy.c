@@ -416,6 +416,7 @@ pj_ota_record_state_t pj_ota_record_state_parse(const char *state)
         "pending_reboot",
         "testing",
         "confirmed",
+        "failed_health",
         "rollback_requested",
         "rolled_back",
         "failed",
@@ -440,29 +441,45 @@ pj_ota_boot_state_t pj_ota_boot_evaluate(const pj_ota_boot_inputs_t *inputs)
         !inputs->running_partition_matches_target) {
         return PJ_OTA_BOOT_ROLLED_BACK;
     }
-    if (inputs->record_state == PJ_OTA_RECORD_CONFIRMED) {
-        if (!inputs->running_pending_verify) {
-            return PJ_OTA_BOOT_CONFIRMED;
-        }
-        return inputs->health_checked && inputs->rollback_possible ?
-            PJ_OTA_BOOT_ROLLBACK_REQUIRED : PJ_OTA_BOOT_FAILED;
+    if (!inputs->running_pending_verify &&
+        (inputs->record_state == PJ_OTA_RECORD_PENDING_REBOOT ||
+         inputs->record_state == PJ_OTA_RECORD_TESTING ||
+         inputs->record_state == PJ_OTA_RECORD_CONFIRMED)) {
+        return PJ_OTA_BOOT_CONFIRMED;
     }
-    int activation_pending =
-        inputs->record_state == PJ_OTA_RECORD_PENDING_REBOOT ||
-        inputs->record_state == PJ_OTA_RECORD_TESTING;
-    if (!activation_pending) {
+    if (inputs->record_state == PJ_OTA_RECORD_PENDING_REBOOT) {
+        return !inputs->running_pending_verify || inputs->health_checked ?
+            PJ_OTA_BOOT_FAILED : PJ_OTA_BOOT_TESTING;
+    }
+    if (inputs->record_state != PJ_OTA_RECORD_TESTING) {
         return inputs->running_pending_verify && inputs->health_checked &&
             inputs->rollback_possible ? PJ_OTA_BOOT_ROLLBACK_REQUIRED :
             PJ_OTA_BOOT_FAILED;
     }
     if (!inputs->running_pending_verify) {
-        return PJ_OTA_BOOT_FAILED;
+        return PJ_OTA_BOOT_CONFIRMED;
     }
     if (!inputs->health_checked) {
-        return PJ_OTA_BOOT_TESTING;
+        return PJ_OTA_BOOT_FAILED;
     }
     if (inputs->health_ok) {
         return PJ_OTA_BOOT_CONFIRMED;
     }
     return inputs->rollback_possible ? PJ_OTA_BOOT_ROLLBACK_REQUIRED : PJ_OTA_BOOT_FAILED;
+}
+
+pj_ota_failure_retry_plan_t pj_ota_failure_retry_plan(
+    int terminal_marker_persisted,
+    int rollback_possible,
+    unsigned attempts_completed)
+{
+    pj_ota_failure_retry_plan_t plan = {0};
+    if (attempts_completed >= PJ_OTA_FAILURE_RETRY_LIMIT ||
+        (terminal_marker_persisted && !rollback_possible)) {
+        return plan;
+    }
+    plan.active = 1;
+    plan.write_terminal_marker = !terminal_marker_persisted;
+    plan.attempt_rollback = rollback_possible;
+    return plan;
 }

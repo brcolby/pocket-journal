@@ -32,6 +32,8 @@
 #define PJ_OTA_SIGNATURE_MAX_BYTES 128U
 #define PJ_OTA_KEY_MAX_BYTES 256U
 #define PJ_OTA_RESTART_DELAY_MS 750U
+#define PJ_OTA_ROLLBACK_RETRY_MS 5000U
+#define PJ_OTA_ROLLBACK_RETRY_MAX_MS 60000U
 #define PJ_OTA_PREFLIGHT_TTL_MS (5U * 60U * 1000U)
 #define PJ_OTA_NVS_NAMESPACE "pj_ota"
 
@@ -50,6 +52,7 @@
 typedef struct {
     SemaphoreHandle_t lock;
     TimerHandle_t preflight_timer;
+    TaskHandle_t rollback_retry_task;
     pj_ota_session_t session;
     pj_ota_mutation_reservation_t mutation_reservation;
     pj_ota_manifest_t manifest;
@@ -61,6 +64,8 @@ typedef struct {
     char target_sha256[PJ_OTA_SHA256_HEX_LEN + 1U];
     int initialized;
     int boot_pending_verify;
+    int boot_terminal_failure;
+    int failed_health_persisted;
     pj_ota_record_state_t boot_record_state;
     int nvs_ready;
     int crypto_ready;
@@ -81,6 +86,7 @@ static pj_ota_context_t g_ota;
 static void preflight_timer_callback(TimerHandle_t timer);
 static void ota_abort(esp_ota_handle_t handle, int begun,
                       pj_ota_mutation_lease_t *lease, const char *reason);
+static void boot_failure_locked(const char *reason);
 static void preflight_abort(const char *upload_id, const char *reason);
 
 static void copy_text(char *destination, size_t capacity, const char *source)
@@ -484,6 +490,7 @@ static void record_load(void)
     nvs_handle_t handle;
     g_ota.nvs_ready = nvs_open(PJ_OTA_NVS_NAMESPACE, NVS_READWRITE, &handle) == ESP_OK;
     if (!g_ota.nvs_ready) {
+        g_ota.boot_terminal_failure = 1;
         state_set("failed", "ota_state_unavailable");
         return;
     }
@@ -515,13 +522,18 @@ static void record_load(void)
         subtype_result != ESP_OK || partition_address == 0U ||
         partition_subtype < ESP_PARTITION_SUBTYPE_APP_OTA_MIN ||
         partition_subtype >= ESP_PARTITION_SUBTYPE_APP_OTA_MAX) {
+        g_ota.boot_terminal_failure = 1;
         state_set("failed", "ota_state_corrupt");
         return;
     }
     g_ota.target_partition_address = partition_address;
     g_ota.target_partition_subtype = partition_subtype;
     g_ota.target_partition_recorded = 1;
-    g_ota.boot_record_state = pj_ota_record_state_parse(persisted_state);
+    pj_ota_record_state_t persisted_record_state =
+        pj_ota_record_state_parse(persisted_state);
+    g_ota.boot_record_state = persisted_record_state;
+    g_ota.failed_health_persisted =
+        persisted_record_state == PJ_OTA_RECORD_FAILED_HEALTH;
     const esp_app_desc_t *running = esp_app_get_description();
     const esp_partition_t *partition = esp_ota_get_running_partition();
     pj_ota_boot_inputs_t boot = {
@@ -535,6 +547,8 @@ static void record_load(void)
     };
     pj_ota_boot_state_t outcome = pj_ota_boot_evaluate(&boot);
     if (outcome == PJ_OTA_BOOT_ROLLED_BACK) {
+        g_ota.boot_record_state = PJ_OTA_RECORD_ROLLED_BACK;
+        g_ota.failed_health_persisted = 0;
         state_set("rolled_back", "target_partition_not_running");
         (void)record_write("rolled_back");
         return;
@@ -543,6 +557,7 @@ static void record_load(void)
     if (esp_ota_get_state_partition(partition, &image_state) != ESP_OK ||
         (image_state != ESP_OTA_IMG_PENDING_VERIFY &&
          image_state != ESP_OTA_IMG_VALID)) {
+        g_ota.boot_terminal_failure = 1;
         state_set("failed", "boot_state_unavailable");
         return;
     }
@@ -550,24 +565,57 @@ static void record_load(void)
     outcome = pj_ota_boot_evaluate(&boot);
     if (outcome == PJ_OTA_BOOT_TESTING) {
         g_ota.boot_pending_verify = 1;
-        state_set("testing", "awaiting_health_confirmation");
+        esp_err_t marker_result = record_write("testing");
+        if (marker_result == ESP_OK) {
+            g_ota.boot_record_state = PJ_OTA_RECORD_TESTING;
+            state_set("testing", "awaiting_health_confirmation");
+        } else {
+            g_ota.boot_record_state = PJ_OTA_RECORD_FAILED_HEALTH;
+            g_ota.boot_terminal_failure = 1;
+            g_ota.failed_health_persisted = 0;
+            state_set("failed", "health_marker_persist_failed");
+            ESP_LOGE(TAG, "Failed to persist OTA health marker: %s",
+                     esp_err_to_name(marker_result));
+        }
         return;
     }
     if (outcome == PJ_OTA_BOOT_CONFIRMED) {
-        state_set("confirmed", "");
-        (void)record_write("confirmed");
+        g_ota.boot_record_state = PJ_OTA_RECORD_CONFIRMED;
+        esp_err_t reconcile_result =
+            persisted_record_state == PJ_OTA_RECORD_CONFIRMED ? ESP_OK :
+            record_write("confirmed");
+        state_set("confirmed", reconcile_result == ESP_OK ? "" :
+                  "confirmation_record_pending");
+        if (reconcile_result != ESP_OK) {
+            ESP_LOGW(TAG, "Failed to reconcile confirmed OTA record: %s",
+                     esp_err_to_name(reconcile_result));
+        }
         return;
     }
     if (outcome == PJ_OTA_BOOT_FAILED) {
         g_ota.boot_pending_verify =
             image_state == ESP_OTA_IMG_PENDING_VERIFY;
-        if (g_ota.boot_record_state == PJ_OTA_RECORD_ROLLBACK_REQUESTED) {
+        g_ota.boot_terminal_failure = 1;
+        if (g_ota.boot_pending_verify) {
+            g_ota.boot_record_state = PJ_OTA_RECORD_FAILED_HEALTH;
+            esp_err_t terminal_result = g_ota.failed_health_persisted ?
+                ESP_OK : record_write("failed_health");
+            g_ota.failed_health_persisted = terminal_result == ESP_OK;
+            if (terminal_result != ESP_OK) {
+                ESP_LOGE(TAG, "Failed to persist terminal OTA record: %s",
+                         esp_err_to_name(terminal_result));
+            }
+        }
+        if (persisted_record_state == PJ_OTA_RECORD_ROLLBACK_REQUESTED) {
             state_set("rollback_requested", "persisted_rollback_request");
+        } else if (persisted_record_state == PJ_OTA_RECORD_TESTING) {
+            state_set("failed", "health_check_interrupted");
         } else {
             state_set("failed", "persisted_state_rejected");
         }
         return;
     }
+    g_ota.boot_terminal_failure = 1;
     state_set("failed", "boot_state_invalid");
 }
 
@@ -790,13 +838,14 @@ static esp_err_t ota_preflight_handler(httpd_req_t *request)
                          "\"reason\":\"OTA busy\","
                          "\"code\":\"ota_busy\"}");
     }
-    int active = g_ota.session.state == PJ_OTA_TRANSFER_WRITING ||
+    int active = g_ota.boot_pending_verify || g_ota.boot_terminal_failure ||
+                 g_ota.session.state == PJ_OTA_TRANSFER_WRITING ||
                  g_ota.session.state == PJ_OTA_TRANSFER_PENDING_REBOOT;
     if (g_ota.session.state == PJ_OTA_TRANSFER_READY &&
         (int32_t)(xTaskGetTickCount() - g_ota.ready_expires_at) >= 0) {
         pj_ota_session_abort(&g_ota.session);
         state_set("failed", "preflight_expired");
-        active = 0;
+        active = g_ota.boot_pending_verify || g_ota.boot_terminal_failure;
     }
     int signature_valid = signature_verify(&candidate, signature_hex);
     pj_ota_check_t check = pj_ota_preflight_check(
@@ -913,6 +962,124 @@ static void restart_task(void *argument)
     (void)argument;
     vTaskDelay(pdMS_TO_TICKS(PJ_OTA_RESTART_DELAY_MS));
     esp_restart();
+}
+
+static void rollback_retry_worker(void *argument)
+{
+    (void)argument;
+    for (unsigned attempt = 0U; attempt < PJ_OTA_FAILURE_RETRY_LIMIT;
+         attempt++) {
+        uint32_t delay_ms = PJ_OTA_ROLLBACK_RETRY_MS;
+        for (unsigned step = 0U; step < attempt &&
+             delay_ms < PJ_OTA_ROLLBACK_RETRY_MAX_MS; step++) {
+            delay_ms *= 2U;
+            if (delay_ms > PJ_OTA_ROLLBACK_RETRY_MAX_MS) {
+                delay_ms = PJ_OTA_ROLLBACK_RETRY_MAX_MS;
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(delay_ms));
+        if (g_ota.lock == NULL ||
+            xSemaphoreTake(g_ota.lock, portMAX_DELAY) != pdTRUE) {
+            continue;
+        }
+        if (!g_ota.boot_pending_verify) {
+            g_ota.rollback_retry_task = NULL;
+            xSemaphoreGive(g_ota.lock);
+            vTaskDelete(NULL);
+            return;
+        }
+        g_ota.boot_record_state = PJ_OTA_RECORD_FAILED_HEALTH;
+        g_ota.boot_terminal_failure = 1;
+        int rollback_possible = esp_ota_check_rollback_is_possible();
+        pj_ota_failure_retry_plan_t plan = pj_ota_failure_retry_plan(
+            g_ota.failed_health_persisted, rollback_possible, attempt);
+        if (!plan.active) {
+            g_ota.rollback_retry_task = NULL;
+            xSemaphoreGive(g_ota.lock);
+            vTaskDelete(NULL);
+            return;
+        }
+        if (plan.write_terminal_marker) {
+            esp_err_t marker_result = record_write("failed_health");
+            g_ota.failed_health_persisted = marker_result == ESP_OK;
+            if (marker_result != ESP_OK) {
+                state_set("failed", "failed_health_persist_failed");
+                ESP_LOGE(TAG, "OTA terminal marker retry failed: %s",
+                         esp_err_to_name(marker_result));
+            }
+        }
+        if (g_ota.failed_health_persisted) {
+            state_set("failed", rollback_possible ? "rollback_retry_pending" :
+                      "rollback_unavailable");
+        }
+        int terminal_stable = g_ota.failed_health_persisted &&
+                              !rollback_possible;
+        if (terminal_stable) {
+            g_ota.rollback_retry_task = NULL;
+        }
+        xSemaphoreGive(g_ota.lock);
+        if (terminal_stable) {
+            vTaskDelete(NULL);
+            return;
+        }
+        if (plan.attempt_rollback) {
+            esp_err_t rollback_result =
+                esp_ota_mark_app_invalid_rollback_and_reboot();
+            ESP_LOGE(TAG, "OTA rollback retry failed: %s",
+                     esp_err_to_name(rollback_result));
+        }
+    }
+    if (g_ota.lock != NULL &&
+        xSemaphoreTake(g_ota.lock, portMAX_DELAY) == pdTRUE) {
+        g_ota.rollback_retry_task = NULL;
+        state_set("failed", "rollback_retry_exhausted");
+        xSemaphoreGive(g_ota.lock);
+    }
+    vTaskDelete(NULL);
+}
+
+static void rollback_retry_start_locked(void)
+{
+    if (g_ota.rollback_retry_task != NULL) {
+        return;
+    }
+    if (xTaskCreate(rollback_retry_worker, "pj-ota-rollback", 3072, NULL, 5,
+                    &g_ota.rollback_retry_task) != pdPASS) {
+        g_ota.rollback_retry_task = NULL;
+        state_set("failed", "rollback_retry_task_failed");
+        ESP_LOGE(TAG, "Failed to start OTA rollback retry task");
+    }
+}
+
+static void boot_failure_locked(const char *reason)
+{
+    g_ota.boot_record_state = PJ_OTA_RECORD_FAILED_HEALTH;
+    g_ota.boot_terminal_failure = 1;
+    esp_err_t marker_result = g_ota.failed_health_persisted ? ESP_OK :
+        record_write("failed_health");
+    g_ota.failed_health_persisted = marker_result == ESP_OK;
+    if (g_ota.failed_health_persisted) {
+        state_set("failed", reason);
+    } else {
+        state_set("failed", "failed_health_persist_failed");
+        ESP_LOGE(TAG, "Failed to persist failed OTA health: %s",
+                 esp_err_to_name(marker_result));
+    }
+    int rollback_possible = esp_ota_check_rollback_is_possible();
+    int retry_needed = !g_ota.failed_health_persisted;
+    if (rollback_possible) {
+        ESP_LOGE(TAG, "OTA health terminal; requesting rollback");
+        esp_err_t rollback_result =
+            esp_ota_mark_app_invalid_rollback_and_reboot();
+        ESP_LOGE(TAG, "OTA rollback request failed: %s",
+                 esp_err_to_name(rollback_result));
+        retry_needed = 1;
+    } else {
+        ESP_LOGE(TAG, "OTA health terminal but rollback is unavailable");
+    }
+    if (retry_needed) {
+        rollback_retry_start_locked();
+    }
 }
 
 static esp_err_t ota_upload_handler(httpd_req_t *request)
@@ -1199,41 +1366,38 @@ void pj_ota_confirm_boot_health(int healthy)
         esp_err_t result = esp_ota_mark_app_valid_cancel_rollback();
         if (result == ESP_OK) {
             g_ota.boot_pending_verify = 0;
+            g_ota.boot_terminal_failure = 0;
             g_ota.boot_record_state = PJ_OTA_RECORD_CONFIRMED;
-            state_set("confirmed", "");
-            (void)record_write("confirmed");
+            esp_err_t record_result = record_write("confirmed");
+            state_set("confirmed", record_result == ESP_OK ? "" :
+                      "confirmation_record_pending");
+            if (record_result != ESP_OK) {
+                ESP_LOGW(TAG, "OTA confirmation record deferred: %s",
+                         esp_err_to_name(record_result));
+            }
             ESP_LOGI(TAG, "OTA image confirmed healthy");
             xSemaphoreGive(g_ota.lock);
             return;
         }
-        state_set("failed", "health_confirmation_failed");
         ESP_LOGE(TAG, "OTA health confirmation failed: %s",
                  esp_err_to_name(result));
+        boot_failure_locked("health_confirmation_failed");
         xSemaphoreGive(g_ota.lock);
         return;
     }
     if (outcome == PJ_OTA_BOOT_ROLLED_BACK) {
         g_ota.boot_pending_verify = 0;
+        g_ota.boot_terminal_failure = 0;
+        g_ota.boot_record_state = PJ_OTA_RECORD_ROLLED_BACK;
+        g_ota.failed_health_persisted = 0;
         state_set("rolled_back", "target_partition_not_running");
         (void)record_write("rolled_back");
         xSemaphoreGive(g_ota.lock);
         return;
     }
-    if (outcome != PJ_OTA_BOOT_ROLLBACK_REQUIRED) {
-        state_set("failed", healthy ? "boot_identity_invalid" :
-                  "rollback_unavailable");
-        xSemaphoreGive(g_ota.lock);
-        return;
-    }
-    state_set("rollback_requested", "post_boot_health_failed");
-    g_ota.boot_record_state = PJ_OTA_RECORD_ROLLBACK_REQUESTED;
-    (void)record_write("rollback_requested");
-    ESP_LOGE(TAG, "Post-boot health failed; rolling back OTA image");
-    esp_err_t result = esp_ota_mark_app_invalid_rollback_and_reboot();
-    if (result != ESP_OK) {
-        state_set("failed", "rollback_unavailable");
-        ESP_LOGE(TAG, "OTA rollback failed: %s", esp_err_to_name(result));
-    }
+    boot_failure_locked(
+        outcome == PJ_OTA_BOOT_ROLLBACK_REQUIRED || !healthy ?
+        "post_boot_health_failed" : "boot_identity_invalid");
     xSemaphoreGive(g_ota.lock);
 }
 
@@ -1246,6 +1410,7 @@ int pj_ota_write_enabled(void)
     return g_ota.initialized && provisioned && g_ota.nvs_ready &&
            g_ota.verification_key_ready && PJ_OTA_IDF_SIGNED_APP_ENABLED &&
            PJ_OTA_ROLLBACK_ENABLED &&
+           !g_ota.boot_pending_verify && !g_ota.boot_terminal_failure &&
            g_ota.preflight_timer != NULL &&
            g_ota.reserve_mutations != NULL && g_ota.release_mutations != NULL;
 }
