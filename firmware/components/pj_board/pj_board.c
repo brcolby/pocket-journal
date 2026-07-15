@@ -44,6 +44,7 @@
 #include "esp_app_desc.h"
 #include "esp_err.h"
 #include "esp_event.h"
+#include "esp_heap_caps.h"
 #include "esp_codec_dev.h"
 #include "esp_codec_dev_defaults.h"
 #include "esp_http_server.h"
@@ -349,6 +350,12 @@ static uint32_t g_runtime_boot_id;
 static int g_cached_pending_sync;
 static int g_cached_transferred_sync;
 static pj_recording_t g_recording;
+#ifdef ESP_PLATFORM
+static DMA_ATTR int16_t g_record_stereo_buffer[PJ_AUDIO_IO_BUFFER_BYTES / sizeof(int16_t)];
+static DMA_ATTR int16_t g_record_mono_buffer[PJ_AUDIO_IO_BUFFER_BYTES / PJ_AUDIO_FRAME_BYTES];
+_Static_assert(PJ_AUDIO_IO_BUFFER_BYTES % PJ_AUDIO_FRAME_BYTES == 0,
+               "recording workspace must contain complete stereo frames");
+#endif
 static pj_time_clock_anchor_t g_time_clock_anchor;
 static pj_time_controller_t g_time_controller;
 static pj_time_controller_diagnostic_t g_time_last_diagnostic;
@@ -5148,8 +5155,8 @@ static void record_task(void *arg)
         return;
     }
     g_record_audio_owned = 1;
-    int16_t *stereo = malloc(PJ_AUDIO_IO_BUFFER_BYTES);
-    int16_t *mono = malloc((PJ_AUDIO_IO_BUFFER_BYTES / PJ_AUDIO_FRAME_BYTES) * sizeof(int16_t));
+    int16_t *stereo = g_record_stereo_buffer;
+    int16_t *mono = g_record_mono_buffer;
     uint32_t data_bytes = 0;
     uint32_t next_capacity_check = PJ_STORAGE_CAPACITY_CHECK_BYTES;
     uint32_t read_errors = 0;
@@ -5162,21 +5169,9 @@ static void record_task(void *arg)
     char temporary_path[144];
     (void)snprintf(temporary_path, sizeof(temporary_path), "%s.tmp", g_active_recording_path);
     remove(temporary_path);
-    if (stereo == NULL || mono == NULL) {
-        ESP_LOGE(TAG, "Recording buffer allocation failed");
-        free(stereo);
-        free(mono);
-        (void)snprintf(g_status.last_error, sizeof(g_status.last_error),
-                       "recording buffer allocation failed");
-        recording_state_finish_capture(0);
-        record_task_exit();
-        return;
-    }
     FILE *file = fopen(temporary_path, "wb+");
     if (file == NULL) {
         ESP_LOGE(TAG, "Recording open failed: %s", temporary_path);
-        free(stereo);
-        free(mono);
         (void)snprintf(g_status.last_error, sizeof(g_status.last_error),
                        "recording file open failed");
         recording_state_finish_capture(0);
@@ -5187,8 +5182,6 @@ static void record_task(void *arg)
         ESP_LOGE(TAG, "Recording initial WAV header failed: %s", temporary_path);
         fclose(file);
         remove(temporary_path);
-        free(stereo);
-        free(mono);
         (void)snprintf(g_status.last_error, sizeof(g_status.last_error),
                        "recording WAV header creation failed");
         recording_state_finish_capture(0);
@@ -5200,14 +5193,18 @@ static void record_task(void *arg)
         ESP_LOGE(TAG, "Recording input gain setup failed: %s", esp_err_to_name((esp_err_t)gain_ret));
         fclose(file);
         remove(temporary_path);
-        free(stereo);
-        free(mono);
         (void)snprintf(g_status.last_error, sizeof(g_status.last_error),
                        "recording input gain setup failed");
         recording_state_finish_capture(0);
         record_task_exit();
         return;
     }
+    ESP_LOGI(TAG,
+             "Recording capture started: %s workspace=%u internal_free=%u largest=%u",
+             g_active_recording_path,
+             (unsigned)(sizeof(g_record_stereo_buffer) + sizeof(g_record_mono_buffer)),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
     int capture_failed = 0;
     while (!g_record_stop_requested) {
         int err = esp_codec_dev_read(g_audio_record_codec, stereo, PJ_AUDIO_IO_BUFFER_BYTES);
@@ -5278,8 +5275,6 @@ static void record_task(void *arg)
     int close_ok = fclose(file) == 0;
     int finalized = header_ok && flush_ok && close_ok && !capture_failed && data_bytes > 0;
     recording_state_finish_capture(finalized);
-    free(stereo);
-    free(mono);
     if (!finalized) {
         ESP_LOGE(TAG, "Recording finalization failed or produced no audio: %s", temporary_path);
         (void)snprintf(g_status.last_error, sizeof(g_status.last_error),
@@ -6818,7 +6813,7 @@ int pj_board_record_set_active(int active)
         ESP_LOGE(TAG, "Record start failed: task create failed");
         return 0;
     }
-    ESP_LOGI(TAG, "Recording started: %s", g_active_recording_path);
+    ESP_LOGI(TAG, "Recording task queued: %s", g_active_recording_path);
 #else
     g_status.recording = 1;
 #endif
