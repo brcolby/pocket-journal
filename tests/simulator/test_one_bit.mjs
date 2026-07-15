@@ -100,8 +100,11 @@ assert.match(wasmBridge, /pj_ui_handle_aux_short/);
 assert.match(wasmBridge, /pj_ui_handle_aux_long/);
 assert.match(wasmBridge, /pj_ui_handle_aux_double/);
 assert.match(wasmBridge, /pj_sim_dirty_partial/);
-assert.match(appMain, /PJ_UI_TICKS_PER_SECOND/);
-assert.match(appMain, /pj_ui_tick\(&g_ui\)/);
+assert.match(appMain, /#include "esp_timer\.h"/);
+assert.match(appMain, /esp_timer_get_time\(\)/);
+assert.match(appMain, /pj_loop_schedule_init\(&schedule, monotonic_ms\(\)\)/);
+assert.match(appMain, /pj_loop_schedule_poll\(\s*&schedule, monotonic_ms\(\)\s*\)/);
+assert.match(appMain, /if \(due\.second_due\) \{\s*dynamic_changed = pj_ui_tick\(&g_ui\)/);
 assert.match(appMain, /pj_ui_set_recording_elapsed\(ui, status\.recording_elapsed_ms\)/);
 assert.match(appMain, /dynamic_changed \|= pj_board_update_time_state\(&g_ui\)/);
 
