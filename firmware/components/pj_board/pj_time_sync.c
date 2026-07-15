@@ -109,6 +109,23 @@ int pj_time_sync_epoch_valid(int64_t epoch_s)
            epoch_s <= PJ_TIME_SYNC_MAX_EPOCH_S;
 }
 
+int pj_time_sync_expected_epoch_ms(const pj_time_sync_state_t *state,
+                                   uint64_t now_ms, int64_t *epoch_ms)
+{
+    if (state == NULL || epoch_ms == NULL ||
+        !pj_time_sync_epoch_valid(state->last_success_utc_s) ||
+        now_ms < state->last_success_monotonic_ms) {
+        return 0;
+    }
+    int64_t base_ms = state->last_success_utc_s * 1000ll;
+    uint64_t elapsed_ms = now_ms - state->last_success_monotonic_ms;
+    if (elapsed_ms > (uint64_t)(INT64_MAX - base_ms)) {
+        return 0;
+    }
+    *epoch_ms = base_ms + (int64_t)elapsed_ms;
+    return 1;
+}
+
 pj_time_sync_correction_t pj_time_sync_correction_policy(int old_time_valid,
                                                          int64_t old_epoch_ms,
                                                          int64_t new_epoch_ms)

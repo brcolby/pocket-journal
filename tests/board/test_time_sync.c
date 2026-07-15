@@ -123,6 +123,23 @@ static void test_large_correction_policy(void)
     assert(state.last_offset_ms < -PJ_TIME_SYNC_LARGE_CORRECTION_MS);
 }
 
+static void test_expected_epoch_advances_from_last_sync(void)
+{
+    pj_time_sync_state_t state;
+    pj_time_sync_init(&state, 0, 0);
+    int64_t epoch_ms = 0;
+    assert(!pj_time_sync_expected_epoch_ms(&state, 100, &epoch_ms));
+
+    pj_time_sync_on_ip(&state, 100);
+    assert(pj_time_sync_tick(&state, 100) == PJ_TIME_SYNC_ACTION_START);
+    assert(pj_time_sync_on_success(&state, VALID_EPOCH_S, 0, 0, 250));
+    assert(pj_time_sync_expected_epoch_ms(&state, 2250, &epoch_ms));
+    assert(epoch_ms == VALID_EPOCH_S * 1000ll + 2000);
+    assert(!pj_time_sync_expected_epoch_ms(&state, 249, &epoch_ms));
+    assert(!pj_time_sync_expected_epoch_ms(NULL, 250, &epoch_ms));
+    assert(!pj_time_sync_expected_epoch_ms(&state, 250, NULL));
+}
+
 static void test_stale_and_reconnect_policy(void)
 {
     pj_time_sync_state_t state;
@@ -174,6 +191,7 @@ int main(void)
     test_start_failure_and_disconnect_cancel_retry();
     test_invalid_time_is_rejected();
     test_large_correction_policy();
+    test_expected_epoch_advances_from_last_sync();
     test_stale_and_reconnect_policy();
     test_status_names();
     puts("time sync tests passed");

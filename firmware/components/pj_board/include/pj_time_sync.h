@@ -76,6 +76,8 @@ void pj_time_sync_on_start_failed(pj_time_sync_state_t *state,
 void pj_time_sync_on_system_clock_failed(pj_time_sync_state_t *state,
                                          uint64_t now_ms);
 int pj_time_sync_epoch_valid(int64_t epoch_s);
+int pj_time_sync_expected_epoch_ms(const pj_time_sync_state_t *state,
+                                   uint64_t now_ms, int64_t *epoch_ms);
 pj_time_sync_correction_t pj_time_sync_correction_policy(int old_time_valid,
                                                          int64_t old_epoch_ms,
                                                          int64_t new_epoch_ms);
