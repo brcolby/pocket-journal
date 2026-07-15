@@ -204,6 +204,32 @@ class AudioTransferConnection(FakeConnection):
         return written
 
 
+class LegacyAudioTransferConnection(AudioTransferConnection):
+    def __init__(self, content: bytes, rejection_code: str = "invalid_request") -> None:
+        super().__init__(content)
+        self.rejection_code = rejection_code
+
+    def write(self, payload: bytes) -> int:
+        fields = dict(
+            token.split("=", 1) for token in payload.decode("ascii").strip().split()[1:]
+        )
+        if int(fields["max_bytes"]) > 256:
+            written = FakeConnection.write(self, payload)
+            response = {
+                "command": "PJ_AUDIO_READ",
+                "request_id": fields["request_id"],
+                "code": self.rejection_code,
+                "retryable": False,
+            }
+            self.lines.append(
+                ("PJ_ERR " + json.dumps(response, separators=(",", ":")) + "\n").encode(
+                    "ascii"
+                )
+            )
+            return written
+        return super().write(payload)
+
+
 class BlockingAudioConnection(FakeConnection):
     def __init__(self) -> None:
         super().__init__()
@@ -217,6 +243,24 @@ class BlockingAudioConnection(FakeConnection):
 
     def cancel_read(self) -> None:
         self.cancelled.set()
+
+
+class BlockingOpenConnection(FakeConnection):
+    def __init__(self) -> None:
+        super().__init__()
+        self.open_started = threading.Event()
+        self.open_cancelled = threading.Event()
+
+    def open(self) -> None:
+        self.open_control_lines = (self.dtr, self.rts)
+        self.open_count += 1
+        self.open_started.set()
+        self.open_cancelled.wait(2)
+        raise FakeSerialException("open cancelled")
+
+    def close(self) -> None:
+        self.open_cancelled.set()
+        super().close()
 
 
 class SteppingClock:
@@ -340,6 +384,57 @@ class SerialLifecycleTests(unittest.TestCase):
         self.assertEqual(connection.open_count, 1)
         self.assertEqual(connection.close_count, 1)
 
+    def test_audio_download_downgrades_stale_chunk_capability_once(self) -> None:
+        content = bytes(index % 251 for index in range(700))
+        connection = LegacyAudioTransferConnection(content)
+        serial_module = FakeSerialModule(connection)
+        client = SerialDeviceClient("/dev/cu.test", timeout=1)
+        client._audio_read_chunk_bytes = USB_MAX_AUDIO_READ_CHUNK_BYTES
+        item = AudioItem(
+            "note.wav", "note.wav", size=len(content),
+            source_sha256=hashlib.sha256(content).hexdigest(),
+        )
+
+        with TemporaryDirectory() as tmp:
+            with patch.dict(sys.modules, {"serial": serial_module}):
+                with patch("pocket_journal_partner.device.time.sleep"):
+                    path = client.download_audio(item, Path(tmp))
+            self.assertEqual(path.read_bytes(), content)
+
+        requested_sizes = [
+            int(dict(
+                token.split("=", 1)
+                for token in wire.decode("ascii").strip().split()[1:]
+            )["max_bytes"])
+            for wire in connection.writes
+        ]
+        self.assertEqual(requested_sizes, [1024, 256, 256, 256])
+        self.assertEqual(client._audio_read_chunk_bytes, 256)
+        self.assertEqual(connection.open_count, 1)
+        self.assertEqual(connection.close_count, 1)
+
+    def test_audio_download_does_not_downgrade_other_rejections(self) -> None:
+        content = b"audio"
+        connection = LegacyAudioTransferConnection(content, "source_changed")
+        serial_module = FakeSerialModule(connection)
+        client = SerialDeviceClient("/dev/cu.test", timeout=1)
+        client._audio_read_chunk_bytes = USB_MAX_AUDIO_READ_CHUNK_BYTES
+        item = AudioItem(
+            "note.wav", "note.wav", size=len(content),
+            source_sha256=hashlib.sha256(content).hexdigest(),
+        )
+
+        with TemporaryDirectory() as tmp:
+            with patch.dict(sys.modules, {"serial": serial_module}):
+                with patch("pocket_journal_partner.device.time.sleep"):
+                    with self.assertRaisesRegex(DeviceError, "source_changed"):
+                        client.download_audio(item, Path(tmp))
+            self.assertEqual(list(Path(tmp).iterdir()), [])
+
+        self.assertEqual(len(connection.writes), 1)
+        self.assertEqual(client._audio_read_chunk_bytes, USB_MAX_AUDIO_READ_CHUNK_BYTES)
+        self.assertEqual(connection.close_count, 1)
+
     def test_audio_download_interrupt_removes_partial_and_releases_port(self) -> None:
         connection = FakeConnection([KeyboardInterrupt()])
         serial_module = FakeSerialModule(connection)
@@ -403,6 +498,33 @@ class SerialLifecycleTests(unittest.TestCase):
         self.assertEqual(len(errors), 1)
         self.assertIsInstance(errors[0], DeviceError)
         self.assertIn("cancelled", str(errors[0]))
+        self.assertEqual(connection.close_count, 1)
+        self.assertFalse(connection.is_open)
+
+    def test_close_cancels_connection_while_open_is_in_progress(self) -> None:
+        connection = BlockingOpenConnection()
+        serial_module = FakeSerialModule(connection)
+        client = SerialDeviceClient("/dev/cu.test", timeout=6)
+        errors: list[BaseException] = []
+
+        def request() -> None:
+            try:
+                client.status()
+            except BaseException as exc:
+                errors.append(exc)
+
+        with patch.dict(sys.modules, {"serial": serial_module}):
+            worker = threading.Thread(target=request)
+            worker.start()
+            self.assertTrue(connection.open_started.wait(1))
+            client.close()
+            worker.join(timeout=1)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(len(errors), 1)
+        self.assertIsInstance(errors[0], DeviceError)
+        self.assertIn("cancelled", str(errors[0]))
+        self.assertEqual(connection.open_count, 1)
         self.assertEqual(connection.close_count, 1)
         self.assertFalse(connection.is_open)
 

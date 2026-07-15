@@ -66,6 +66,14 @@ class DeviceRequestTimeout(DeviceError):
     pass
 
 
+class _SerialCommandRejected(DeviceError):
+    def __init__(self, command: str, code: str | None) -> None:
+        suffix = f" ({code})" if code is not None else ""
+        super().__init__(f"USB command failed: device rejected {command}{suffix}")
+        self.command = command
+        self.code = code
+
+
 class SerialPortNotFound(DeviceError):
     pass
 
@@ -685,17 +693,22 @@ class SerialDeviceClient:
             connection = self._active_connection
         if connection is None:
             return
+        self._cancel_connection(connection)
+
+    @staticmethod
+    def _cancel_connection(connection: Any) -> None:
         for method_name in ("cancel_read", "cancel_write"):
             method = getattr(connection, method_name, None)
             if callable(method):
                 try:
                     method()
-                except (OSError, RuntimeError):
+                except Exception:
                     pass
         try:
-            if connection.is_open:
-                connection.close()
-        except (OSError, RuntimeError):
+            # Calling close unconditionally also gives drivers that support
+            # cancelling an in-progress open a chance to release it.
+            connection.close()
+        except Exception:
             pass
 
     def _ensure_open(self) -> None:
@@ -727,12 +740,20 @@ class SerialDeviceClient:
                 serial_options["exclusive"] = True
             connection = serial_module.Serial(**serial_options)
             connection.port = self.port
-            _idle_serial_control_lines(connection)
-            _open_serial_without_modem_control(connection)
-            _disable_hangup_on_close(connection)
             with self._active_connection_lock:
                 self._ensure_open()
                 self._active_connection = connection
+            # Own the object before open starts. POSIX pyserial opens with
+            # O_NONBLOCK; other drivers can now be cancelled through their
+            # public cancel/close methods while open is in progress.
+            _idle_serial_control_lines(connection)
+            self._ensure_open()
+            _open_serial_without_modem_control(connection)
+            if self._closed.is_set():
+                raise DeviceError(
+                    f"USB serial transfer on {self.port} was cancelled"
+                )
+            _disable_hangup_on_close(connection)
             yield connection
         finally:
             if connection is not None:
@@ -800,8 +821,7 @@ class SerialDeviceClient:
                         code=code,
                         retryable=retryable,
                     )
-                suffix = f" ({code})" if code is not None else ""
-                raise DeviceError(f"USB command failed: device rejected {expected_command}{suffix}")
+                raise _SerialCommandRejected(expected_command, code)
 
             now = time.monotonic()
             if (
@@ -903,6 +923,10 @@ class SerialDeviceClient:
                 if response is not None:
                     return response
         except (serial.SerialException, OSError) as exc:
+            if self._closed.is_set():
+                raise DeviceError(
+                    f"USB serial transfer on {self.port} was cancelled"
+                ) from exc
             raise DeviceError(f"USB serial connection failed on {self.port}: {exc}") from exc
         raise self._request_timeout(evidence)
 
@@ -1211,12 +1235,24 @@ class SerialDeviceClient:
                         )
                         if source_sha256 is not None:
                             command += f" source_sha256={source_sha256}"
-                        response = serial_request(
-                            command,
-                            request_id=_new_request_id(),
-                            retry_interval=_USB_READ_RETRY_INTERVAL_SECONDS,
-                            max_attempts=_USB_READ_MAX_ATTEMPTS,
-                        )
+                        try:
+                            response = serial_request(
+                                command,
+                                request_id=_new_request_id(),
+                                retry_interval=_USB_READ_RETRY_INTERVAL_SECONDS,
+                                max_attempts=_USB_READ_MAX_ATTEMPTS,
+                            )
+                        except _SerialCommandRejected as exc:
+                            if (
+                                offset == 0
+                                and chunk_bytes > USB_TRANSFER_CHUNK_BYTES
+                                and exc.command == "PJ_AUDIO_READ"
+                                and exc.code == "invalid_request"
+                            ):
+                                chunk_bytes = USB_TRANSFER_CHUNK_BYTES
+                                self._audio_read_chunk_bytes = chunk_bytes
+                                continue
+                            raise
                         if response.get("id_hex") != id_hex:
                             raise DeviceError("USB command failed: audio read id did not match request")
                         if _usb_uint(response.get("offset"), "audio read offset") != offset:
