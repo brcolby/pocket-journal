@@ -10,6 +10,7 @@ from pocket_journal_partner.device import (
     AudioItem,
     DeviceError,
     SerialDeviceClient,
+    USB_SERIAL_LINE_BYTES,
     USB_TRANSFER_CHUNK_BYTES,
     USB_TRANSCRIPT_CHUNK_BYTES,
 )
@@ -25,9 +26,10 @@ class UsbAudioListTests(unittest.TestCase):
                 "cursor": 0,
                 "snapshot": 42,
                 "next_cursor": 1,
-                "done": False,
+                # Firmware sets done on the response carrying the final item.
+                "done": True,
                 "item": {
-                    "audio_id_hex": "note-1".encode().hex(),
+                    "audio_id_hex": "note-1.wav".encode().hex(),
                     "filename_hex": "note-1.wav".encode().hex(),
                     "label_hex": "First note".encode().hex(),
                     "size": 123,
@@ -39,7 +41,6 @@ class UsbAudioListTests(unittest.TestCase):
                     "transcript_uploaded": False,
                 },
             },
-            {"cursor": 1, "snapshot": 42, "next_cursor": 1, "done": True},
         ])
 
         def request(command: str, **kwargs):  # type: ignore[no-untyped-def]
@@ -53,15 +54,25 @@ class UsbAudioListTests(unittest.TestCase):
             [command for command, _ in calls],
             [
                 "PJ_AUDIO_LIST cursor=0 snapshot=0",
-                "PJ_AUDIO_LIST cursor=1 snapshot=42",
             ],
         )
         self.assertTrue(all(call[1]["max_attempts"] == 2 for call in calls))
         self.assertEqual(items, [AudioItem(
-            "note-1", "note-1.wav", label="First note", size=123, data_bytes=79,
+            "note-1.wav", "note-1.wav", label="First note", size=123, data_bytes=79,
             source_sha256="a" * 64, created_at="2026-07-14T12:00:00Z",
             duration_ms=2500,
         )])
+
+    def test_empty_list_uses_terminal_response_without_an_item(self) -> None:
+        client = SerialDeviceClient("/dev/cu.test")
+        client._request = lambda *args, **kwargs: {  # type: ignore[method-assign]
+            "cursor": 0,
+            "snapshot": 1,
+            "next_cursor": 0,
+            "done": True,
+        }
+
+        self.assertEqual(client.list_audio(), [])
 
     def test_list_rejects_snapshot_changes_and_path_filenames(self) -> None:
         for name, responses, message in (
@@ -69,7 +80,7 @@ class UsbAudioListTests(unittest.TestCase):
                 "snapshot",
                 [
                     {"cursor": 0, "snapshot": 1, "next_cursor": 1, "done": False,
-                     "item": {"audio_id_hex": "a".encode().hex(), "filename_hex": "a.wav".encode().hex()}},
+                     "item": {"audio_id_hex": "a.wav".encode().hex(), "filename_hex": "a.wav".encode().hex()}},
                     {"cursor": 1, "snapshot": 2, "next_cursor": 1, "done": True},
                 ],
                 "snapshot changed",
@@ -90,10 +101,23 @@ class UsbAudioListTests(unittest.TestCase):
 
 
 class UsbAudioReadTests(unittest.TestCase):
+    def test_usb_audio_ids_match_firmware_filename_rules(self) -> None:
+        client = SerialDeviceClient("/dev/cu.test")
+        client._request = lambda *args, **kwargs: self.fail("invalid id reached device")  # type: ignore[method-assign]
+
+        for audio_id in ("note", "../note.wav", "a" * 92 + ".wav"):
+            with self.subTest(audio_id=audio_id):
+                with TemporaryDirectory() as tmp:
+                    with self.assertRaisesRegex(DeviceError, "plain \\.wav filename"):
+                        client.download_audio(
+                            AudioItem(audio_id, Path(audio_id).name),
+                            Path(tmp),
+                        )
+
     def test_download_streams_chunks_and_verifies_digest_before_replace(self) -> None:
         content = bytes(index % 251 for index in range(USB_TRANSFER_CHUNK_BYTES + 17))
         digest = hashlib.sha256(content).hexdigest()
-        item = AudioItem("note/1", "note.wav", size=len(content), source_sha256=digest)
+        item = AudioItem("note-1.wav", "note-1.wav", size=len(content), source_sha256=digest)
         client = SerialDeviceClient("/dev/cu.test")
         commands: list[str] = []
 
@@ -120,14 +144,14 @@ class UsbAudioReadTests(unittest.TestCase):
         self.assertEqual(downloaded, content)
         self.assertEqual(leftovers, [])
         self.assertEqual(len(commands), 2)
-        self.assertIn("id_hex=6e6f74652f31", commands[0])
+        self.assertIn("id_hex=6e6f74652d312e776176", commands[0])
         self.assertIn("max_bytes=256", commands[0])
         self.assertIn(f"source_sha256={digest}", commands[0])
 
     def test_download_rejects_inconsistent_offset_and_removes_partial(self) -> None:
         client = SerialDeviceClient("/dev/cu.test")
         client._request = lambda *args, **kwargs: {  # type: ignore[method-assign]
-            "id_hex": "note".encode().hex(),
+            "id_hex": "note.wav".encode().hex(),
             "offset": 1,
             "total_bytes": 1,
             "data_hex": "00",
@@ -135,14 +159,14 @@ class UsbAudioReadTests(unittest.TestCase):
         }
         with TemporaryDirectory() as tmp:
             with self.assertRaisesRegex(DeviceError, "offset"):
-                client.download_audio(AudioItem("note", "note.wav", size=1), Path(tmp))
+                client.download_audio(AudioItem("note.wav", "note.wav", size=1), Path(tmp))
             self.assertEqual(list(Path(tmp).iterdir()), [])
 
     def test_download_rejects_noncanonical_hex_and_removes_partial(self) -> None:
         client = SerialDeviceClient("/dev/cu.test")
         digest = hashlib.sha256(b"\xaf").hexdigest()
         client._request = lambda *args, **kwargs: {  # type: ignore[method-assign]
-            "id_hex": "note".encode().hex(),
+            "id_hex": "note.wav".encode().hex(),
             "offset": 0,
             "total_bytes": 1,
             "data_hex": "AF",
@@ -151,13 +175,13 @@ class UsbAudioReadTests(unittest.TestCase):
         }
         with TemporaryDirectory() as tmp:
             with self.assertRaisesRegex(DeviceError, "invalid audio data chunk"):
-                client.download_audio(AudioItem("note", "note.wav", size=1), Path(tmp))
+                client.download_audio(AudioItem("note.wav", "note.wav", size=1), Path(tmp))
             self.assertEqual(list(Path(tmp).iterdir()), [])
 
     def test_download_requires_a_source_digest(self) -> None:
         client = SerialDeviceClient("/dev/cu.test")
         client._request = lambda *args, **kwargs: {  # type: ignore[method-assign]
-            "id_hex": "note".encode().hex(),
+            "id_hex": "note.wav".encode().hex(),
             "offset": 0,
             "total_bytes": 1,
             "data_hex": "00",
@@ -165,7 +189,7 @@ class UsbAudioReadTests(unittest.TestCase):
         }
         with TemporaryDirectory() as tmp:
             with self.assertRaisesRegex(DeviceError, "source digest"):
-                client.download_audio(AudioItem("note", "note.wav", size=1), Path(tmp))
+                client.download_audio(AudioItem("note.wav", "note.wav", size=1), Path(tmp))
             self.assertEqual(list(Path(tmp).iterdir()), [])
 
 
@@ -193,9 +217,11 @@ class UsbTranscriptUploadTests(unittest.TestCase):
             self.fail(f"unexpected command {command}")
 
         client._request = request  # type: ignore[method-assign]
-        client.upload_transcript("note", transcript)
+        client.upload_transcript("note.wav", transcript)
 
-        self.assertTrue(commands[0].startswith("PJ_TRANSCRIPT_BEGIN id_hex=6e6f7465 "))
+        self.assertTrue(commands[0].startswith(
+            "PJ_TRANSCRIPT_BEGIN id_hex=6e6f74652e776176 "
+        ))
         self.assertGreaterEqual(sum(command.startswith("PJ_TRANSCRIPT_WRITE") for command in commands), 2)
         self.assertTrue(commands[-1].startswith("PJ_TRANSCRIPT_COMMIT upload_id=7"))
         self.assertLessEqual(
@@ -203,18 +229,18 @@ class UsbTranscriptUploadTests(unittest.TestCase):
             USB_TRANSCRIPT_CHUNK_BYTES * 2,
         )
         worst_case = (
-            f"PJ_TRANSCRIPT_WRITE upload_id={2**64 - 1} offset=65536 "
+            f"PJ_TRANSCRIPT_WRITE upload_id={2**32 - 1} offset=65536 "
             f"data_hex={'f' * (USB_TRANSCRIPT_CHUNK_BYTES * 2)} "
             f"request_id={'a' * 32}\n"
         )
-        self.assertLessEqual(len(worst_case.encode("ascii")), 512)
+        self.assertLess(len(worst_case.encode("ascii")), USB_SERIAL_LINE_BYTES)
 
     def test_failed_chunk_triggers_best_effort_abort(self) -> None:
         client = SerialDeviceClient("/dev/cu.test")
-        commands: list[str] = []
+        calls: list[tuple[str, dict[str, object]]] = []
 
         def request(command: str, **kwargs):  # type: ignore[no-untyped-def]
-            commands.append(command)
+            calls.append((command, kwargs))
             if command.startswith("PJ_TRANSCRIPT_BEGIN"):
                 return {"upload_id": 9, "offset": 0, "accepted": True}
             if command.startswith("PJ_TRANSCRIPT_ABORT"):
@@ -223,9 +249,12 @@ class UsbTranscriptUploadTests(unittest.TestCase):
 
         client._request = request  # type: ignore[method-assign]
         with self.assertRaisesRegex(DeviceError, "link failed"):
-            client.upload_transcript("note", {"text": "hello"})
+            client.upload_transcript("note.wav", {"text": "hello"})
 
-        self.assertTrue(commands[-1].startswith("PJ_TRANSCRIPT_ABORT upload_id=9"))
+        abort_command, abort_options = calls[-1]
+        self.assertTrue(abort_command.startswith("PJ_TRANSCRIPT_ABORT upload_id=9"))
+        self.assertEqual(abort_options["max_attempts"], 2)
+        self.assertGreater(abort_options["retry_interval"], 0)
 
     def test_device_session_advertises_usb_sync_capabilities(self) -> None:
         client = SerialDeviceClient("/dev/cu.test")

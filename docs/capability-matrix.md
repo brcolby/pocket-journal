@@ -65,9 +65,9 @@ these optional fields, so the versioned `/v1` contract remains the compatibility
 baseline.
 
 USB note transfers never place arbitrary UTF-8 or binary bytes directly on a
-console line. Identifiers and payload chunks are hex encoded, identifiers are
-bounded to 160 UTF-8 bytes, audio chunks are bounded to 256 bytes, transcript
-chunks are bounded to 192 bytes,
+console line. Identifiers and payload chunks are hex encoded, current recording
+identifiers are bounded to 95 UTF-8 bytes, audio chunks are bounded to 256 bytes,
+transcript chunks are bounded to 192 bytes,
 lists return at most one item per response, and transcripts are limited to 64
 KiB. Audio reads validate a stable snapshot/source digest and exact offsets.
 Transcript uploads validate declared byte count and SHA-256 before an atomic

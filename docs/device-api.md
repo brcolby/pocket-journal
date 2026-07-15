@@ -139,10 +139,10 @@ PJ_TIME 2026 06 20 14 05 -420
 PJ_WIPE_RECORDINGS [request_id=ID]
 PJ_AUDIO_LIST cursor=0 snapshot=0 [request_id=ID]
 PJ_AUDIO_READ id_hex=ID offset=0 max_bytes=256 [source_sha256=SHA256] [request_id=ID]
-PJ_TRANSCRIPT_BEGIN id_hex=ID bytes=N sha256=SHA256 [request_id=ID]
-PJ_TRANSCRIPT_WRITE upload_id=ID offset=N data_hex=DATA [request_id=ID]
-PJ_TRANSCRIPT_COMMIT upload_id=ID sha256=SHA256 [request_id=ID]
-PJ_TRANSCRIPT_ABORT upload_id=ID [request_id=ID]
+PJ_TRANSCRIPT_BEGIN id_hex=ID bytes=N sha256=SHA256 request_id=ID
+PJ_TRANSCRIPT_WRITE upload_id=ID offset=N data_hex=DATA request_id=ID
+PJ_TRANSCRIPT_COMMIT upload_id=ID sha256=SHA256 request_id=ID
+PJ_TRANSCRIPT_ABORT upload_id=ID request_id=ID
 PJ_AUDIO_TONE [0|1|-] [dout_gpio] [pa=0|1|-] [dout=gpio] [pwr=0|1|-] [gpio44=0x00..0xff] [gp45=0x00..0xff]
 PJ_MIC_CHECK [duration_ms] [ms=1..10000] [gain_db=0..42]
 ```
@@ -160,8 +160,9 @@ host offset changes.
 
 The note-transfer commands are line bounded. All identifiers, filenames, labels,
 timestamps, transcript paths, and binary chunks are lowercase hex encoding of
-their UTF-8/raw bytes. Identifiers and filenames decode to at most 160 bytes;
-each audio-read chunk is at most 256 bytes, each transcript-write chunk is at
+their UTF-8/raw bytes. Current audio identifiers are recording filenames and
+decode to at most 95 bytes; the partner bounds other decoded text to 160 bytes.
+Each audio-read chunk is at most 256 bytes, each transcript-write chunk is at
 most 192 bytes, and a transcript is at most 65536 bytes. The smaller write bound
 keeps the hex-encoded command plus a 32-character request id below the client's
 conservative 512-byte compatibility envelope. Current firmware may accept a
@@ -169,11 +170,13 @@ conservative 512-byte compatibility envelope. Current firmware may accept a
 
 `PJ_AUDIO_LIST` returns one item at a time. The first request uses `snapshot=0`;
 the response creates a positive snapshot id. Every subsequent request echoes it.
-A response has `snapshot`, `cursor`, `next_cursor`, `done`, and, unless `done` is
-true, one `item` with `audio_id_hex`, `filename_hex`, optional `label_hex`,
-`created_at_hex`, `transcript_path_hex`, `size`, `data_bytes`, `duration_ms`,
-`source_sha256`, `synced`, and `transcript_uploaded`. The firmware returns a
-retryable `list_changed` error instead of mixing generations.
+A response has `snapshot`, `cursor`, `next_cursor`, and `done`. A non-empty
+response also has one `item` with `audio_id_hex`, `filename_hex`, optional
+`label_hex`, `created_at_hex`, `transcript_path_hex`, `size`, `data_bytes`,
+`duration_ms`, `source_sha256`, `synced`, and `transcript_uploaded`. `done` is
+true on the response carrying the final item; only an empty list has `done: true`
+without an item. The firmware returns a retryable `list_changed` error instead
+of mixing generations.
 
 `PJ_AUDIO_READ` returns `id_hex`, `offset`, `total_bytes`, `data_hex`, `eof`, and
 the required source SHA-256. The response offset must equal the requested
@@ -181,9 +184,10 @@ offset, total length and digest remain invariant across chunks, and EOF is true
 exactly when the returned bytes end at `total_bytes`. When supplied, the request
 digest rejects a recording that changed after listing.
 
-Transcript upload is a staged transaction. `PJ_TRANSCRIPT_BEGIN` returns a
-positive `upload_id`, `offset: 0`, and `accepted: true`. Each write returns that
-id plus its exact `next_offset`. Commit succeeds only when byte count and SHA-256
+Transcript upload is a staged transaction. A new `PJ_TRANSCRIPT_BEGIN` returns a
+positive `upload_id`, `offset: 0`, and `accepted: true`; an idempotent replay also
+sets `attached: true` and reports the current offset. Each write returns that id
+plus its exact `next_offset`. Commit succeeds only when byte count and SHA-256
 match the begin declaration, then atomically replaces the transcript and marks
 the associated note synced; it returns `committed: true` and `bytes`. Abort is
 safe to repeat. Begin, repeated identical writes, commit, and abort must be
@@ -192,7 +196,7 @@ does not duplicate or corrupt state.
 
 Responses start with `PJ_OK` or `PJ_ERR` followed by a compact JSON object. Normal ESP-IDF logs may appear on the same serial stream, so clients should scan for those prefixes.
 
-`PJ_STATUS`, `PJ_WIPE_RECORDINGS`, and all note-transfer commands accept an optional 1-32 character request id containing letters, digits, `.`, `_`, or `-`. Tagged responses include both `command` and `request_id`; clients must reject a response when either differs from the request. The partner CLI retries a lost wipe-start or transfer acknowledgment with the same request id, allowing firmware to return the associated operation. It uses a newly opened, bounded-lifetime serial descriptor for requests and never retains the port while idle. A wipe timeout identifies the still-running operation id so a later status check can determine the outcome.
+`PJ_STATUS`, `PJ_WIPE_RECORDINGS`, `PJ_AUDIO_LIST`, and `PJ_AUDIO_READ` accept an optional 1-32 character request id containing letters, digits, `.`, `_`, or `-`; the staged transcript commands require one. The partner tags every note-transfer request. Tagged responses include both `command` and `request_id`; clients must reject a response when either differs from the request. The partner CLI retries a lost wipe-start or transfer acknowledgment with the same request id, allowing firmware to return the associated operation. It uses a newly opened, bounded-lifetime serial descriptor for requests and never retains the port while idle. A wipe timeout identifies the still-running operation id so a later status check can determine the outcome.
 
 ## Calendar Event Shape
 

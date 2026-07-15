@@ -93,8 +93,10 @@ _USB_RESET_MARKERS = ("esp-rom:", "rst:0x")
 USB_TRANSFER_CHUNK_BYTES = 256
 USB_TRANSCRIPT_CHUNK_BYTES = 192
 USB_MAX_TEXT_BYTES = 160
+USB_MAX_AUDIO_ID_BYTES = 95
 USB_MAX_AUDIO_ITEMS = 10_000
 USB_MAX_TRANSCRIPT_BYTES = 64 * 1024
+USB_SERIAL_LINE_BYTES = 768
 _USB_READ_RETRY_INTERVAL_SECONDS = 1.0
 _USB_READ_MAX_ATTEMPTS = 2
 
@@ -245,6 +247,22 @@ def _usb_encode_text(value: str, field: str) -> str:
             f"{field} must contain between 1 and {USB_MAX_TEXT_BYTES} UTF-8 bytes for USB-C transfer"
         )
     return raw.hex()
+
+
+def _usb_encode_audio_id(value: str) -> str:
+    encoded = _usb_encode_text(value, "audio id")
+    if (
+        len(encoded) > USB_MAX_AUDIO_ID_BYTES * 2
+        or ".." in value
+        or "/" in value
+        or "\\" in value
+        or not value.lower().endswith(".wav")
+    ):
+        raise DeviceError(
+            "audio id must be a plain .wav filename of at most "
+            f"{USB_MAX_AUDIO_ID_BYTES} UTF-8 bytes for USB-C transfer"
+        )
+    return encoded
 
 
 def _usb_uint(value: Any, field: str, *, positive: bool = False) -> int:
@@ -719,9 +737,10 @@ class SerialDeviceClient:
             if not isinstance(done, bool):
                 raise DeviceError("USB command failed: invalid audio list completion state")
             raw_item = response.get("item")
-            if done:
-                if raw_item is not None:
-                    raise DeviceError("USB command failed: completed audio list contained an item")
+            next_cursor = _usb_uint(response.get("next_cursor"), "next audio list cursor")
+            if raw_item is None:
+                if not done or next_cursor != cursor:
+                    raise DeviceError("USB command failed: audio list item is missing")
                 return items
             if not isinstance(raw_item, dict):
                 raise DeviceError("USB command failed: audio list item is missing")
@@ -732,6 +751,9 @@ class SerialDeviceClient:
                 raise DeviceError("USB command failed: audio list returned a duplicate id")
             if Path(filename).name != filename or filename in {".", ".."}:
                 raise DeviceError("USB command failed: invalid audio filename")
+            if audio_id != filename:
+                raise DeviceError("USB command failed: audio id did not match filename")
+            _usb_encode_audio_id(audio_id)
             seen_ids.add(audio_id)
             if len(items) >= USB_MAX_AUDIO_ITEMS:
                 raise DeviceError(
@@ -769,13 +791,14 @@ class SerialDeviceClient:
                 transcript_uploaded=transcript_uploaded,
                 transcript_path=transcript_path,
             ))
-            next_cursor = _usb_uint(response.get("next_cursor"), "next audio list cursor")
-            if next_cursor <= cursor:
+            if next_cursor != cursor + 1:
                 raise DeviceError("USB command failed: audio list cursor did not advance")
+            if done:
+                return items
             cursor = next_cursor
 
     def download_audio(self, item: AudioItem, target_dir: Path) -> Path:
-        id_hex = _usb_encode_text(item.audio_id, "audio id")
+        id_hex = _usb_encode_audio_id(item.audio_id)
         filename = Path(item.filename).name
         if not filename or filename in {".", ".."} or filename != item.filename:
             raise DeviceError(f"device returned an invalid filename for audio {item.audio_id!r}")
@@ -859,7 +882,7 @@ class SerialDeviceClient:
                 partial.unlink()
 
     def upload_transcript(self, audio_id: str, transcript: dict[str, Any]) -> None:
-        id_hex = _usb_encode_text(audio_id, "audio id")
+        id_hex = _usb_encode_audio_id(audio_id)
         try:
             payload = json.dumps(
                 transcript,
@@ -917,6 +940,8 @@ class SerialDeviceClient:
                 self._request(
                     f"PJ_TRANSCRIPT_ABORT upload_id={upload_id}",
                     request_id=_new_request_id(),
+                    retry_interval=_USB_READ_RETRY_INTERVAL_SECONDS,
+                    max_attempts=_USB_READ_MAX_ATTEMPTS,
                 )
             except Exception:
                 pass
