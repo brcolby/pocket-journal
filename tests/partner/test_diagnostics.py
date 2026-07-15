@@ -160,6 +160,42 @@ class WifiDiagnosticsTests(unittest.TestCase):
         self.assertNotIn("time_sync", result)
         self.assertIn("wifi_diagnostics", raw_status)
 
+    def test_general_status_reports_legacy_time_repair_without_mutating_raw_status(self) -> None:
+        raw_status = {
+            "device_id": "pj-test",
+            "time_set": True,
+            "time_sync": {
+                "civil_time_semantics": "unconfigured",
+                "publication": "timezone_required",
+                "utc_offset_minutes": None,
+            },
+        }
+        client = SerialDeviceClient("/dev/cu.test")
+        client.status = lambda: raw_status  # type: ignore[method-assign]
+        repair = {
+            "state": "repaired",
+            "reason": "legacy_missing_utc_offset",
+            "retryable": False,
+        }
+        stdout = StringIO()
+
+        with patch(
+            "pocket_journal_partner.cli._session_from_args",
+            return_value=DeviceSession("pj-test", client),
+        ), patch(
+            "pocket_journal_partner.cli._repair_legacy_time_offset",
+            return_value=repair,
+        ) as repair_call:
+            with redirect_stdout(stdout):
+                exit_code = cli.main(["device", "status"])
+
+        self.assertEqual(exit_code, 0)
+        result = json.loads(stdout.getvalue())["result"]
+        self.assertEqual(result["time_repair"], repair)
+        self.assertNotIn("time_sync", result)
+        self.assertIn("time_sync", raw_status)
+        repair_call.assert_called_once_with(client, raw_status)
+
 
 if __name__ == "__main__":
     unittest.main()

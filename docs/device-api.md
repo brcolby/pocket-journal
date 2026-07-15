@@ -51,6 +51,16 @@ for weekday calculation and `utc_offset_minutes` from `-840` through `840` for
 projecting SNTP UTC into the same local civil time and RTC basis. Omitting the
 offset preserves compatibility with older callers.
 
+`pj device status` also performs one narrowly guarded upgrade repair. When status
+reports all three legacy-migration signals (`civil_time_semantics` is
+`unconfigured`, `publication` is `timezone_required`, and
+`utc_offset_minutes` is explicitly `null`), the partner writes and validates the
+current host civil time and fixed UTC offset once. The status result includes a
+`time_repair` object with `repaired` or `failed` state and an explicit retry
+command on failure. Every other time state remains read-only, including older
+firmware that does not report the offset field. A successful write persists the
+offset, so later status calls are idempotent no-ops.
+
 ```json
 {
   "hour": 14,

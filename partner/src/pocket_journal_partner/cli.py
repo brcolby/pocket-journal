@@ -51,6 +51,7 @@ from .web import DEFAULT_HOST, DEFAULT_PORT, create_server
 USB_PROVISIONING_TOKEN_BYTES = 16
 TIME_SYNC_PRECISION_SECONDS = 60
 TIME_SYNC_RETRY_COMMAND = "pj device sync-time"
+TIME_REPAIR_REASON = "legacy_missing_utc_offset"
 
 
 def _print_json(payload) -> None:
@@ -102,6 +103,39 @@ def _sync_time_from_host(
         "host_utc": local_now.astimezone(timezone.utc).isoformat().replace("+00:00", "Z"),
         "utc_offset_minutes": int(offset_seconds // 60),
         "device_local_time": expected,
+    }
+
+
+def _repair_legacy_time_offset(
+    client: DeviceClient | SerialDeviceClient,
+    status: dict[str, Any],
+    now: datetime | None = None,
+) -> dict[str, Any] | None:
+    time_sync = status.get("time_sync")
+    if not (
+        isinstance(time_sync, dict)
+        and time_sync.get("civil_time_semantics") == "unconfigured"
+        and time_sync.get("publication") == "timezone_required"
+        and "utc_offset_minutes" in time_sync
+        and time_sync["utc_offset_minutes"] is None
+    ):
+        return None
+
+    try:
+        result = _sync_time_from_host(client, now)
+    except DeviceError as exc:
+        return {
+            "state": "failed",
+            "reason": TIME_REPAIR_REASON,
+            "error": str(exc),
+            "retryable": True,
+            "retry_command": TIME_SYNC_RETRY_COMMAND,
+        }
+    return {
+        "state": "repaired",
+        "reason": TIME_REPAIR_REASON,
+        "retryable": False,
+        "sync": result,
     }
 
 
@@ -644,10 +678,14 @@ def cmd_device_sync_time(args: argparse.Namespace) -> int:
 
 def cmd_device_status(args: argparse.Namespace) -> int:
     session = _session_from_args(args)
-    status = credential_safe_status(session.status())
+    raw_status = session.status()
+    time_repair = _repair_legacy_time_offset(session.client, raw_status)
+    status = credential_safe_status(raw_status)
     if isinstance(status, dict):
         status.pop("wifi_diagnostics", None)
         status.pop("time_sync", None)
+        if time_repair is not None:
+            status["time_repair"] = credential_safe_status(time_repair)
     _print_json(session.envelope(status))
     return 0
 

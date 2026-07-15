@@ -200,6 +200,88 @@ class AutomaticTimeSyncTests(unittest.TestCase):
         with self.assertRaisesRegex(DeviceError, "could not be validated"):
             cli._sync_time_from_host(client, local)
 
+    def test_status_repairs_the_exact_legacy_offset_sentinel_once(self) -> None:
+        local = datetime(2026, 7, 15, 8, 42, tzinfo=timezone(timedelta(hours=-7)))
+        client = Mock(spec=SerialDeviceClient)
+        client.put_time.return_value = {
+            "hour": 8,
+            "minute": 42,
+            "year": 2026,
+            "month": 7,
+            "day": 15,
+            "utc_offset_minutes": -420,
+        }
+        status = {
+            "time_sync": {
+                "civil_time_semantics": "unconfigured",
+                "publication": "timezone_required",
+                "utc_offset_minutes": None,
+            },
+        }
+
+        repair = cli._repair_legacy_time_offset(client, status, local)
+
+        self.assertEqual(repair["state"], "repaired")
+        self.assertEqual(repair["reason"], "legacy_missing_utc_offset")
+        self.assertEqual(repair["sync"]["utc_offset_minutes"], -420)
+        client.put_time.assert_called_once_with(8, 42, 7, 15, 2026, -420)
+
+    def test_status_time_repair_is_a_noop_for_every_other_state(self) -> None:
+        cases = (
+            {},
+            {"time_sync": None},
+            {"time_sync": {
+                "civil_time_semantics": "unconfigured",
+                "publication": "timezone_required",
+            }},
+            {"time_sync": {
+                "civil_time_semantics": "fixed_utc_offset",
+                "publication": "timezone_required",
+                "utc_offset_minutes": None,
+            }},
+            {"time_sync": {
+                "civil_time_semantics": "unconfigured",
+                "publication": "published",
+                "utc_offset_minutes": None,
+            }},
+            {"time_sync": {
+                "civil_time_semantics": "unconfigured",
+                "publication": "timezone_required",
+                "utc_offset_minutes": 0,
+            }},
+        )
+
+        for status in cases:
+            with self.subTest(status=status):
+                client = Mock(spec=SerialDeviceClient)
+
+                self.assertIsNone(cli._repair_legacy_time_offset(client, status))
+
+                client.put_time.assert_not_called()
+
+    def test_status_reports_one_failed_repair_without_retrying(self) -> None:
+        local = datetime(2026, 7, 15, 8, 42, tzinfo=timezone.utc)
+        client = Mock(spec=SerialDeviceClient)
+        client.put_time.side_effect = DeviceRequestTimeout("time write timed out")
+        status = {
+            "time_sync": {
+                "civil_time_semantics": "unconfigured",
+                "publication": "timezone_required",
+                "utc_offset_minutes": None,
+            },
+        }
+
+        repair = cli._repair_legacy_time_offset(client, status, local)
+
+        self.assertEqual(repair, {
+            "state": "failed",
+            "reason": "legacy_missing_utc_offset",
+            "error": "time write timed out",
+            "retryable": True,
+            "retry_command": "pj device sync-time",
+        })
+        client.put_time.assert_called_once_with(8, 42, 7, 15, 2026, 0)
+
     def test_sync_reanchors_stale_and_already_valid_clocks_without_a_preflight_read(self) -> None:
         local = datetime(2026, 7, 14, 8, 42, tzinfo=timezone.utc)
         for reported_time in (
