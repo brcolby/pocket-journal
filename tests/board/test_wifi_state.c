@@ -24,11 +24,15 @@ static void test_connect_associate_and_dhcp_success(void)
     assert(state.retry_state == PJ_WIFI_RETRY_RETRYING);
     assert(state.connect_deadline_ms == 100 + PJ_WIFI_CONNECT_TIMEOUT_MS);
 
-    pj_wifi_state_on_associated(&state, 200);
+    pj_wifi_state_on_associated(&state, 200, 11, 3);
     assert(state.phase == PJ_WIFI_PHASE_DHCP);
     assert(state.dhcp_state == PJ_WIFI_DHCP_REQUESTING);
     assert(state.connect_deadline_ms == 0);
     assert(state.dhcp_deadline_ms == 200 + PJ_WIFI_DHCP_TIMEOUT_MS);
+    assert(state.channel_known == 1);
+    assert(state.channel == 11);
+    assert(state.auth_mode_known == 1);
+    assert(state.auth_mode == 3);
 
     pj_wifi_state_on_got_ip(&state, 400, -57, 11);
     assert(state.phase == PJ_WIFI_PHASE_CONNECTED);
@@ -37,6 +41,7 @@ static void test_connect_associate_and_dhcp_success(void)
     assert(state.retry_state == PJ_WIFI_RETRY_IDLE);
     assert(state.retry_count == 0);
     assert(state.rssi_dbm == -57);
+    assert(state.rssi_known == 1);
     assert(state.channel == 11);
     assert(state.last_success_monotonic_ms == 400);
     assert(strcmp(pj_wifi_phase_name(state.phase), "connected") == 0);
@@ -90,6 +95,8 @@ static void test_disconnect_classification_and_backoff(void)
          PJ_WIFI_PHASE_ACCESS_POINT_UNAVAILABLE, 0},
         {203, PJ_WIFI_DISCONNECT_ASSOCIATION,
          PJ_WIFI_PHASE_ASSOCIATION_FAILED, 1},
+        {205, PJ_WIFI_DISCONNECT_CONNECTION,
+         PJ_WIFI_PHASE_CONNECTION_FAILED, 1},
         {999, PJ_WIFI_DISCONNECT_OTHER,
          PJ_WIFI_PHASE_DISCONNECTED, -1},
     };
@@ -97,7 +104,8 @@ static void test_disconnect_classification_and_backoff(void)
         pj_wifi_state_t state;
         pj_wifi_state_init(&state, 1, 0);
         assert(pj_wifi_state_tick(&state, 0) == PJ_WIFI_ACTION_CONNECT);
-        pj_wifi_state_on_disconnected(&state, cases[i].reason, 500);
+        pj_wifi_state_on_disconnected(&state, cases[i].reason,
+                                      cases[i].visible > 0, -61, 500);
         assert(pj_wifi_disconnect_classify(cases[i].reason) ==
                cases[i].classification);
         assert(state.phase == cases[i].phase);
@@ -121,17 +129,35 @@ static void test_backoff_is_bounded_and_resets_on_success(void)
     uint64_t now = 1;
     const uint32_t expected[] = {2000, 4000, 8000, 15000, 30000, 60000, 60000};
     for (size_t i = 0; i < sizeof(expected) / sizeof(expected[0]); i++) {
-        pj_wifi_state_on_disconnected(&state, 200, now);
+        pj_wifi_state_on_disconnected(&state, 200, 0, -127, now);
         assert(state.backoff_ms == expected[i]);
         now += state.backoff_ms;
         assert(pj_wifi_state_tick(&state, now) == PJ_WIFI_ACTION_CONNECT);
         now++;
     }
     assert(state.backoff_ms <= PJ_WIFI_RETRY_MAX_MS);
-    pj_wifi_state_on_associated(&state, now);
+    pj_wifi_state_on_associated(&state, now, 6, 3);
     pj_wifi_state_on_got_ip(&state, now + 1, -40, 6);
     assert(state.retry_count == 0);
     assert(state.backoff_ms == 0);
+}
+
+static void test_connection_failure_preserves_ap_diagnostics(void)
+{
+    pj_wifi_state_t state;
+    pj_wifi_state_init(&state, 1, 0);
+    assert(pj_wifi_state_tick(&state, 0) == PJ_WIFI_ACTION_CONNECT);
+    pj_wifi_state_on_associated(&state, 10, 11, 3);
+    pj_wifi_state_on_disconnected(&state, 205, 1, -63, 20);
+
+    assert(state.phase == PJ_WIFI_PHASE_CONNECTION_FAILED);
+    assert(state.ap_visible == 1);
+    assert(state.rssi_known == 1);
+    assert(state.rssi_dbm == -63);
+    assert(state.channel_known == 1);
+    assert(state.channel == 11);
+    assert(state.auth_mode_known == 1);
+    assert(state.auth_mode == 3);
 }
 
 static void test_dhcp_timeout_reconnects_after_backoff(void)
@@ -139,7 +165,7 @@ static void test_dhcp_timeout_reconnects_after_backoff(void)
     pj_wifi_state_t state;
     pj_wifi_state_init(&state, 1, 0);
     assert(pj_wifi_state_tick(&state, 0) == PJ_WIFI_ACTION_CONNECT);
-    pj_wifi_state_on_associated(&state, 10);
+    pj_wifi_state_on_associated(&state, 10, 1, 3);
     assert(pj_wifi_state_tick(&state, 10 + PJ_WIFI_DHCP_TIMEOUT_MS - 1) ==
            PJ_WIFI_ACTION_NONE);
     assert(pj_wifi_state_tick(&state, 10 + PJ_WIFI_DHCP_TIMEOUT_MS) ==
@@ -157,7 +183,7 @@ static void test_lost_ip_and_failed_connect_request_retry(void)
     pj_wifi_state_t state;
     pj_wifi_state_init(&state, 1, 5);
     assert(pj_wifi_state_tick(&state, 5) == PJ_WIFI_ACTION_CONNECT);
-    pj_wifi_state_on_associated(&state, 10);
+    pj_wifi_state_on_associated(&state, 10, 1, 3);
     pj_wifi_state_on_got_ip(&state, 20, -70, 1);
     pj_wifi_state_on_lost_ip(&state, 30);
     assert(state.phase == PJ_WIFI_PHASE_DHCP_FAILED);
@@ -175,7 +201,7 @@ static void test_reprovision_and_success_metadata(void)
     pj_wifi_state_init(&state, 0, 0);
     pj_wifi_state_set_provisioned(&state, 1, 50);
     assert(pj_wifi_state_tick(&state, 50) == PJ_WIFI_ACTION_CONNECT);
-    pj_wifi_state_on_associated(&state, 60);
+    pj_wifi_state_on_associated(&state, 60, 6, 3);
     pj_wifi_state_on_got_ip(&state, 70, -30, 2000);
     assert(state.channel == UINT8_MAX);
     pj_wifi_state_set_last_success_utc(&state, 1784041200);
@@ -194,6 +220,7 @@ int main(void)
     test_connect_associate_and_dhcp_success();
     test_missing_driver_event_times_out_and_reconnects();
     test_disconnect_classification_and_backoff();
+    test_connection_failure_preserves_ap_diagnostics();
     test_backoff_is_bounded_and_resets_on_success();
     test_dhcp_timeout_reconnects_after_backoff();
     test_lost_ip_and_failed_connect_request_retry();

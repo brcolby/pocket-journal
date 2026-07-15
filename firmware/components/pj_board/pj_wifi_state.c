@@ -60,6 +60,10 @@ void pj_wifi_state_set_provisioned(pj_wifi_state_t *state, int provisioned,
     state->ap_visible = -1;
     state->rssi_dbm = -127;
     state->channel = 0;
+    state->auth_mode = 0;
+    state->rssi_known = 0;
+    state->channel_known = 0;
+    state->auth_mode_known = 0;
     state->last_success_monotonic_ms = 0;
     state->last_success_utc_s = 0;
     if (!state->provisioned) {
@@ -86,7 +90,8 @@ void pj_wifi_state_on_driver_started(pj_wifi_state_t *state,
     state->next_retry_ms = now_ms;
 }
 
-void pj_wifi_state_on_associated(pj_wifi_state_t *state, uint64_t now_ms)
+void pj_wifi_state_on_associated(pj_wifi_state_t *state, uint64_t now_ms,
+                                 unsigned channel, unsigned auth_mode)
 {
     if (state == NULL || !state->provisioned) {
         return;
@@ -99,6 +104,10 @@ void pj_wifi_state_on_associated(pj_wifi_state_t *state, uint64_t now_ms)
     state->next_retry_ms = 0;
     state->dhcp_deadline_ms = deadline_after(now_ms, PJ_WIFI_DHCP_TIMEOUT_MS);
     state->ap_visible = 1;
+    state->channel = channel > UINT8_MAX ? UINT8_MAX : (uint8_t)channel;
+    state->auth_mode = auth_mode > UINT8_MAX ? UINT8_MAX : (uint8_t)auth_mode;
+    state->channel_known = channel != 0;
+    state->auth_mode_known = 1;
 }
 
 void pj_wifi_state_on_got_ip(pj_wifi_state_t *state, uint64_t now_ms,
@@ -114,6 +123,8 @@ void pj_wifi_state_on_got_ip(pj_wifi_state_t *state, uint64_t now_ms,
     state->ap_visible = 1;
     state->rssi_dbm = (int16_t)rssi_dbm;
     state->channel = channel > UINT8_MAX ? UINT8_MAX : (uint8_t)channel;
+    state->rssi_known = rssi_dbm > -127;
+    state->channel_known = channel != 0;
     state->retry_count = 0;
     state->backoff_ms = 0;
     state->connect_deadline_ms = 0;
@@ -167,12 +178,15 @@ pj_wifi_disconnect_class_t pj_wifi_disconnect_classify(unsigned reason)
     case 18:
     case 203:
         return PJ_WIFI_DISCONNECT_ASSOCIATION;
+    case 205:
+        return PJ_WIFI_DISCONNECT_CONNECTION;
     default:
         return PJ_WIFI_DISCONNECT_OTHER;
     }
 }
 
 void pj_wifi_state_on_disconnected(pj_wifi_state_t *state, unsigned reason,
+                                   int ap_observed, int rssi_dbm,
                                    uint64_t now_ms)
 {
     if (state == NULL || !state->provisioned) {
@@ -183,6 +197,13 @@ void pj_wifi_state_on_disconnected(pj_wifi_state_t *state, unsigned reason,
     state->connect_deadline_ms = 0;
     state->dhcp_deadline_ms = 0;
     state->last_disconnect_reason = reason > UINT16_MAX ? UINT16_MAX : (uint16_t)reason;
+    if (ap_observed) {
+        state->ap_visible = 1;
+        if (rssi_dbm > -127) {
+            state->rssi_dbm = (int16_t)rssi_dbm;
+            state->rssi_known = 1;
+        }
+    }
     switch (pj_wifi_disconnect_classify(reason)) {
     case PJ_WIFI_DISCONNECT_AUTHENTICATION:
         state->phase = PJ_WIFI_PHASE_AUTHENTICATION_FAILED;
@@ -191,15 +212,26 @@ void pj_wifi_state_on_disconnected(pj_wifi_state_t *state, unsigned reason,
     case PJ_WIFI_DISCONNECT_ACCESS_POINT_UNAVAILABLE:
         state->phase = PJ_WIFI_PHASE_ACCESS_POINT_UNAVAILABLE;
         state->ap_visible = 0;
+        state->rssi_known = 0;
+        state->channel_known = 0;
+        state->auth_mode_known = 0;
         break;
     case PJ_WIFI_DISCONNECT_ASSOCIATION:
         state->phase = PJ_WIFI_PHASE_ASSOCIATION_FAILED;
         state->ap_visible = 1;
         break;
+    case PJ_WIFI_DISCONNECT_CONNECTION:
+        state->phase = PJ_WIFI_PHASE_CONNECTION_FAILED;
+        if (!ap_observed && state->ap_visible < 0) {
+            state->ap_visible = -1;
+        }
+        break;
     case PJ_WIFI_DISCONNECT_OTHER:
     default:
         state->phase = PJ_WIFI_PHASE_DISCONNECTED;
-        state->ap_visible = -1;
+        if (!ap_observed && state->ap_visible < 0) {
+            state->ap_visible = -1;
+        }
         break;
     }
     schedule_retry(state, now_ms);
@@ -277,6 +309,7 @@ const char *pj_wifi_phase_name(pj_wifi_phase_t phase)
     case PJ_WIFI_PHASE_AUTHENTICATION_FAILED: return "authentication_failed";
     case PJ_WIFI_PHASE_ACCESS_POINT_UNAVAILABLE: return "access_point_unavailable";
     case PJ_WIFI_PHASE_ASSOCIATION_FAILED: return "association_failed";
+    case PJ_WIFI_PHASE_CONNECTION_FAILED: return "connection_failed";
     case PJ_WIFI_PHASE_DHCP: return "dhcp";
     case PJ_WIFI_PHASE_DHCP_FAILED: return "dhcp_failed";
     case PJ_WIFI_PHASE_CONNECTED: return "connected";

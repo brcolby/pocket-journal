@@ -1545,15 +1545,24 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
         return;
     }
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_CONNECTED) {
+        const wifi_event_sta_connected_t *event = event_data;
+        unsigned channel = event == NULL ? 0U : (unsigned)event->channel;
+        unsigned auth_mode = event == NULL ? 0U : (unsigned)event->authmode;
         portENTER_CRITICAL(&g_connectivity_lock);
-        pj_wifi_state_on_associated(&g_wifi_state, board_monotonic_ms());
+        pj_wifi_state_on_associated(&g_wifi_state, board_monotonic_ms(),
+                                    channel, auth_mode);
         portEXIT_CRITICAL(&g_connectivity_lock);
+        ESP_LOGI(TAG, "Wi-Fi associated: channel=%u auth_mode=%u",
+                 channel, auth_mode);
         return;
     }
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
         const wifi_event_sta_disconnected_t *event = event_data;
         unsigned reason = event == NULL ? 0U : (unsigned)event->reason;
+        int ap_observed = event != NULL && event->ssid_len > 0;
+        int rssi_dbm = event == NULL ? -127 : event->rssi;
         int control_disconnect = 0;
+        pj_wifi_phase_t failure_phase = PJ_WIFI_PHASE_DISCONNECTED;
         portENTER_CRITICAL(&g_connectivity_lock);
         if (g_wifi_control_disconnect_pending) {
             /* A DHCP/reprovision reconnect is transport control, not a new
@@ -1562,7 +1571,9 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
             control_disconnect = 1;
         } else {
             pj_wifi_state_on_disconnected(&g_wifi_state, reason,
+                                          ap_observed, rssi_dbm,
                                           board_monotonic_ms());
+            failure_phase = g_wifi_state.phase;
         }
         pj_time_sync_on_network_lost(&g_time_sync_state,
                                      board_monotonic_ms());
@@ -1571,8 +1582,12 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
         (void)snprintf(g_status.ip_addr, sizeof(g_status.ip_addr), "0.0.0.0");
         if (!control_disconnect) {
             (void)snprintf(g_status.last_error, sizeof(g_status.last_error),
-                           "Wi-Fi disconnected (reason %u); retry scheduled",
-                           reason);
+                           "Wi-Fi %s (reason %u); retry scheduled",
+                           pj_wifi_phase_name(failure_phase), reason);
+            ESP_LOGW(TAG,
+                     "Wi-Fi disconnected: reason=%u phase=%s ap_visible=%d rssi=%d",
+                     reason, pj_wifi_phase_name(failure_phase),
+                     ap_observed, rssi_dbm);
         }
         return;
     }
@@ -1629,6 +1644,8 @@ static esp_err_t wifi_apply_config(void)
     config.sta.threshold.authmode = WIFI_AUTH_OPEN;
     config.sta.pmf_cfg.capable = true;
     config.sta.pmf_cfg.required = false;
+    config.sta.disable_wpa3_compatible_mode = true;
+    config.sta.failure_retry_cnt = 3;
     return esp_wifi_set_config(WIFI_IF_STA, &config);
 }
 
@@ -1680,7 +1697,8 @@ static void wifi_apply_provisioning_status(void)
     if (!g_wifi_credentials_stored) {
         return;
     }
-    g_status.ble_provisioning = PJ_BOARD_SERVICE_READY;
+    g_status.ble_provisioning = g_ble_started ? PJ_BOARD_SERVICE_READY :
+        PJ_BOARD_SERVICE_UNAVAILABLE;
     if (g_status.wifi != PJ_BOARD_SERVICE_READY) {
         g_status.wifi = PJ_BOARD_SERVICE_UNAVAILABLE;
         (void)snprintf(g_status.last_error, sizeof(g_status.last_error), "Wi-Fi credentials stored");
@@ -6097,12 +6115,17 @@ void pj_board_start_services(const pj_board_profile_t *profile)
     (void)profile;
     (void)pj_board_http_start();
 #ifdef ESP_PLATFORM
-    esp_err_t ble_err = ble_provisioning_start();
-    if (ble_err != ESP_OK) {
-        g_status.ble_provisioning = PJ_BOARD_SERVICE_ERROR;
-        (void)snprintf(g_status.last_error, sizeof(g_status.last_error),
-                       "BLE provisioning start failed: %s", esp_err_to_name(ble_err));
-        ESP_LOGE(TAG, "%s", g_status.last_error);
+    if (!g_wifi_credentials_stored) {
+        esp_err_t ble_err = ble_provisioning_start();
+        if (ble_err != ESP_OK) {
+            g_status.ble_provisioning = PJ_BOARD_SERVICE_ERROR;
+            (void)snprintf(g_status.last_error, sizeof(g_status.last_error),
+                           "BLE provisioning start failed: %s", esp_err_to_name(ble_err));
+            ESP_LOGE(TAG, "%s", g_status.last_error);
+        }
+    } else {
+        g_status.ble_provisioning = PJ_BOARD_SERVICE_UNAVAILABLE;
+        ESP_LOGI(TAG, "BLE provisioning skipped because Wi-Fi credentials are stored");
     }
     if (g_wifi_credentials_stored) {
         esp_err_t wifi_err = wifi_start_or_reconfigure();
@@ -7327,12 +7350,29 @@ static int connectivity_add_json(cJSON *json, const pj_board_status_t *status)
         cJSON_AddBoolToObject(wifi, "ap_visible",
                               wifi_state->ap_visible != 0);
     }
-    if (wifi_state->has_ip) {
+    if (wifi_state->rssi_known) {
         cJSON_AddNumberToObject(wifi, "rssi_dbm", wifi_state->rssi_dbm);
-        cJSON_AddNumberToObject(wifi, "channel", wifi_state->channel);
     } else {
         cJSON_AddNullToObject(wifi, "rssi_dbm");
+    }
+    if (wifi_state->channel_known) {
+        cJSON_AddNumberToObject(wifi, "channel", wifi_state->channel);
+    } else {
         cJSON_AddNullToObject(wifi, "channel");
+    }
+    static const char *const auth_modes[] = {
+        "open", "wep", "wpa_psk", "wpa2_psk", "wpa_wpa2_psk",
+        "wpa2_enterprise", "wpa3_psk", "wpa2_wpa3_psk", "wapi_psk",
+        "owe", "wpa3_enterprise_192", "reserved_11", "reserved_12",
+        "dpp", "wpa3_enterprise", "wpa2_wpa3_enterprise",
+        "wpa_enterprise",
+    };
+    if (wifi_state->auth_mode_known &&
+        wifi_state->auth_mode < sizeof(auth_modes) / sizeof(auth_modes[0])) {
+        cJSON_AddStringToObject(wifi, "auth_mode",
+                                auth_modes[wifi_state->auth_mode]);
+    } else {
+        cJSON_AddNullToObject(wifi, "auth_mode");
     }
     char wifi_success[32] = {0};
     if (format_utc_time(wifi_state->last_success_utc_s, wifi_success,

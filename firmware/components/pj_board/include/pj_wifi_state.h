@@ -14,6 +14,7 @@ typedef enum {
     PJ_WIFI_PHASE_AUTHENTICATION_FAILED,
     PJ_WIFI_PHASE_ACCESS_POINT_UNAVAILABLE,
     PJ_WIFI_PHASE_ASSOCIATION_FAILED,
+    PJ_WIFI_PHASE_CONNECTION_FAILED,
     PJ_WIFI_PHASE_DHCP,
     PJ_WIFI_PHASE_DHCP_FAILED,
     PJ_WIFI_PHASE_CONNECTED,
@@ -40,6 +41,7 @@ typedef enum {
     PJ_WIFI_DISCONNECT_AUTHENTICATION,
     PJ_WIFI_DISCONNECT_ACCESS_POINT_UNAVAILABLE,
     PJ_WIFI_DISCONNECT_ASSOCIATION,
+    PJ_WIFI_DISCONNECT_CONNECTION,
 } pj_wifi_disconnect_class_t;
 
 typedef enum {
@@ -57,6 +59,10 @@ typedef struct {
     int8_t ap_visible;
     int16_t rssi_dbm;
     uint8_t channel;
+    uint8_t auth_mode;
+    uint8_t rssi_known;
+    uint8_t channel_known;
+    uint8_t auth_mode_known;
     uint16_t last_disconnect_reason;
     uint32_t retry_count;
     uint32_t backoff_ms;
@@ -73,11 +79,13 @@ void pj_wifi_state_set_provisioned(pj_wifi_state_t *state, int provisioned,
                                    uint64_t now_ms);
 void pj_wifi_state_on_driver_started(pj_wifi_state_t *state,
                                      uint64_t now_ms);
-void pj_wifi_state_on_associated(pj_wifi_state_t *state, uint64_t now_ms);
+void pj_wifi_state_on_associated(pj_wifi_state_t *state, uint64_t now_ms,
+                                 unsigned channel, unsigned auth_mode);
 void pj_wifi_state_on_got_ip(pj_wifi_state_t *state, uint64_t now_ms,
                              int rssi_dbm, unsigned channel);
 void pj_wifi_state_on_lost_ip(pj_wifi_state_t *state, uint64_t now_ms);
 void pj_wifi_state_on_disconnected(pj_wifi_state_t *state, unsigned reason,
+                                   int ap_observed, int rssi_dbm,
                                    uint64_t now_ms);
 void pj_wifi_state_on_connect_request_failed(pj_wifi_state_t *state,
                                              uint64_t now_ms);
