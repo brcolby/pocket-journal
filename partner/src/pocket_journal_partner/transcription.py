@@ -316,6 +316,8 @@ class WhisperCppTranscriptionBackend(TranscriptionBackend):
         *,
         language: str = "en",
         threads: int | None = None,
+        expected_executable_sha256: str | None = None,
+        expected_model_sha256: str | None = None,
     ) -> None:
         configured_model = model_path or os.environ.get(WHISPER_CPP_MODEL_ENV)
         self.model_path = Path(configured_model).expanduser() if configured_model else None
@@ -325,14 +327,40 @@ class WhisperCppTranscriptionBackend(TranscriptionBackend):
         self.threads = threads if threads is not None else WHISPER_CPP_DEFAULT_THREADS
         if threads is not None and threads <= 0:
             raise ValueError("whisper.cpp thread count must be positive")
+        self.expected_executable_sha256 = self._normalize_expected_digest(
+            expected_executable_sha256, "expected_executable_sha256"
+        )
+        self.expected_model_sha256 = self._normalize_expected_digest(
+            expected_model_sha256, "expected_model_sha256"
+        )
+
+    @staticmethod
+    def _normalize_expected_digest(value: str | None, field: str) -> str | None:
+        if value is None:
+            return None
+        digest = value.lower()
+        if len(digest) != 64 or any(character not in "0123456789abcdef" for character in digest):
+            raise ValueError(f"{field} must be a 64-character hexadecimal digest")
+        return digest
 
     def availability(self, *, digest: bool = False) -> dict[str, Any]:
         issues: list[str] = []
+        executable_digest = None
         if self.executable is None:
             issues.append(
                 f"whisper.cpp executable {self.executable_name!r} was not found on PATH; "
                 f"set {WHISPER_CPP_EXECUTABLE_ENV} or pass --whisper-executable"
             )
+        elif digest or self.expected_executable_sha256 is not None:
+            executable_digest = _sha256_file(Path(self.executable).resolve())
+            if (
+                self.expected_executable_sha256 is not None
+                and executable_digest != self.expected_executable_sha256
+            ):
+                issues.append(
+                    "whisper.cpp executable SHA-256 does not match the persisted verified setup; "
+                    "run 'pj transcription setup' again"
+                )
         model_size = None
         model_digest = None
         if self.model_path is None:
@@ -351,6 +379,16 @@ class WhisperCppTranscriptionBackend(TranscriptionBackend):
                 )
             if digest:
                 model_digest = _sha256_file(self.model_path)
+            elif self.expected_model_sha256 is not None:
+                model_digest = _sha256_file(self.model_path)
+            if (
+                self.expected_model_sha256 is not None
+                and model_digest != self.expected_model_sha256
+            ):
+                issues.append(
+                    "whisper.cpp model SHA-256 does not match the persisted verified setup; "
+                    "run 'pj transcription setup' again"
+                )
         return {
             "backend": "whisper-cpp",
             "available": not issues,
@@ -358,9 +396,17 @@ class WhisperCppTranscriptionBackend(TranscriptionBackend):
             "cloud_required": False,
             "recommended_model": WHISPER_CPP_DEFAULT_MODEL,
             "executable": self.executable,
+            "executable_sha256": executable_digest,
+            "expected_executable_sha256": self.expected_executable_sha256,
             "model_path": str(self.model_path) if self.model_path is not None else None,
             "model_bytes": model_size,
             "model_sha256": model_digest,
+            "expected_model_sha256": self.expected_model_sha256,
+            "integrity_verified": bool(
+                not issues
+                and self.expected_executable_sha256 is not None
+                and self.expected_model_sha256 is not None
+            ),
             "issues": issues,
         }
 
@@ -488,6 +534,8 @@ def backend_from_name(
     model_path: Path | str | None = None,
     executable: str | None = None,
     threads: int | None = None,
+    expected_executable_sha256: str | None = None,
+    expected_model_sha256: str | None = None,
 ) -> TranscriptionBackend:
     if name == "fake":
         return FakeTranscriptionBackend()
@@ -498,5 +546,7 @@ def backend_from_name(
             model_path=model_path,
             executable=executable,
             threads=threads,
+            expected_executable_sha256=expected_executable_sha256,
+            expected_model_sha256=expected_model_sha256,
         )
     raise ValueError(f"unknown transcription backend: {name}")

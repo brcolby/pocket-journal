@@ -6,14 +6,21 @@ sleep, an offline laptop, and device reboot. Run the foreground companion before
 after selecting Sync:
 
 ```sh
-pj transcription status --model /models/ggml-base.en-q5_0.bin
-pj companion serve --model /models/ggml-base.en-q5_0.bin
+pj transcription setup --model /models/ggml-base.en-q5_0.bin
+pj transcription status --digest
+pj companion serve
 ```
+
+`setup` verifies and persists the selected runtime/model identities; `serve`
+re-hashes them before it accepts work. Status and serve never acquire artifacts.
+Use `--download-model` and, on supported platforms, `--download-runtime` only as
+an explicit online setup step. See [Install](install.md) for pinned sources,
+platform support, local-runtime enrollment, and failure behavior.
 
 When more than one Pocket Journal is paired, select the profile explicitly:
 
 ```sh
-pj companion serve --device pj-abcdef --model /models/ggml-base.en-q5_0.bin
+pj companion serve --device pj-abcdef
 ```
 
 ## USB-C Default

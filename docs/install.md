@@ -78,20 +78,59 @@ pip install -e '.[ble,transcription]'
 ```
 
 The default transcription runtime is the external CPU-only `whisper.cpp`
-`whisper-cli`, so it does not require the Python `transcription` extra. Install
-that runtime separately, obtain a local `ggml-base.en-q5_0.bin` model deliberately,
-and point the partner at it without an implicit model download:
+`whisper-cli`, so it does not require the Python `transcription` extra. Configure
+the pinned `whisper.cpp` 1.9.1 runtime and `ggml-base.en-q5_0.bin` model once, then
+status, sync, and the companion reuse that digest-verified configuration:
 
 ```sh
-pj transcription status --model /models/ggml-base.en-q5_0.bin --digest
+pj transcription setup \
+  --runtime /usr/local/bin/whisper-cli \
+  --runtime-sha256 <sha256> \
+  --runtime-source <pinned-source> \
+  --runtime-license MIT \
+  --model /models/ggml-base.en-q5_0.bin
+pj transcription status --digest
 pj transcription benchmark --manifest /path/to/manifest.json --model /models/ggml-base.en-q5_0.bin --output /path/to/report.json
-pj sync --model /models/ggml-base.en-q5_0.bin
-pj companion serve --model /models/ggml-base.en-q5_0.bin
+pj sync
+pj companion serve
 pj library tui
 pj library serve
 ```
 
-Set `PJ_WHISPER_CPP` and `PJ_WHISPER_MODEL` to retain the executable/model choices.
+The repository recognizes the exact Apple Silicon Homebrew executable used for
+its `whisper.cpp` 1.9.1 benchmark. With that version installed, macOS can locate
+it from `PATH` and derive the pinned model deliberately:
+
+```sh
+pj transcription setup --download-model
+```
+
+Pinned upstream CLI archives are available to setup on Linux x86-64/AArch64 and
+Windows x86-64:
+
+```sh
+pj transcription setup --download-runtime --download-model
+```
+
+Those flags are the only setup operations that access the network. Runtime
+archives are selected by platform, bounded by size and timeout, and checked
+against release SHA-256 values before safe extraction. Q5_0 is not fetched from
+an unverified mirror: setup downloads the immutable official `base.en` input,
+verifies its size and SHA-256, runs the verified 1.9.1 quantizer without a shell,
+and accepts the result only when it matches the benchmarked Q5_0 digest. Staging
+files are removed on interruption or mismatch, artifact replacement is atomic,
+and config is saved only after both artifacts pass. Provenance and license values
+are stored with paths, versions, hashes, and the CPU thread count; no additional
+credential is stored.
+
+The official 1.9.1 release does not publish a macOS CLI archive, and unsupported
+platforms fail with an actionable local-install command instead of selecting an
+unverified download. A different local 1.9.1 build remains supported when its
+exact `--runtime-sha256`, `--runtime-source`, and `--runtime-license` are supplied.
+Explicit `--model` and `--whisper-executable` arguments, followed by the existing
+`PJ_WHISPER_MODEL` and `PJ_WHISPER_CPP` environment variables, override persisted
+setup for one command.
+
 The web library binds only to `127.0.0.1` by default.
 The benchmark command and cross-platform evidence procedure are documented in
 [Transcription Benchmark](transcription-benchmark.md).

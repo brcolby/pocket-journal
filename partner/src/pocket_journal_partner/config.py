@@ -20,8 +20,35 @@ class DeviceProfile:
 
 
 @dataclass
+class TranscriptionProfile:
+    backend: str = "whisper-cpp"
+    executable: str = ""
+    executable_sha256: str = ""
+    runtime_version: str = ""
+    runtime_source: str = ""
+    runtime_license: str = ""
+    runtime_archive_sha256: str = ""
+    model_path: str = ""
+    model_sha256: str = ""
+    model_source: str = ""
+    model_license: str = ""
+    threads: int = 4
+
+    @property
+    def configured(self) -> bool:
+        return bool(
+            self.backend == "whisper-cpp"
+            and self.executable
+            and self.executable_sha256
+            and self.model_path
+            and self.model_sha256
+        )
+
+
+@dataclass
 class PartnerConfig:
     devices: dict[str, DeviceProfile] = field(default_factory=dict)
+    transcription: TranscriptionProfile | None = None
 
     @classmethod
     def load(cls, path: Path) -> "PartnerConfig":
@@ -32,7 +59,13 @@ class PartnerConfig:
             key: DeviceProfile(**value)
             for key, value in data.get("devices", {}).items()
         }
-        return cls(devices=devices)
+        raw_transcription = data.get("transcription")
+        transcription = (
+            TranscriptionProfile(**raw_transcription)
+            if isinstance(raw_transcription, dict)
+            else None
+        )
+        return cls(devices=devices, transcription=transcription)
 
     def save(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -42,6 +75,8 @@ class PartnerConfig:
                 for key, profile in sorted(self.devices.items())
             }
         }
+        if self.transcription is not None:
+            data["transcription"] = self.transcription.__dict__
         serialized = json.dumps(data, indent=2, sort_keys=True) + "\n"
         temp_path: Path | None = None
         try:

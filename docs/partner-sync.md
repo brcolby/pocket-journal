@@ -9,9 +9,11 @@ pj provision --ssid <ssid> --password <password>
 pj provision --ssid <ssid> --password <password> --serial-port /dev/cu.usbmodem1101
 pj provision --ssid <ssid> --password <password> --ble
 pj discover
-pj transcription status --model /path/to/ggml-base.en-q5_0.bin
+pj transcription setup --model /path/to/ggml-base.en-q5_0.bin
+pj transcription status --digest
 pj transcription benchmark --manifest /path/to/manifest.json --model /path/to/ggml-base.en-q5_0.bin --output /path/to/report.json
-pj sync --model /path/to/ggml-base.en-q5_0.bin
+pj sync
+pj companion serve
 pj library list
 pj library tui
 pj library serve
@@ -96,14 +98,24 @@ guessed.
 `pj sync` manually downloads new recordings over USB-C or authenticated LAN/Wi-Fi,
 transcribes them locally, writes transcripts back to the matching device record,
 and indexes the local result. Its default backend is the CPU-only `whisper.cpp`
-CLI. No model is downloaded implicitly. Configure an existing local model with
-`--model` or `PJ_WHISPER_MODEL`, and check the complete runtime/model setup before
-a long sync:
+CLI. No model or runtime is downloaded implicitly. Configure the pinned artifacts
+once and check them before a long sync:
 
 ```sh
-pj transcription status --model /models/ggml-base.en-q5_0.bin --digest
-pj sync --model /models/ggml-base.en-q5_0.bin
+pj transcription setup --model /models/ggml-base.en-q5_0.bin
+pj transcription status --digest
+pj sync
 ```
+
+`pj transcription setup` accepts an existing Q5_0 model only when its size and
+SHA-256 match the production baseline. It recognizes the benchmarked Apple
+Silicon Homebrew 1.9.1 runtime; other local builds require an explicit expected
+runtime digest, source, and license. `--download-runtime` opts in to a pinned
+official 1.9.1 archive on supported Linux/Windows platforms. `--download-model`
+opts in to the immutable official F16 source and derives Q5_0 with the verified
+quantizer. Both paths use bounded staging, digest checks, and atomic replacement;
+config remains unchanged after an offline, truncated, wrong-digest, extraction,
+or quantization failure. See [Install](install.md) for the complete commands.
 
 To let the device's Settings **Sync** action initiate that pipeline, keep the
 companion running. USB-C polling is enabled by default, and the same process also
@@ -111,8 +123,12 @@ advertises the mutually authenticated LAN service. It runs each request
 asynchronously and reports conditional generation progress back to firmware:
 
 ```sh
-pj companion serve --model /models/ggml-base.en-q5_0.bin
+pj companion serve
 ```
+
+The companion resolves persisted verified setup when no command-line or
+environment override is present and refuses to start if either artifact changed
+after setup. Its transcription path does not need network access.
 
 See [Device-Initiated Sync](device-initiated-sync.md) for discovery,
 authentication, retry, and port-selection details. Explicit `pj sync --transport
@@ -176,7 +192,10 @@ audio through the operating system without constructing a shell command.
 
 By default the partner stores data under `~/.pocket-journal`:
 
-- `config.json`: paired devices and tokens.
+- `config.json`: paired devices/tokens plus non-secret verified transcription
+  paths, hashes, provenance, licenses, version, and CPU thread count.
+- `transcription/`: explicitly acquired runtime/model artifacts and transient
+  same-filesystem staging directories; failed staging is removed before return.
 - `audio/<device-id>/`: downloaded WAV files.
 - `transcripts/<device-id>/`: transcript JSON files.
 - `jobs/<device-id>/`: resumable, versioned per-note sync state.

@@ -6,6 +6,7 @@ from typing import Any
 import argparse
 import asyncio
 import json
+import os
 import secrets
 import sqlite3
 import sys
@@ -17,7 +18,7 @@ from .companion import (
     DEFAULT_COMPANION_PORT,
     CompanionService,
 )
-from .config import DeviceProfile, load_config, save_config
+from .config import DeviceProfile, default_data_dir, load_config, save_config
 from .device import (
     DeviceClient,
     DeviceError,
@@ -43,6 +44,12 @@ from .transcription_benchmark import (
     BenchmarkManifestError,
     benchmark_manifest,
     write_benchmark_report,
+)
+from .transcription_setup import (
+    DEFAULT_DOWNLOAD_TIMEOUT_SECONDS,
+    DEFAULT_PROCESS_TIMEOUT_SECONDS,
+    TranscriptionSetupError,
+    setup_transcription,
 )
 from .tui import run_tui
 from .web import DEFAULT_HOST, DEFAULT_PORT, create_server
@@ -422,20 +429,82 @@ def cmd_sync(args: argparse.Namespace) -> int:
     return 1 if failed_count else 0
 
 
+def _whisper_backend_from_args(
+    args: argparse.Namespace,
+) -> tuple[WhisperCppTranscriptionBackend, dict[str, Any]]:
+    data_dir = Path(args.data_dir) if getattr(args, "data_dir", None) else None
+    profile = load_config(data_dir).transcription
+    explicit_model = getattr(args, "model", None)
+    explicit_executable = getattr(args, "whisper_executable", None)
+    environment_model = os.environ.get("PJ_WHISPER_MODEL")
+    environment_executable = os.environ.get("PJ_WHISPER_CPP")
+
+    model = explicit_model or environment_model
+    executable = explicit_executable or environment_executable
+    expected_model_sha256 = None
+    expected_executable_sha256 = None
+    model_source = "argument" if explicit_model else ("environment" if environment_model else "default")
+    executable_source = (
+        "argument" if explicit_executable else ("environment" if environment_executable else "PATH")
+    )
+    if profile is not None and profile.configured:
+        if model is None:
+            model = profile.model_path
+            expected_model_sha256 = profile.model_sha256
+            model_source = "persisted_verified_setup"
+        if executable is None:
+            executable = profile.executable
+            expected_executable_sha256 = profile.executable_sha256
+            executable_source = "persisted_verified_setup"
+    threads = getattr(args, "threads", None)
+    if threads is None and profile is not None and profile.configured:
+        threads = profile.threads
+
+    backend = WhisperCppTranscriptionBackend(
+        model_path=model,
+        executable=executable,
+        threads=threads,
+        expected_executable_sha256=expected_executable_sha256,
+        expected_model_sha256=expected_model_sha256,
+    )
+    selection: dict[str, Any] = {
+        "model": model_source,
+        "runtime": executable_source,
+        "persisted_setup": bool(profile is not None and profile.configured),
+    }
+    if profile is not None and profile.configured:
+        selection["provenance"] = {
+            "runtime": {
+                "version": profile.runtime_version,
+                "source": profile.runtime_source,
+                "license": profile.runtime_license,
+                "archive_sha256": profile.runtime_archive_sha256 or None,
+            },
+            "model": {
+                "source": profile.model_source,
+                "license": profile.model_license,
+            },
+        }
+    return backend, selection
+
+
 def _backend_from_args(args: argparse.Namespace) -> TranscriptionBackend:
     try:
-        backend = backend_from_name(
-            args.backend,
-            model_path=getattr(args, "model", None),
-            executable=getattr(args, "whisper_executable", None),
-            threads=getattr(args, "threads", None),
-        )
-    except ValueError as exc:
-        raise DeviceError(str(exc)) from exc
-    if isinstance(backend, WhisperCppTranscriptionBackend):
-        availability = backend.availability()
-        if not availability["available"]:
-            raise DeviceError("; ".join(availability["issues"]))
+        if args.backend == "whisper-cpp":
+            backend, _ = _whisper_backend_from_args(args)
+        else:
+            backend = backend_from_name(
+                args.backend,
+                model_path=getattr(args, "model", None),
+                executable=getattr(args, "whisper_executable", None),
+                threads=getattr(args, "threads", None),
+            )
+        if isinstance(backend, WhisperCppTranscriptionBackend):
+            availability = backend.availability()
+            if not availability["available"]:
+                raise DeviceError("; ".join(availability["issues"]))
+    except (OSError, ValueError) as exc:
+        raise DeviceError(f"transcription artifacts could not be inspected: {exc}") from exc
     return backend
 
 
@@ -571,16 +640,47 @@ def cmd_library_serve(args: argparse.Namespace) -> int:
 
 def cmd_transcription_status(args: argparse.Namespace) -> int:
     try:
-        backend = WhisperCppTranscriptionBackend(
-            model_path=args.model,
-            executable=args.whisper_executable,
-            threads=args.threads,
-        )
-    except ValueError as exc:
-        raise DeviceError(str(exc)) from exc
-    status = backend.availability(digest=args.digest)
+        backend, selection = _whisper_backend_from_args(args)
+        status = backend.availability(digest=args.digest)
+    except (OSError, ValueError) as exc:
+        raise DeviceError(f"transcription artifacts could not be inspected: {exc}") from exc
+    status["selection"] = selection
     _print_json(status)
     return 0 if status["available"] else 1
+
+
+def cmd_transcription_setup(args: argparse.Namespace) -> int:
+    data_dir = Path(args.data_dir) if args.data_dir else None
+    root = data_dir or default_data_dir()
+    config = load_config(data_dir)
+    runtime_path = args.runtime
+    model_path = args.model
+    if not args.download_runtime and runtime_path is None:
+        runtime_path = os.environ.get("PJ_WHISPER_CPP")
+    if not args.download_model and model_path is None:
+        model_path = os.environ.get("PJ_WHISPER_MODEL")
+    try:
+        profile, result = setup_transcription(
+            root,
+            config.transcription,
+            runtime_path=runtime_path,
+            runtime_sha256=args.runtime_sha256,
+            runtime_source=args.runtime_source,
+            runtime_license=args.runtime_license,
+            model_path=model_path,
+            download_runtime=args.download_runtime,
+            download_model=args.download_model,
+            threads=args.threads,
+            download_timeout_seconds=args.download_timeout,
+            process_timeout_seconds=args.process_timeout,
+        )
+        config.transcription = profile
+        save_config(config, data_dir)
+    except (OSError, TranscriptionSetupError, ValueError) as exc:
+        raise DeviceError(f"transcription setup failed: {exc}") from exc
+    result["config"] = str(root / "config.json")
+    _print_json(result)
+    return 0
 
 
 def cmd_transcription_benchmark(args: argparse.Namespace) -> int:
@@ -1032,10 +1132,13 @@ def build_parser() -> argparse.ArgumentParser:
         default="whisper-cpp",
         help="local transcription runtime (default: whisper-cpp)",
     )
-    sync.add_argument("--model", help="local whisper.cpp GGML/GGUF model path; or set PJ_WHISPER_MODEL")
+    sync.add_argument(
+        "--model",
+        help="local whisper.cpp model path; defaults to verified 'pj transcription setup' config",
+    )
     sync.add_argument(
         "--whisper-executable",
-        help="whisper.cpp CLI executable; or set PJ_WHISPER_CPP",
+        help="whisper.cpp CLI executable; defaults to verified setup config",
     )
     sync.add_argument("--threads", type=int, help="CPU threads for whisper.cpp")
     sync.add_argument("--reprocess", action="store_true", help="reprocess notes already marked synced")
@@ -1078,8 +1181,12 @@ def build_parser() -> argparse.ArgumentParser:
     companion_serve.add_argument(
         "--backend", choices=["whisper-cpp", "hf"], default="whisper-cpp"
     )
-    companion_serve.add_argument("--model", help="local whisper.cpp model path; or set PJ_WHISPER_MODEL")
-    companion_serve.add_argument("--whisper-executable", help="whisper.cpp executable; or set PJ_WHISPER_CPP")
+    companion_serve.add_argument(
+        "--model", help="local whisper.cpp model path; defaults to verified setup config"
+    )
+    companion_serve.add_argument(
+        "--whisper-executable", help="whisper.cpp executable; defaults to verified setup config"
+    )
     companion_serve.add_argument("--threads", type=int)
     companion_serve.set_defaults(func=cmd_companion_serve)
 
@@ -1119,7 +1226,53 @@ def build_parser() -> argparse.ArgumentParser:
     transcription_status.add_argument("--whisper-executable", help="whisper.cpp executable; or set PJ_WHISPER_CPP")
     transcription_status.add_argument("--threads", type=int)
     transcription_status.add_argument("--digest", action="store_true", help="compute the model SHA-256")
+    transcription_status.add_argument("--data-dir")
     transcription_status.set_defaults(func=cmd_transcription_status)
+    transcription_setup = transcription_sub.add_parser(
+        "setup",
+        help="verify and persist the pinned CPU-only whisper.cpp runtime and Q5_0 model",
+        description=(
+            "Locate existing pinned artifacts or explicitly acquire them. Network access occurs "
+            "only with --download-runtime or --download-model; every acquired artifact is "
+            "size- and SHA-256-verified before atomic installation."
+        ),
+    )
+    transcription_setup.add_argument("--runtime", help="existing whisper.cpp 1.9.1 whisper-cli path")
+    transcription_setup.add_argument(
+        "--runtime-sha256", help="expected SHA-256 for an operator-supplied local runtime"
+    )
+    transcription_setup.add_argument(
+        "--runtime-source", help="source/provenance for an operator-supplied local runtime"
+    )
+    transcription_setup.add_argument(
+        "--runtime-license", help="license identifier for an operator-supplied local runtime"
+    )
+    transcription_setup.add_argument("--model", help="existing pinned ggml-base.en-q5_0.bin path")
+    transcription_setup.add_argument(
+        "--download-runtime",
+        action="store_true",
+        help="opt in to a pinned official runtime download on supported platforms",
+    )
+    transcription_setup.add_argument(
+        "--download-model",
+        action="store_true",
+        help="opt in to downloading verified base.en and deriving the pinned Q5_0 model",
+    )
+    transcription_setup.add_argument("--threads", type=int, help="persist CPU thread count")
+    transcription_setup.add_argument(
+        "--download-timeout",
+        type=float,
+        default=DEFAULT_DOWNLOAD_TIMEOUT_SECONDS,
+        help="total seconds allowed for each explicit artifact download",
+    )
+    transcription_setup.add_argument(
+        "--process-timeout",
+        type=float,
+        default=DEFAULT_PROCESS_TIMEOUT_SECONDS,
+        help="seconds allowed for runtime inspection or model quantization",
+    )
+    transcription_setup.add_argument("--data-dir")
+    transcription_setup.set_defaults(func=cmd_transcription_setup)
     transcription_benchmark = transcription_sub.add_parser(
         "benchmark",
         help="run a manifest-driven, CPU-only whisper.cpp benchmark",
