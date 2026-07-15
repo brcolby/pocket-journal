@@ -12,6 +12,7 @@ export const states = {
   TIMER: "timer",
   INTERVAL: "interval",
   SETTINGS: "settings",
+  SYNC: "sync",
   VOLUME: "volume",
   CALENDAR: "calendar",
   NOTE_DETAIL: "note_detail",
@@ -31,6 +32,7 @@ export const meta = {
   timer: { title: "TIMER", parent: "time" },
   interval: { title: "INTERVAL", parent: "time" },
   settings: { title: "SETTINGS", parent: "home" },
+  sync: { title: "SYNC", parent: "settings" },
   volume: { title: "VOLUME", parent: "settings" },
   calendar: { title: "CALENDAR", parent: "home" },
   note_detail: { title: "NOTE", parent: "read" },
@@ -63,9 +65,10 @@ const menus = {
     { label: "", icon: "repeat", state: "interval" },
   ],
   settings: [
-    { label: "Volume", value: "10", action: "volume", state: "volume" },
-    { label: "Light/Dark", value: "LIGHT", action: "theme", state: "settings" },
-    { label: "12/24", value: "24H", action: "clock", state: "settings" },
+    { label: "VOLUME", action: "volume", state: "volume" },
+    { label: "LIGHT", action: "theme", state: "settings" },
+    { label: "24H", action: "clock", state: "settings" },
+    { label: "SYNC", action: "sync", state: "sync" },
   ],
 };
 
@@ -114,7 +117,7 @@ export function loadHomeDesign() {
 }
 
 export function parentOf(state) {
-  return meta[state]?.parent ?? "static";
+  return meta[state]?.parent ?? "home";
 }
 
 export function menuFor(state) {
@@ -136,12 +139,21 @@ export function tilesFor(state) {
   if (!menu) {
     return [];
   }
-  if (["home", "settings"].includes(state) && menu.length >= 3) {
+  if (state === "home" && menu.length >= 3) {
     return [
       { ...menu[0], x: 0, y: 0, width: 200, height: 66 },
       { ...menu[1], x: 0, y: 66, width: 200, height: 67 },
       { ...menu[2], x: 0, y: 133, width: 200, height: 67 },
     ];
+  }
+  if (state === "settings" && menu.length >= 4) {
+    return menu.slice(0, 4).map((item, index) => ({
+      ...item,
+      x: (index % 2) * 100,
+      y: Math.floor(index / 2) * 100,
+      width: 100,
+      height: 100,
+    }));
   }
   if (state === "notes" && menu.length >= 3) {
     return [
@@ -173,12 +185,12 @@ export function menuHit(state, x, y) {
 }
 
 export function handleAuxLong(state) {
-  return state === "static" ? "static" : parentOf(state);
+  return ["static", "time_temp"].includes(state) ? state : parentOf(state);
 }
 
 export function handleAuxShort(state) {
   if (state === "static") {
-    return "time_temp";
+    return "static";
   }
   if (state === "time_temp") {
     return "home";
@@ -198,7 +210,7 @@ export function handleTap(state, x, y) {
   }
 
   if (state === "static") {
-    return "time_temp";
+    return "static";
   }
   if (state === "time_temp") {
     return "home";

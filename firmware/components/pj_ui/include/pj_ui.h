@@ -16,7 +16,6 @@ extern "C" {
 #define PJ_UI_MAX_NOTES 12
 #define PJ_UI_NOTE_LABEL_LEN 96
 #define PJ_UI_FOCUS_TIMEOUT_TICKS 3
-#define PJ_UI_DYNAMIC_FULL_REFRESH_PARTIALS 30
 
 typedef enum {
     PJ_UI_STATE_STATIC = 0,
@@ -148,8 +147,6 @@ typedef struct {
     int note_detail_transcript;
     pj_home_layout_t home_layout;
     char note_labels[PJ_UI_MAX_NOTES][PJ_UI_NOTE_LABEL_LEN];
-    uint8_t static_art[PJ_FRAMEBUFFER_BYTES];
-    int static_art_valid;
     pj_record_state_t record_state;
     int recording_seconds;
     pj_playback_state_t playback_state;
@@ -185,8 +182,6 @@ void pj_ui_set_time_projection(pj_ui_context_t *ctx, const pj_ui_time_projection
 int pj_ui_consume_time_command(pj_ui_context_t *ctx, pj_ui_time_command_t *command);
 int pj_ui_discard_pending_interval_command(pj_ui_context_t *ctx);
 void pj_ui_set_sync_state(pj_ui_context_t *ctx, int pending, int transferred, int online);
-void pj_ui_set_static_art(pj_ui_context_t *ctx, const uint8_t *pixels, size_t pixel_bytes);
-void pj_ui_clear_static_art(pj_ui_context_t *ctx);
 int pj_ui_set_home_layout(pj_ui_context_t *ctx, const pj_home_layout_t *layout);
 void pj_ui_restore_default_home(pj_ui_context_t *ctx);
 int pj_ui_tick(pj_ui_context_t *ctx);

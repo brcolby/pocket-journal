@@ -38,20 +38,21 @@ const debugLog = loadDebugLog();
 
 const REVIEW_ROUTES = {
   static: [],
-  time_temp: ["wake"],
-  home: ["wake", "aux"],
-  notes: ["wake", "aux", [100, 33]],
-  record: ["wake", "aux", [100, 33], [100, 33]],
-  listen: ["wake", "aux", [100, 33], [100, 100]],
-  listen_page_2: ["wake", "aux", [100, 33], [100, 100], [150, 175]],
-  read: ["wake", "aux", [100, 33], [100, 166]],
-  time: ["wake", "aux", [20, 125]],
-  alarm: ["wake", "aux", [20, 125], [40, 70]],
-  stopwatch: ["wake", "aux", [20, 125], [150, 70]],
-  timer: ["wake", "aux", [20, 125], [40, 150]],
-  interval: ["wake", "aux", [20, 125], [150, 150]],
-  settings: ["wake", "aux", [20, 170]],
-  volume: ["wake", "aux", [20, 170], [100, 30]],
+  time_temp: ["wake", "back"],
+  home: ["wake"],
+  notes: ["wake", [100, 33]],
+  record: ["wake", [100, 33], [100, 33]],
+  listen: ["wake", [100, 33], [100, 100]],
+  listen_page_2: ["wake", [100, 33], [100, 100], [150, 175]],
+  read: ["wake", [100, 33], [100, 166]],
+  time: ["wake", [20, 125]],
+  alarm: ["wake", [20, 125], [40, 70]],
+  stopwatch: ["wake", [20, 125], [150, 70]],
+  timer: ["wake", [20, 125], [40, 150]],
+  interval: ["wake", [20, 125], [150, 150]],
+  settings: ["wake", [20, 170]],
+  volume: ["wake", [20, 170], [50, 50]],
+  sync: ["wake", [20, 170], [150, 150]],
 };
 
 window.__pocketJournalSimulatorModuleLoaded = true;
@@ -395,6 +396,8 @@ function openReviewView(name) {
   for (const step of route) {
     if (step === "wake") {
       api.wake();
+    } else if (step === "back") {
+      api.auxLong();
     } else if (step === "aux") {
       api.auxShort();
     } else {

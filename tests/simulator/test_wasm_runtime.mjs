@@ -62,6 +62,10 @@ assert.deepEqual(
   packedPbm(staticArtPbm),
   "simulator fallback must preserve the generated artwork orientation and pixels",
 );
+assert.equal(api.pj_sim_aux_double(), 0);
+assertRendered("static");
+api.pj_sim_wake();
+assertRendered("home");
 assert.equal(api.pj_sim_aux_double(), 1);
 assertRendered("record");
 assert.equal(api.pj_sim_record_state(), 1);
@@ -76,6 +80,9 @@ assert.equal(api.pj_sim_record_state(), 0);
 assertRendered("home");
 
 api.pj_sim_reset();
+assert.equal(api.pj_sim_aux_double(), 0);
+assertRendered("static");
+api.pj_sim_wake();
 assert.equal(api.pj_sim_aux_double(), 1);
 assertRendered("record");
 api.pj_sim_set_audio_state(0, 0);
@@ -84,6 +91,8 @@ assertRendered("home");
 
 api.pj_sim_reset();
 api.pj_sim_wake();
+assertRendered("home");
+assert.equal(api.pj_sim_aux_long(), 1);
 assertRendered("time_temp");
 assert.equal(api.pj_sim_aux_double(), 1);
 assertRendered("record");
@@ -92,14 +101,12 @@ assertRendered("record");
 
 api.pj_sim_reset();
 api.pj_sim_wake();
-assert.equal(api.pj_sim_aux_short(), 1);
 assertRendered("home");
 assert.equal(api.pj_sim_aux_double(), 1);
 assertRendered("record");
 
 api.pj_sim_reset();
 api.pj_sim_wake();
-api.pj_sim_aux_short();
 api.pj_sim_set_note_count(1);
 assert.equal(api.pj_sim_touch_tap(100, 33), 1);
 assertRendered("notes");
@@ -129,7 +136,6 @@ assertRendered("listen");
 
 api.pj_sim_reset();
 api.pj_sim_wake();
-api.pj_sim_aux_short();
 api.pj_sim_set_note_count(1);
 api.pj_sim_touch_tap(100, 33);
 api.pj_sim_touch_tap(100, 100);
@@ -145,7 +151,6 @@ assertRendered("listen");
 
 api.pj_sim_reset();
 api.pj_sim_wake();
-api.pj_sim_aux_short();
 api.pj_sim_seed_review_notes();
 api.pj_sim_touch_tap(100, 33);
 api.pj_sim_touch_tap(100, 100);
@@ -161,6 +166,7 @@ api.pj_sim_wake();
 api.pj_sim_set_status(84, 22, 45);
 api.pj_sim_set_time(21, 41, 2026, 6, 6);
 api.pj_sim_set_preferences(0, 1, 3);
+api.pj_sim_aux_long();
 assertRendered("time_temp");
 
 api.pj_sim_reset();
@@ -177,13 +183,11 @@ assertRendered("home");
 
 api.pj_sim_reset();
 api.pj_sim_wake();
-api.pj_sim_aux_short();
 assert.equal(api.pj_sim_aux_long(), 1);
 assertRendered("time_temp");
 
 api.pj_sim_reset();
 api.pj_sim_wake();
-api.pj_sim_aux_short();
 assert.equal(api.pj_sim_touch_tap(20, 125), 1);
 assertRendered("time");
 assert.equal(api.pj_sim_touch_tap(150, 70), 1);
