@@ -52,7 +52,7 @@ static uint32_t envelope(uint32_t tone_frame, uint32_t tone_length)
 }
 
 static int16_t tone_sample(uint64_t absolute_frame, const pj_alert_tone_t *tone,
-                           uint32_t tone_frame, uint8_t volume)
+                           uint32_t tone_frame)
 {
     uint32_t phase =
         (uint32_t)((absolute_frame % PJ_ALERT_AUDIO_SAMPLE_RATE) *
@@ -67,9 +67,9 @@ static int16_t tone_sample(uint64_t absolute_frame, const pj_alert_tone_t *tone,
                    (int32_t)((uint64_t)(phase - PJ_ALERT_AUDIO_SAMPLE_RATE / 2u) *
                              65534u / (PJ_ALERT_AUDIO_SAMPLE_RATE / 2u));
     }
-    int64_t scaled = (int64_t)triangle * PJ_ALERT_AUDIO_PEAK * volume;
+    int64_t scaled = (int64_t)triangle * PJ_ALERT_AUDIO_PEAK;
     scaled *= envelope(tone_frame, tone->length);
-    scaled /= (int64_t)32767 * 100 * PJ_ALERT_AUDIO_ATTACK_FRAMES;
+    scaled /= (int64_t)32767 * PJ_ALERT_AUDIO_ATTACK_FRAMES;
     return (int16_t)scaled;
 }
 
@@ -92,8 +92,9 @@ int pj_alert_audio_generate_block(
             const pj_alert_tone_t *tone = &tones[tone_index];
             if (pattern_frame >= tone->start &&
                 pattern_frame < tone->start + tone->length) {
-                sample = tone_sample(absolute_frame, tone,
-                                     pattern_frame - tone->start, volume);
+                sample = volume == 0 ? 0 :
+                    tone_sample(absolute_frame, tone,
+                                pattern_frame - tone->start);
                 break;
             }
         }
