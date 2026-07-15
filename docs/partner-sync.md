@@ -162,7 +162,8 @@ creates local-only test transcripts that are never uploaded.
 
 The bounded USB firmware protocol also supports the complete sync data path.
 `PJ_AUDIO_LIST` returns one hex-safe item per snapshot-paged response,
-`PJ_AUDIO_READ` returns at most 256 bytes per offset-checked response, and
+`PJ_AUDIO_READ` returns at most the stable `audio_read_max_bytes` value advertised
+by `PJ_AUDIO_LIST` (1024 on current firmware, 256 when absent) per offset-checked response, and
 `PJ_TRANSCRIPT_BEGIN/WRITE/COMMIT` streams 192-byte write chunks and stages at
 most 64 KiB before a digest-verified
 atomic commit. Failed uploads receive a best-effort `PJ_TRANSCRIPT_ABORT`.

@@ -11,6 +11,7 @@ import unittest
 
 from pocket_journal_partner.device import (
     SerialDeviceClient,
+    USB_MAX_AUDIO_READ_CHUNK_BYTES,
     USB_SERIAL_LINE_BYTES,
     USB_TRANSFER_CHUNK_BYTES,
 )
@@ -19,7 +20,9 @@ from pocket_journal_partner.device import (
 class FirmwareUsbProtocolFixture:
     """Executable fixture for the JSON emitted by pj_board.c USB handlers."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self, audio_read_max_bytes: int | None = USB_MAX_AUDIO_READ_CHUNK_BYTES,
+    ) -> None:
         self.audio = {
             "rec-a.wav": b"RIFF" + bytes(index % 251 for index in range(300)),
             "rec-b.wav": b"RIFF" + bytes(index % 239 for index in range(37)),
@@ -56,6 +59,7 @@ class FirmwareUsbProtocolFixture:
         }
         self.settings_generation = 12
         self.settings_request: tuple[str, int, str] | None = None
+        self.audio_read_max_bytes = audio_read_max_bytes
 
     @staticmethod
     def _parse(line: str) -> tuple[str, dict[str, str]]:
@@ -151,6 +155,8 @@ class FirmwareUsbProtocolFixture:
                 # pj_board.c sets done on the response carrying the final item.
                 "done": next_cursor >= len(names),
             }
+            if self.audio_read_max_bytes is not None:
+                response["audio_read_max_bytes"] = self.audio_read_max_bytes
             if cursor < len(names):
                 name = names[cursor]
                 content = self.audio[name]
@@ -191,7 +197,8 @@ class FirmwareUsbProtocolFixture:
             if offset > 0 and fields.get("source_sha256") != digest:
                 raise AssertionError("host did not pin the source digest after the first chunk")
             maximum = int(fields["max_bytes"])
-            if not 1 <= maximum <= USB_TRANSFER_CHUNK_BYTES:
+            supported = self.audio_read_max_bytes or USB_TRANSFER_CHUNK_BYTES
+            if not 1 <= maximum <= supported:
                 raise AssertionError("host requested an oversized audio chunk")
             chunk = content[offset : offset + maximum]
             return self._response(command, request_id, {
@@ -389,6 +396,11 @@ class FirmwareUsbProtocolParityTests(unittest.TestCase):
         with TemporaryDirectory() as temporary:
             downloaded = client.download_audio(items[0], Path(temporary))
             self.assertEqual(downloaded.read_bytes(), fixture.audio[items[0].audio_id])
+        audio_read_lines = [
+            line for line in fixture.received_lines if line.startswith("PJ_AUDIO_READ ")
+        ]
+        self.assertEqual(len(audio_read_lines), 1)
+        self.assertIn("max_bytes=1024", audio_read_lines[0])
 
         transcript = {"model": "fixture", "text": "word " * 80}
         client.upload_transcript(items[0].audio_id, transcript)
@@ -408,6 +420,21 @@ class FirmwareUsbProtocolParityTests(unittest.TestCase):
             sorted(count for line, count in counts.items() if line.startswith("PJ_TRANSCRIPT_COMMIT ")),
             [2],
         )
+
+    def test_old_firmware_without_chunk_capability_uses_legacy_reads(self) -> None:
+        fixture = FirmwareUsbProtocolFixture(audio_read_max_bytes=None)
+        client = FirmwareFixtureClient(fixture)
+
+        item = client.list_audio()[0]
+        with TemporaryDirectory() as temporary:
+            downloaded = client.download_audio(item, Path(temporary))
+            self.assertEqual(downloaded.read_bytes(), fixture.audio[item.audio_id])
+
+        audio_read_lines = [
+            line for line in fixture.received_lines if line.startswith("PJ_AUDIO_READ ")
+        ]
+        self.assertEqual(len(audio_read_lines), 2)
+        self.assertTrue(all("max_bytes=256" in line for line in audio_read_lines))
 
 
 if __name__ == "__main__":

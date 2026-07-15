@@ -146,6 +146,11 @@ int pj_usb_sync_sha256_hex_valid(const char *value)
     return 1;
 }
 
+int pj_usb_sync_audio_read_size_valid(uint32_t size)
+{
+    return size > 0U && size <= PJ_USB_SYNC_AUDIO_READ_CHUNK_BYTES;
+}
+
 static int hex_nibble(unsigned char value)
 {
     if (value >= '0' && value <= '9') {

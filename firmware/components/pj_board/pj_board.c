@@ -208,7 +208,8 @@
 #define PJ_AUDIO_COLLECT_STORAGE_BUSY (-1)
 #define PJ_AUDIO_COLLECT_TOO_MANY (-2)
 #define PJ_AUDIO_COLLECT_NO_MEMORY (-3)
-#define PJ_SERIAL_COMMAND_TASK_STACK 6144
+/* PJ_AUDIO_READ holds 1024 raw bytes plus 2049 hex bytes on this task's stack. */
+#define PJ_SERIAL_COMMAND_TASK_STACK 9216
 #define PJ_STORAGE_WIPE_TASK_STACK 4096
 #define PJ_STORAGE_WIPE_BATCH_ENTRIES 64U
 #define PJ_STORAGE_WIPE_MAX_BATCHES 64U
@@ -8437,6 +8438,12 @@ static void serial_audio_list(char *line)
 
     cJSON *json = serial_sync_response(command, request_id);
     cJSON *item = NULL;
+    if (json != NULL &&
+        cJSON_AddNumberToObject(json, "audio_read_max_bytes",
+                                PJ_USB_SYNC_AUDIO_READ_CHUNK_BYTES) == NULL) {
+        cJSON_Delete(json);
+        json = NULL;
+    }
     if (json != NULL) {
         cJSON_AddNumberToObject(json, "snapshot", snapshot);
         cJSON_AddNumberToObject(json, "cursor", cursor);
@@ -8533,7 +8540,7 @@ static void serial_audio_read(char *line)
                               sizeof(audio_id)) ||
         !pj_usb_sync_parse_u64(pj_usb_sync_arg(&args, "offset"), &offset) ||
         !pj_usb_sync_parse_u32(pj_usb_sync_arg(&args, "max_bytes"), &maximum) ||
-        maximum == 0U || maximum > PJ_USB_SYNC_CHUNK_BYTES ||
+        !pj_usb_sync_audio_read_size_valid(maximum) ||
         (expected_sha != NULL && !pj_usb_sync_sha256_hex_valid(expected_sha)) ||
         (request_id != NULL && !pj_usb_sync_request_id_valid(request_id))) {
         serial_sync_error(command, request_id, "invalid audio read arguments",
@@ -8568,7 +8575,7 @@ static void serial_audio_read(char *line)
                           "invalid_offset", 0);
         return;
     }
-    uint8_t data[PJ_USB_SYNC_CHUNK_BYTES];
+    uint8_t data[PJ_USB_SYNC_AUDIO_READ_CHUNK_BYTES];
     size_t wanted = maximum;
     uint64_t remaining = (uint64_t)st.st_size - offset;
     if ((uint64_t)wanted > remaining) {
@@ -8590,21 +8597,23 @@ static void serial_audio_read(char *line)
                           "storage_io", 1);
         return;
     }
-    char encoded[PJ_USB_SYNC_CHUNK_BYTES * 2U + 1U];
+    char encoded[PJ_USB_SYNC_AUDIO_READ_CHUNK_BYTES * 2U + 1U];
     cJSON *json = serial_sync_response(command, request_id);
     if (json == NULL ||
-        !pj_usb_sync_hex_encode(data, read, encoded, sizeof(encoded))) {
+        !pj_usb_sync_hex_encode(data, read, encoded, sizeof(encoded)) ||
+        cJSON_AddStringToObject(json, "id_hex",
+                                pj_usb_sync_arg(&args, "id_hex")) == NULL ||
+        cJSON_AddNumberToObject(json, "offset", (double)offset) == NULL ||
+        cJSON_AddNumberToObject(json, "total_bytes", (double)st.st_size) == NULL ||
+        cJSON_AddStringToObject(json, "data_hex", encoded) == NULL ||
+        cJSON_AddBoolToObject(json, "eof",
+                              offset + read == (uint64_t)st.st_size) == NULL ||
+        cJSON_AddStringToObject(json, "source_sha256", actual_sha) == NULL) {
         cJSON_Delete(json);
         serial_sync_error(command, request_id, "audio response allocation failed",
                           "out_of_memory", 1);
         return;
     }
-    cJSON_AddStringToObject(json, "id_hex", pj_usb_sync_arg(&args, "id_hex"));
-    cJSON_AddNumberToObject(json, "offset", (double)offset);
-    cJSON_AddNumberToObject(json, "total_bytes", (double)st.st_size);
-    cJSON_AddStringToObject(json, "data_hex", encoded);
-    cJSON_AddBoolToObject(json, "eof", offset + read == (uint64_t)st.st_size);
-    cJSON_AddStringToObject(json, "source_sha256", actual_sha);
     serial_print_json("PJ_OK", json);
     cJSON_Delete(json);
 }

@@ -19,6 +19,7 @@ from pocket_journal_partner.device import (
     DeviceOperationTimeout,
     DeviceRequestTimeout,
     SerialDeviceClient,
+    USB_MAX_AUDIO_READ_CHUNK_BYTES,
     _stop_child_process,
 )
 
@@ -290,10 +291,11 @@ class SerialLifecycleTests(unittest.TestCase):
         self.assertEqual(connection.writes, [b"PJ_STATUS\n"])
 
     def test_audio_download_reuses_one_connection_and_settles_once(self) -> None:
-        content = bytes(index % 251 for index in range(700))
+        content = bytes(index % 251 for index in range(2200))
         connection = AudioTransferConnection(content)
         serial_module = FakeSerialModule(connection)
         client = SerialDeviceClient("/dev/cu.test", timeout=1)
+        client._audio_read_chunk_bytes = USB_MAX_AUDIO_READ_CHUNK_BYTES
         item = AudioItem(
             "note.wav", "note.wav", size=len(content),
             source_sha256=hashlib.sha256(content).hexdigest(),
@@ -308,13 +310,15 @@ class SerialLifecycleTests(unittest.TestCase):
         self.assertEqual(connection.open_count, 1)
         self.assertEqual(connection.close_count, 1)
         self.assertEqual(len(connection.writes), 3)
+        self.assertTrue(all(b"max_bytes=1024" in wire for wire in connection.writes))
         sleep.assert_called_once()
 
     def test_audio_download_retries_same_request_on_one_connection(self) -> None:
-        content = bytes(index % 251 for index in range(300))
-        connection = AudioTransferConnection(content, drop_once_at=256)
+        content = bytes(index % 251 for index in range(1100))
+        connection = AudioTransferConnection(content, drop_once_at=1024)
         serial_module = FakeSerialModule(connection)
         client = SerialDeviceClient("/dev/cu.test", timeout=2)
+        client._audio_read_chunk_bytes = USB_MAX_AUDIO_READ_CHUNK_BYTES
         item = AudioItem(
             "note.wav", "note.wav", size=len(content),
             source_sha256=hashlib.sha256(content).hexdigest(),
@@ -330,7 +334,7 @@ class SerialLifecycleTests(unittest.TestCase):
                         path = client.download_audio(item, Path(tmp))
             self.assertEqual(path.read_bytes(), content)
 
-        retried = [wire for wire in connection.writes if b"offset=256 " in wire]
+        retried = [wire for wire in connection.writes if b"offset=1024 " in wire]
         self.assertEqual(len(retried), 2)
         self.assertEqual(retried[0], retried[1])
         self.assertEqual(connection.open_count, 1)

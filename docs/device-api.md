@@ -230,7 +230,7 @@ PJ_WIPE_RECORDINGS [request_id=ID]
 PJ_SETTINGS_GET request_id=ID
 PJ_SETTINGS_SET expected_generation=N payload_hex=JSON_HEX request_id=ID
 PJ_AUDIO_LIST cursor=0 snapshot=0 [request_id=ID]
-PJ_AUDIO_READ id_hex=ID offset=0 max_bytes=256 [source_sha256=SHA256] [request_id=ID]
+PJ_AUDIO_READ id_hex=ID offset=0 max_bytes=N [source_sha256=SHA256] [request_id=ID]
 PJ_TRANSCRIPT_BEGIN id_hex=ID bytes=N sha256=SHA256 request_id=ID
 PJ_TRANSCRIPT_WRITE upload_id=ID offset=N data_hex=DATA request_id=ID
 PJ_TRANSCRIPT_COMMIT upload_id=ID sha256=SHA256 request_id=ID
@@ -263,15 +263,18 @@ The note-transfer commands are line bounded. All identifiers, filenames, labels,
 timestamps, transcript paths, and binary chunks are lowercase hex encoding of
 their UTF-8/raw bytes. Current audio identifiers are recording filenames and
 decode to at most 95 bytes; the partner bounds other decoded text to 160 bytes.
-Each audio-read chunk is at most 256 bytes, each transcript-write chunk is at
-most 192 bytes, and a transcript is at most 65536 bytes. The smaller write bound
+`PJ_AUDIO_LIST` advertises `audio_read_max_bytes` on every page. Current firmware
+advertises at most 1024 bytes; partners that do not receive the field use the legacy
+256-byte limit. Each transcript-write chunk is at most 192 bytes, and a transcript
+is at most 65536 bytes. The smaller write bound
 keeps the hex-encoded command plus a 32-character request id below the client's
 conservative 512-byte compatibility envelope. Current firmware may accept a
 256-byte write chunk, but the partner emits at most 192 bytes.
 
 `PJ_AUDIO_LIST` returns one item at a time. The first request uses `snapshot=0`;
 the response creates a positive snapshot id. Every subsequent request echoes it.
-A response has `snapshot`, `cursor`, `next_cursor`, and `done`. A non-empty
+A response has `snapshot`, `cursor`, `next_cursor`, `done`, and the stable
+`audio_read_max_bytes` capability. A non-empty
 response also has one `item` with `audio_id_hex`, `filename_hex`, optional
 `label_hex`, `created_at_hex`, `transcript_path_hex`, `size`, `data_bytes`,
 `duration_ms`, `source_sha256`, `synced`, and `transcript_uploaded`. `done` is

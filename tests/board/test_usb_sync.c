@@ -29,6 +29,18 @@ static void test_arguments_and_numbers(void)
     assert(!pj_usb_sync_parse_u32("4294967296", &maximum));
 }
 
+static void test_audio_read_chunk_bounds(void)
+{
+    assert(PJ_USB_SYNC_CHUNK_BYTES == 256U);
+    assert(PJ_USB_SYNC_AUDIO_READ_CHUNK_BYTES == 1024U);
+    assert(!pj_usb_sync_audio_read_size_valid(0U));
+    assert(pj_usb_sync_audio_read_size_valid(1U));
+    assert(pj_usb_sync_audio_read_size_valid(256U));
+    assert(pj_usb_sync_audio_read_size_valid(1024U));
+    assert(!pj_usb_sync_audio_read_size_valid(1025U));
+    assert(!pj_usb_sync_audio_read_size_valid(UINT32_MAX));
+}
+
 static void test_hex_and_snapshot(void)
 {
     uint8_t bytes[4];
@@ -98,6 +110,7 @@ static void test_abort_is_safe(void)
 int main(void)
 {
     test_arguments_and_numbers();
+    test_audio_read_chunk_bounds();
     test_hex_and_snapshot();
     test_upload_idempotency_and_bounds();
     test_abort_is_safe();

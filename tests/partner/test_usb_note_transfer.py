@@ -11,6 +11,7 @@ from pocket_journal_partner.device import (
     AudioItem,
     DeviceError,
     SerialDeviceClient,
+    USB_MAX_AUDIO_READ_CHUNK_BYTES,
     USB_SERIAL_LINE_BYTES,
     USB_TRANSFER_CHUNK_BYTES,
     USB_TRANSCRIPT_CHUNK_BYTES,
@@ -35,6 +36,7 @@ class UsbAudioListTests(unittest.TestCase):
                 "cursor": 0,
                 "snapshot": 42,
                 "next_cursor": 1,
+                "audio_read_max_bytes": USB_MAX_AUDIO_READ_CHUNK_BYTES,
                 # Firmware sets done on the response carrying the final item.
                 "done": True,
                 "item": {
@@ -66,6 +68,10 @@ class UsbAudioListTests(unittest.TestCase):
             ],
         )
         self.assertTrue(all(call[1]["max_attempts"] == 2 for call in calls))
+        self.assertEqual(
+            client._audio_read_chunk_bytes,  # type: ignore[attr-defined]
+            USB_MAX_AUDIO_READ_CHUNK_BYTES,
+        )
         self.assertEqual(items, [AudioItem(
             "note-1.wav", "note-1.wav", label="First note", size=123, data_bytes=79,
             source_sha256="a" * 64, created_at="2026-07-14T12:00:00Z",
@@ -82,6 +88,45 @@ class UsbAudioListTests(unittest.TestCase):
         }
 
         self.assertEqual(client.list_audio(), [])
+        self.assertEqual(
+            client._audio_read_chunk_bytes,  # type: ignore[attr-defined]
+            USB_TRANSFER_CHUNK_BYTES,
+        )
+
+    def test_list_rejects_invalid_audio_read_chunk_capability(self) -> None:
+        for value in (None, True, "1024", 0, USB_MAX_AUDIO_READ_CHUNK_BYTES + 1):
+            with self.subTest(value=value):
+                client = SerialDeviceClient("/dev/cu.test")
+                client._request = lambda *args, **kwargs: {  # type: ignore[method-assign]
+                    "cursor": 0,
+                    "snapshot": 1,
+                    "next_cursor": 0,
+                    "done": True,
+                    "audio_read_max_bytes": value,
+                }
+                with self.assertRaisesRegex(DeviceError, "chunk capability"):
+                    client.list_audio()
+
+    def test_list_rejects_audio_read_capability_change_between_pages(self) -> None:
+        responses = iter([
+            {
+                "cursor": 0, "snapshot": 1, "next_cursor": 1, "done": False,
+                "audio_read_max_bytes": USB_MAX_AUDIO_READ_CHUNK_BYTES,
+                "item": {
+                    "audio_id_hex": "a.wav".encode().hex(),
+                    "filename_hex": "a.wav".encode().hex(),
+                },
+            },
+            {
+                "cursor": 1, "snapshot": 1, "next_cursor": 1, "done": True,
+                "audio_read_max_bytes": USB_TRANSFER_CHUNK_BYTES,
+            },
+        ])
+        client = SerialDeviceClient("/dev/cu.test")
+        client._request = lambda *args, **kwargs: next(responses)  # type: ignore[method-assign]
+
+        with self.assertRaisesRegex(DeviceError, "capability changed"):
+            client.list_audio()
 
     def test_list_rejects_snapshot_changes_and_path_filenames(self) -> None:
         for name, responses, message in (
@@ -159,6 +204,49 @@ class UsbAudioReadTests(unittest.TestCase):
         self.assertIn("id_hex=6e6f74652d312e776176", commands[0])
         self.assertIn("max_bytes=256", commands[0])
         self.assertIn(f"source_sha256={digest}", commands[0])
+
+    def test_advertised_chunk_size_controls_download(self) -> None:
+        content = bytes(index % 251 for index in range(USB_MAX_AUDIO_READ_CHUNK_BYTES + 17))
+        digest = hashlib.sha256(content).hexdigest()
+        client = SerialDeviceClient("/dev/cu.test")
+        client._request = lambda *args, **kwargs: {  # type: ignore[method-assign]
+            "cursor": 0,
+            "snapshot": 4,
+            "next_cursor": 1,
+            "done": True,
+            "audio_read_max_bytes": USB_MAX_AUDIO_READ_CHUNK_BYTES,
+            "item": {
+                "audio_id_hex": "note.wav".encode().hex(),
+                "filename_hex": "note.wav".encode().hex(),
+                "size": len(content),
+                "source_sha256": digest,
+            },
+        }
+        item = client.list_audio()[0]
+        commands: list[str] = []
+
+        def request(command: str, **kwargs):  # type: ignore[no-untyped-def]
+            commands.append(command)
+            fields = dict(field.split("=", 1) for field in command.split()[1:])
+            offset = int(fields["offset"])
+            maximum = int(fields["max_bytes"])
+            chunk = content[offset:offset + maximum]
+            return {
+                "id_hex": item.audio_id.encode().hex(),
+                "offset": offset,
+                "total_bytes": len(content),
+                "data_hex": chunk.hex(),
+                "eof": offset + len(chunk) == len(content),
+                "source_sha256": digest,
+            }
+
+        use_audio_requests(client, request)
+        with TemporaryDirectory() as tmp:
+            path = client.download_audio(item, Path(tmp))
+            self.assertEqual(path.read_bytes(), content)
+
+        self.assertEqual(len(commands), 2)
+        self.assertTrue(all("max_bytes=1024" in command for command in commands))
 
     def test_download_rejects_inconsistent_offset_and_removes_partial(self) -> None:
         client = SerialDeviceClient("/dev/cu.test")

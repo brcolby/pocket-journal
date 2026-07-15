@@ -9,6 +9,7 @@
 #define PJ_USB_SYNC_AUDIO_ID_BYTES 161U
 #define PJ_USB_SYNC_SHA256_HEX_BYTES 65U
 #define PJ_USB_SYNC_CHUNK_BYTES 256U
+#define PJ_USB_SYNC_AUDIO_READ_CHUNK_BYTES 1024U
 #define PJ_USB_SYNC_TRANSCRIPT_MAX_BYTES (64U * 1024U)
 
 typedef struct {
@@ -29,6 +30,7 @@ int pj_usb_sync_parse_u32(const char *value, uint32_t *out);
 int pj_usb_sync_parse_u64(const char *value, uint64_t *out);
 int pj_usb_sync_request_id_valid(const char *request_id);
 int pj_usb_sync_sha256_hex_valid(const char *value);
+int pj_usb_sync_audio_read_size_valid(uint32_t size);
 int pj_usb_sync_hex_decode(const char *hex, uint8_t *out, size_t out_size,
                            size_t *decoded_size);
 int pj_usb_sync_hex_encode(const uint8_t *data, size_t data_size, char *out,

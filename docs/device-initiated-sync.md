@@ -29,7 +29,9 @@ pj companion serve --device pj-abcdef
 the port, issues one bounded command, and closes the descriptor; it does not retain
 the serial link between polls. A recording download opens one exclusive descriptor,
 pays the device settle delay once, and reuses that connection for all of the file's
-256-byte chunks. Each chunk keeps its own request id, retry budget, response evidence,
+chunks. Current firmware advertises a 1024-byte maximum on every audio-list page;
+the partner falls back to 256 bytes when older firmware omits the capability.
+Each chunk keeps its own request id, retry budget, response evidence,
 and command timeout; exact size and digest checks still bound and verify the complete
 transaction. Use `--serial-port PORT` to select a port,
 `--usb-poll-interval SECONDS` to choose a value from 0.25 through 60, or `--no-usb`

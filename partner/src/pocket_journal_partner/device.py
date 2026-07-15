@@ -106,6 +106,7 @@ _WIPE_START_RETRY_INTERVAL_SECONDS = 1.5
 _WIPE_START_MAX_ATTEMPTS = 3
 _USB_RESET_MARKERS = ("esp-rom:", "rst:0x")
 USB_TRANSFER_CHUNK_BYTES = 256
+USB_MAX_AUDIO_READ_CHUNK_BYTES = 1024
 USB_TRANSCRIPT_CHUNK_BYTES = 192
 USB_MAX_TEXT_BYTES = 160
 USB_MAX_AUDIO_ID_BYTES = 95
@@ -319,6 +320,20 @@ def _usb_uint(value: Any, field: str, *, positive: bool = False) -> int:
         raise DeviceError(f"USB command failed: invalid {field}")
     if value < (1 if positive else 0):
         raise DeviceError(f"USB command failed: invalid {field}")
+    return value
+
+
+def _usb_audio_read_chunk_capability(response: dict[str, Any]) -> int:
+    field = "audio_read_max_bytes"
+    if field not in response:
+        return USB_TRANSFER_CHUNK_BYTES
+    value = response[field]
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or not 1 <= value <= USB_MAX_AUDIO_READ_CHUNK_BYTES
+    ):
+        raise DeviceError("USB command failed: invalid audio read chunk capability")
     return value
 
 
@@ -658,6 +673,7 @@ class SerialDeviceClient:
         self.baudrate = baudrate
         self.timeout = timeout
         self._request_lock = _serial_port_lock(port)
+        self._audio_read_chunk_bytes = USB_TRANSFER_CHUNK_BYTES
         self._closed = threading.Event()
         self._active_connection_lock = threading.Lock()
         self._active_connection: Any | None = None
@@ -1080,6 +1096,7 @@ class SerialDeviceClient:
         seen_ids: set[str] = set()
         cursor = 0
         snapshot = 0
+        audio_read_chunk_bytes: int | None = None
         while True:
             response = self._request(
                 f"PJ_AUDIO_LIST cursor={cursor} snapshot={snapshot}",
@@ -1091,6 +1108,13 @@ class SerialDeviceClient:
             response_snapshot = _usb_uint(
                 response.get("snapshot"), "audio list snapshot", positive=True
             )
+            response_chunk_bytes = _usb_audio_read_chunk_capability(response)
+            if audio_read_chunk_bytes is None:
+                audio_read_chunk_bytes = response_chunk_bytes
+            elif response_chunk_bytes != audio_read_chunk_bytes:
+                raise DeviceError(
+                    "USB command failed: audio read chunk capability changed during transfer"
+                )
             if response_cursor != cursor:
                 raise DeviceError("USB command failed: audio list cursor did not match request")
             if snapshot not in {0, response_snapshot}:
@@ -1104,6 +1128,8 @@ class SerialDeviceClient:
             if raw_item is None:
                 if not done or next_cursor != cursor:
                     raise DeviceError("USB command failed: audio list item is missing")
+                assert audio_read_chunk_bytes is not None
+                self._audio_read_chunk_bytes = audio_read_chunk_bytes
                 return items
             if not isinstance(raw_item, dict):
                 raise DeviceError("USB command failed: audio list item is missing")
@@ -1157,6 +1183,8 @@ class SerialDeviceClient:
             if next_cursor != cursor + 1:
                 raise DeviceError("USB command failed: audio list cursor did not advance")
             if done:
+                assert audio_read_chunk_bytes is not None
+                self._audio_read_chunk_bytes = audio_read_chunk_bytes
                 return items
             cursor = next_cursor
 
@@ -1172,13 +1200,14 @@ class SerialDeviceClient:
         total_bytes: int | None = None
         source_sha256 = item.source_sha256
         digest = hashlib.sha256()
+        chunk_bytes = self._audio_read_chunk_bytes
         try:
             with partial.open("wb") as handle:
                 with self._serial_request_sequence() as serial_request:
                     while True:
                         command = (
                             f"PJ_AUDIO_READ id_hex={id_hex} offset={offset} "
-                            f"max_bytes={USB_TRANSFER_CHUNK_BYTES}"
+                            f"max_bytes={chunk_bytes}"
                         )
                         if source_sha256 is not None:
                             command += f" source_sha256={source_sha256}"
@@ -1212,7 +1241,7 @@ class SerialDeviceClient:
                         data_hex = response.get("data_hex")
                         if (
                             not isinstance(data_hex, str)
-                            or len(data_hex) > USB_TRANSFER_CHUNK_BYTES * 2
+                            or len(data_hex) > chunk_bytes * 2
                             or len(data_hex) % 2
                             or any(character not in "0123456789abcdef" for character in data_hex)
                         ):
