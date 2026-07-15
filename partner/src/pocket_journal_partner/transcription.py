@@ -22,10 +22,18 @@ MODEL_ARTIFACT_DIGEST_UNAVAILABLE_REASON = (
     "no canonical SHA-256 exists for the multi-file Hugging Face snapshot; "
     "model_revision pins its immutable contents"
 )
-WHISPER_CPP_DEFAULT_MODEL = "ggml-base.en.bin"
+WHISPER_CPP_DEFAULT_MODEL = "ggml-base.en-q5_0.bin"
 WHISPER_CPP_MODEL_ENV = "PJ_WHISPER_MODEL"
 WHISPER_CPP_EXECUTABLE_ENV = "PJ_WHISPER_CPP"
 WHISPER_CPP_MAX_MODEL_BYTES = 2 * 1024 * 1024 * 1024
+WHISPER_CPP_DEFAULT_THREADS = 4
+WHISPER_CPP_BEAM_SIZE = 5
+WHISPER_CPP_BEST_OF = 5
+WHISPER_CPP_TEMPERATURE = 0.0
+WHISPER_CPP_TEMPERATURE_INCREMENT = 0.2
+WHISPER_CPP_NO_SPEECH_THRESHOLD = 0.6
+WHISPER_CPP_BLANK_AUDIO_SENTINEL = "[BLANK_AUDIO]"
+WHISPER_CPP_NO_SPEECH_TEXT = "NO SPEECH"
 
 
 def inspect_wav(path: Path) -> dict[str, Any]:
@@ -235,7 +243,11 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _whisper_cpp_text(payload: Any) -> tuple[str, list[dict[str, Any]]]:
+def _whisper_cpp_text(
+    payload: Any,
+    *,
+    allow_empty: bool = False,
+) -> tuple[str, list[dict[str, Any]]]:
     if not isinstance(payload, dict):
         raise RuntimeError("whisper.cpp returned invalid JSON")
     segments: list[dict[str, Any]] = []
@@ -246,7 +258,10 @@ def _whisper_cpp_text(payload: Any) -> tuple[str, list[dict[str, Any]]]:
         for raw in raw_segments:
             if not isinstance(raw, dict) or not isinstance(raw.get("text"), str):
                 continue
-            segment: dict[str, Any] = {"text": raw["text"].strip()}
+            raw_text = raw["text"].strip()
+            if raw_text.casefold() == WHISPER_CPP_BLANK_AUDIO_SENTINEL.casefold():
+                continue
+            segment: dict[str, Any] = {"text": raw_text}
             timestamps = raw.get("timestamps")
             if isinstance(timestamps, dict):
                 if isinstance(timestamps.get("from"), str):
@@ -262,9 +277,33 @@ def _whisper_cpp_text(payload: Any) -> tuple[str, list[dict[str, Any]]]:
     text = " ".join(segment["text"] for segment in segments).strip()
     if not text and isinstance(payload.get("text"), str):
         text = payload["text"].strip()
-    if not text:
+    if text.casefold() == WHISPER_CPP_BLANK_AUDIO_SENTINEL.casefold():
+        text = ""
+    if not text and not allow_empty:
         raise RuntimeError("whisper.cpp returned an empty transcript")
     return text, segments
+
+
+def _whisper_cpp_has_blank_audio_sentinel(payload: Any) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    if (
+        isinstance(payload.get("text"), str)
+        and payload["text"].strip().casefold()
+        == WHISPER_CPP_BLANK_AUDIO_SENTINEL.casefold()
+    ):
+        return True
+    for key in ("transcription", "segments"):
+        raw_segments = payload.get(key)
+        if isinstance(raw_segments, list) and any(
+            isinstance(raw, dict)
+            and isinstance(raw.get("text"), str)
+            and raw["text"].strip().casefold()
+            == WHISPER_CPP_BLANK_AUDIO_SENTINEL.casefold()
+            for raw in raw_segments
+        ):
+            return True
+    return False
 
 
 class WhisperCppTranscriptionBackend(TranscriptionBackend):
@@ -283,7 +322,7 @@ class WhisperCppTranscriptionBackend(TranscriptionBackend):
         self.executable_name = executable or os.environ.get(WHISPER_CPP_EXECUTABLE_ENV) or "whisper-cli"
         self.executable = shutil.which(self.executable_name)
         self.language = language
-        self.threads = threads
+        self.threads = threads if threads is not None else WHISPER_CPP_DEFAULT_THREADS
         if threads is not None and threads <= 0:
             raise ValueError("whisper.cpp thread count must be positive")
 
@@ -348,33 +387,64 @@ class WhisperCppTranscriptionBackend(TranscriptionBackend):
                 "status": "verified",
             },
             "decoding_parameters": {
+                "task": "transcribe",
                 "language": self.language,
                 "threads": self.threads,
+                "processors": 1,
+                "beam_size": WHISPER_CPP_BEAM_SIZE,
+                "best_of": WHISPER_CPP_BEST_OF,
+                "temperature": WHISPER_CPP_TEMPERATURE,
+                "temperature_increment": WHISPER_CPP_TEMPERATURE_INCREMENT,
+                "no_speech_threshold": WHISPER_CPP_NO_SPEECH_THRESHOLD,
+                "blank_audio_sentinel": WHISPER_CPP_BLANK_AUDIO_SENTINEL,
+                "timestamps": "segment",
+                "vad": False,
                 "cpu_only": True,
             },
         }
 
-    def transcribe(self, audio_path: Path) -> dict[str, Any]:
+    def build_command(
+        self,
+        audio_path: Path,
+        output_prefix: Path,
+        *,
+        quiet: bool = True,
+    ) -> list[str]:
         executable, model_path = self._require_available()
+        command = [
+            executable,
+            "-m",
+            str(model_path),
+            "-f",
+            str(audio_path),
+            "-l",
+            self.language,
+            "-oj",
+            "-of",
+            str(output_prefix),
+            "--no-gpu",
+            "--beam-size",
+            str(WHISPER_CPP_BEAM_SIZE),
+            "--best-of",
+            str(WHISPER_CPP_BEST_OF),
+            "--temperature",
+            str(WHISPER_CPP_TEMPERATURE),
+            "--temperature-inc",
+            str(WHISPER_CPP_TEMPERATURE_INCREMENT),
+            "--no-speech-thold",
+            str(WHISPER_CPP_NO_SPEECH_THRESHOLD),
+        ]
+        if quiet:
+            command.append("--no-prints")
+        command.extend(("-t", str(self.threads)))
+        return command
+
+    def transcribe(self, audio_path: Path) -> dict[str, Any]:
+        _, model_path = self._require_available()
         with tempfile.TemporaryDirectory(prefix="pj-whisper-") as temporary:
             output_prefix = Path(temporary) / "transcript"
-            command = [
-                executable,
-                "-m",
-                str(model_path),
-                "-f",
-                str(audio_path),
-                "-l",
-                self.language,
-                "-oj",
-                "-of",
-                str(output_prefix),
-                "--no-prints",
-            ]
-            if self.threads is not None:
-                command.extend(("-t", str(self.threads)))
             completed = subprocess.run(
-                command,
+                self.build_command(audio_path, output_prefix),
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -394,7 +464,11 @@ class WhisperCppTranscriptionBackend(TranscriptionBackend):
                 raise RuntimeError("whisper.cpp did not create its JSON transcript") from exc
             except (UnicodeError, json.JSONDecodeError) as exc:
                 raise RuntimeError("whisper.cpp created an invalid JSON transcript") from exc
-        text, segments = _whisper_cpp_text(payload)
+        blank_audio = _whisper_cpp_has_blank_audio_sentinel(payload)
+        text, segments = _whisper_cpp_text(payload, allow_empty=blank_audio)
+        no_speech = blank_audio and not text
+        if no_speech:
+            text = WHISPER_CPP_NO_SPEECH_TEXT
         result: dict[str, Any] = {
             "model": model_path.name,
             "runtime": "whisper.cpp",
@@ -402,6 +476,7 @@ class WhisperCppTranscriptionBackend(TranscriptionBackend):
             "text": text,
             "created_at": datetime.now(timezone.utc).isoformat(),
             "language": self.language,
+            "no_speech": no_speech,
         }
         if segments:
             result["segments"] = segments

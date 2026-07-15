@@ -16,7 +16,9 @@ from pocket_journal_partner.transcription import (
     MODEL_REVISION,
     MODEL_ARTIFACT_DIGEST_UNAVAILABLE_REASON,
     WHISPER_CPP_DEFAULT_MODEL,
+    WHISPER_CPP_NO_SPEECH_TEXT,
     WhisperCppTranscriptionBackend,
+    _whisper_cpp_text,
     backend_from_name,
     inspect_wav,
 )
@@ -281,6 +283,12 @@ class TranscriptionTests(unittest.TestCase):
             def run(command, **kwargs):  # type: ignore[no-untyped-def]
                 self.assertIsInstance(command, list)
                 self.assertNotIn("shell", kwargs)
+                self.assertIn("--no-gpu", command)
+                self.assertEqual(command[command.index("--beam-size") + 1], "5")
+                self.assertEqual(command[command.index("--best-of") + 1], "5")
+                self.assertEqual(command[command.index("--temperature") + 1], "0.0")
+                self.assertEqual(command[command.index("--no-speech-thold") + 1], "0.6")
+                self.assertEqual(command[command.index("-t") + 1], "4")
                 output = Path(command[command.index("-of") + 1]).with_suffix(".json")
                 output.write_text(json.dumps({
                     "transcription": [
@@ -296,6 +304,42 @@ class TranscriptionTests(unittest.TestCase):
         self.assertEqual(result["text"], "Hello world")
         self.assertEqual(result["language"], "en")
         self.assertEqual(len(result["segments"]), 2)
+
+    def test_whisper_cpp_normalizes_blank_audio_to_no_speech_result(self) -> None:
+        text, segments = _whisper_cpp_text(
+            {"transcription": [{"text": " [BLANK_AUDIO] "}]},
+            allow_empty=True,
+        )
+
+        self.assertEqual(text, "")
+        self.assertEqual(segments, [])
+        with self.assertRaisesRegex(RuntimeError, "empty transcript"):
+            _whisper_cpp_text({"transcription": []})
+
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            executable = root / "whisper-cli"
+            executable.write_text("#!/bin/sh\n", encoding="utf-8")
+            executable.chmod(0o755)
+            model = root / WHISPER_CPP_DEFAULT_MODEL
+            model.write_bytes(b"model")
+            audio = root / "audio.wav"
+            audio.write_bytes(pcm_wav())
+            backend = WhisperCppTranscriptionBackend(model, str(executable))
+
+            def run(command, **_kwargs):  # type: ignore[no-untyped-def]
+                output = Path(command[command.index("-of") + 1]).with_suffix(".json")
+                output.write_text(
+                    json.dumps({"transcription": [{"text": "[BLANK_AUDIO]"}]}),
+                    encoding="utf-8",
+                )
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+            with patch("pocket_journal_partner.transcription.subprocess.run", side_effect=run):
+                result = backend.transcribe(audio)
+
+        self.assertEqual(result["text"], WHISPER_CPP_NO_SPEECH_TEXT)
+        self.assertTrue(result["no_speech"])
 
     def test_backend_factory_selects_whisper_cpp(self) -> None:
         backend = backend_from_name("whisper-cpp", model_path="model.bin")

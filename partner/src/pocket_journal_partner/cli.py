@@ -29,6 +29,11 @@ from .ota import inspect_firmware_image, ota_preflight, ota_status, stream_firmw
 from .storage import PartnerStore
 from .sync import sync_device_audio
 from .transcription import FakeTranscriptionBackend, WhisperCppTranscriptionBackend, backend_from_name
+from .transcription_benchmark import (
+    BenchmarkManifestError,
+    benchmark_manifest,
+    write_benchmark_report,
+)
 from .tui import run_tui
 from .web import DEFAULT_HOST, DEFAULT_PORT, create_server
 
@@ -460,6 +465,41 @@ def cmd_transcription_status(args: argparse.Namespace) -> int:
     return 0 if status["available"] else 1
 
 
+def cmd_transcription_benchmark(args: argparse.Namespace) -> int:
+    try:
+        backend = WhisperCppTranscriptionBackend(
+            model_path=args.model,
+            executable=args.whisper_executable,
+            threads=args.threads,
+        )
+        availability = backend.availability()
+        if not availability["available"]:
+            raise DeviceError("; ".join(availability["issues"]))
+        report = benchmark_manifest(
+            Path(args.manifest),
+            backend,
+            runs=args.runs,
+            timeout_seconds=args.timeout,
+            runtime_root=Path(args.runtime_root) if args.runtime_root else None,
+            provenance={
+                "runtime": {
+                    "source": args.runtime_source,
+                    "license": args.runtime_license,
+                },
+                "model": {
+                    "source": args.model_source,
+                    "license": args.model_license,
+                },
+            },
+        )
+        if args.output:
+            write_benchmark_report(Path(args.output), report)
+    except (BenchmarkManifestError, OSError, ValueError, RuntimeError) as exc:
+        raise DeviceError(f"transcription benchmark failed: {exc}") from exc
+    _print_json(report)
+    return 0 if report["passed"] else 1
+
+
 def cmd_settings_get(args: argparse.Namespace) -> int:
     session = _session_from_args(args)
     session.require("settings.read")
@@ -880,6 +920,34 @@ def build_parser() -> argparse.ArgumentParser:
     transcription_status.add_argument("--threads", type=int)
     transcription_status.add_argument("--digest", action="store_true", help="compute the model SHA-256")
     transcription_status.set_defaults(func=cmd_transcription_status)
+    transcription_benchmark = transcription_sub.add_parser(
+        "benchmark",
+        help="run a manifest-driven, CPU-only whisper.cpp benchmark",
+    )
+    transcription_benchmark.add_argument("--manifest", required=True, help="JSON corpus manifest")
+    transcription_benchmark.add_argument("--model", help="local model path; or set PJ_WHISPER_MODEL")
+    transcription_benchmark.add_argument(
+        "--whisper-executable",
+        help="whisper.cpp executable; or set PJ_WHISPER_CPP",
+    )
+    transcription_benchmark.add_argument("--threads", type=int)
+    transcription_benchmark.add_argument("--runs", type=int, default=2)
+    transcription_benchmark.add_argument(
+        "--timeout",
+        type=float,
+        default=60 * 60,
+        help="per-process timeout in seconds (default: 3600)",
+    )
+    transcription_benchmark.add_argument("--output", help="atomically write the JSON report")
+    transcription_benchmark.add_argument(
+        "--runtime-root",
+        help="runtime install directory to measure; defaults to the executable",
+    )
+    transcription_benchmark.add_argument("--runtime-source")
+    transcription_benchmark.add_argument("--runtime-license")
+    transcription_benchmark.add_argument("--model-source")
+    transcription_benchmark.add_argument("--model-license")
+    transcription_benchmark.set_defaults(func=cmd_transcription_benchmark)
 
     settings = sub.add_parser("settings", help="device settings")
     settings_sub = settings.add_subparsers(dest="settings_command", required=True)

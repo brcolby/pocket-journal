@@ -44,18 +44,21 @@ pip install -e '.[ble,transcription]'
 
 The default transcription runtime is the external CPU-only `whisper.cpp`
 `whisper-cli`, so it does not require the Python `transcription` extra. Install
-that runtime separately, obtain a local `ggml-base.en.bin` model deliberately,
+that runtime separately, obtain a local `ggml-base.en-q5_0.bin` model deliberately,
 and point the partner at it without an implicit model download:
 
 ```sh
-pj transcription status --model /models/ggml-base.en.bin --digest
-pj sync --model /models/ggml-base.en.bin
+pj transcription status --model /models/ggml-base.en-q5_0.bin --digest
+pj transcription benchmark --manifest /path/to/manifest.json --model /models/ggml-base.en-q5_0.bin --output /path/to/report.json
+pj sync --model /models/ggml-base.en-q5_0.bin
 pj library tui
 pj library serve
 ```
 
 Set `PJ_WHISPER_CPP` and `PJ_WHISPER_MODEL` to retain the executable/model choices.
 The web library binds only to `127.0.0.1` by default.
+The benchmark command and cross-platform evidence procedure are documented in
+[Transcription Benchmark](transcription-benchmark.md).
 
 For source-tree runs before installation:
 

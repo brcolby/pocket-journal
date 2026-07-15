@@ -9,8 +9,9 @@ pj provision --ssid <ssid> --password <password>
 pj provision --ssid <ssid> --password <password> --serial-port /dev/cu.usbmodem1101
 pj provision --ssid <ssid> --password <password> --ble
 pj discover
-pj transcription status --model /path/to/ggml-base.en.bin
-pj sync --model /path/to/ggml-base.en.bin
+pj transcription status --model /path/to/ggml-base.en-q5_0.bin
+pj transcription benchmark --manifest /path/to/manifest.json --model /path/to/ggml-base.en-q5_0.bin --output /path/to/report.json
+pj sync --model /path/to/ggml-base.en-q5_0.bin
 pj library list
 pj library tui
 pj library serve
@@ -100,13 +101,16 @@ CLI. No model is downloaded implicitly. Configure an existing local model with
 a long sync:
 
 ```sh
-pj transcription status --model /models/ggml-base.en.bin --digest
-pj sync --model /models/ggml-base.en.bin
+pj transcription status --model /models/ggml-base.en-q5_0.bin --digest
+pj sync --model /models/ggml-base.en-q5_0.bin
 ```
 
-The recommended baseline is `ggml-base.en.bin`. It is small enough for the
-16 GB, CPU-only product profile and keeps runtime packaging independent of
-PyTorch. `small.en` can be evaluated when its additional latency is acceptable.
+The recommended baseline is `ggml-base.en-q5_0.bin`. It is small enough for the
+16 GB, CPU-only product profile, passed the repository benchmark on macOS, and
+keeps runtime packaging independent of PyTorch. See
+[Transcription Benchmark](transcription-benchmark.md) for the measured F16/Q5_0
+comparison, corpus format, and Linux/Windows reproduction procedure.
+`small.en` can be evaluated when its additional latency is acceptable.
 The partner refuses models above its 2 GiB guardrail for this backend. The legacy
 `--backend hf` path remains available for comparison, and `--backend fake`
 creates local-only test transcripts that are never uploaded.
