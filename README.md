@@ -4,14 +4,19 @@ Pocket Journal is a derisking workspace for a Waveshare ESP32-S3 Touch e-Paper 1
 
 The repo is split into four main areas:
 
-- `firmware/`: ESP-IDF firmware skeleton and shared UI/state-machine core.
+- `firmware/`: ESP-IDF target firmware, board services, and shared UI/state-machine core.
 - `simulator/`: browser-based 200x200 black/white e-paper simulator for UI iteration before hardware arrives.
 - `partner/`: CLI-first laptop app for provisioning, sync, transcription, diagnostics, and settings.
 - `docs/`: hardware, install, API, sync, and test notes.
 
 ## Current Status
 
-This is an initial derisk implementation. The shared UI core is real C code with native tests. The ESP-IDF app and hardware services are structured around the target board, but hardware drivers are intentionally isolated until the actual V1/V2 board revision is verified.
+The ESP-IDF application runs on the Waveshare V2 target with integrated e-paper,
+touch, RTC, environmental sensor, SD, ES8311 audio, USB-C partner commands,
+Wi-Fi, BLE provisioning, and authenticated LAN services. Native, simulator, and
+partner tests cover the shared behavior; consolidated physical validation remains
+tracked explicitly for display, input, recording, networking, power, and audio
+quality.
 
 ## Quick Start
 
