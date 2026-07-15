@@ -240,7 +240,8 @@ typedef struct {
     int valid;
     char request_id[PJ_USB_SYNC_REQUEST_ID_BYTES];
     uint32_t expected_generation;
-    uint32_t payload_hash;
+    size_t payload_size;
+    char payload[PJ_USB_SETTINGS_BODY_BYTES + 1U];
     pj_settings_t committed;
     uint32_t resulting_generation;
     int changed;
@@ -7872,12 +7873,11 @@ static void serial_settings_set(char *line)
         return;
     }
     body[body_size] = '\0';
-    uint32_t payload_hash = pj_usb_sync_snapshot_finish(
-        pj_usb_sync_snapshot_update(0U, body, body_size));
     if (g_usb_settings_replay.valid &&
         strcmp(g_usb_settings_replay.request_id, request_id) == 0) {
         if (g_usb_settings_replay.expected_generation != expected_generation ||
-            g_usb_settings_replay.payload_hash != payload_hash) {
+            g_usb_settings_replay.payload_size != body_size ||
+            memcmp(g_usb_settings_replay.payload, body, body_size) != 0) {
             serial_sync_error(command, request_id,
                               "settings request id reused with different content",
                               "request_id_reused", 0);
@@ -7919,13 +7919,14 @@ static void serial_settings_set(char *line)
     g_usb_settings_replay = (pj_usb_settings_replay_t) {
         .valid = 1,
         .expected_generation = expected_generation,
-        .payload_hash = payload_hash,
+        .payload_size = body_size,
         .committed = committed,
         .resulting_generation = generation,
         .changed = changed,
     };
     (void)snprintf(g_usb_settings_replay.request_id,
                    sizeof(g_usb_settings_replay.request_id), "%s", request_id);
+    memcpy(g_usb_settings_replay.payload, body, body_size + 1U);
     serial_settings_response(command, request_id, &committed, generation,
                              changed, 0);
 }
