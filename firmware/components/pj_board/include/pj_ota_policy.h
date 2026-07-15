@@ -147,6 +147,12 @@ typedef enum {
 } pj_ota_boot_state_t;
 
 typedef enum {
+    PJ_OTA_BOOT_PARTITION_UNKNOWN = 0,
+    PJ_OTA_BOOT_PARTITION_FACTORY,
+    PJ_OTA_BOOT_PARTITION_OTA,
+} pj_ota_boot_partition_kind_t;
+
+typedef enum {
     PJ_OTA_RECORD_INVALID = 0,
     PJ_OTA_RECORD_PENDING_REBOOT,
     PJ_OTA_RECORD_TESTING,
@@ -171,6 +177,11 @@ typedef struct {
 } pj_ota_boot_inputs_t;
 
 pj_ota_boot_state_t pj_ota_boot_evaluate(const pj_ota_boot_inputs_t *inputs);
+int pj_ota_unrecorded_boot_requires_recovery(
+    pj_ota_boot_partition_kind_t partition_kind,
+    int image_state_available,
+    int image_state_valid);
+int pj_ota_boot_recovery_active(int pending_verify, int terminal_failure);
 
 typedef struct {
     int active;
@@ -180,6 +191,7 @@ typedef struct {
 
 pj_ota_failure_retry_plan_t pj_ota_failure_retry_plan(
     int terminal_marker_persisted,
+    int terminal_marker_writable,
     int rollback_possible,
     unsigned attempts_completed);
 

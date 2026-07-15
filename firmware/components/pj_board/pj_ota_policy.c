@@ -434,8 +434,15 @@ pj_ota_record_state_t pj_ota_record_state_parse(const char *state)
 
 pj_ota_boot_state_t pj_ota_boot_evaluate(const pj_ota_boot_inputs_t *inputs)
 {
-    if (inputs == NULL || !inputs->update_recorded) {
+    if (inputs == NULL) {
         return PJ_OTA_BOOT_IDLE;
+    }
+    if (!inputs->update_recorded) {
+        if (!inputs->running_pending_verify) {
+            return PJ_OTA_BOOT_IDLE;
+        }
+        return inputs->health_checked && inputs->rollback_possible ?
+            PJ_OTA_BOOT_ROLLBACK_REQUIRED : PJ_OTA_BOOT_FAILED;
     }
     if (!inputs->running_version_matches_target ||
         !inputs->running_partition_matches_target) {
@@ -468,18 +475,38 @@ pj_ota_boot_state_t pj_ota_boot_evaluate(const pj_ota_boot_inputs_t *inputs)
     return inputs->rollback_possible ? PJ_OTA_BOOT_ROLLBACK_REQUIRED : PJ_OTA_BOOT_FAILED;
 }
 
+int pj_ota_unrecorded_boot_requires_recovery(
+    pj_ota_boot_partition_kind_t partition_kind,
+    int image_state_available,
+    int image_state_valid)
+{
+    if (partition_kind == PJ_OTA_BOOT_PARTITION_FACTORY) {
+        return 0;
+    }
+    return partition_kind != PJ_OTA_BOOT_PARTITION_OTA ||
+           !image_state_available || !image_state_valid;
+}
+
+int pj_ota_boot_recovery_active(int pending_verify, int terminal_failure)
+{
+    return pending_verify || terminal_failure;
+}
+
 pj_ota_failure_retry_plan_t pj_ota_failure_retry_plan(
     int terminal_marker_persisted,
+    int terminal_marker_writable,
     int rollback_possible,
     unsigned attempts_completed)
 {
     pj_ota_failure_retry_plan_t plan = {0};
     if (attempts_completed >= PJ_OTA_FAILURE_RETRY_LIMIT ||
-        (terminal_marker_persisted && !rollback_possible)) {
+        ((!terminal_marker_writable || terminal_marker_persisted) &&
+         !rollback_possible)) {
         return plan;
     }
     plan.active = 1;
-    plan.write_terminal_marker = !terminal_marker_persisted;
+    plan.write_terminal_marker = terminal_marker_writable &&
+                                 !terminal_marker_persisted;
     plan.attempt_rollback = rollback_possible;
     return plan;
 }

@@ -184,6 +184,43 @@ static void test_activation_health_reset_and_factory_migration(void)
     assert(pj_ota_boot_evaluate(&boot) == PJ_OTA_BOOT_ROLLED_BACK);
 }
 
+static void test_missing_record_pending_verify_fails_closed(void)
+{
+    assert(!pj_ota_unrecorded_boot_requires_recovery(
+        PJ_OTA_BOOT_PARTITION_FACTORY, 0, 0));
+    assert(!pj_ota_unrecorded_boot_requires_recovery(
+        PJ_OTA_BOOT_PARTITION_OTA, 1, 1));
+    assert(pj_ota_unrecorded_boot_requires_recovery(
+        PJ_OTA_BOOT_PARTITION_OTA, 1, 0));
+    assert(pj_ota_unrecorded_boot_requires_recovery(
+        PJ_OTA_BOOT_PARTITION_OTA, 0, 0));
+    assert(pj_ota_unrecorded_boot_requires_recovery(
+        PJ_OTA_BOOT_PARTITION_OTA, 0, 1));
+    assert(pj_ota_unrecorded_boot_requires_recovery(
+        PJ_OTA_BOOT_PARTITION_UNKNOWN, 0, 0));
+    assert(pj_ota_unrecorded_boot_requires_recovery(
+        PJ_OTA_BOOT_PARTITION_UNKNOWN, 1, 1));
+
+    pj_ota_boot_inputs_t boot = {0};
+    assert(pj_ota_boot_evaluate(&boot) == PJ_OTA_BOOT_IDLE);
+    assert(!pj_ota_boot_recovery_active(0, 0));
+
+    boot.running_pending_verify = 1;
+    assert(pj_ota_boot_evaluate(&boot) == PJ_OTA_BOOT_FAILED);
+    assert(pj_ota_boot_recovery_active(1, 0));
+    assert(pj_ota_boot_recovery_active(1, 1));
+
+    boot.health_checked = 1;
+    boot.health_ok = 1;
+    assert(pj_ota_boot_evaluate(&boot) == PJ_OTA_BOOT_FAILED);
+    boot.rollback_possible = 1;
+    assert(pj_ota_boot_evaluate(&boot) == PJ_OTA_BOOT_ROLLBACK_REQUIRED);
+
+    boot.running_pending_verify = 0;
+    assert(pj_ota_boot_evaluate(&boot) == PJ_OTA_BOOT_IDLE);
+    assert(pj_ota_boot_recovery_active(0, 1));
+}
+
 static void test_persisted_state_boot_matrix(void)
 {
     assert(pj_ota_record_state_parse("pending_reboot") ==
@@ -292,15 +329,15 @@ static void test_torn_confirmation_reconciles_only_nonfailed_records(void)
 static void test_failure_retry_plan_bounds_nvs_writes(void)
 {
     pj_ota_failure_retry_plan_t plan =
-        pj_ota_failure_retry_plan(0, 0, 0U);
+        pj_ota_failure_retry_plan(0, 1, 0, 0U);
     assert(plan.active && plan.write_terminal_marker &&
            !plan.attempt_rollback);
 
-    plan = pj_ota_failure_retry_plan(1, 0, 0U);
+    plan = pj_ota_failure_retry_plan(1, 1, 0, 0U);
     assert(!plan.active && !plan.write_terminal_marker &&
            !plan.attempt_rollback);
 
-    plan = pj_ota_failure_retry_plan(1, 1, 0U);
+    plan = pj_ota_failure_retry_plan(1, 1, 1, 0U);
     assert(plan.active && !plan.write_terminal_marker &&
            plan.attempt_rollback);
 
@@ -308,7 +345,7 @@ static void test_failure_retry_plan_bounds_nvs_writes(void)
     int marker_persisted = 0;
     for (unsigned attempt = 0U; attempt < PJ_OTA_FAILURE_RETRY_LIMIT;
          attempt++) {
-        plan = pj_ota_failure_retry_plan(marker_persisted, 0, attempt);
+        plan = pj_ota_failure_retry_plan(marker_persisted, 1, 0, attempt);
         if (!plan.active) {
             break;
         }
@@ -318,21 +355,30 @@ static void test_failure_retry_plan_bounds_nvs_writes(void)
         }
     }
     assert(writes == 3U);
-    plan = pj_ota_failure_retry_plan(marker_persisted, 0, 3U);
+    plan = pj_ota_failure_retry_plan(marker_persisted, 1, 0, 3U);
     assert(!plan.active); /* No NVS writes after the first success. */
 
     plan = pj_ota_failure_retry_plan(
-        0, 1, PJ_OTA_FAILURE_RETRY_LIMIT);
+        0, 1, 1, PJ_OTA_FAILURE_RETRY_LIMIT);
     assert(!plan.active); /* Persistent faults are bounded. */
 
     writes = 0U;
     for (unsigned attempt = 0U; attempt < PJ_OTA_FAILURE_RETRY_LIMIT;
          attempt++) {
-        plan = pj_ota_failure_retry_plan(0, 0, attempt);
+        plan = pj_ota_failure_retry_plan(0, 1, 0, attempt);
         assert(plan.active && plan.write_terminal_marker);
         writes++;
     }
     assert(writes == PJ_OTA_FAILURE_RETRY_LIMIT);
+
+    for (unsigned attempt = 0U; attempt < PJ_OTA_FAILURE_RETRY_LIMIT;
+         attempt++) {
+        plan = pj_ota_failure_retry_plan(0, 0, 1, attempt);
+        assert(plan.active && !plan.write_terminal_marker &&
+               plan.attempt_rollback);
+    }
+    plan = pj_ota_failure_retry_plan(0, 0, 0, 0U);
+    assert(!plan.active); /* Missing target identity cannot produce a marker. */
 }
 
 int main(void)
@@ -342,6 +388,7 @@ int main(void)
     test_transfer_interruption_concurrency_and_replay();
     test_mutation_reservation_is_request_owned();
     test_activation_health_reset_and_factory_migration();
+    test_missing_record_pending_verify_fails_closed();
     test_persisted_state_boot_matrix();
     test_failed_health_is_irrevocable_across_failures();
     test_torn_confirmation_reconciles_only_nonfailed_records();

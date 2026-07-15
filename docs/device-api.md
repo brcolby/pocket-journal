@@ -190,7 +190,11 @@ Activation records the exact target partition address/subtype as well as version
 and digest. On reboot, both version and running partition must match. Before
 health can be accepted, `pending_reboot` is durably changed to `testing`; a
 reboot that finds `testing` plus IDF `PENDING_VERIFY` treats the prior health
-attempt as interrupted and forces rollback. Firmware is confirmed only after
+attempt as interrupted and forces rollback. If NVS recovery removes the OTA
+record, only a factory image or an OTA slot explicitly reported IDF `VALID` may
+continue as idle. `NEW`, `PENDING_VERIFY`, unexpected, and unreadable OTA states
+are terminal: writes remain blocked and rollback is attempted without inventing
+incomplete target metadata. Firmware is confirmed only after
 required services/tasks, UI initialization, and the first display flush
 succeed. A torn post-health NVS write is reconciled only when the exact image is
 already IDF `VALID` and the durable record is nonterminal. `failed_health`,
