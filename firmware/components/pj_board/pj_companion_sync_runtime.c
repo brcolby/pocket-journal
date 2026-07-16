@@ -67,6 +67,8 @@ typedef struct {
 } companion_http_response_t;
 
 static SemaphoreHandle_t g_sync_mutex;
+static StaticSemaphore_t g_sync_mutex_storage;
+static portMUX_TYPE g_sync_mutex_init_lock = portMUX_INITIALIZER_UNLOCKED;
 static pj_companion_sync_state_t g_sync_state;
 static int g_sync_initialized;
 static int g_sync_task_running;
@@ -78,11 +80,13 @@ static int g_sync_auth_self_test_state;
 
 static int sync_mutex_init(void)
 {
-    if (g_sync_mutex != NULL) {
-        return 1;
+    portENTER_CRITICAL(&g_sync_mutex_init_lock);
+    if (g_sync_mutex == NULL) {
+        g_sync_mutex = xSemaphoreCreateMutexStatic(&g_sync_mutex_storage);
     }
-    g_sync_mutex = xSemaphoreCreateMutex();
-    return g_sync_mutex != NULL;
+    int initialized = g_sync_mutex != NULL;
+    portEXIT_CRITICAL(&g_sync_mutex_init_lock);
+    return initialized;
 }
 
 static int persist_state_locked(void)
