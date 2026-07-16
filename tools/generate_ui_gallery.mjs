@@ -1,5 +1,5 @@
 import { deflateSync } from "node:zlib";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, unlink, writeFile } from "node:fs/promises";
 import { analyzeFrame, validateFrame } from "./ui_image_checks.mjs";
 
 const outputDir = process.argv[2] ?? "build/ui-gallery";
@@ -108,6 +108,11 @@ const scenarios = [
 ];
 
 await mkdir(outputDir, { recursive: true });
+for (const name of await readdir(outputDir)) {
+  if (name === "manifest.json" || name.endsWith(".png")) {
+    await unlink(`${outputDir}/${name}`);
+  }
+}
 const rendered = [];
 const failures = [];
 for (const [name, expectedState, setup, validationOptions] of scenarios) {
