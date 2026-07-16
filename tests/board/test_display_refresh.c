@@ -146,6 +146,33 @@ static void test_changed_bounds_are_tight_and_byte_aligned(void)
     assert(plan.transfer_bytes == 6);
 }
 
+static void test_single_pixel_patch_geometry_exhaustive(void)
+{
+    pj_framebuffer_t framebuffer = {0};
+    const pj_framebuffer_t shadow = {0};
+    pj_display_refresh_policy_t policy;
+    pj_display_refresh_policy_init(&policy, 0);
+
+    for (int y = 0; y < PJ_DISPLAY_HEIGHT; y++) {
+        for (int x = 0; x < PJ_DISPLAY_WIDTH; x++) {
+            const pj_ui_dirty_region_t dirty = {
+                .x = x, .y = y, .width = 1, .height = 1, .partial = 1,
+            };
+            set_pixel(&framebuffer, x, y);
+            pj_display_refresh_plan_t plan = pj_display_refresh_plan(
+                &policy, &framebuffer, &shadow, 1, &dirty);
+            assert(plan.kind == PJ_DISPLAY_REFRESH_PARTIAL);
+            assert(plan.region.x == (x & ~7));
+            assert(plan.region.y == y);
+            assert(plan.region.width == 8);
+            assert(plan.region.height == 1);
+            assert(plan.changed_pixels == 1);
+            assert(plan.transfer_bytes == 1);
+            framebuffer.pixels[((size_t)y * PJ_DISPLAY_WIDTH + (size_t)x) >> 3u] = 0;
+        }
+    }
+}
+
 static void test_invalid_shadow_and_cadence_promote_to_full(void)
 {
     pj_framebuffer_t framebuffer = {0};
@@ -487,6 +514,7 @@ int main(void)
     test_region_y_is_pixel_granular_and_clipped();
     test_identical_partial_is_noop();
     test_changed_bounds_are_tight_and_byte_aligned();
+    test_single_pixel_patch_geometry_exhaustive();
     test_invalid_shadow_and_cadence_promote_to_full();
     test_partial_shadow_copy_does_not_hide_out_of_region_change();
     test_failed_refresh_records_error_without_advancing_cadence();
