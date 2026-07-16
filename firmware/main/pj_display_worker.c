@@ -15,6 +15,12 @@ static pj_ui_dirty_region_t full_region(void)
     };
 }
 
+static int generation_is_newer(uint32_t candidate, uint32_t reference)
+{
+    return candidate != reference &&
+        (reference == 0 || (int32_t)(candidate - reference) > 0);
+}
+
 static int normalize_region(const pj_ui_dirty_region_t *input,
                             pj_ui_dirty_region_t *output)
 {
@@ -95,8 +101,9 @@ static int latest_ready_slot(const pj_display_worker_model_t *model)
         if (model->slots[i].state != PJ_DISPLAY_WORKER_SLOT_READY) {
             continue;
         }
-        if (latest < 0 ||
-            model->slots[i].generation > model->slots[latest].generation) {
+        if (latest < 0 || generation_is_newer(
+                model->slots[i].generation,
+                model->slots[latest].generation)) {
             latest = i;
         }
     }
@@ -113,8 +120,16 @@ static void coalesce_ready_slots(pj_display_worker_model_t *model, int latest)
             model->slots[i].state != PJ_DISPLAY_WORKER_SLOT_READY) {
             continue;
         }
-        model->slots[latest].dirty = merge_regions(
-            &model->slots[latest].dirty, &model->slots[i].dirty);
+        if (model->slots[latest].scene_epoch ==
+            model->slots[i].scene_epoch) {
+            model->slots[latest].dirty = merge_regions(
+                &model->slots[latest].dirty, &model->slots[i].dirty);
+        } else {
+            model->slots[latest].dirty = full_region();
+        }
+        if (model->superseded_frames < UINT32_MAX) {
+            model->superseded_frames++;
+        }
         clear_slot(&model->slots[i]);
     }
 }
@@ -157,7 +172,9 @@ int pj_display_worker_model_begin_submit(pj_display_worker_model_t *model,
 
 int pj_display_worker_model_commit_submit(pj_display_worker_model_t *model,
                                           int slot_index,
-                                          const pj_ui_dirty_region_t *dirty)
+                                          const pj_ui_dirty_region_t *dirty,
+                                          uint32_t scene_epoch,
+                                          uint32_t *generation)
 {
     pj_ui_dirty_region_t normalized;
     if (model == NULL || slot_index < 0 ||
@@ -171,9 +188,14 @@ int pj_display_worker_model_commit_submit(pj_display_worker_model_t *model,
     }
 
     pj_display_worker_slot_t *slot = &model->slots[slot_index];
+    uint32_t replaced_generation = slot->generation;
+    uint32_t replaced_scene_epoch = slot->scene_epoch;
     if (model->force_full_on_commit) {
         slot->dirty = full_region();
         model->force_full_on_commit = 0;
+    } else if (replaced_generation != 0 &&
+               replaced_scene_epoch != scene_epoch) {
+        slot->dirty = full_region();
     } else if (slot->dirty.width > 0 && slot->dirty.height > 0) {
         slot->dirty = merge_regions(&slot->dirty, &normalized);
     } else {
@@ -183,14 +205,51 @@ int pj_display_worker_model_commit_submit(pj_display_worker_model_t *model,
     if (model->next_generation == 0) {
         model->next_generation = 1;
     }
+    slot->scene_epoch = scene_epoch;
     slot->state = PJ_DISPLAY_WORKER_SLOT_READY;
+    model->accepted_generation = slot->generation;
+    if (replaced_generation != 0 && model->superseded_frames < UINT32_MAX) {
+        model->superseded_frames++;
+    }
+    if (generation != NULL) {
+        *generation = slot->generation;
+    }
+    return 1;
+}
+
+int pj_display_worker_model_peek(pj_display_worker_model_t *model,
+                                 pj_ui_dirty_region_t *dirty,
+                                 uint32_t *generation,
+                                 uint32_t *scene_epoch)
+{
+    if (model == NULL || dirty == NULL) {
+        return 0;
+    }
+    for (int i = 0; i < PJ_DISPLAY_WORKER_SLOT_COUNT; i++) {
+        if (model->slots[i].state == PJ_DISPLAY_WORKER_SLOT_DISPLAYING) {
+            return 0;
+        }
+    }
+    int slot = latest_ready_slot(model);
+    if (slot < 0) {
+        return 0;
+    }
+    coalesce_ready_slots(model, slot);
+    *dirty = model->slots[slot].dirty;
+    if (generation != NULL) {
+        *generation = model->slots[slot].generation;
+    }
+    if (scene_epoch != NULL) {
+        *scene_epoch = model->slots[slot].scene_epoch;
+    }
     return 1;
 }
 
 int pj_display_worker_model_take(pj_display_worker_model_t *model,
                                  int *slot_index,
                                  pj_ui_dirty_region_t *dirty,
-                                 uint32_t *generation)
+                                 uint32_t *generation,
+                                 uint32_t *scene_epoch)
 {
     if (model == NULL || slot_index == NULL || dirty == NULL) {
         return 0;
@@ -212,6 +271,18 @@ int pj_display_worker_model_take(pj_display_worker_model_t *model,
     if (generation != NULL) {
         *generation = model->slots[slot].generation;
     }
+    if (scene_epoch != NULL) {
+        *scene_epoch = model->slots[slot].scene_epoch;
+    }
+    if (model->slots[slot].generation != model->started_generation &&
+        !generation_is_newer(model->slots[slot].generation,
+                             model->started_generation)) {
+        if (model->ordering_errors < UINT32_MAX) {
+            model->ordering_errors++;
+        }
+    }
+    model->started_generation = model->slots[slot].generation;
+    model->started_scene_epoch = model->slots[slot].scene_epoch;
     return 1;
 }
 
@@ -224,7 +295,22 @@ void pj_display_worker_model_complete(pj_display_worker_model_t *model,
         model->slots[slot_index].state != PJ_DISPLAY_WORKER_SLOT_DISPLAYING) {
         return;
     }
-    if (success || !model->accepting) {
+    if (success) {
+        if (!generation_is_newer(model->slots[slot_index].generation,
+                                 model->committed_generation)) {
+            if (model->ordering_errors < UINT32_MAX) {
+                model->ordering_errors++;
+            }
+        } else {
+            model->committed_generation =
+                model->slots[slot_index].generation;
+            model->committed_scene_epoch =
+                model->slots[slot_index].scene_epoch;
+        }
+        clear_slot(&model->slots[slot_index]);
+        return;
+    }
+    if (!model->accepting) {
         clear_slot(&model->slots[slot_index]);
         return;
     }
@@ -275,9 +361,106 @@ int pj_display_worker_model_is_idle(const pj_display_worker_model_t *model)
     return 1;
 }
 
+int pj_display_worker_model_scene_presented(
+    const pj_display_worker_model_t *model, uint32_t scene_epoch)
+{
+    return model != NULL && scene_epoch != 0 &&
+        model->committed_scene_epoch == scene_epoch;
+}
+
+pj_display_worker_status_t pj_display_worker_model_status(
+    const pj_display_worker_model_t *model)
+{
+    if (model == NULL) {
+        return (pj_display_worker_status_t) {0};
+    }
+    return (pj_display_worker_status_t) {
+        .accepted_generation = model->accepted_generation,
+        .started_generation = model->started_generation,
+        .started_scene_epoch = model->started_scene_epoch,
+        .committed_generation = model->committed_generation,
+        .committed_scene_epoch = model->committed_scene_epoch,
+        .superseded_frames = model->superseded_frames,
+        .rate_deferred_frames = model->rate_deferred_frames,
+        .input_deferred_events = model->input_deferred_events,
+        .ordering_errors = model->ordering_errors,
+    };
+}
+
+void pj_display_worker_model_note_rate_deferred(
+    pj_display_worker_model_t *model)
+{
+    if (model != NULL && model->rate_deferred_frames < UINT32_MAX) {
+        model->rate_deferred_frames++;
+    }
+}
+
+void pj_display_worker_model_note_input_deferred(
+    pj_display_worker_model_t *model)
+{
+    if (model != NULL && model->input_deferred_events < UINT32_MAX) {
+        model->input_deferred_events++;
+    }
+}
+
+void pj_display_worker_rate_init(pj_display_worker_rate_limiter_t *limiter,
+                                 uint32_t minimum_interval_ms)
+{
+    if (limiter == NULL) {
+        return;
+    }
+    memset(limiter, 0, sizeof(*limiter));
+    limiter->minimum_interval_ms = minimum_interval_ms;
+}
+
+uint64_t pj_display_worker_rate_earliest_start(
+    const pj_display_worker_rate_limiter_t *limiter,
+    const pj_ui_dirty_region_t *dirty, uint64_t now_ms)
+{
+    if (limiter == NULL || dirty == NULL || !dirty->partial ||
+        limiter->minimum_interval_ms == 0) {
+        return now_ms;
+    }
+    pj_ui_dirty_region_t normalized;
+    if (!normalize_region(dirty, &normalized) ||
+        !limiter->partial_started) {
+        return now_ms;
+    }
+    uint64_t elapsed = now_ms >= limiter->last_partial_started_ms ?
+        now_ms - limiter->last_partial_started_ms : 0;
+    if (elapsed >= limiter->minimum_interval_ms) {
+        return now_ms;
+    }
+    return now_ms + (limiter->minimum_interval_ms - elapsed);
+}
+
+int pj_display_worker_rate_record_start(
+    pj_display_worker_rate_limiter_t *limiter,
+    const pj_ui_dirty_region_t *dirty, uint64_t now_ms)
+{
+    if (limiter == NULL || dirty == NULL) {
+        return 0;
+    }
+    if (!dirty->partial) {
+        return 1;
+    }
+    if (pj_display_worker_rate_earliest_start(limiter, dirty, now_ms) >
+        now_ms) {
+        return 0;
+    }
+    pj_ui_dirty_region_t normalized;
+    if (!normalize_region(dirty, &normalized)) {
+        return 0;
+    }
+    limiter->last_partial_started_ms = now_ms;
+    limiter->partial_started = 1;
+    return 1;
+}
+
 #ifdef ESP_PLATFORM
 
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "pj_board.h"
@@ -296,6 +479,25 @@ static TaskHandle_t g_task;
 static portMUX_TYPE g_lock = portMUX_INITIALIZER_UNLOCKED;
 static int g_stop_requested;
 static uint32_t g_committed_frames;
+static pj_display_worker_rate_limiter_t g_rate_limiter;
+
+static uint64_t monotonic_ms(void)
+{
+    int64_t now_us = esp_timer_get_time();
+    return now_us <= 0 ? 0 : (uint64_t)now_us / 1000u;
+}
+
+static TickType_t delay_ticks(uint64_t delay_ms)
+{
+    if (delay_ms == 0) {
+        return 0;
+    }
+    if (delay_ms > UINT32_MAX) {
+        delay_ms = UINT32_MAX;
+    }
+    TickType_t ticks = pdMS_TO_TICKS((uint32_t)delay_ms);
+    return ticks == 0 ? 1 : ticks;
+}
 
 static uint32_t retry_delay_ms(uint32_t failures)
 {
@@ -321,10 +523,23 @@ static void display_worker_task(void *argument)
         int stopping;
         pj_ui_dirty_region_t dirty;
         uint32_t generation = 0;
+        uint32_t scene_epoch = 0;
+        uint64_t now_ms = monotonic_ms();
+        uint64_t earliest_ms = now_ms;
         portENTER_CRITICAL(&g_lock);
         stopping = g_stop_requested;
-        int ready = !stopping && pj_display_worker_model_take(
-            &g_model, &slot, &dirty, &generation);
+        int ready = !stopping && pj_display_worker_model_peek(
+            &g_model, &dirty, &generation, &scene_epoch);
+        if (ready) {
+            earliest_ms = pj_display_worker_rate_earliest_start(
+                &g_rate_limiter, &dirty, now_ms);
+            if (earliest_ms <= now_ms) {
+                ready = pj_display_worker_model_take(
+                    &g_model, &slot, &dirty, &generation, &scene_epoch);
+            } else {
+                pj_display_worker_model_note_rate_deferred(&g_model);
+            }
+        }
         portEXIT_CRITICAL(&g_lock);
         if (stopping) {
             break;
@@ -334,12 +549,28 @@ static void display_worker_task(void *argument)
             continue;
         }
 
+        if (earliest_ms > now_ms) {
+            wait_ticks = delay_ticks(earliest_ms - now_ms);
+            continue;
+        }
+        if (!ready) {
+            wait_ticks = 0;
+            continue;
+        }
+        portENTER_CRITICAL(&g_lock);
+        configASSERT(g_model.ordering_errors == 0);
+        portEXIT_CRITICAL(&g_lock);
+        int rate_allowed = pj_display_worker_rate_record_start(
+            &g_rate_limiter, &dirty, monotonic_ms());
+        configASSERT(rate_allowed);
+
         int success = pj_board_display_framebuffer(&g_slots[slot], &dirty);
         portENTER_CRITICAL(&g_lock);
         pj_display_worker_model_complete(&g_model, slot, success);
         if (success && g_committed_frames < UINT32_MAX) {
             g_committed_frames++;
         }
+        configASSERT(g_model.ordering_errors == 0);
         stopping = g_stop_requested;
         portEXIT_CRITICAL(&g_lock);
 
@@ -379,6 +610,8 @@ int pj_display_worker_start(void)
     }
     memset(g_slots, 0, sizeof(g_slots));
     pj_display_worker_model_init(&g_model);
+    pj_display_worker_rate_init(&g_rate_limiter,
+                                PJ_DISPLAY_WORKER_PARTIAL_INTERVAL_MS);
     g_stop_requested = 0;
     g_committed_frames = 0;
     portEXIT_CRITICAL(&g_lock);
@@ -413,7 +646,9 @@ void pj_display_worker_stop(void)
 }
 
 int pj_display_worker_submit(const pj_framebuffer_t *framebuffer,
-                             const pj_ui_dirty_region_t *dirty)
+                             const pj_ui_dirty_region_t *dirty,
+                             uint32_t scene_epoch,
+                             uint32_t *generation)
 {
     if (framebuffer == NULL || dirty == NULL) {
         return 0;
@@ -432,7 +667,8 @@ int pj_display_worker_submit(const pj_framebuffer_t *framebuffer,
 
     TaskHandle_t task;
     portENTER_CRITICAL(&g_lock);
-    accepted = pj_display_worker_model_commit_submit(&g_model, slot, dirty);
+    accepted = pj_display_worker_model_commit_submit(
+        &g_model, slot, dirty, scene_epoch, generation);
     task = g_task;
     portEXIT_CRITICAL(&g_lock);
     if (!accepted || task == NULL) {
@@ -459,6 +695,31 @@ uint32_t pj_display_worker_committed_frames(void)
     return committed;
 }
 
+int pj_display_worker_scene_presented(uint32_t scene_epoch)
+{
+    portENTER_CRITICAL(&g_lock);
+    int presented = pj_display_worker_model_scene_presented(
+        &g_model, scene_epoch);
+    portEXIT_CRITICAL(&g_lock);
+    return presented;
+}
+
+pj_display_worker_status_t pj_display_worker_status(void)
+{
+    portENTER_CRITICAL(&g_lock);
+    pj_display_worker_status_t status =
+        pj_display_worker_model_status(&g_model);
+    portEXIT_CRITICAL(&g_lock);
+    return status;
+}
+
+void pj_display_worker_note_input_deferred(void)
+{
+    portENTER_CRITICAL(&g_lock);
+    pj_display_worker_model_note_input_deferred(&g_model);
+    portEXIT_CRITICAL(&g_lock);
+}
+
 #else
 
 int pj_display_worker_start(void)
@@ -471,10 +732,16 @@ void pj_display_worker_stop(void)
 }
 
 int pj_display_worker_submit(const pj_framebuffer_t *framebuffer,
-                             const pj_ui_dirty_region_t *dirty)
+                             const pj_ui_dirty_region_t *dirty,
+                             uint32_t scene_epoch,
+                             uint32_t *generation)
 {
     (void)framebuffer;
     (void)dirty;
+    (void)scene_epoch;
+    if (generation != NULL) {
+        *generation = 0;
+    }
     return 0;
 }
 
@@ -486,6 +753,21 @@ int pj_display_worker_is_idle(void)
 uint32_t pj_display_worker_committed_frames(void)
 {
     return 0;
+}
+
+int pj_display_worker_scene_presented(uint32_t scene_epoch)
+{
+    (void)scene_epoch;
+    return 1;
+}
+
+pj_display_worker_status_t pj_display_worker_status(void)
+{
+    return (pj_display_worker_status_t) {0};
+}
+
+void pj_display_worker_note_input_deferred(void)
+{
 }
 
 #endif

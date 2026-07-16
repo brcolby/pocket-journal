@@ -1,4 +1,4 @@
-.PHONY: test test-ui test-input test-display-worker test-partner test-simulator test-simulator-runtime test-ui-images ui-gallery check-lvgl-managed check-static-art generate-static-art generate-font-assets generate-icon-assets generate-simulator-wasm simulator clean
+.PHONY: test test-ui test-input test-display-worker test-display-pipeline test-partner test-simulator test-simulator-runtime test-ui-images ui-gallery check-lvgl-managed check-static-art generate-static-art generate-font-assets generate-icon-assets generate-simulator-wasm simulator clean
 
 CC ?= cc
 CFLAGS ?= -std=c11 -Wall -Wextra -Werror -pedantic
@@ -21,6 +21,7 @@ STORAGE_COORDINATOR_TEST_BIN := build/test_storage_coordinator
 RUNTIME_DIAGNOSTICS_TEST_BIN := build/test_runtime_diagnostics
 LOOP_SCHEDULE_TEST_BIN := build/test_loop_schedule
 DISPLAY_WORKER_TEST_BIN := build/test_display_worker
+DISPLAY_PIPELINE_TEST_BIN := build/test_display_pipeline
 DISPLAY_REFRESH_TEST_BIN := build/test_display_refresh
 TIME_CIVIL_TEST_BIN := build/test_time_civil
 TIME_CLOCK_TEST_BIN := build/test_time_clock
@@ -87,7 +88,22 @@ test-display-worker:
 		-o $(DISPLAY_WORKER_TEST_BIN)
 	$(DISPLAY_WORKER_TEST_BIN)
 
-test-input: test-display-worker
+test-display-pipeline: check-static-art
+	mkdir -p build
+	$(CC) $(CFLAGS) \
+		-Ifirmware/main \
+		-Ifirmware/components/pj_ui/include \
+		-Ifirmware/components/pj_board/include \
+		firmware/components/pj_ui/pj_home_layout.c \
+		firmware/components/pj_ui/pj_default_static_art.c \
+		firmware/components/pj_ui/pj_ui.c \
+		firmware/components/pj_board/pj_display_refresh.c \
+		firmware/main/pj_display_worker.c \
+		tests/board/test_display_pipeline.c \
+		-o $(DISPLAY_PIPELINE_TEST_BIN)
+	$(DISPLAY_PIPELINE_TEST_BIN)
+
+test-input: test-display-worker test-display-pipeline
 	mkdir -p build
 	$(CC) $(CFLAGS) \
 		-Ifirmware/components/pj_board/include \

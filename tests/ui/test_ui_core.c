@@ -1572,6 +1572,48 @@ static void test_sync_preflight_and_success_wait_for_exact_physical_presentation
     assert(action_generation == ready_session);
 }
 
+static void test_interaction_generation_tracks_hit_identity(void)
+{
+    pj_ui_context_t ui;
+    pj_ui_init(&ui);
+    uint32_t generation = pj_ui_interaction_generation(&ui);
+    assert(generation != 0);
+
+    pj_ui_set_status(&ui, 73, 19, 44);
+    assert(pj_ui_interaction_generation(&ui) == generation);
+    pj_ui_wake(&ui);
+    generation = pj_ui_interaction_generation(&ui);
+
+    const char labels[6][PJ_UI_NOTE_LABEL_LEN] = {
+        "JUL 15 08:30", "JUL 15 08:31", "JUL 15 08:32",
+        "JUL 15 08:33", "JUL 15 08:34", "JUL 15 08:35",
+    };
+    pj_ui_set_notes(&ui, 6, labels);
+    assert(pj_ui_interaction_generation(&ui) == generation);
+
+    ui.state = PJ_UI_STATE_LISTEN;
+    char changed[6][PJ_UI_NOTE_LABEL_LEN];
+    memcpy(changed, labels, sizeof(changed));
+    (void)snprintf(changed[3], sizeof(changed[3]), "%s", "JUL 15 09:33");
+    pj_ui_set_notes(&ui, 6, changed);
+    generation = pj_ui_interaction_generation(&ui);
+    assert(pj_ui_handle_touch(&ui, 150, 160, PJ_TOUCH_TAP));
+    assert(pj_ui_interaction_generation(&ui) != generation);
+
+    ui.state = PJ_UI_STATE_STOPWATCH;
+    generation = pj_ui_interaction_generation(&ui);
+    pj_ui_time_projection_t projection = {
+        .stopwatch_running = 1,
+        .stopwatch_elapsed_ms = 42000,
+    };
+    pj_ui_set_time_projection(&ui, &projection);
+    assert(pj_ui_interaction_generation(&ui) == generation);
+
+    ui.state = PJ_UI_STATE_SYNC;
+    pj_ui_set_sync_detail(&ui, "failed", 1, "offline", 0);
+    assert(pj_ui_interaction_generation(&ui) != generation);
+}
+
 static void test_dirty_lifecycle(void)
 {
     pj_ui_context_t ui;
@@ -2482,6 +2524,7 @@ int main(void)
     test_sync_state_is_board_driven();
     test_sync_render_distinguishes_transport_and_failure_states();
     test_sync_preflight_and_success_wait_for_exact_physical_presentation();
+    test_interaction_generation_tracks_hit_identity();
     test_dirty_lifecycle();
     test_dynamic_updates_force_periodic_full_refresh();
     test_recording_elapsed_projection_is_bounded_and_monotonic_by_seconds();

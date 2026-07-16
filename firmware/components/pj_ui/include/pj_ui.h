@@ -122,6 +122,7 @@ typedef struct {
 
 typedef struct {
     pj_ui_state_t state;
+    uint32_t interaction_generation;
     int dark_mode;
     int volume;
     int sync_pending;
@@ -186,6 +187,7 @@ typedef struct {
 
 void pj_ui_init(pj_ui_context_t *ctx);
 pj_ui_state_t pj_ui_current_state(const pj_ui_context_t *ctx);
+uint32_t pj_ui_interaction_generation(const pj_ui_context_t *ctx);
 const char *pj_ui_state_name(pj_ui_state_t state);
 pj_ui_state_t pj_ui_parent_state(pj_ui_state_t state);
 int pj_ui_handle_touch(pj_ui_context_t *ctx, int x, int y, pj_touch_kind_t kind);

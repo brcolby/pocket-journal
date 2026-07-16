@@ -224,10 +224,17 @@ static uint32_t next_generation(uint32_t generation)
     return generation == 0 ? 1 : generation;
 }
 
+static void interaction_changed(pj_ui_context_t *ctx)
+{
+    ctx->interaction_generation =
+        next_generation(ctx->interaction_generation);
+}
+
 static void sync_presentation_changed(pj_ui_context_t *ctx)
 {
     ctx->sync_presentation_generation =
         next_generation(ctx->sync_presentation_generation);
+    interaction_changed(ctx);
 }
 
 static void begin_sync_session(pj_ui_context_t *ctx)
@@ -254,6 +261,9 @@ static void set_state(pj_ui_context_t *ctx, pj_ui_state_t state)
     if (state >= 0 && state < PJ_UI_STATE_COUNT) {
         pj_ui_state_t previous = ctx->state;
         ctx->state = state;
+        if (previous != state) {
+            interaction_changed(ctx);
+        }
         if (state == PJ_UI_STATE_SYNC && previous != PJ_UI_STATE_SYNC) {
             begin_sync_session(ctx);
         } else if (state != PJ_UI_STATE_SYNC && previous == PJ_UI_STATE_SYNC) {
@@ -785,6 +795,7 @@ void pj_ui_init(pj_ui_context_t *ctx)
 {
     memset(ctx, 0, sizeof(*ctx));
     ctx->state = PJ_UI_STATE_STATIC;
+    ctx->interaction_generation = 1;
     ctx->volume = 5;
     ctx->battery_percent = 84;
     ctx->temperature_c = 22;
@@ -823,6 +834,7 @@ int pj_ui_set_home_layout(pj_ui_context_t *ctx, const pj_home_layout_t *layout)
     }
     ctx->home_layout = canonical;
     if (ctx->state == PJ_UI_STATE_HOME) {
+        interaction_changed(ctx);
         mark_full(ctx);
     }
     return 1;
@@ -841,6 +853,11 @@ void pj_ui_restore_default_home(pj_ui_context_t *ctx)
 pj_ui_state_t pj_ui_current_state(const pj_ui_context_t *ctx)
 {
     return ctx->state;
+}
+
+uint32_t pj_ui_interaction_generation(const pj_ui_context_t *ctx)
+{
+    return ctx == NULL ? 0 : ctx->interaction_generation;
 }
 
 const char *pj_ui_state_name(pj_ui_state_t state)
@@ -932,6 +949,7 @@ static int jog_note_page(pj_ui_context_t *ctx, int direction)
     }
     ctx->note_page = target;
     ctx->focus_index = target * notes_per_page();
+    interaction_changed(ctx);
     mark_full(ctx);
     return 1;
 }
@@ -973,7 +991,9 @@ void pj_ui_set_notes(pj_ui_context_t *ctx, int count, const char labels[][PJ_UI_
     if (ctx->selected_note >= count) {
         ctx->selected_note = count > 0 ? count - 1 : 0;
     }
-    if (ctx->state == PJ_UI_STATE_LISTEN || ctx->state == PJ_UI_STATE_READ) {
+    if (ctx->state == PJ_UI_STATE_LISTEN || ctx->state == PJ_UI_STATE_READ ||
+        ctx->state == PJ_UI_STATE_NOTE_DETAIL) {
+        interaction_changed(ctx);
         mark_full(ctx);
     }
 }

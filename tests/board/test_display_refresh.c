@@ -39,6 +39,75 @@ static void test_region_clips_and_aligns(void)
     assert(!pj_display_refresh_region_normalize(&outside, 1, &normalized));
 }
 
+static void test_region_alignment_exhaustive_x_sweep(void)
+{
+    for (int x = -PJ_DISPLAY_WIDTH; x <= PJ_DISPLAY_WIDTH * 2; x++) {
+        for (int width = 1; width <= PJ_DISPLAY_WIDTH * 2; width++) {
+            const pj_ui_dirty_region_t dirty = {
+                .x = x,
+                .y = 37,
+                .width = width,
+                .height = 19,
+                .partial = 1,
+            };
+            pj_ui_dirty_region_t normalized;
+            const int64_t requested_x1 = (int64_t)x + width;
+            const int intersects = requested_x1 > 0 && x < PJ_DISPLAY_WIDTH;
+
+            assert(pj_display_refresh_region_normalize(
+                       &dirty, 1, &normalized) == intersects);
+            if (!intersects) {
+                continue;
+            }
+
+            const int clipped_x0 = x < 0 ? 0 : x;
+            const int clipped_x1 = requested_x1 > PJ_DISPLAY_WIDTH
+                ? PJ_DISPLAY_WIDTH : (int)requested_x1;
+            assert(normalized.x >= 0);
+            assert(normalized.x % 8 == 0);
+            assert(normalized.width > 0);
+            assert(normalized.width % 8 == 0);
+            assert(normalized.x + normalized.width <= PJ_DISPLAY_WIDTH);
+            assert(normalized.x <= clipped_x0);
+            assert(normalized.x + normalized.width >= clipped_x1);
+            assert(normalized.y == dirty.y);
+            assert(normalized.height == dirty.height);
+        }
+    }
+}
+
+static void test_region_y_is_pixel_granular_and_clipped(void)
+{
+    for (int y = -PJ_DISPLAY_HEIGHT; y <= PJ_DISPLAY_HEIGHT * 2; y++) {
+        for (int height = 1; height <= PJ_DISPLAY_HEIGHT * 2; height++) {
+            const pj_ui_dirty_region_t dirty = {
+                .x = 17,
+                .y = y,
+                .width = 1,
+                .height = height,
+                .partial = 1,
+            };
+            pj_ui_dirty_region_t normalized;
+            const int64_t requested_y1 = (int64_t)y + height;
+            const int intersects = requested_y1 > 0 && y < PJ_DISPLAY_HEIGHT;
+
+            assert(pj_display_refresh_region_normalize(
+                       &dirty, 1, &normalized) == intersects);
+            if (!intersects) {
+                continue;
+            }
+
+            const int clipped_y0 = y < 0 ? 0 : y;
+            const int clipped_y1 = requested_y1 > PJ_DISPLAY_HEIGHT
+                ? PJ_DISPLAY_HEIGHT : (int)requested_y1;
+            assert(normalized.y == clipped_y0);
+            assert(normalized.height == clipped_y1 - clipped_y0);
+            assert(normalized.x == 16);
+            assert(normalized.width == 8);
+        }
+    }
+}
+
 static void test_identical_partial_is_noop(void)
 {
     pj_framebuffer_t framebuffer = {0};
@@ -414,6 +483,8 @@ static void test_partial_bw_repeated_digit_transitions(void)
 int main(void)
 {
     test_region_clips_and_aligns();
+    test_region_alignment_exhaustive_x_sweep();
+    test_region_y_is_pixel_granular_and_clipped();
     test_identical_partial_is_noop();
     test_changed_bounds_are_tight_and_byte_aligned();
     test_invalid_shadow_and_cadence_promote_to_full();
