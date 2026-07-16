@@ -185,8 +185,11 @@ pj_transcript_source_result_t pj_transcript_source_check(
         return PJ_TRANSCRIPT_SOURCE_INVALID;
     }
     uint64_t source_bytes = (uint64_t)bytes->valuedouble;
-    if ((double)source_bytes != bytes->valuedouble ||
-        !sha256_equal(sha256->valuestring, expected_sha256)) {
+    if ((double)source_bytes != bytes->valuedouble) {
+        cJSON_Delete(json);
+        return PJ_TRANSCRIPT_SOURCE_INVALID;
+    }
+    if (!sha256_equal(sha256->valuestring, expected_sha256)) {
         cJSON_Delete(json);
         return PJ_TRANSCRIPT_SOURCE_MISMATCH;
     }
@@ -201,8 +204,7 @@ pj_transcript_commit_source_decision_t pj_transcript_source_commit_decision(
     if (source_result == PJ_TRANSCRIPT_SOURCE_MISMATCH) {
         return PJ_TRANSCRIPT_COMMIT_SOURCE_RETRY_CHANGED;
     }
-    if (source_result == PJ_TRANSCRIPT_SOURCE_MATCH ||
-        source_result == PJ_TRANSCRIPT_SOURCE_UNSPECIFIED) {
+    if (source_result == PJ_TRANSCRIPT_SOURCE_MATCH) {
         return PJ_TRANSCRIPT_COMMIT_SOURCE_ACCEPT;
     }
     return PJ_TRANSCRIPT_COMMIT_SOURCE_REJECT_INVALID;

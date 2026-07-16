@@ -10,6 +10,7 @@ import time
 import unittest
 
 from pocket_journal_partner.device import (
+    DeviceError,
     SerialDeviceClient,
     USB_MAX_AUDIO_READ_CHUNK_BYTES,
     USB_SERIAL_LINE_BYTES,
@@ -89,6 +90,31 @@ class FirmwareUsbProtocolFixture:
             self.drop_ack[command] -= 1
             return None
         return encoded
+
+    @staticmethod
+    def _error(
+        command: str,
+        request_id: str,
+        message: str,
+        code: str,
+        *,
+        retryable: bool,
+    ) -> bytes:
+        return (
+            "PJ_ERR "
+            + json.dumps(
+                {
+                    "command": command,
+                    "request_id": request_id,
+                    "error": message,
+                    "code": code,
+                    "retryable": retryable,
+                },
+                ensure_ascii=True,
+                separators=(",", ":"),
+            )
+            + "\n"
+        ).encode("ascii")
 
     def handle(self, wire: bytes) -> bytes | None:
         if not wire.endswith(b"\n") or len(wire) >= USB_SERIAL_LINE_BYTES:
@@ -273,11 +299,43 @@ class FirmwareUsbProtocolFixture:
             payload = json.loads(self.upload.decode("utf-8"))
             if not isinstance(payload.get("text"), str) or not payload["text"].strip():
                 raise AssertionError("fixture transcript does not satisfy firmware validation")
+            source = payload.get("source")
+            expected_audio = self.audio[self.upload_audio_id]
+            if not isinstance(source, dict):
+                return self._error(
+                    command,
+                    request_id,
+                    "invalid transcript source provenance",
+                    "invalid_transcript",
+                    retryable=False,
+                )
+            if (
+                source.get("sha256") != hashlib.sha256(expected_audio).hexdigest()
+                or source.get("bytes") != len(expected_audio)
+            ):
+                return self._error(
+                    command,
+                    request_id,
+                    "audio source changed; download and retry",
+                    "source_changed",
+                    retryable=True,
+                )
             self.committed = True
             return self._response(command, request_id, {
                 "upload_id": self.upload_id,
                 "committed": True,
                 "bytes": len(self.upload),
+            })
+
+        if command == "PJ_TRANSCRIPT_ABORT":
+            if (
+                set(fields) != {"upload_id"}
+                or int(fields["upload_id"]) != self.upload_id
+            ):
+                raise AssertionError("host aborted an unknown transcript upload")
+            return self._response(command, request_id, {
+                "upload_id": self.upload_id,
+                "aborted": True,
             })
 
         raise AssertionError(f"unexpected command: {command}")
@@ -402,7 +460,15 @@ class FirmwareUsbProtocolParityTests(unittest.TestCase):
         self.assertEqual(len(audio_read_lines), 1)
         self.assertIn("max_bytes=1024", audio_read_lines[0])
 
-        transcript = {"model": "fixture", "text": "word " * 80}
+        audio = fixture.audio[items[0].audio_id]
+        transcript = {
+            "model": "fixture",
+            "text": "word " * 80,
+            "source": {
+                "sha256": hashlib.sha256(audio).hexdigest(),
+                "bytes": len(audio),
+            },
+        }
         client.upload_transcript(items[0].audio_id, transcript)
 
         self.assertTrue(fixture.committed)
@@ -420,6 +486,31 @@ class FirmwareUsbProtocolParityTests(unittest.TestCase):
             sorted(count for line, count in counts.items() if line.startswith("PJ_TRANSCRIPT_COMMIT ")),
             [2],
         )
+
+    def test_transcript_commit_rejects_missing_or_stale_source_identity(self) -> None:
+        cases = (
+            ({"text": "missing"}, "invalid_transcript"),
+            (
+                {
+                    "text": "stale",
+                    "source": {"sha256": "0" * 64, "bytes": 1},
+                },
+                "source_changed",
+            ),
+        )
+        for transcript, expected_code in cases:
+            with self.subTest(expected_code=expected_code):
+                fixture = FirmwareUsbProtocolFixture()
+                client = FirmwareFixtureClient(fixture)
+                with self.assertRaisesRegex(DeviceError, expected_code):
+                    client.upload_transcript("rec-a.wav", transcript)
+                self.assertFalse(fixture.committed)
+                self.assertTrue(
+                    any(
+                        line.startswith("PJ_TRANSCRIPT_ABORT ")
+                        for line in fixture.received_lines
+                    )
+                )
 
     def test_old_firmware_without_chunk_capability_uses_legacy_reads(self) -> None:
         fixture = FirmwareUsbProtocolFixture(audio_read_max_bytes=None)

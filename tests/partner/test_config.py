@@ -111,10 +111,23 @@ class ConfigTests(unittest.TestCase):
             return Response()
 
         client = DeviceClient("http://127.0.0.1", "token")
+        transcript = {
+            "text": "caf\u00e9",
+            "source": {"sha256": "a" * 64, "bytes": 4},
+        }
         with patch("pocket_journal_partner.device.request.urlopen", fake_urlopen):
-            client.upload_transcript("note.wav", {"text": "caf\u00e9"})
+            client.upload_transcript("note.wav", transcript)
 
-        self.assertEqual(captured, ['{"text":"caf\u00e9"}'.encode("utf-8")])
+        self.assertEqual(
+            captured,
+            [
+                (
+                    '{"source":{"bytes":4,"sha256":"'
+                    + "a" * 64
+                    + '"},"text":"caf\u00e9"}'
+                ).encode("utf-8")
+            ],
+        )
         self.assertNotIn(b"\\u00e9", captured[0])
 
     def test_http_client_rejects_unsafe_connection_configuration(self) -> None:
@@ -155,6 +168,50 @@ class ConfigTests(unittest.TestCase):
                 failure.close()
                 self.assertEqual(raised.exception.status_code, code)
                 self.assertEqual(raised.exception.retryable, retryable)
+
+    def test_http_source_changed_preserves_retry_contract(self) -> None:
+        client = DeviceClient("http://device.local", "token")
+        body = BytesIO(
+            b'{"error":"audio source changed; download and retry",'
+            b'"code":"source_changed","retryable":true}'
+        )
+        failure = error.HTTPError(
+            client._url("/v1/transcripts/note.wav"), 409, "Conflict", {}, body
+        )
+        with patch(
+            "pocket_journal_partner.device.request.urlopen", side_effect=failure
+        ):
+            with self.assertRaises(DeviceHTTPError) as raised:
+                client.upload_transcript(
+                    "note.wav",
+                    {
+                        "text": "hello",
+                        "source": {"sha256": "a" * 64, "bytes": 4},
+                    },
+                )
+        self.assertEqual(raised.exception.status_code, 409)
+        self.assertEqual(raised.exception.code, "source_changed")
+        self.assertTrue(raised.exception.retryable)
+        failure.close()
+
+    def test_http_missing_source_preserves_fail_closed_contract(self) -> None:
+        client = DeviceClient("http://device.local", "token")
+        body = BytesIO(
+            b'{"error":"invalid transcript source provenance",'
+            b'"code":"invalid_transcript","retryable":false}'
+        )
+        failure = error.HTTPError(
+            client._url("/v1/transcripts/note.wav"), 400, "Bad Request", {}, body
+        )
+        with patch(
+            "pocket_journal_partner.device.request.urlopen", side_effect=failure
+        ):
+            with self.assertRaises(DeviceHTTPError) as raised:
+                client.upload_transcript("note.wav", {"text": "legacy"})
+        self.assertEqual(raised.exception.status_code, 400)
+        self.assertEqual(raised.exception.code, "invalid_transcript")
+        self.assertFalse(raised.exception.retryable)
+        failure.close()
 
     def test_http_request_timeouts_have_specific_type(self) -> None:
         client = DeviceClient("http://device.local", "token")

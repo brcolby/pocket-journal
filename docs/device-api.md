@@ -134,7 +134,26 @@ Recording, playback, directory enumeration, audio downloads, transcript/metadata
 PUT /v1/transcripts/{audio_id}
 ```
 
-Uploads a JSON transcription containing non-empty `text` for an existing recording. A successful upload atomically stores the transcript and marks the note synced; the READ view is populated from these transcript records.
+Uploads a JSON transcription containing non-empty `text` plus the exact identity
+of the WAV used to produce it:
+
+```json
+{
+  "text": "TRANSCRIBED NOTE",
+  "source": {
+    "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    "bytes": 123456
+  }
+}
+```
+
+`source.sha256` and `source.bytes` are required and must match the current
+recording. A missing or malformed source fails closed with `400 Bad Request`,
+`code: "invalid_transcript"`, and `retryable: false`. A well-formed identity
+that no longer matches returns `409 Conflict`, `code: "source_changed"`, and
+`retryable: true`; list and download the recording again before retrying. Only a
+matching upload atomically stores the transcript and marks the note synced. The
+READ view is populated from these transcript records.
 
 ```http
 GET /v1/ota
@@ -292,11 +311,14 @@ Transcript upload is a staged transaction. A new `PJ_TRANSCRIPT_BEGIN` returns a
 positive `upload_id`, `offset: 0`, and `accepted: true`; an idempotent replay also
 sets `attached: true` and reports the current offset. Each write returns that id
 plus its exact `next_offset`. Commit succeeds only when byte count and SHA-256
-match the begin declaration, then atomically replaces the transcript and marks
-the associated note synced; it returns `committed: true` and `bytes`. Abort is
-safe to repeat. Begin, repeated identical writes, commit, and abort must be
-idempotent for the same request/upload identity so a lost serial acknowledgment
-does not duplicate or corrupt state.
+match the begin declaration and the JSON document contains `source.sha256` and
+`source.bytes` matching the current WAV. Missing or malformed provenance returns
+non-retryable `invalid_transcript`; a stale but well-formed identity returns
+retryable `source_changed`. Only a source-matched commit atomically replaces the
+transcript and marks the associated note synced; it returns `committed: true`
+and `bytes`. Abort is safe to repeat. Begin, repeated identical writes, commit,
+and abort must be idempotent for the same request/upload identity so a lost
+serial acknowledgment does not duplicate or corrupt state.
 
 Responses start with `PJ_OK` or `PJ_ERR` followed by a compact JSON object. Normal ESP-IDF logs may appear on the same serial stream, so clients should scan for those prefixes.
 

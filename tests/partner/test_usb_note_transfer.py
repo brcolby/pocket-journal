@@ -296,7 +296,11 @@ class UsbAudioReadTests(unittest.TestCase):
 class UsbTranscriptUploadTests(unittest.TestCase):
     def test_upload_uses_begin_chunk_commit_and_exact_digest(self) -> None:
         client = SerialDeviceClient("/dev/cu.test")
-        transcript = {"text": "word " * 90, "model": "local"}
+        transcript = {
+            "text": "word " * 90,
+            "model": "local",
+            "source": {"sha256": "a" * 64, "bytes": 1234},
+        }
         commands: list[str] = []
 
         def request(command: str, **kwargs):  # type: ignore[no-untyped-def]
@@ -349,7 +353,13 @@ class UsbTranscriptUploadTests(unittest.TestCase):
 
         client._request = request  # type: ignore[method-assign]
         with self.assertRaisesRegex(DeviceError, "link failed"):
-            client.upload_transcript("note.wav", {"text": "hello"})
+            client.upload_transcript(
+                "note.wav",
+                {
+                    "text": "hello",
+                    "source": {"sha256": "a" * 64, "bytes": 1234},
+                },
+            )
 
         abort_command, abort_options = calls[-1]
         self.assertTrue(abort_command.startswith("PJ_TRANSCRIPT_ABORT upload_id=9"))

@@ -30,6 +30,9 @@ int main(void)
     assert(pj_transcript_source_check(matching_source,
                                       strlen(matching_source), raw_sha256,
                                       1234U) == PJ_TRANSCRIPT_SOURCE_MATCH);
+    assert(pj_transcript_source_commit_decision(
+               PJ_TRANSCRIPT_SOURCE_MATCH) ==
+           PJ_TRANSCRIPT_COMMIT_SOURCE_ACCEPT);
     assert(pj_transcript_source_check(matching_source,
                                       strlen(matching_source), enhanced_sha256,
                                       1234U) == PJ_TRANSCRIPT_SOURCE_MISMATCH);
@@ -48,7 +51,7 @@ int main(void)
            PJ_TRANSCRIPT_SOURCE_UNSPECIFIED);
     assert(pj_transcript_source_commit_decision(
                PJ_TRANSCRIPT_SOURCE_UNSPECIFIED) ==
-           PJ_TRANSCRIPT_COMMIT_SOURCE_ACCEPT);
+           PJ_TRANSCRIPT_COMMIT_SOURCE_REJECT_INVALID);
     const char malformed_source[] =
         "{\"text\":\"hello\",\"source\":{\"sha256\":\"not-a-hash\","
         "\"bytes\":1234}}";
@@ -65,7 +68,21 @@ int main(void)
     assert(pj_transcript_source_check(fractional_source_bytes,
                                       strlen(fractional_source_bytes),
                                       raw_sha256, 1234U) ==
+           PJ_TRANSCRIPT_SOURCE_INVALID);
+    assert(pj_transcript_source_commit_decision(
+               PJ_TRANSCRIPT_SOURCE_INVALID) ==
+           PJ_TRANSCRIPT_COMMIT_SOURCE_REJECT_INVALID);
+    const char changed_source_bytes[] =
+        "{\"text\":\"hello\",\"source\":{"
+        "\"sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\","
+        "\"bytes\":1235}}";
+    assert(pj_transcript_source_check(changed_source_bytes,
+                                      strlen(changed_source_bytes),
+                                      raw_sha256, 1234U) ==
            PJ_TRANSCRIPT_SOURCE_MISMATCH);
+    assert(pj_transcript_source_commit_decision(
+               PJ_TRANSCRIPT_SOURCE_MISMATCH) ==
+           PJ_TRANSCRIPT_COMMIT_SOURCE_RETRY_CHANGED);
 
     char embedded_nul[] = {'{', '\0', '}'};
     assert(pj_transcript_body_validate(embedded_nul, sizeof(embedded_nul),

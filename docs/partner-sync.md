@@ -166,7 +166,10 @@ The bounded USB firmware protocol also supports the complete sync data path.
 by `PJ_AUDIO_LIST` (1024 on current firmware, 256 when absent) per offset-checked response, and
 `PJ_TRANSCRIPT_BEGIN/WRITE/COMMIT` streams 192-byte write chunks and stages at
 most 64 KiB before a digest-verified
-atomic commit. Failed uploads receive a best-effort `PJ_TRANSCRIPT_ABORT`.
+atomic commit. The transcript document carries the verified WAV
+`source.sha256` and `source.bytes`; firmware refuses to mark the note synced if
+that identity is missing, malformed, or stale. Failed uploads receive a
+best-effort `PJ_TRANSCRIPT_ABORT`.
 `pj sync --transport usb` selects it explicitly; `auto` prefers an unambiguous
 USB-C device and falls back to paired LAN discovery when none is attached.
 
