@@ -11,7 +11,6 @@ extern "C" {
 
 #define PJ_DISPLAY_REFRESH_DEFAULT_PARTIAL_LIMIT 30u
 #define PJ_DISPLAY_PARTIAL_CURRENT_RAM_COMMAND UINT8_C(0x24)
-#define PJ_DISPLAY_PARTIAL_PREVIOUS_RAM_COMMAND UINT8_C(0x26)
 
 typedef int (*pj_display_partial_position_fn)(void *context);
 typedef int (*pj_display_partial_command_fn)(void *context, uint8_t command);
@@ -94,6 +93,7 @@ int pj_display_refresh_complete(pj_display_refresh_policy_t *policy,
                                 int success,
                                 uint32_t latency_us,
                                 uint32_t busy_time_us);
+/* Waveshare BW partial update: write RAM 0x24 once, then activate and wait BUSY. */
 int pj_display_refresh_commit_partial_planes(
     const pj_display_partial_plane_io_t *io,
     const uint8_t *current,

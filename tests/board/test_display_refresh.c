@@ -74,7 +74,7 @@ static void test_changed_bounds_are_tight_and_byte_aligned(void)
     assert(plan.region.x == 8 && plan.region.y == 10);
     assert(plan.region.width == 16 && plan.region.height == 3);
     assert(plan.changed_pixels == 2);
-    assert(plan.transfer_bytes == 12);
+    assert(plan.transfer_bytes == 6);
 }
 
 static void test_invalid_shadow_and_cadence_promote_to_full(void)
@@ -216,24 +216,27 @@ typedef enum {
     TEST_EVENT_CURRENT_COMMAND,
     TEST_EVENT_CURRENT_WRITE,
     TEST_EVENT_ACTIVATE,
-    TEST_EVENT_PREVIOUS_COMMAND,
-    TEST_EVENT_PREVIOUS_WRITE,
 } test_event_t;
 
+#define TEST_PARTIAL_BYTES 8u
+#define TEST_ACTIVATION_CAPACITY 2u
+
 typedef struct {
-    test_event_t events[32];
+    test_event_t events[16];
     size_t event_count;
     uint8_t selected_command;
-    uint8_t current_plane[4];
-    uint8_t previous_plane[4];
-    uint8_t activated_current[4];
-    uint8_t activated_previous[4];
+    uint8_t current_plane[TEST_PARTIAL_BYTES];
+    uint8_t activated_current[TEST_ACTIVATION_CAPACITY][TEST_PARTIAL_BYTES];
     size_t activation_count;
+    size_t activation_calls;
+    size_t command_count;
+    size_t write_count;
     size_t operation_count;
     size_t fail_operation;
-} fake_partial_controller_t;
+    uint8_t unexpected_command;
+} fake_partial_bw_controller_t;
 
-static int fake_operation(fake_partial_controller_t *controller)
+static int fake_operation(fake_partial_bw_controller_t *controller)
 {
     controller->operation_count++;
     return controller->fail_operation == controller->operation_count ? 73 : 0;
@@ -241,49 +244,56 @@ static int fake_operation(fake_partial_controller_t *controller)
 
 static int fake_position(void *opaque)
 {
-    fake_partial_controller_t *controller = opaque;
+    fake_partial_bw_controller_t *controller = opaque;
     controller->events[controller->event_count++] = TEST_EVENT_POSITION;
     return fake_operation(controller);
 }
 
 static int fake_command(void *opaque, uint8_t command)
 {
-    fake_partial_controller_t *controller = opaque;
-    controller->selected_command = command;
-    controller->events[controller->event_count++] =
-        command == PJ_DISPLAY_PARTIAL_CURRENT_RAM_COMMAND ?
-            TEST_EVENT_CURRENT_COMMAND : TEST_EVENT_PREVIOUS_COMMAND;
-    return fake_operation(controller);
+    fake_partial_bw_controller_t *controller = opaque;
+    controller->events[controller->event_count++] = TEST_EVENT_CURRENT_COMMAND;
+    controller->command_count++;
+    if (command != PJ_DISPLAY_PARTIAL_CURRENT_RAM_COMMAND) {
+        controller->unexpected_command = command;
+    }
+    int result = fake_operation(controller);
+    if (result == 0) {
+        controller->selected_command = command;
+    }
+    return result;
 }
 
 static int fake_write(void *opaque, const uint8_t *data, size_t length)
 {
-    fake_partial_controller_t *controller = opaque;
+    fake_partial_bw_controller_t *controller = opaque;
     assert(length == sizeof(controller->current_plane));
-    if (controller->selected_command == PJ_DISPLAY_PARTIAL_CURRENT_RAM_COMMAND) {
-        controller->events[controller->event_count++] = TEST_EVENT_CURRENT_WRITE;
+    assert(controller->selected_command == PJ_DISPLAY_PARTIAL_CURRENT_RAM_COMMAND);
+    controller->events[controller->event_count++] = TEST_EVENT_CURRENT_WRITE;
+    controller->write_count++;
+    int result = fake_operation(controller);
+    if (result == 0) {
         memcpy(controller->current_plane, data, length);
-    } else {
-        assert(controller->selected_command == PJ_DISPLAY_PARTIAL_PREVIOUS_RAM_COMMAND);
-        controller->events[controller->event_count++] = TEST_EVENT_PREVIOUS_WRITE;
-        memcpy(controller->previous_plane, data, length);
     }
-    return fake_operation(controller);
+    return result;
 }
 
 static int fake_activate(void *opaque)
 {
-    fake_partial_controller_t *controller = opaque;
+    fake_partial_bw_controller_t *controller = opaque;
     controller->events[controller->event_count++] = TEST_EVENT_ACTIVATE;
-    memcpy(controller->activated_current, controller->current_plane,
-           sizeof(controller->current_plane));
-    memcpy(controller->activated_previous, controller->previous_plane,
-           sizeof(controller->previous_plane));
-    controller->activation_count++;
-    return fake_operation(controller);
+    controller->activation_calls++;
+    int result = fake_operation(controller);
+    if (result == 0) {
+        assert(controller->activation_count < TEST_ACTIVATION_CAPACITY);
+        memcpy(controller->activated_current[controller->activation_count],
+               controller->current_plane, sizeof(controller->current_plane));
+        controller->activation_count++;
+    }
+    return result;
 }
 
-static pj_display_partial_plane_io_t fake_io(fake_partial_controller_t *controller)
+static pj_display_partial_plane_io_t fake_io(fake_partial_bw_controller_t *controller)
 {
     return (pj_display_partial_plane_io_t) {
         .context = controller,
@@ -294,7 +304,7 @@ static pj_display_partial_plane_io_t fake_io(fake_partial_controller_t *controll
     };
 }
 
-static void assert_partial_event_sequence(const fake_partial_controller_t *controller,
+static void assert_partial_event_sequence(const fake_partial_bw_controller_t *controller,
                                           size_t offset)
 {
     const test_event_t expected[] = {
@@ -302,69 +312,103 @@ static void assert_partial_event_sequence(const fake_partial_controller_t *contr
         TEST_EVENT_CURRENT_COMMAND,
         TEST_EVENT_CURRENT_WRITE,
         TEST_EVENT_ACTIVATE,
-        TEST_EVENT_POSITION,
-        TEST_EVENT_PREVIOUS_COMMAND,
-        TEST_EVENT_PREVIOUS_WRITE,
     };
     assert(controller->event_count >= offset + sizeof(expected) / sizeof(expected[0]));
     assert(memcmp(&controller->events[offset], expected, sizeof(expected)) == 0);
 }
 
-static void test_partial_plane_commit_advances_previous_after_activation(void)
+static void test_partial_bw_commit_writes_current_once_then_activates(void)
 {
-    fake_partial_controller_t controller;
+    fake_partial_bw_controller_t controller;
     memset(&controller, 0, sizeof(controller));
     memset(controller.current_plane, 0xff, sizeof(controller.current_plane));
-    memset(controller.previous_plane, 0xff, sizeof(controller.previous_plane));
     pj_display_partial_plane_io_t io = fake_io(&controller);
 
-    const uint8_t first[] = {0xf0, 0x0f, 0xaa, 0x55};
+    const uint8_t first[TEST_PARTIAL_BYTES] = {
+        0xf0, 0x0f, 0xaa, 0x55, 0x81, 0x42, 0x24, 0x18,
+    };
     assert(pj_display_refresh_commit_partial_planes(
                &io, first, sizeof(first)) == 0);
     assert_partial_event_sequence(&controller, 0);
     assert(controller.activation_count == 1);
-    assert(memcmp(controller.activated_previous,
-                  (uint8_t[]) {0xff, 0xff, 0xff, 0xff}, sizeof(first)) == 0);
-    assert(memcmp(controller.activated_current, first, sizeof(first)) == 0);
-    assert(memcmp(controller.previous_plane, first, sizeof(first)) == 0);
+    assert(controller.activation_calls == 1);
+    assert(controller.command_count == 1);
+    assert(controller.write_count == 1);
+    assert(controller.unexpected_command == 0);
+    assert(memcmp(controller.activated_current[0], first, sizeof(first)) == 0);
 
-    const uint8_t second[] = {0x0f, 0xf0, 0x55, 0xaa};
+    const uint8_t second[TEST_PARTIAL_BYTES] = {
+        0x0f, 0xf0, 0x55, 0xaa, 0x18, 0x24, 0x42, 0x81,
+    };
     assert(pj_display_refresh_commit_partial_planes(
                &io, second, sizeof(second)) == 0);
-    assert_partial_event_sequence(&controller, 7);
+    assert_partial_event_sequence(&controller, 4);
     assert(controller.activation_count == 2);
-    assert(memcmp(controller.activated_previous, first, sizeof(first)) == 0);
-    assert(memcmp(controller.activated_current, second, sizeof(second)) == 0);
-    assert(memcmp(controller.previous_plane, second, sizeof(second)) == 0);
+    assert(controller.activation_calls == 2);
+    assert(controller.command_count == 2);
+    assert(controller.write_count == 2);
+    assert(controller.unexpected_command == 0);
+    assert(memcmp(controller.activated_current[0], first, sizeof(first)) == 0);
+    assert(memcmp(controller.activated_current[1], second, sizeof(second)) == 0);
 }
 
-static void test_partial_plane_commit_fails_before_advancing_previous(void)
+static void test_partial_bw_commit_propagates_each_failure(void)
 {
-    fake_partial_controller_t controller;
-    memset(&controller, 0, sizeof(controller));
-    memset(controller.previous_plane, 0xa5, sizeof(controller.previous_plane));
-    controller.fail_operation = 4;
-    pj_display_partial_plane_io_t io = fake_io(&controller);
-    const uint8_t current[] = {1, 2, 3, 4};
+    const uint8_t current[TEST_PARTIAL_BYTES] = {1, 2, 3, 4, 5, 6, 7, 8};
+    for (size_t failed_operation = 1; failed_operation <= 4; failed_operation++) {
+        fake_partial_bw_controller_t controller;
+        memset(&controller, 0, sizeof(controller));
+        controller.fail_operation = failed_operation;
+        pj_display_partial_plane_io_t io = fake_io(&controller);
 
-    assert(pj_display_refresh_commit_partial_planes(
-               &io, current, sizeof(current)) == 73);
-    assert(controller.event_count == 4);
-    assert(controller.events[3] == TEST_EVENT_ACTIVATE);
-    assert(memcmp(controller.previous_plane,
-                  (uint8_t[]) {0xa5, 0xa5, 0xa5, 0xa5}, sizeof(current)) == 0);
+        assert(pj_display_refresh_commit_partial_planes(
+                   &io, current, sizeof(current)) == 73);
+        assert(controller.operation_count == failed_operation);
+        assert(controller.event_count == failed_operation);
+        assert(controller.activation_count == 0);
+        assert(controller.unexpected_command == 0);
+    }
+}
 
-    memset(&controller, 0, sizeof(controller));
-    memset(controller.previous_plane, 0x5a, sizeof(controller.previous_plane));
-    controller.fail_operation = 6;
-    io = fake_io(&controller);
-    assert(pj_display_refresh_commit_partial_planes(
-               &io, current, sizeof(current)) == 73);
-    assert(controller.event_count == 6);
-    assert(controller.events[4] == TEST_EVENT_POSITION);
-    assert(controller.events[5] == TEST_EVENT_PREVIOUS_COMMAND);
-    assert(memcmp(controller.previous_plane,
-                  (uint8_t[]) {0x5a, 0x5a, 0x5a, 0x5a}, sizeof(current)) == 0);
+static void test_partial_bw_repeated_digit_transitions(void)
+{
+    static const uint8_t digits[10][TEST_PARTIAL_BYTES] = {
+        {0x0e, 0x11, 0x13, 0x15, 0x19, 0x11, 0x0e, 0x00},
+        {0x04, 0x0c, 0x04, 0x04, 0x04, 0x04, 0x0e, 0x00},
+        {0x0e, 0x11, 0x01, 0x02, 0x04, 0x08, 0x1f, 0x00},
+        {0x1e, 0x01, 0x01, 0x0e, 0x01, 0x01, 0x1e, 0x00},
+        {0x02, 0x06, 0x0a, 0x12, 0x1f, 0x02, 0x02, 0x00},
+        {0x1f, 0x10, 0x10, 0x1e, 0x01, 0x01, 0x1e, 0x00},
+        {0x0e, 0x10, 0x10, 0x1e, 0x11, 0x11, 0x0e, 0x00},
+        {0x1f, 0x01, 0x02, 0x04, 0x08, 0x08, 0x08, 0x00},
+        {0x0e, 0x11, 0x11, 0x0e, 0x11, 0x11, 0x0e, 0x00},
+        {0x0e, 0x11, 0x11, 0x0f, 0x01, 0x01, 0x0e, 0x00},
+    };
+
+    for (size_t first = 0; first < 10; first++) {
+        for (size_t second = 0; second < 10; second++) {
+            fake_partial_bw_controller_t controller;
+            memset(&controller, 0, sizeof(controller));
+            pj_display_partial_plane_io_t io = fake_io(&controller);
+
+            assert(pj_display_refresh_commit_partial_planes(
+                       &io, digits[first], sizeof(digits[first])) == 0);
+            assert(pj_display_refresh_commit_partial_planes(
+                       &io, digits[second], sizeof(digits[second])) == 0);
+            assert_partial_event_sequence(&controller, 0);
+            assert_partial_event_sequence(&controller, 4);
+            assert(controller.event_count == 8);
+            assert(controller.command_count == 2);
+            assert(controller.write_count == 2);
+            assert(controller.activation_count == 2);
+            assert(controller.activation_calls == 2);
+            assert(controller.unexpected_command == 0);
+            assert(memcmp(controller.activated_current[0], digits[first],
+                          TEST_PARTIAL_BYTES) == 0);
+            assert(memcmp(controller.activated_current[1], digits[second],
+                          TEST_PARTIAL_BYTES) == 0);
+        }
+    }
 }
 
 int main(void)
@@ -377,8 +421,9 @@ int main(void)
     test_failed_refresh_records_error_without_advancing_cadence();
     test_successful_refresh_atomically_updates_shadow_and_metrics();
     test_partial_refresh_cannot_establish_an_invalid_shadow();
-    test_partial_plane_commit_advances_previous_after_activation();
-    test_partial_plane_commit_fails_before_advancing_previous();
+    test_partial_bw_commit_writes_current_once_then_activates();
+    test_partial_bw_commit_propagates_each_failure();
+    test_partial_bw_repeated_digit_transitions();
     puts("display refresh tests passed");
     return 0;
 }

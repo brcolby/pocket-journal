@@ -156,7 +156,7 @@ pj_display_refresh_plan_t pj_display_refresh_plan(
     } else {
         plan.kind = PJ_DISPLAY_REFRESH_PARTIAL;
         plan.transfer_bytes = (uint32_t)(plan.region.width / 8) *
-            (uint32_t)plan.region.height * 2u;
+            (uint32_t)plan.region.height;
     }
     return plan;
 }
@@ -275,14 +275,5 @@ int pj_display_refresh_commit_partial_planes(
     if (result != 0) return result;
     result = io->write(io->context, current, length);
     if (result != 0) return result;
-    result = io->activate(io->context);
-    if (result != 0) return result;
-
-    /* The partial LUT treats the SSD1681 secondary RAM as the previous image.
-     * Advance it only after the new image has reached the panel. */
-    result = io->position(io->context);
-    if (result != 0) return result;
-    result = io->command(io->context, PJ_DISPLAY_PARTIAL_PREVIOUS_RAM_COMMAND);
-    if (result != 0) return result;
-    return io->write(io->context, current, length);
+    return io->activate(io->context);
 }
