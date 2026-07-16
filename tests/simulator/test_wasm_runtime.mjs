@@ -175,6 +175,13 @@ assert.equal(api.pj_sim_touch_tap(50, 175), 1);
 
 api.pj_sim_reset();
 api.pj_sim_wake();
+api.pj_sim_seed_timestamp_notes();
+api.pj_sim_touch_tap(100, 33);
+api.pj_sim_touch_tap(100, 100);
+assertRendered("listen");
+
+api.pj_sim_reset();
+api.pj_sim_wake();
 api.pj_sim_set_status(84, 22, 45);
 api.pj_sim_set_time(21, 41, 2026, 6, 6);
 api.pj_sim_set_preferences(0, 1, 3);

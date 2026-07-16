@@ -174,6 +174,22 @@ void pj_sim_seed_review_notes(void)
 }
 
 EMSCRIPTEN_KEEPALIVE
+void pj_sim_seed_timestamp_notes(void)
+{
+    static const char *labels[] = {
+        "JAN 19 09:19",
+        "JUL 15 21:41",
+        "DEC 31 19:09",
+    };
+    memset(g_note_labels, 0, sizeof(g_note_labels));
+    g_note_count = (int)(sizeof(labels) / sizeof(labels[0]));
+    for (int i = 0; i < g_note_count; i++) {
+        strncpy(g_note_labels[i], labels[i], PJ_UI_NOTE_LABEL_LEN - 1);
+    }
+    sync_notes();
+}
+
+EMSCRIPTEN_KEEPALIVE
 void pj_sim_render(void)
 {
     pj_ui_render(&g_ctx, &g_fb);

@@ -218,6 +218,7 @@
 #define PJ_AUDIO_COLLECT_STORAGE_BUSY (-1)
 #define PJ_AUDIO_COLLECT_TOO_MANY (-2)
 #define PJ_AUDIO_COLLECT_NO_MEMORY (-3)
+#define PJ_AUDIO_COLLECT_OPEN_FAILED (-4)
 /* PJ_AUDIO_READ holds 1024 raw bytes plus 2049 hex bytes on this task's stack. */
 #define PJ_SERIAL_COMMAND_TASK_STACK 9216
 #define PJ_SERIAL_RX_BUFFER_BYTES 1024U
@@ -3328,7 +3329,7 @@ static esp_err_t epd_refresh_partial(const pj_framebuffer_t *framebuffer,
     }
     ESP_RETURN_ON_ERROR(epd_prepare_partial(), TAG,
                         "display partial mode preparation failed");
-    ESP_LOGI(TAG, "Display partial refresh x=%d y=%d w=%d h=%d bytes=%d ram=0x24->0x26",
+    ESP_LOGI(TAG, "Display partial refresh x=%d y=%d w=%d h=%d bytes=%d ram=0x24",
              x0, y0, x1 - x0 + 1, y1 - y0 + 1, byte_len);
     ESP_RETURN_ON_ERROR(epd_set_windows((uint16_t)x0, mem_y_start,
                                         (uint16_t)x1, mem_y_end),
@@ -3919,7 +3920,7 @@ static int collect_audio_entries(pj_audio_entry_t **entries_out)
     DIR *dir = opendir(PJ_AUDIO_DIR);
     if (dir == NULL) {
         storage_shared_release();
-        return 0;
+        return PJ_AUDIO_COLLECT_OPEN_FAILED;
     }
     pj_audio_entry_t *entries = NULL;
     size_t capacity = 0;
@@ -3966,17 +3967,21 @@ static int collect_audio_entries(pj_audio_entry_t **entries_out)
     return result;
 }
 
-static void collect_sync_counts(int *pending, int *transferred)
+static pj_board_sync_inventory_state_t collect_sync_counts_fresh(
+    int *pending, int *transferred)
 {
-    storage_sync_counts_snapshot(pending, transferred);
+    if (pending == NULL || transferred == NULL) {
+        return PJ_BOARD_SYNC_INVENTORY_ERROR;
+    }
+    *pending = 0;
+    *transferred = 0;
     pj_audio_entry_t *entries = NULL;
     int count = collect_audio_entries(&entries);
     if (count < 0) {
         free(entries);
-        return;
+        return count == PJ_AUDIO_COLLECT_STORAGE_BUSY ?
+            PJ_BOARD_SYNC_INVENTORY_BUSY : PJ_BOARD_SYNC_INVENTORY_ERROR;
     }
-    *pending = 0;
-    *transferred = 0;
     for (int i = 0; i < count; i++) {
         if (entries[i].note.synced) {
             (*transferred)++;
@@ -3986,6 +3991,19 @@ static void collect_sync_counts(int *pending, int *transferred)
     }
     free(entries);
     storage_sync_counts_cache(*pending, *transferred);
+    return PJ_BOARD_SYNC_INVENTORY_READY;
+}
+
+static void collect_sync_counts(int *pending, int *transferred)
+{
+    storage_sync_counts_snapshot(pending, transferred);
+    int fresh_pending = 0;
+    int fresh_transferred = 0;
+    if (collect_sync_counts_fresh(&fresh_pending, &fresh_transferred) ==
+        PJ_BOARD_SYNC_INVENTORY_READY) {
+        *pending = fresh_pending;
+        *transferred = fresh_transferred;
+    }
 }
 
 static void refresh_ui_sync_state(pj_ui_context_t *ui)
@@ -7220,6 +7238,26 @@ int pj_board_consume_settings_update(pj_ui_context_t *ui)
     return 1;
 }
 
+int pj_board_sync_inventory_snapshot(pj_board_sync_inventory_t *inventory)
+{
+    if (inventory == NULL) {
+        return 0;
+    }
+    *inventory = (pj_board_sync_inventory_t) {
+        .state = PJ_BOARD_SYNC_INVENTORY_ERROR,
+    };
+#ifdef ESP_PLATFORM
+    pj_board_status_t status = board_status_snapshot_base();
+    inventory->online = status.wifi == PJ_BOARD_SERVICE_READY;
+    if (status.storage != PJ_BOARD_SERVICE_READY) {
+        return 1;
+    }
+    inventory->state = collect_sync_counts_fresh(
+        &inventory->pending, &inventory->transferred);
+#endif
+    return 1;
+}
+
 void pj_board_refresh_status(pj_ui_context_t *ui)
 {
 #ifdef ESP_PLATFORM
@@ -7377,12 +7415,16 @@ static int time_controller_command_from_ui(
             PJ_TIME_CONTROLLER_COMMAND_TIMER_PAUSE,
         [PJ_UI_TIME_COMMAND_TIMER_RESET] =
             PJ_TIME_CONTROLLER_COMMAND_TIMER_RESET,
+        [PJ_UI_TIME_COMMAND_TIMER_SET] =
+            PJ_TIME_CONTROLLER_COMMAND_TIMER_SET,
         [PJ_UI_TIME_COMMAND_INTERVAL_START] =
             PJ_TIME_CONTROLLER_COMMAND_INTERVAL_START,
         [PJ_UI_TIME_COMMAND_INTERVAL_PAUSE] =
             PJ_TIME_CONTROLLER_COMMAND_INTERVAL_PAUSE,
         [PJ_UI_TIME_COMMAND_INTERVAL_RESET] =
             PJ_TIME_CONTROLLER_COMMAND_INTERVAL_RESET,
+        [PJ_UI_TIME_COMMAND_INTERVAL_SET] =
+            PJ_TIME_CONTROLLER_COMMAND_INTERVAL_SET,
     };
     if (source == NULL || target == NULL || source->type <= 0 ||
         (size_t)source->type >= sizeof(types) / sizeof(types[0]) ||

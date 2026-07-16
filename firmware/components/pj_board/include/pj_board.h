@@ -85,6 +85,19 @@ typedef struct {
     pj_time_sync_state_t time_sync;
 } pj_board_status_t;
 
+typedef enum {
+    PJ_BOARD_SYNC_INVENTORY_READY = 0,
+    PJ_BOARD_SYNC_INVENTORY_BUSY,
+    PJ_BOARD_SYNC_INVENTORY_ERROR,
+} pj_board_sync_inventory_state_t;
+
+typedef struct {
+    pj_board_sync_inventory_state_t state;
+    int pending;
+    int transferred;
+    int online;
+} pj_board_sync_inventory_t;
+
 pj_board_profile_t pj_board_default_profile(void);
 void pj_board_init(const pj_board_profile_t *profile);
 int pj_board_start_services(const pj_board_profile_t *profile);
@@ -117,8 +130,13 @@ int pj_board_playback_toggle_index(int note_index);
 int pj_board_wipe_recordings(pj_ui_context_t *ui);
 int pj_board_storage_recover(void);
 int pj_board_http_start(void);
+/* Returns a fresh storage scan. BUSY and ERROR never contain cached counts. */
+int pj_board_sync_inventory_snapshot(pj_board_sync_inventory_t *inventory);
 /* Creates a durable request and starts or attaches to asynchronous sync. */
 int pj_board_companion_sync_start(void);
+/* Atomically returns the newly persisted request snapshot before task progress. */
+int pj_board_companion_sync_start_snapshot(
+    pj_companion_sync_state_t *snapshot);
 /* Restarts a pending durable request without incrementing its generation. */
 int pj_board_companion_sync_resume(void);
 int pj_board_companion_sync_snapshot(pj_companion_sync_state_t *snapshot);
@@ -133,7 +151,15 @@ int pj_board_companion_sync_scoped_auth_valid(const char *authorization,
                                                const char *method,
                                                const char *uri,
                                                const char *token);
+/* Atomically consumes the pending notification and its corresponding snapshot. */
+int pj_board_consume_companion_sync_update_snapshot(
+    pj_companion_sync_state_t *snapshot);
 int pj_board_consume_companion_sync_update(pj_ui_context_t *ui);
+/* A queued request does not match until any older active generation completes. */
+int pj_board_companion_sync_snapshot_matches_target(
+    const pj_companion_sync_state_t *snapshot, uint32_t target_generation);
+int pj_board_companion_sync_snapshot_target_succeeded(
+    const pj_companion_sync_state_t *snapshot, uint32_t target_generation);
 
 #ifdef __cplusplus
 }

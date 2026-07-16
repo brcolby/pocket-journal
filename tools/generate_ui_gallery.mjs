@@ -53,6 +53,12 @@ function resetToNoteList(rowY) {
   api.pj_sim_touch_tap(100, 33);
   api.pj_sim_touch_tap(100, rowY);
 }
+function resetToTimestampNoteList() {
+  resetToHome();
+  api.pj_sim_seed_timestamp_notes();
+  api.pj_sim_touch_tap(100, 33);
+  api.pj_sim_touch_tap(100, 100);
+}
 function advanceToSecondNotePage() {
   api.pj_sim_touch_tap(150, 175);
 }
@@ -76,6 +82,7 @@ const scenarios = [
   ["listen-empty", "listen", () => { resetToHome(); api.pj_sim_touch_tap(100, 33); api.pj_sim_touch_tap(100, 100); }, fullBleed()],
   ["listen-page-1", "listen", () => resetToNoteList(100), fullBleed()],
   ["listen-page-2", "listen", () => { resetToNoteList(100); advanceToSecondNotePage(); }, fullBleed()],
+  ["listen-timestamps", "listen", resetToTimestampNoteList, fullBleed()],
   ["read-page-1", "read", () => resetToNoteList(166), fullBleed()],
   ["note-detail", "note_detail", () => { resetToHome(); api.pj_sim_set_note_count(1); api.pj_sim_touch_tap(100, 33); api.pj_sim_touch_tap(100, 100); api.pj_sim_touch_tap(100, 25); }],
   ["transcript-detail", "note_detail", () => { resetToHome(); api.pj_sim_seed_review_notes(); api.pj_sim_touch_tap(100, 33); api.pj_sim_touch_tap(100, 166); api.pj_sim_touch_tap(100, 25); }],

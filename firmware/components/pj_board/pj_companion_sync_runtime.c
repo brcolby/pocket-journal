@@ -2,13 +2,34 @@
 #include "pj_companion_auth.h"
 #include "pj_companion_sync.h"
 
+#include <string.h>
+
+int pj_board_companion_sync_snapshot_matches_target(
+    const pj_companion_sync_state_t *snapshot, uint32_t target_generation)
+{
+    return snapshot != NULL && target_generation != 0U &&
+           snapshot->requested_generation == target_generation &&
+           (snapshot->active_generation == 0U ||
+            snapshot->active_generation == target_generation);
+}
+
+int pj_board_companion_sync_snapshot_target_succeeded(
+    const pj_companion_sync_state_t *snapshot, uint32_t target_generation)
+{
+    return pj_board_companion_sync_snapshot_matches_target(
+               snapshot, target_generation) &&
+           snapshot->active_generation == 0U &&
+           snapshot->acknowledged_generation == target_generation &&
+           snapshot->phase == PJ_COMPANION_SYNC_SUCCEEDED &&
+           snapshot->acknowledged_phase == PJ_COMPANION_SYNC_SUCCEEDED;
+}
+
 #ifdef ESP_PLATFORM
 
 #include <ctype.h>
 #include <inttypes.h>
 #include <limits.h>
 #include <stdio.h>
-#include <string.h>
 #include <sys/time.h>
 
 #include "cJSON.h"
@@ -659,8 +680,13 @@ static int start_task_if_pending(void)
     return 0;
 }
 
-int pj_board_companion_sync_start(void)
+int pj_board_companion_sync_start_snapshot(
+    pj_companion_sync_state_t *snapshot)
 {
+    if (snapshot == NULL) {
+        return 0;
+    }
+    memset(snapshot, 0, sizeof(*snapshot));
     if (!sync_mutex_init()) {
         ESP_LOGE(TAG, "Unable to allocate companion sync mutex");
         return 0;
@@ -700,8 +726,15 @@ int pj_board_companion_sync_start(void)
     }
     ESP_LOGI(TAG, "Queued durable sync generation=%" PRIu32,
              g_sync_state.requested_generation);
+    *snapshot = g_sync_state;
     xSemaphoreGive(g_sync_mutex);
     return start_task_if_pending();
+}
+
+int pj_board_companion_sync_start(void)
+{
+    pj_companion_sync_state_t snapshot;
+    return pj_board_companion_sync_start_snapshot(&snapshot);
 }
 
 int pj_board_companion_sync_resume(void)
@@ -813,20 +846,36 @@ int pj_board_companion_sync_scoped_auth_valid(const char *authorization,
     return valid;
 }
 
-int pj_board_consume_companion_sync_update(pj_ui_context_t *ui)
+int pj_board_consume_companion_sync_update_snapshot(
+    pj_companion_sync_state_t *snapshot)
 {
-    if (ui == NULL || g_sync_mutex == NULL) {
+    if (snapshot == NULL) {
         return 0;
     }
-    pj_companion_sync_state_t snapshot;
+    memset(snapshot, 0, sizeof(*snapshot));
+    if (g_sync_mutex == NULL) {
+        return 0;
+    }
     xSemaphoreTake(g_sync_mutex, portMAX_DELAY);
     if (!g_sync_update_pending) {
         xSemaphoreGive(g_sync_mutex);
         return 0;
     }
-    snapshot = g_sync_state;
+    *snapshot = g_sync_state;
     g_sync_update_pending = 0;
     xSemaphoreGive(g_sync_mutex);
+    return 1;
+}
+
+int pj_board_consume_companion_sync_update(pj_ui_context_t *ui)
+{
+    if (ui == NULL) {
+        return 0;
+    }
+    pj_companion_sync_state_t snapshot;
+    if (!pj_board_consume_companion_sync_update_snapshot(&snapshot)) {
+        return 0;
+    }
     pj_ui_set_sync_state(ui, snapshot.pending, snapshot.transferred,
                          snapshot.online);
     pj_ui_set_sync_detail(ui, pj_companion_sync_phase_name(snapshot.phase),
@@ -837,9 +886,19 @@ int pj_board_consume_companion_sync_update(pj_ui_context_t *ui)
 
 #else
 
+int pj_board_companion_sync_start_snapshot(
+    pj_companion_sync_state_t *snapshot)
+{
+    if (snapshot != NULL) {
+        memset(snapshot, 0, sizeof(*snapshot));
+    }
+    return 0;
+}
+
 int pj_board_companion_sync_start(void)
 {
-    return 0;
+    pj_companion_sync_state_t snapshot;
+    return pj_board_companion_sync_start_snapshot(&snapshot);
 }
 
 int pj_board_companion_sync_resume(void)
@@ -889,6 +948,15 @@ int pj_board_companion_sync_scoped_auth_valid(const char *authorization,
     (void)method;
     (void)uri;
     (void)token;
+    return 0;
+}
+
+int pj_board_consume_companion_sync_update_snapshot(
+    pj_companion_sync_state_t *snapshot)
+{
+    if (snapshot != NULL) {
+        memset(snapshot, 0, sizeof(*snapshot));
+    }
     return 0;
 }
 
