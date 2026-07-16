@@ -1,207 +1,192 @@
 # Human Validation Checklist
 
-Beads is the source of truth. This is the concise operator path for one
-low-frequency, large-batch hardware pass. Notes may be mildly lossy: record what
-you actually observed, including blockers, and agents will map it to the exact
-acceptance criteria.
+Beads is the source of truth. This file is the operator path for one
+low-frequency, large-batch hardware pass. Human notes may be mildly lossy:
+record what you actually observed, including blockers, and agents will map that
+evidence to the exact Bead acceptance criteria.
 
-Last synchronized with `bd human list`: 2026-07-15 (31 open/in-progress beads).
+Last synchronized with `bd human list`: 2026-07-16 (33 human-validation Beads).
 Do not repeat a failed check on unchanged firmware.
 
 ## Nominated Build
 
-- Source and partner: `8472f3b`; partner package `0.1.0`.
-- Ordinary fail-closed image:
-  `/private/tmp/pj-final-8472f3b-ordinary/pocket_journal.bin`, 1,827,888
-  bytes, SHA-256
-  `1fde473d91bb33ee09adbb99096a54d87a1a17734f61fd22ad0035b67a9ad8fe`.
-- Flashed signed-development factory:
-  `/private/tmp/pj-final-8472f3b-signed-factory/pocket_journal.bin`,
-  1,839,104 bytes, SHA-256
-  `da0a6e3391635647d8d71ffee68a841fe165cdefbc4b6cd33327f4a79c4f533a`.
-- Signed OTA candidate version `0.1.0`:
-  `/private/tmp/pj-final-8472f3b-ota-candidate/pocket_journal.bin`,
-  1,839,104 bytes, SHA-256
-  `048fde91a55ec611b7faf14668dbf8a97c2fccf6da2f1db9fb8f9bbc74b477dc`.
-  Its manifest SHA-256 is
-  `8cd0972286d1f94f913770a2fa324ec290a8f712a2e79cf8966cbc8ea1e7099b`
-  and signature SHA-256 is
-  `7207b4baaecc6005b6ed081d5fd0d9f9d250ebc1709e744263df75bfb67b5bb1`.
-- Trust fingerprints: P-256 manifest public DER
-  `b8cd13c9dcfa943ef4804039573bee1849cb9e1158e73cebb4eb079c6bb84a2c`;
-  RSA application public file
-  `eeaf88a36f8add64d15160fb8c4ad2d5aa5800cb83992f99d4dfba6c915b9e86`.
-- The factory image was flashed directly on 2026-07-15 without a monitor and
-  without writing NVS. This is development validation, not a release; no eFuse,
-  release tag, or production Secure Boot claim is involved.
-- Automated evidence: full `make test` with 312 partner tests, all native/UI and
-  simulator gates, `make test-simulator-runtime ui-gallery`, ordinary and signed
-  ESP-IDF 6.0.1 builds, RSA image verification, P-256 canonical-manifest
-  verification, and partner bundle inspection all pass.
-- Live target evidence: exact `8472f3b`; USB, audio, storage, Wi-Fi, DHCP, LAN,
-  mDNS, and authenticated OTA status ready; persisted UTC offset `-420`; SNTP
-  synchronized and published; interval durably inactive. Five USB status
-  open/close cycles took 1.39 seconds total with no holder left behind.
-- The retained 993,324-byte note has SHA-256
-  `5c04a1ce64a73c8c6a34da0f29ed95d48826f963f0efd4d6aaeb3f752f9dd385`.
-  A full USB reprocess completed through one descriptor in 67.79 seconds versus
-  the 257.09-second baseline, then released the port with no partial file. A
-  subsequent device-initiated generation-4 Sync transferred this file and a new
-  286,764-byte note through the isolated companion, acknowledged the exact
-  generation with zero failures, and released USB. `pocket-journal-nqa` is
-  closed.
-- `firmware/02a.log` and the second-round notes are failure baselines from older
-  `4aca539-dirty` firmware, not evidence about this nominated build.
+- Commit and firmware version: `4fe641c`.
+- Image: `/private/tmp/pj-final-4fe641c/pocket_journal.bin`.
+- Size: 1,642,496 bytes.
+- SHA-256:
+  `07d0d69ddf917a0438c0b006aeeff39abfc3d345b86d65751a1d894383105dbd`.
+- ESP image validation hash:
+  `a772e867b562872158e19295d5d3b90f2e08c415ad74b3cb39270e8217f6a276`.
+- Built with ESP-IDF 6.0.1 and 22% free in each 2 MiB application partition.
+- Flashed successfully as a development image without starting a monitor.
+- Live evidence after flashing: exact firmware, SD/audio/Wi-Fi/DHCP ready at
+  `192.168.213.241`, storage healthy, fixed UTC offset synchronized, and boot ID
+  `764293020`. Ten independent USB status open/request/close cycles kept that
+  boot ID, returned without panic, and released the port every time. A bounded
+  no-reset check returned complete status with no low-stack warning.
+- Existing recordings were removed; the final device inventory is empty. The
+  first cleanup removed 4 WAVs, 4 note files, and 2 transcripts but reported a
+  retryable residue; after terminal-state inspection, a zero-item cleanup retry
+  succeeded.
+- The managed validation companion is running on port `8765`; generation 7 is
+  acknowledged, online, and succeeded with zero pending files.
+- Automated evidence: full `make test` passed with 327 partner tests and all
+  native/UI/simulator gates. `make test-simulator-runtime ui-gallery` passed;
+  all 25 gallery frames and the contact sheet were image-inspected.
+- This is development validation, not a release. No tag or release has been
+  created.
 
-Before starting, record board revision, enclosure state, SD identity, battery or
-USB power, and approximate room conditions. Keep `idf.py monitor` closed. Before
-the Sync step, ask the agent to start the bounded isolated companion; the agent
-will verify no process already owns `/dev/cu.usbmodem1101`.
+Before starting, record board revision, enclosure state, SD identity, power
+source, and approximate room conditions. Keep a monitor closed unless an agent
+requests bounded diagnostics. Before the Sync checks, ask the agent to confirm
+that the managed validation companion is still active and that no unrelated
+process owns the USB serial port.
 
-## One Ordered Pass
+## One Ordered Core Pass
 
 ### 1. Boot, Network, And Time
 
-- [ ] Boot once and reboot once. Confirm normal display/touch/RTC/sensor/SD/audio
-  initialization, no boot loop, automatic connection to the configured network,
-  and discovery as `pj-d45d34.local`. If network recovery fails, preserve only
-  credential-safe phase, RSSI, channel, DHCP, reason, retry, and backoff evidence
-  (`pocket-journal-d3d`).
-- [ ] Confirm the displayed local clock is correct in both 12-hour and 24-hour
-  modes, with no AM/PM in 12-hour mode. Start a Timer or Stopwatch before a
-  reconnect/SNTP refresh; confirm its duration never jumps. Reboot and confirm
-  local time remains correct (`pocket-journal-2f2`).
+- [ ] Boot once and reboot once. Confirm normal startup, no boot loop, SD/audio
+  readiness, automatic connection to the configured network, and truthful
+  network state after any disconnect/reconnect (`pocket-journal-d3d`).
+- [ ] Confirm local time is correct in 12-hour and 24-hour modes, with no AM/PM
+  on the Clock screen. Start a Stopwatch or Timer across one network/SNTP
+  refresh and confirm its duration does not jump. Reboot and confirm local time
+  and preferences persist (`pocket-journal-2f2`, `pocket-journal-aw7`,
+  `pocket-journal-wsl`).
 
 ### 2. Display, Touch, And AUX
 
 - [ ] Inspect Clock, Home, note lists, note playback, Record, Alarm, Stopwatch,
-  Timer, Interval, Settings, Volume, and Sync. Confirm uppercase text, contiguous
-  edge-to-edge controls, thick boundaries, large unclipped typography, no top
-  titles or back button, three notes per page with full-page arrows, full-screen
-  play/pause and recording time, and a full-height Volume bar. Confirm direct
-  touch targets without a focus dot, hidden focus cycle, or inverted focus
-  (`pocket-journal-nz5`, `pocket-journal-2ji`).
-- [ ] Change Volume, Light/Dark, 12/24-hour, C/F, transcript size, Alarm, Timer,
-  and Interval values; reboot and confirm every setting persists. Check large
-  day/date, temperature, humidity, battery percentage, Alarm HR/MIN controls,
-  Timer controls, and readable transcript sizing (`pocket-journal-wsl`,
-  `pocket-journal-aw7`).
-- [ ] Produce at least 30 partial updates across Record, Stopwatch, Timer,
-  Interval, and Volume. Digits must advance in order; the bar and controls must
-  never reorder, leave horizontal residue, or borrow pixels from adjacent areas.
-  Full-refresh cleanup must remain coherent (`pocket-journal-cjx`,
-  `pocket-journal-zi6`, `pocket-journal-e43`).
-- [ ] During both a roughly 0.6-second partial and 1.8-second full refresh, use
-  touch and AUX. Input and time models must continue immediately, a delayed
-  gesture must not land on a later screen, and the latest frame must win without
-  flicker or stale pixels (`pocket-journal-9by`, `pocket-journal-1vc`,
+  Timer, Interval, Settings, Volume, and Sync. Confirm uppercase text,
+  contiguous edge-to-edge controls, thick boundaries, large unclipped type, no
+  top title or back button, full-screen playback/recording controls, and a
+  full-height Volume bar (`pocket-journal-nz5`, `pocket-journal-2ji`).
+- [ ] Exercise digit boundaries `09 -> 10`, `19 -> 20`, `39 -> 40`, and
+  `59 -> 60` across Stopwatch, Timer, Interval, and Record. Confirm digits
+  advance in order, `1` and `9` are upright and distinct, play/pause never
+  flips by itself, and no stale lines, reordered digits, or neighboring pixels
+  appear (`pocket-journal-cjx`, `pocket-journal-zi6`,
+  `pocket-journal-e43`).
+- [ ] Produce at least 30 partial updates, including Volume changes. During
+  several updates, rapidly press the current control and a control that changes
+  screens. The latest requested frame must win; stale taps must not affect the
+  later screen; elapsed time and input must remain responsive during both
+  partial and full refreshes (`pocket-journal-9by`, `pocket-journal-1vc`,
   `pocket-journal-jjt`).
-- [ ] Confirm AUX short performs the obvious primary action, AUX double starts
+- [ ] While Stopwatch runs, repeatedly toggle play/pause and confirm the icon
+  and digits remain authoritative. While Timer and Interval are paused,
+  repeatedly use plus/minus and confirm each displayed value is applied exactly
+  once, without reverting to an older preset (`pocket-journal-8q5`,
+  `pocket-journal-9by`).
+- [ ] Confirm AUX short performs the current primary action, AUX double enters
   Record only from Clock or Home, and AUX hold goes Back once at 0.5 seconds.
-  Holding through a transition and releasing afterward must not trigger another
-  action (`pocket-journal-61u`, `pocket-journal-d8j`).
+  Playback must navigate Back from both playing and paused states; holding
+  through a transition must not trigger a second action on release
+  (`pocket-journal-61u`, `pocket-journal-d8j`).
 
-### 3. Record, Listen, Audio, And Sync
+No empirical panel patch alignment or size calibration is requested for this
+build. Offline tests exhaustively cover byte-aligned X origins/ranges and
+pixel-granular Y origins/ranges. If clean black/white-only firmware still shows
+corruption, stop repeating the broad display pass and record the exact screen,
+region, preceding action, and a photo; an agent will add a focused target-pattern
+diagnostic before asking for calibration evidence.
 
-- [ ] Record for at least five seconds. Elapsed seconds must be sequential and
-  based on captured audio. AUX short must stop/save and return immediately with
-  no Saving screen or blocking repaint. Exactly one playable note must appear
-  after asynchronous finalization; immediate Record re-entry must be rejected
-  until then. Also verify one interrupted capture creates no corrupt note
-  (`pocket-journal-sm1`, `pocket-journal-te0`).
-- [ ] While rapidly starting/stopping Record, re-entering it, playing/stopping a
-  note, navigating Back, and polling status, confirm no hang, torn/stale state,
-  lost stop, or missing note refresh (`pocket-journal-5eo`).
-- [ ] Play/pause a note and AUX Back from both active and paused states. No square
-  Stop or recovered overlay may appear. Play through EOF and confirm the UI and
-  audio hardware return to authoritative idle (`pocket-journal-61u`).
-- [ ] Record one intelligible phrase and one silence/no-speech sample. Confirm
-  the fixed local model produces useful readable text for speech and does not
-  fabricate a transcript for noise. Preserve both samples for later enclosure
-  comparison (`pocket-journal-zon`).
-- [x] Agent protocol proof: the isolated companion resumed offline generation 4,
-  observed active USB transfer, transferred both queued notes, and reached
-  requested generation = acknowledged generation = 4 with zero failures. Both
-  WAV digests verified; companion shutdown was immediate and left no USB holder
-  (`pocket-journal-nqa`, closed).
-- [ ] Confirm the generation-4 Sync screen visibly showed actionable offline,
-  active, and complete states without blocking navigation. If those transitions
-  were not observed, run one additional Sync while the companion is online
-  (`pocket-journal-kin`).
-- [ ] Stop the companion, request Sync again, and confirm an actionable offline
-  state survives navigation and reboot. Restart the companion and confirm that
-  exact operation resumes once, without duplicate audio, transcript, or title.
-  Sync must never be blank or claim false progress (`pocket-journal-kin`,
-  `pocket-journal-d3d`).
-- [ ] Using an expendable or backed-up SD card, test removal/reinsert/remount,
-  low/full-space behavior, and one interrupted write. Record and playback must
-  fail clearly while unavailable, existing valid notes must survive recovery,
-  and no phantom or corrupt note may appear (`pocket-journal-pc3`,
-  `pocket-journal-te0`).
+### 3. Notes, Recording, Playback, And Sync
+
+- [ ] Confirm note list rows show three notes per page with full-page navigation.
+  Dates must omit the year, use the available width, remain legible, and
+  truncate long note text cleanly without overlapping controls
+  (`pocket-journal-nz5`, `pocket-journal-te0`).
+- [ ] Record continuously for at least two minutes. Stop/save with AUX and
+  confirm immediate return with no Saving screen or blocking display load.
+  As soon as the durable raw note appears, enter Record again and create a
+  second note while optional processing of the first continues. Exactly one
+  valid playable note must result from each capture (`pocket-journal-sm1`,
+  `pocket-journal-sm1.1`, `pocket-journal-5eo`).
+- [ ] Play/pause both notes, navigate Back from active and paused playback, and
+  play one through EOF. Confirm no square Stop or Recovered overlay, no stuck
+  audio state, and no corrupt note after a reboot during or shortly after
+  background processing (`pocket-journal-61u`, `pocket-journal-te0`).
+- [ ] With at least two visible notes, request Sync while the companion is
+  offline, then bring it online. Confirm the screen shows the note inventory
+  before ACTIVE, communicates offline/active/complete truthfully, remains
+  navigable, and returns to Settings after visible completion
+  (`pocket-journal-kin`, `pocket-journal-kin.1`).
+- [ ] During ACTIVE Sync, create or finish processing another note. Sync must
+  never report false completion for the changed inventory. Confirm exactly one
+  successor operation transfers the new generation, with no duplicate audio,
+  transcript, or title (`pocket-journal-kin`, `pocket-journal-kin.1`,
+  `pocket-journal-5eo`).
 
 ### 4. Time Apps And Alerts
 
+- [ ] Start Interval at round 0 with the default 90-second duration. Observe at
+  least two boundaries. Rounds must increment once, timing must not drift, and
+  no large square Stop/INTERVAL/Recovered screen may appear. There must be no
+  spontaneous or repeated beeping; reset before leaving the device
+  (`pocket-journal-8q5`, `pocket-journal-xl8`).
 - [ ] Start, pause, adjust, resume, leave, and revisit Stopwatch and Timer.
-  Paused plus/minus controls must apply to the displayed remainder rather than
-  the original preset. Time must remain stable and large; Back must perform the
-  documented pause/reset/return behavior (`pocket-journal-8q5`).
-- [ ] Start a 90-second Interval at round 0 and observe rounds 1 and 2. It must
-  not drift, show a large square Stop/INTERVAL/Recovered screen, or emit more
-  than one chime per boundary. Reboot once mid-round, verify exact recovery, then
-  reset before leaving the device (`pocket-journal-8q5`, `pocket-journal-xl8`).
-- [ ] At a nonzero volume, trigger one Timer or Alarm alert. Confirm one short
-  nonmodal sound, exact alert clearing, responsive navigation, and PA idle after
-  it. Repeat at volume zero and confirm silence. Record any pop, click, crackle,
-  or harshness (`pocket-journal-oi9`, `pocket-journal-xl8`).
-- [ ] Arm a short Timer, enter sleep, and confirm one RTC/GPIO5 wake with no wake
-  loop. Manual BOOT/AUX wake must still work, including an early wake followed
-  by re-entering sleep (`pocket-journal-54s`).
+  Confirm large stable time, exact paused adjustments, and documented
+  pause/reset/back behavior (`pocket-journal-8q5`).
+- [ ] At nonzero volume, trigger one Timer or Alarm alert. Confirm one short
+  nonmodal sound, responsive navigation, exact alert clearing, and audio idle
+  afterward. Repeat at volume zero and confirm silence
+  (`pocket-journal-oi9`, `pocket-journal-xl8`).
+- [ ] Arm a short alert, enter sleep, and confirm one RTC wake without a wake
+  loop. Manual wake must still work, including an early wake followed by
+  re-entering sleep (`pocket-journal-54s`).
 
-### 5. Signed OTA And Recovery
+### 5. Settings, Off, And Wake
 
-- [ ] From factory `8472f3b`, select the documented `0.1.0` candidate through
-  the companion CLI. Confirm exact device/version/digest/slot preflight, explicit
-  confirmation, bounded upload progress, reboot/reconnect, healthy confirmation,
-  and preserved token/settings (`pocket-journal-i4s.2`, `pocket-journal-i4s`).
-- [ ] Reject bad manifest and image signatures, changed fields, wrong board or
-  project, digest mismatch, oversize/truncated bodies, replay/downgrade, and a
-  concurrent update without changing the boot partition.
-- [ ] Separately test factory-to-first-OTA behavior, interrupted upload, and an
-  unconfirmed/failed first boot. The previous partition must remain bootable and
-  status must report the truthful rollback or unknown outcome. Do not remove
-  power during an active flash write unless that destructive test is explicitly
-  accepted. Do not create or publish a release tag.
-
-### 6. Physical Power
-
-- [ ] On USB power, press PWR once to show only the compiled splash art and sleep.
-  Press PWR once to wake directly to Home with fresh time/sensor data. The first
-  full refresh and first edge/corner touch must work; held/bouncing input must not
-  double-toggle. A recoverable display failure must force a truthful later full
-  refresh (`pocket-journal-ap4.1`, `pocket-journal-ap4`,
-  `pocket-journal-jjt`, `pocket-journal-1vc`).
-- [ ] Repeat the same off/wake sequence on battery and record current, LED,
-  disconnect, and wake-source behavior (`pocket-journal-ap4.1`,
+- [ ] Change Volume, Light/Dark, 12/24-hour, C/F, reading size, Alarm, Timer,
+  and Interval values. Reboot and confirm every setting persists. Check the
+  large day/date, temperature, humidity, battery percentage, Alarm HR/MIN
+  controls, and transcript text sizing (`pocket-journal-wsl`,
+  `pocket-journal-aw7`).
+- [ ] On USB power, press PWR once and confirm only the splash art is rendered
+  before sleep. Wake once and confirm direct return to Home, not Clock, with
+  fresh time/sensor data. The first refresh and first edge/corner touch must
+  work, with no double toggle (`pocket-journal-ap4.1`,
+  `pocket-journal-ap4`, `pocket-journal-jjt`).
+- [ ] Repeat the off/wake sequence on battery and record LED, disconnect,
+  current, and wake-source behavior (`pocket-journal-ap4.1`,
   `pocket-journal-ap4`).
 
-## Separate Decisions And Physical Work
+## Separate Physical And Perceptual Checks
 
-These do not interrupt the consolidated core pass.
+These checks do not block completion of the core regression pass.
 
-- [ ] Choose optional BLE possession, provisioning entry/timeout, replacement,
-  recovery, rate-limit, and clearing semantics. USB-C remains the default
-  (`pocket-journal-4et`; implementation remains `pocket-journal-db1`).
-- [ ] Approve same-origin portal session/authentication, CSRF, revision, and
-  capability scope before portal work (`pocket-journal-9si`; implementation
-  remains `pocket-journal-kky`).
-- [ ] Correct enclosure microphone and speaker openings, then capture controlled
-  before/after audio before detailed gain, filtering, crackle, or loudness tuning
-  (`pocket-journal-cpk`).
+- [ ] **Audio and enclosure:** correct the microphone and speaker openings,
+  then record matched speech and silence samples. Compare intelligibility,
+  noise, pops, clicks, crackle, and playback loudness before detailed gain or
+  filtering changes (`pocket-journal-cpk`, `pocket-journal-zon`).
+- [ ] **SD recovery:** using an expendable or backed-up card, test
+  remove/reinsert/remount, low/full-space behavior, and one interrupted write.
+  Existing valid notes must survive, unavailable operations must fail clearly,
+  and no phantom/corrupt note may appear (`pocket-journal-pc3`,
+  `pocket-journal-te0`).
+- [ ] **Provisioning decisions:** USB-C remains the default. BLE possession and
+  recovery semantics and portal authentication/capability scope still require
+  explicit product decisions (`pocket-journal-4et`, `pocket-journal-9si`).
+
+## OTA Deferred
+
+Do not run OTA in this batch. The previous OTA candidate predates the fixes in
+`4fe641c` and is not nominated. A fresh signed candidate, manifest, digest, and
+rollback plan must be prepared and identified before hardware OTA validation
+(`pocket-journal-i4s`, `pocket-journal-i4s.2`). Do not create or publish a
+release tag without explicit human approval.
 
 ## Result Template
 
-For each checked or blocked section, record the firmware version, exact actions,
-expected and observed behavior, board/power/enclosure state, and only the small
-relevant log/photo/recording excerpt. State any obvious bead that can close or
-the narrow follow-up defect. Agents will reconcile Beads and this file; unchanged
-verified behavior is not retested.
+For each completed or blocked section, record:
+
+- Firmware version and exact actions.
+- Expected and observed behavior.
+- Board, power, enclosure, SD, and network state.
+- Only the smallest relevant photo, recording, or log excerpt.
+- Any clear Bead closure evidence or the narrow new defect.
+
+Agents will reconcile the notes with Beads. Already verified behavior does not
+need to be retested on unchanged firmware.
