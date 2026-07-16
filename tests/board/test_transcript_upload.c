@@ -7,6 +7,10 @@
 
 int main(void)
 {
+    static const char raw_sha256[] =
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    static const char enhanced_sha256[] =
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
     const char rich[] =
         "{\"text\":\"hello\",\"language\":\"en\",\"segments\":[{\"start\":0.0,\"end\":1.0}],"
         "\"future_metadata\":{\"speaker\":\"unknown\"}}";
@@ -18,6 +22,50 @@ int main(void)
     assert(pj_transcript_body_validate("{bad", 4, 4) == PJ_TRANSCRIPT_BODY_MALFORMED);
     assert(pj_transcript_body_validate("{\"text\":\"\"}", 11, 11) ==
            PJ_TRANSCRIPT_BODY_INVALID_CONTENT);
+
+    const char matching_source[] =
+        "{\"text\":\"hello\",\"source\":{"
+        "\"sha256\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\","
+        "\"bytes\":1234}}";
+    assert(pj_transcript_source_check(matching_source,
+                                      strlen(matching_source), raw_sha256,
+                                      1234U) == PJ_TRANSCRIPT_SOURCE_MATCH);
+    assert(pj_transcript_source_check(matching_source,
+                                      strlen(matching_source), enhanced_sha256,
+                                      1234U) == PJ_TRANSCRIPT_SOURCE_MISMATCH);
+    assert(pj_transcript_source_commit_decision(
+               pj_transcript_source_check(matching_source,
+                                          strlen(matching_source),
+                                          enhanced_sha256, 1234U)) ==
+           PJ_TRANSCRIPT_COMMIT_SOURCE_RETRY_CHANGED);
+    assert(pj_transcript_source_check(matching_source,
+                                      strlen(matching_source), raw_sha256,
+                                      1235U) == PJ_TRANSCRIPT_SOURCE_MISMATCH);
+
+    const char no_source[] = "{\"text\":\"legacy client\"}";
+    assert(pj_transcript_source_check(no_source, strlen(no_source), raw_sha256,
+                                      1234U) ==
+           PJ_TRANSCRIPT_SOURCE_UNSPECIFIED);
+    assert(pj_transcript_source_commit_decision(
+               PJ_TRANSCRIPT_SOURCE_UNSPECIFIED) ==
+           PJ_TRANSCRIPT_COMMIT_SOURCE_ACCEPT);
+    const char malformed_source[] =
+        "{\"text\":\"hello\",\"source\":{\"sha256\":\"not-a-hash\","
+        "\"bytes\":1234}}";
+    assert(pj_transcript_source_check(malformed_source,
+                                      strlen(malformed_source), raw_sha256,
+                                      1234U) == PJ_TRANSCRIPT_SOURCE_INVALID);
+    assert(pj_transcript_source_commit_decision(
+               PJ_TRANSCRIPT_SOURCE_INVALID) ==
+           PJ_TRANSCRIPT_COMMIT_SOURCE_REJECT_INVALID);
+    const char fractional_source_bytes[] =
+        "{\"text\":\"hello\",\"source\":{"
+        "\"sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\","
+        "\"bytes\":1234.5}}";
+    assert(pj_transcript_source_check(fractional_source_bytes,
+                                      strlen(fractional_source_bytes),
+                                      raw_sha256, 1234U) ==
+           PJ_TRANSCRIPT_SOURCE_MISMATCH);
 
     char embedded_nul[] = {'{', '\0', '}'};
     assert(pj_transcript_body_validate(embedded_nul, sizeof(embedded_nul),

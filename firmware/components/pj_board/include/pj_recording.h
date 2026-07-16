@@ -25,6 +25,8 @@ typedef struct {
     uint8_t completion_succeeded;
 } pj_recording_t;
 
+typedef int (*pj_recording_path_validator_t)(const char *path, void *context);
+
 void pj_recording_init(pj_recording_t *recording);
 int pj_recording_start(pj_recording_t *recording, uint32_t sample_rate,
                        uint16_t channels, uint16_t bits_per_sample);
@@ -36,6 +38,16 @@ uint64_t pj_recording_elapsed_ms(const pj_recording_t *recording);
 
 /* Returns one completion event at most once for each start. */
 int pj_recording_take_completion(pj_recording_t *recording, int *succeeded);
+
+/*
+ * Atomically replace a published raw recording with processed audio. Any
+ * transcript marker is moved aside before the audio bytes change, so a crash
+ * or successful replacement leaves the new audio pending for Sync.
+ */
+int pj_recording_replace_processed(
+    const char *processed_path, const char *published_path,
+    const char *transcript_marker_path,
+    pj_recording_path_validator_t validate, void *validate_context);
 
 #ifdef __cplusplus
 }

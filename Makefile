@@ -35,6 +35,7 @@ OTA_POLICY_TEST_BIN := build/test_ota_policy
 WIFI_STATE_TEST_BIN := build/test_wifi_state
 TIME_SYNC_TEST_BIN := build/test_time_sync
 COMPANION_SYNC_TEST_BIN := build/test_companion_sync
+COMPANION_SYNC_RUNTIME_TEST_BIN := build/test_companion_sync_runtime
 LVGL_DIR := firmware/managed_components/lvgl__lvgl
 ifneq ($(wildcard $(LVGL_DIR)/src),)
 LVGL_SRCS := $(wildcard $(LVGL_DIR)/src/*.c)
@@ -152,8 +153,12 @@ test-input: test-display-worker test-sync-inventory-gate test-display-pipeline
 	$(ALERT_AUDIO_TEST_BIN)
 	$(CC) $(CFLAGS) \
 		-Ifirmware/components/pj_board/include \
+		-Ifirmware/managed_components/espressif__cjson/cJSON \
+		firmware/managed_components/espressif__cjson/cJSON/cJSON.c \
 		firmware/components/pj_board/pj_recording.c \
+		firmware/components/pj_board/pj_transcript_upload.c \
 		tests/board/test_recording.c \
+		-lm \
 		-o $(RECORDING_TEST_BIN)
 	$(RECORDING_TEST_BIN)
 	$(CC) $(CFLAGS) \
@@ -288,6 +293,13 @@ test-input: test-display-worker test-sync-inventory-gate test-display-pipeline
 		tests/board/test_companion_sync.c \
 		-o $(COMPANION_SYNC_TEST_BIN)
 	$(COMPANION_SYNC_TEST_BIN)
+	$(CC) $(CFLAGS) \
+		-Ifirmware/components/pj_board/include \
+		-Ifirmware/components/pj_ui/include \
+		firmware/components/pj_board/pj_companion_sync_runtime.c \
+		tests/board/test_companion_sync_runtime.c \
+		-o $(COMPANION_SYNC_RUNTIME_TEST_BIN)
+	$(COMPANION_SYNC_RUNTIME_TEST_BIN)
 
 test-partner:
 	cd partner && PYTHONPATH=src python -m unittest discover -s ../tests/partner -p 'test_*.py'

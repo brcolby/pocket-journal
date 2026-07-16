@@ -3637,34 +3637,6 @@ static cJSON *json_read_file(const char *path, size_t max_bytes)
     return json;
 }
 
-static char *text_read_file(const char *path, size_t max_bytes,
-                            size_t *body_size)
-{
-    struct stat st;
-    if (path == NULL || body_size == NULL || stat(path, &st) != 0 ||
-        st.st_size <= 0 || (size_t)st.st_size > max_bytes) {
-        return NULL;
-    }
-    FILE *file = fopen(path, "rb");
-    if (file == NULL) {
-        return NULL;
-    }
-    char *body = malloc((size_t)st.st_size + 1U);
-    if (body == NULL) {
-        fclose(file);
-        return NULL;
-    }
-    size_t read = fread(body, 1, (size_t)st.st_size, file);
-    fclose(file);
-    if (read != (size_t)st.st_size) {
-        free(body);
-        return NULL;
-    }
-    body[read] = '\0';
-    *body_size = read;
-    return body;
-}
-
 static esp_err_t json_write_file_atomic(const char *path, const char *body, size_t body_size)
 {
     char temporary_path[256];
@@ -3793,14 +3765,7 @@ static int transcript_label_for_audio(const char *filename, char *label, size_t 
     if (!transcript_path_for_audio(path, path_size, filename)) {
         return 0;
     }
-    size_t body_size = 0U;
-    char *body = text_read_file(path, PJ_TRANSCRIPT_MAX_BODY_BYTES, &body_size);
-    if (body == NULL) {
-        return 0;
-    }
-    int result = pj_transcript_label_extract(body, body_size, label, label_size);
-    free(body);
-    return result;
+    return pj_transcript_marker_load(path, label, label_size);
 }
 
 static void write_recording_metadata(const char *final_path, uint32_t data_bytes)
@@ -5906,51 +5871,30 @@ static int recording_copy_for_processing(const char *source_path,
     return 1;
 }
 
+static int recording_file_valid_for_replace(const char *path, void *context)
+{
+    return context != NULL &&
+           recording_file_valid(path, *(const uint32_t *)context);
+}
+
 static int recording_replace_with_processed(const char *temporary_path,
                                             const char *final_path,
                                             uint32_t data_bytes)
 {
-    char backup_path[144];
-    int backup_length = snprintf(backup_path, sizeof(backup_path), "%s.bak",
-                                 final_path);
-    if (backup_length < 0 || backup_length >= (int)sizeof(backup_path) ||
-        !recording_file_valid(temporary_path, data_bytes)) {
+    const char *filename = strrchr(final_path, '/');
+    char transcript_path[PJ_NOTE_TRANSCRIPT_PATH_LEN];
+    if (filename == NULL || filename[1] == '\0' ||
+        !transcript_path_for_audio(transcript_path, sizeof(transcript_path),
+                                   filename + 1)) {
         return 0;
     }
     memset(&g_usb_audio_identity, 0, sizeof(g_usb_audio_identity));
-    if (remove(backup_path) != 0 && errno != ENOENT) {
-        ESP_LOGE(TAG, "Audio processing stale backup removal failed: %s errno=%d",
-                 backup_path, errno);
+    uint32_t expected_data_bytes = data_bytes;
+    if (!pj_recording_replace_processed(
+            temporary_path, final_path, transcript_path,
+            recording_file_valid_for_replace, &expected_data_bytes)) {
+        ESP_LOGE(TAG, "Audio processing publication failed: %s", final_path);
         return 0;
-    }
-    if (rename(final_path, backup_path) != 0) {
-        ESP_LOGW(TAG, "Audio processing raw backup failed: %s errno=%d",
-                 final_path, errno);
-        return 0;
-    }
-    if (rename(temporary_path, final_path) != 0) {
-        int publish_errno = errno;
-        if (rename(backup_path, final_path) != 0) {
-            ESP_LOGE(TAG, "Raw recording retained at %s; restore failed errno=%d",
-                     backup_path, errno);
-        }
-        ESP_LOGE(TAG, "Audio processing publication failed: %s errno=%d",
-                 final_path, publish_errno);
-        return 0;
-    }
-    if (!recording_file_valid(final_path, data_bytes)) {
-        ESP_LOGE(TAG, "Processed recording failed post-publication validation: %s",
-                 final_path);
-        remove(final_path);
-        if (rename(backup_path, final_path) != 0) {
-            ESP_LOGE(TAG, "Raw recording retained at %s; restore failed errno=%d",
-                     backup_path, errno);
-        }
-        return 0;
-    }
-    if (remove(backup_path) != 0 && errno != ENOENT) {
-        ESP_LOGW(TAG, "Processed recording published; raw backup cleanup failed: %s errno=%d",
-                 backup_path, errno);
     }
     return 1;
 }
@@ -9027,6 +8971,21 @@ static int file_sha256_hex_unlocked(const char *path, char out[65]);
 static int audio_sha256_hex_unlocked(const char *filename, char out[65]);
 static int audio_sha256_hex(const char *filename, char out[65]);
 
+static int transcript_source_check_audio_unlocked(
+    const char *body, size_t body_size, const pj_audio_entry_t *entry,
+    pj_transcript_source_result_t *result)
+{
+    char current_sha256[65];
+    if (body == NULL || entry == NULL || result == NULL ||
+        entry->size_bytes < 0 ||
+        !audio_sha256_hex_unlocked(entry->filename, current_sha256)) {
+        return 0;
+    }
+    *result = pj_transcript_source_check(
+        body, body_size, current_sha256, (uint64_t)entry->size_bytes);
+    return 1;
+}
+
 static int serial_command_prefix(const char *line, const char *command)
 {
     size_t size = strlen(command);
@@ -10011,16 +9970,52 @@ static void serial_transcript_commit(char *line)
                               "invalid_transcript", 0);
             return;
         }
+        if (!storage_shared_try_acquire()) {
+            free(body);
+            serial_sync_error(command, request_id, "storage maintenance active",
+                              "storage_busy", 1);
+            return;
+        }
         pj_audio_entry_t entry;
-        if (!probe_audio_entry(g_usb_upload.audio_id, &entry)) {
+        if (!probe_audio_entry_unlocked(g_usb_upload.audio_id, &entry)) {
+            storage_shared_release();
             free(body);
             serial_sync_error(command, request_id, "audio not found",
                               "audio_not_found", 0);
             return;
         }
+        pj_transcript_source_result_t source_result;
+        if (!transcript_source_check_audio_unlocked(
+                body, body_size, &entry, &source_result)) {
+            storage_shared_release();
+            free(body);
+            serial_sync_error(command, request_id,
+                              "audio checksum could not be read",
+                              "storage_io", 1);
+            return;
+        }
+        pj_transcript_commit_source_decision_t source_decision =
+            pj_transcript_source_commit_decision(source_result);
+        if (source_decision == PJ_TRANSCRIPT_COMMIT_SOURCE_RETRY_CHANGED) {
+            storage_shared_release();
+            free(body);
+            serial_sync_error(command, request_id,
+                              "audio source changed; download and retry",
+                              "source_changed", 1);
+            return;
+        }
+        if (source_decision == PJ_TRANSCRIPT_COMMIT_SOURCE_REJECT_INVALID) {
+            storage_shared_release();
+            free(body);
+            serial_sync_error(command, request_id,
+                              "invalid transcript source provenance",
+                              "invalid_transcript", 0);
+            return;
+        }
         char path[PJ_NOTE_TRANSCRIPT_PATH_LEN];
         if (!transcript_path_for_audio(path, sizeof(path),
                                        g_usb_upload.audio_id)) {
+            storage_shared_release();
             free(body);
             serial_sync_error(command, request_id, "invalid audio id",
                               "invalid_arguments", 0);
@@ -10029,6 +10024,7 @@ static void serial_transcript_commit(char *line)
         esp_err_t write_error = json_write_file_atomic(path, body, body_size);
         free(body);
         if (write_error != ESP_OK) {
+            storage_shared_release();
             serial_sync_error(command, request_id,
                               "transcript could not be committed",
                               write_error == ESP_ERR_INVALID_STATE ?
@@ -10036,13 +10032,11 @@ static void serial_transcript_commit(char *line)
                               1);
             return;
         }
-        if (storage_shared_try_acquire()) {
-            remove(PJ_USB_TRANSCRIPT_TEMP_PATH);
-            storage_shared_release();
-        }
-        if (!probe_audio_entry(g_usb_upload.audio_id, &entry)) {
+        remove(PJ_USB_TRANSCRIPT_TEMP_PATH);
+        if (!probe_audio_entry_unlocked(g_usb_upload.audio_id, &entry)) {
             ESP_LOGW(TAG, "USB transcript committed but metadata refresh failed");
         }
+        storage_shared_release();
         pj_usb_upload_mark_committed(&g_usb_upload);
         board_update_publish(BOARD_UPDATE_NOTES);
     }
@@ -11304,11 +11298,39 @@ static esp_err_t transcript_put_handler(httpd_req_t *req)
                          "\"code\":\"storage_busy\",\"retryable\":true}");
     }
     pj_audio_entry_t entry;
-    if (!probe_audio_entry(id + 1, &entry)) {
+    if (!probe_audio_entry_unlocked(id + 1, &entry)) {
         storage_shared_release();
         free(body);
         httpd_resp_set_status(req, "404 Not Found");
         return send_json(req, "{\"error\":\"audio not found\"}");
+    }
+    pj_transcript_source_result_t source_result;
+    if (!transcript_source_check_audio_unlocked(
+            body, (size_t)req->content_len, &entry, &source_result)) {
+        storage_shared_release();
+        free(body);
+        httpd_resp_set_status(req, "500 Internal Server Error");
+        return send_json(req,
+                         "{\"error\":\"audio checksum could not be read\","
+                         "\"code\":\"storage_io\",\"retryable\":true}");
+    }
+    pj_transcript_commit_source_decision_t source_decision =
+        pj_transcript_source_commit_decision(source_result);
+    if (source_decision == PJ_TRANSCRIPT_COMMIT_SOURCE_RETRY_CHANGED) {
+        storage_shared_release();
+        free(body);
+        httpd_resp_set_status(req, "409 Conflict");
+        return send_json(req,
+                         "{\"error\":\"audio source changed; download and retry\","
+                         "\"code\":\"source_changed\",\"retryable\":true}");
+    }
+    if (source_decision == PJ_TRANSCRIPT_COMMIT_SOURCE_REJECT_INVALID) {
+        storage_shared_release();
+        free(body);
+        httpd_resp_set_status(req, "400 Bad Request");
+        return send_json(req,
+                         "{\"error\":\"invalid transcript source provenance\","
+                         "\"code\":\"invalid_transcript\",\"retryable\":false}");
     }
     char path[PJ_NOTE_TRANSCRIPT_PATH_LEN];
     if (!transcript_path_for_audio(path, sizeof(path), id + 1)) {
@@ -11337,7 +11359,7 @@ static esp_err_t transcript_put_handler(httpd_req_t *req)
         httpd_resp_set_status(req, "500 Internal Server Error");
         return send_json(req, "{\"error\":\"transcript store failed\"}");
     }
-    if (!probe_audio_entry(id + 1, &entry)) {
+    if (!probe_audio_entry_unlocked(id + 1, &entry)) {
         ESP_LOGW(TAG, "Transcript stored but note metadata refresh failed: %s", id + 1);
     }
     storage_shared_release();

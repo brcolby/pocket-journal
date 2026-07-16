@@ -1,6 +1,8 @@
 #include "pj_recording.h"
 
+#include <errno.h>
 #include <limits.h>
+#include <stdio.h>
 #include <string.h>
 
 static int format_valid(uint32_t sample_rate, uint16_t channels,
@@ -120,5 +122,89 @@ int pj_recording_take_completion(pj_recording_t *recording, int *succeeded)
     }
     *succeeded = recording->completion_succeeded != 0;
     recording->completion_pending = 0;
+    return 1;
+}
+
+static int format_artifact_path(char *output, size_t output_size,
+                                const char *path, const char *suffix)
+{
+    if (output == NULL || output_size == 0U || path == NULL || suffix == NULL) {
+        return 0;
+    }
+    int written = snprintf(output, output_size, "%s%s", path, suffix);
+    return written >= 0 && (size_t)written < output_size;
+}
+
+static int remove_if_present(const char *path)
+{
+    return remove(path) == 0 || errno == ENOENT;
+}
+
+static int restore_marker(const char *temporary_path, const char *marker_path,
+                          int marker_moved)
+{
+    if (!marker_moved) {
+        return 1;
+    }
+    if (!remove_if_present(marker_path)) {
+        return 0;
+    }
+    return rename(temporary_path, marker_path) == 0;
+}
+
+int pj_recording_replace_processed(
+    const char *processed_path, const char *published_path,
+    const char *transcript_marker_path,
+    pj_recording_path_validator_t validate, void *validate_context)
+{
+    char audio_backup[256];
+    char marker_temporary[256];
+    if (processed_path == NULL || published_path == NULL ||
+        transcript_marker_path == NULL || validate == NULL ||
+        !format_artifact_path(audio_backup, sizeof(audio_backup),
+                              published_path, ".bak") ||
+        !format_artifact_path(marker_temporary, sizeof(marker_temporary),
+                              transcript_marker_path, ".tmp") ||
+        !validate(processed_path, validate_context)) {
+        return 0;
+    }
+
+    if (!remove_if_present(marker_temporary)) {
+        return 0;
+    }
+    int marker_moved = rename(transcript_marker_path, marker_temporary) == 0;
+    if (!marker_moved && errno != ENOENT) {
+        return 0;
+    }
+    if (!remove_if_present(audio_backup)) {
+        (void)restore_marker(marker_temporary, transcript_marker_path,
+                             marker_moved);
+        return 0;
+    }
+    if (rename(published_path, audio_backup) != 0) {
+        (void)restore_marker(marker_temporary, transcript_marker_path,
+                             marker_moved);
+        return 0;
+    }
+    if (rename(processed_path, published_path) != 0) {
+        int audio_restored = rename(audio_backup, published_path) == 0;
+        if (audio_restored) {
+            (void)restore_marker(marker_temporary, transcript_marker_path,
+                                 marker_moved);
+        }
+        return 0;
+    }
+    if (!validate(published_path, validate_context)) {
+        (void)remove(published_path);
+        int audio_restored = rename(audio_backup, published_path) == 0;
+        if (audio_restored) {
+            (void)restore_marker(marker_temporary, transcript_marker_path,
+                                 marker_moved);
+        }
+        return 0;
+    }
+
+    (void)remove(audio_backup);
+    (void)remove(marker_temporary);
     return 1;
 }
