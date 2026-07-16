@@ -32,9 +32,13 @@ assert.ok(fontAsset.sizes["2"].glyphs.A.rows.join("").includes("1"));
 assert.ok(fontAsset.sizes["2"].glyphs.Z.rows.join("").includes("1"));
 for (const size of Object.values(fontAsset.sizes)) {
   const capitals = [..."ABCDEFGHIJKLMNOPQRSTUVWXYZ"].map((char) => size.glyphs[char]);
+  const digits = [..."0123456789"].map((char) => size.glyphs[char]);
   assert.ok(capitals[0].y_offset < size.ascent);
   assert.ok(capitals.every((glyph) => glyph.y_offset === capitals[0].y_offset));
   assert.ok(capitals.every((glyph) => glyph.y_offset + glyph.height <= size.line_height));
+  assert.ok(digits.every((glyph) => glyph.y_offset === digits[0].y_offset));
+  assert.ok(digits.every((glyph) => glyph.y_offset + glyph.height <= size.line_height));
+  assert.notDeepEqual(size.glyphs["1"].rows, size.glyphs["9"].rows);
 }
 assert.equal(iconAsset.family, "Carbon Icons");
 assert.equal(iconAsset.source, "assets/icons/carbon/svg/32");
