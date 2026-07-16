@@ -5,6 +5,24 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+
+#if defined(__GNUC__)
+#define PJ_STORAGE_WEAK __attribute__((weak))
+#else
+#define PJ_STORAGE_WEAK
+#endif
+
+PJ_STORAGE_WEAK int pj_storage_fs_remove(const char *path)
+{
+    return remove(path);
+}
+
+PJ_STORAGE_WEAK int pj_storage_fs_rename(const char *old_path,
+                                         const char *new_path)
+{
+    return rename(old_path, new_path);
+}
 
 static int has_suffix(const char *value, const char *suffix)
 {
@@ -90,11 +108,57 @@ pj_storage_recovery_action_t pj_storage_recovery_action(const char *filename, in
     if (has_suffix(filename, ".wav.tmp") || has_suffix(filename, ".json.tmp")) {
         return PJ_STORAGE_RECOVERY_DELETE_TEMP;
     }
-    if (has_suffix(filename, ".json.bak") ||
-        has_suffix(filename, ".wav.bak")) {
+    if (has_suffix(filename, ".wav.bak")) {
+        return PJ_STORAGE_RECOVERY_VALIDATE_BACKUP;
+    }
+    if (has_suffix(filename, ".json.bak")) {
         return target_exists ? PJ_STORAGE_RECOVERY_DELETE_BACKUP : PJ_STORAGE_RECOVERY_RESTORE_BACKUP;
     }
     return PJ_STORAGE_RECOVERY_IGNORE;
+}
+
+pj_storage_backup_recovery_result_t pj_storage_recover_backup(
+    const char *backup_path, const char *target_path,
+    pj_storage_path_validator_t validate, void *validate_context)
+{
+    if (backup_path == NULL || target_path == NULL || validate == NULL ||
+        backup_path[0] == '\0' || target_path[0] == '\0' ||
+        strcmp(backup_path, target_path) == 0) {
+        return PJ_STORAGE_BACKUP_RECOVERY_FAILED;
+    }
+
+    struct stat backup_stat;
+    if (stat(backup_path, &backup_stat) != 0) {
+        return errno == ENOENT ? PJ_STORAGE_BACKUP_RECOVERY_NONE :
+                                PJ_STORAGE_BACKUP_RECOVERY_FAILED;
+    }
+
+    int backup_validity = validate(backup_path, validate_context);
+    int target_validity = validate(target_path, validate_context);
+    if (backup_validity < 0 || target_validity < 0) {
+        return PJ_STORAGE_BACKUP_RECOVERY_FAILED;
+    }
+    if (backup_validity > 0) {
+        if (pj_storage_fs_remove(target_path) != 0 && errno != ENOENT) {
+            return PJ_STORAGE_BACKUP_RECOVERY_FAILED;
+        }
+        if (pj_storage_fs_rename(backup_path, target_path) != 0) {
+            return PJ_STORAGE_BACKUP_RECOVERY_FAILED;
+        }
+        int restored_validity = validate(target_path, validate_context);
+        if (restored_validity <= 0) {
+            (void)pj_storage_fs_rename(target_path, backup_path);
+            return PJ_STORAGE_BACKUP_RECOVERY_FAILED;
+        }
+        return PJ_STORAGE_BACKUP_RECOVERY_RESTORED;
+    }
+
+    if (target_validity > 0) {
+        return pj_storage_fs_remove(backup_path) == 0 || errno == ENOENT ?
+                   PJ_STORAGE_BACKUP_RECOVERY_REMOVED :
+                   PJ_STORAGE_BACKUP_RECOVERY_FAILED;
+    }
+    return PJ_STORAGE_BACKUP_RECOVERY_NONE;
 }
 
 pj_storage_delete_result_t pj_storage_delete_matching(const char *dir_path,
@@ -173,7 +237,7 @@ pj_storage_delete_result_t pj_storage_delete_matching(const char *dir_path,
     if (result.close_errno == 0) {
         for (size_t i = 0; i < result.snapshotted; i++) {
             errno = 0;
-            if (remove(paths[i]) == 0) {
+            if (pj_storage_fs_remove(paths[i]) == 0) {
                 result.deleted++;
                 continue;
             }

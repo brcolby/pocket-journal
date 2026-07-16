@@ -2,16 +2,53 @@
 #include "pj_transcript_upload.h"
 
 #include <assert.h>
+#include <errno.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 
 typedef struct {
-    const uint8_t *expected;
-    size_t expected_size;
+    const uint8_t *accepted[2];
+    size_t accepted_size[2];
     unsigned calls;
-    int fail_after_publish;
+    unsigned fail_on_call;
 } replacement_validation_t;
+
+static const char *g_fail_remove_path;
+static const char *g_fail_rename_old_path;
+static const char *g_fail_rename_new_path;
+
+int pj_recording_fs_remove(const char *path)
+{
+    if (g_fail_remove_path != NULL &&
+        strcmp(path, g_fail_remove_path) == 0) {
+        g_fail_remove_path = NULL;
+        errno = EIO;
+        return -1;
+    }
+    return remove(path);
+}
+
+int pj_recording_fs_rename(const char *old_path, const char *new_path)
+{
+    if (g_fail_rename_old_path != NULL &&
+        g_fail_rename_new_path != NULL &&
+        strcmp(old_path, g_fail_rename_old_path) == 0 &&
+        strcmp(new_path, g_fail_rename_new_path) == 0) {
+        g_fail_rename_old_path = NULL;
+        g_fail_rename_new_path = NULL;
+        errno = EIO;
+        return -1;
+    }
+    return rename(old_path, new_path);
+}
+
+static void reset_fs_faults(void)
+{
+    g_fail_remove_path = NULL;
+    g_fail_rename_old_path = NULL;
+    g_fail_rename_new_path = NULL;
+}
 
 static int write_bytes(const char *path, const void *data, size_t size)
 {
@@ -57,13 +94,22 @@ static int replacement_validate(const char *path, void *opaque)
 {
     replacement_validation_t *validation = opaque;
     validation->calls++;
-    if (validation->fail_after_publish && validation->calls > 1U) {
+    if (validation->fail_on_call == validation->calls) {
         return 0;
     }
     uint8_t actual[64];
-    assert(validation->expected_size <= sizeof(actual));
-    return read_bytes(path, actual, validation->expected_size) &&
-           memcmp(actual, validation->expected, validation->expected_size) == 0;
+    for (size_t i = 0; i < 2U; i++) {
+        if (validation->accepted[i] == NULL) {
+            continue;
+        }
+        assert(validation->accepted_size[i] <= sizeof(actual));
+        if (read_bytes(path, actual, validation->accepted_size[i]) &&
+            memcmp(actual, validation->accepted[i],
+                   validation->accepted_size[i]) == 0) {
+            return 1;
+        }
+    }
+    return 0;
 }
 
 static void remove_replacement_artifacts(const char *published,
@@ -78,6 +124,7 @@ static void remove_replacement_artifacts(const char *published,
     (void)remove(path);
     (void)snprintf(path, sizeof(path), "%s.tmp", transcript);
     (void)remove(path);
+    reset_fs_faults();
 }
 
 static void test_progress_comes_only_from_committed_pcm(void)
@@ -184,12 +231,12 @@ static void test_raw_synced_processed_swap_becomes_pending_with_new_hash(void)
     assert(raw_hash != enhanced_hash);
 
     replacement_validation_t validation = {
-        .expected = enhanced,
-        .expected_size = sizeof(enhanced),
+        .accepted = {raw, enhanced},
+        .accepted_size = {sizeof(raw), sizeof(enhanced)},
     };
     assert(pj_recording_replace_processed(
         processed, published, transcript, replacement_validate, &validation));
-    assert(validation.calls == 2U);
+    assert(validation.calls == 3U);
     assert(file_hash(published) == enhanced_hash);
     assert(file_hash(published) != raw_hash);
     assert(!file_exists(transcript));
@@ -214,9 +261,9 @@ static void test_failed_processed_swap_restores_raw_and_sync_marker(void)
     assert(write_bytes(transcript, synced, sizeof(synced) - 1U));
 
     replacement_validation_t validation = {
-        .expected = enhanced,
-        .expected_size = sizeof(enhanced),
-        .fail_after_publish = 1,
+        .accepted = {raw, enhanced},
+        .accepted_size = {sizeof(raw), sizeof(enhanced)},
+        .fail_on_call = 3U,
     };
     assert(!pj_recording_replace_processed(
         processed, published, transcript, replacement_validate, &validation));
@@ -231,6 +278,164 @@ static void test_failed_processed_swap_restores_raw_and_sync_marker(void)
     remove_replacement_artifacts(published, processed, transcript);
 }
 
+static void test_failed_validation_remove_keeps_raw_backup(void)
+{
+    static const char published[] = "build/recording-remove-failure.wav";
+    static const char processed[] = "build/recording-remove-failure.processed";
+    static const char transcript[] = "build/recording-remove-failure.json";
+    static const char backup[] = "build/recording-remove-failure.wav.bak";
+    static const char marker_temporary[] =
+        "build/recording-remove-failure.json.tmp";
+    static const uint8_t raw[] = "raw survives target remove failure";
+    static const uint8_t enhanced[] = "invalid processed target remains";
+    static const char synced[] = "{\"text\":\"raw marker\"}";
+    remove_replacement_artifacts(published, processed, transcript);
+    assert(write_bytes(published, raw, sizeof(raw)));
+    assert(write_bytes(processed, enhanced, sizeof(enhanced)));
+    assert(write_bytes(transcript, synced, sizeof(synced) - 1U));
+
+    replacement_validation_t validation = {
+        .accepted = {raw, enhanced},
+        .accepted_size = {sizeof(raw), sizeof(enhanced)},
+        .fail_on_call = 3U,
+    };
+    g_fail_remove_path = published;
+    assert(!pj_recording_replace_processed(
+        processed, published, transcript, replacement_validate, &validation));
+    uint8_t actual_raw[sizeof(raw)];
+    assert(read_bytes(backup, actual_raw, sizeof(actual_raw)));
+    assert(memcmp(actual_raw, raw, sizeof(raw)) == 0);
+    assert(file_exists(published));
+    assert(!file_exists(transcript));
+    assert(file_exists(marker_temporary));
+    remove_replacement_artifacts(published, processed, transcript);
+}
+
+static void test_failed_validation_rename_keeps_raw_backup(void)
+{
+    static const char published[] = "build/recording-rename-failure.wav";
+    static const char processed[] = "build/recording-rename-failure.processed";
+    static const char transcript[] = "build/recording-rename-failure.json";
+    static const char backup[] = "build/recording-rename-failure.wav.bak";
+    static const char marker_temporary[] =
+        "build/recording-rename-failure.json.tmp";
+    static const uint8_t raw[] = "raw survives rollback rename failure";
+    static const uint8_t enhanced[] = "processed target fails validation";
+    static const char synced[] = "{\"text\":\"raw marker\"}";
+    remove_replacement_artifacts(published, processed, transcript);
+    assert(write_bytes(published, raw, sizeof(raw)));
+    assert(write_bytes(processed, enhanced, sizeof(enhanced)));
+    assert(write_bytes(transcript, synced, sizeof(synced) - 1U));
+
+    replacement_validation_t validation = {
+        .accepted = {raw, enhanced},
+        .accepted_size = {sizeof(raw), sizeof(enhanced)},
+        .fail_on_call = 3U,
+    };
+    g_fail_rename_old_path = backup;
+    g_fail_rename_new_path = published;
+    assert(!pj_recording_replace_processed(
+        processed, published, transcript, replacement_validate, &validation));
+    uint8_t actual_raw[sizeof(raw)];
+    assert(read_bytes(backup, actual_raw, sizeof(actual_raw)));
+    assert(memcmp(actual_raw, raw, sizeof(raw)) == 0);
+    assert(!file_exists(published));
+    assert(!file_exists(transcript));
+    assert(file_exists(marker_temporary));
+    remove_replacement_artifacts(published, processed, transcript);
+}
+
+static void test_backup_cleanup_failure_rolls_back_to_raw(void)
+{
+    static const char published[] = "build/recording-cleanup-failure.wav";
+    static const char processed[] = "build/recording-cleanup-failure.processed";
+    static const char transcript[] = "build/recording-cleanup-failure.json";
+    static const char backup[] = "build/recording-cleanup-failure.wav.bak";
+    static const uint8_t raw[] = "raw restored when backup cleanup fails";
+    static const uint8_t enhanced[] = "valid processed target not committed";
+    static const char synced[] = "{\"text\":\"raw marker\"}";
+    remove_replacement_artifacts(published, processed, transcript);
+    assert(write_bytes(published, raw, sizeof(raw)));
+    assert(write_bytes(processed, enhanced, sizeof(enhanced)));
+    assert(write_bytes(transcript, synced, sizeof(synced) - 1U));
+
+    replacement_validation_t validation = {
+        .accepted = {raw, enhanced},
+        .accepted_size = {sizeof(raw), sizeof(enhanced)},
+    };
+    g_fail_remove_path = backup;
+    assert(!pj_recording_replace_processed(
+        processed, published, transcript, replacement_validate, &validation));
+    uint8_t actual_raw[sizeof(raw)];
+    assert(read_bytes(published, actual_raw, sizeof(actual_raw)));
+    assert(memcmp(actual_raw, raw, sizeof(raw)) == 0);
+    assert(!file_exists(backup));
+    assert(!file_exists(transcript));
+    assert(!file_exists("build/recording-cleanup-failure.json.tmp"));
+    remove_replacement_artifacts(published, processed, transcript);
+}
+
+static void test_marker_cleanup_failure_rolls_back_before_commit(void)
+{
+    static const char published[] = "build/recording-marker-failure.wav";
+    static const char processed[] = "build/recording-marker-failure.processed";
+    static const char transcript[] = "build/recording-marker-failure.json";
+    static const char backup[] = "build/recording-marker-failure.wav.bak";
+    static const char marker_temporary[] =
+        "build/recording-marker-failure.json.tmp";
+    static const uint8_t raw[] = "raw retained until marker invalidation";
+    static const uint8_t enhanced[] = "processed audio awaiting commit";
+    static const char synced[] = "{\"text\":\"raw marker\"}";
+    remove_replacement_artifacts(published, processed, transcript);
+    assert(write_bytes(published, raw, sizeof(raw)));
+    assert(write_bytes(processed, enhanced, sizeof(enhanced)));
+    assert(write_bytes(transcript, synced, sizeof(synced) - 1U));
+
+    replacement_validation_t validation = {
+        .accepted = {raw, enhanced},
+        .accepted_size = {sizeof(raw), sizeof(enhanced)},
+    };
+    g_fail_remove_path = marker_temporary;
+    assert(!pj_recording_replace_processed(
+        processed, published, transcript, replacement_validate, &validation));
+    uint8_t actual_raw[sizeof(raw)];
+    uint8_t actual_transcript[sizeof(synced) - 1U];
+    assert(read_bytes(published, actual_raw, sizeof(actual_raw)));
+    assert(memcmp(actual_raw, raw, sizeof(raw)) == 0);
+    assert(!file_exists(backup));
+    assert(read_bytes(transcript, actual_transcript, sizeof(actual_transcript)));
+    assert(memcmp(actual_transcript, synced, sizeof(actual_transcript)) == 0);
+    assert(!file_exists(marker_temporary));
+    remove_replacement_artifacts(published, processed, transcript);
+}
+
+static void test_existing_transaction_artifacts_are_never_overwritten(void)
+{
+    static const char published[] = "build/recording-stale.wav";
+    static const char processed[] = "build/recording-stale.processed";
+    static const char transcript[] = "build/recording-stale.json";
+    static const char backup[] = "build/recording-stale.wav.bak";
+    static const uint8_t raw[] = "current raw recording";
+    static const uint8_t older_raw[] = "only raw backup from prior transaction";
+    static const uint8_t enhanced[] = "new processed candidate";
+    remove_replacement_artifacts(published, processed, transcript);
+    assert(write_bytes(published, raw, sizeof(raw)));
+    assert(write_bytes(processed, enhanced, sizeof(enhanced)));
+    assert(write_bytes(backup, older_raw, sizeof(older_raw)));
+
+    replacement_validation_t validation = {
+        .accepted = {raw, enhanced},
+        .accepted_size = {sizeof(raw), sizeof(enhanced)},
+    };
+    assert(!pj_recording_replace_processed(
+        processed, published, transcript, replacement_validate, &validation));
+    uint8_t actual_backup[sizeof(older_raw)];
+    assert(read_bytes(backup, actual_backup, sizeof(actual_backup)));
+    assert(memcmp(actual_backup, older_raw, sizeof(older_raw)) == 0);
+    assert(file_exists(processed));
+    remove_replacement_artifacts(published, processed, transcript);
+}
+
 int main(void)
 {
     test_progress_comes_only_from_committed_pcm();
@@ -240,6 +445,11 @@ int main(void)
     test_invalid_transitions_and_overflow_are_rejected();
     test_raw_synced_processed_swap_becomes_pending_with_new_hash();
     test_failed_processed_swap_restores_raw_and_sync_marker();
+    test_failed_validation_remove_keeps_raw_backup();
+    test_failed_validation_rename_keeps_raw_backup();
+    test_backup_cleanup_failure_rolls_back_to_raw();
+    test_marker_cleanup_failure_rolls_back_before_commit();
+    test_existing_transaction_artifacts_are_never_overwritten();
     puts("recording lifecycle tests passed");
     return 0;
 }

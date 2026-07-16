@@ -4,6 +4,24 @@
 #include <limits.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/stat.h>
+
+#if defined(__GNUC__)
+#define PJ_RECORDING_WEAK __attribute__((weak))
+#else
+#define PJ_RECORDING_WEAK
+#endif
+
+PJ_RECORDING_WEAK int pj_recording_fs_remove(const char *path)
+{
+    return remove(path);
+}
+
+PJ_RECORDING_WEAK int pj_recording_fs_rename(const char *old_path,
+                                             const char *new_path)
+{
+    return rename(old_path, new_path);
+}
 
 static int format_valid(uint32_t sample_rate, uint16_t channels,
                         uint16_t bits_per_sample)
@@ -137,7 +155,16 @@ static int format_artifact_path(char *output, size_t output_size,
 
 static int remove_if_present(const char *path)
 {
-    return remove(path) == 0 || errno == ENOENT;
+    return pj_recording_fs_remove(path) == 0 || errno == ENOENT;
+}
+
+static int path_absent(const char *path)
+{
+    struct stat st;
+    if (stat(path, &st) == 0) {
+        return 0;
+    }
+    return errno == ENOENT;
 }
 
 static int restore_marker(const char *temporary_path, const char *marker_path,
@@ -149,7 +176,15 @@ static int restore_marker(const char *temporary_path, const char *marker_path,
     if (!remove_if_present(marker_path)) {
         return 0;
     }
-    return rename(temporary_path, marker_path) == 0;
+    return pj_recording_fs_rename(temporary_path, marker_path) == 0;
+}
+
+static int restore_audio(const char *backup_path, const char *published_path)
+{
+    if (!remove_if_present(published_path)) {
+        return 0;
+    }
+    return pj_recording_fs_rename(backup_path, published_path) == 0;
 }
 
 int pj_recording_replace_processed(
@@ -165,29 +200,24 @@ int pj_recording_replace_processed(
                               published_path, ".bak") ||
         !format_artifact_path(marker_temporary, sizeof(marker_temporary),
                               transcript_marker_path, ".tmp") ||
-        !validate(processed_path, validate_context)) {
+        !validate(processed_path, validate_context) ||
+        !validate(published_path, validate_context) ||
+        !path_absent(audio_backup) || !path_absent(marker_temporary)) {
         return 0;
     }
 
-    if (!remove_if_present(marker_temporary)) {
-        return 0;
-    }
-    int marker_moved = rename(transcript_marker_path, marker_temporary) == 0;
+    int marker_moved =
+        pj_recording_fs_rename(transcript_marker_path, marker_temporary) == 0;
     if (!marker_moved && errno != ENOENT) {
         return 0;
     }
-    if (!remove_if_present(audio_backup)) {
+    if (pj_recording_fs_rename(published_path, audio_backup) != 0) {
         (void)restore_marker(marker_temporary, transcript_marker_path,
                              marker_moved);
         return 0;
     }
-    if (rename(published_path, audio_backup) != 0) {
-        (void)restore_marker(marker_temporary, transcript_marker_path,
-                             marker_moved);
-        return 0;
-    }
-    if (rename(processed_path, published_path) != 0) {
-        int audio_restored = rename(audio_backup, published_path) == 0;
+    if (pj_recording_fs_rename(processed_path, published_path) != 0) {
+        int audio_restored = restore_audio(audio_backup, published_path);
         if (audio_restored) {
             (void)restore_marker(marker_temporary, transcript_marker_path,
                                  marker_moved);
@@ -195,8 +225,7 @@ int pj_recording_replace_processed(
         return 0;
     }
     if (!validate(published_path, validate_context)) {
-        (void)remove(published_path);
-        int audio_restored = rename(audio_backup, published_path) == 0;
+        int audio_restored = restore_audio(audio_backup, published_path);
         if (audio_restored) {
             (void)restore_marker(marker_temporary, transcript_marker_path,
                                  marker_moved);
@@ -204,7 +233,18 @@ int pj_recording_replace_processed(
         return 0;
     }
 
-    (void)remove(audio_backup);
-    (void)remove(marker_temporary);
+    /* Invalidate stale transcript provenance before removing the raw commit record. */
+    if (marker_moved && !remove_if_present(marker_temporary)) {
+        int audio_restored = restore_audio(audio_backup, published_path);
+        if (audio_restored) {
+            (void)restore_marker(marker_temporary, transcript_marker_path,
+                                 marker_moved);
+        }
+        return 0;
+    }
+    if (!remove_if_present(audio_backup)) {
+        (void)restore_audio(audio_backup, published_path);
+        return 0;
+    }
     return 1;
 }

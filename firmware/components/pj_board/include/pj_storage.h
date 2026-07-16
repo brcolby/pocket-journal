@@ -20,6 +20,7 @@ typedef enum {
     PJ_STORAGE_RECOVERY_DELETE_TEMP,
     PJ_STORAGE_RECOVERY_DELETE_BACKUP,
     PJ_STORAGE_RECOVERY_RESTORE_BACKUP,
+    PJ_STORAGE_RECOVERY_VALIDATE_BACKUP,
 } pj_storage_recovery_action_t;
 
 typedef struct {
@@ -30,6 +31,15 @@ typedef struct {
 } pj_storage_wav_info_t;
 
 typedef int (*pj_storage_name_match_fn)(const char *name);
+/* Returns positive for valid, zero for invalid/missing, negative for I/O error. */
+typedef int (*pj_storage_path_validator_t)(const char *path, void *context);
+
+typedef enum {
+    PJ_STORAGE_BACKUP_RECOVERY_FAILED = -1,
+    PJ_STORAGE_BACKUP_RECOVERY_NONE = 0,
+    PJ_STORAGE_BACKUP_RECOVERY_RESTORED,
+    PJ_STORAGE_BACKUP_RECOVERY_REMOVED,
+} pj_storage_backup_recovery_result_t;
 
 typedef struct {
     size_t matched;
@@ -52,6 +62,13 @@ pj_storage_health_t pj_storage_capacity_health(int mounted, int capacity_known,
                                                uint64_t reserve_bytes);
 int pj_storage_can_write(uint64_t free_bytes, uint64_t write_bytes, uint64_t reserve_bytes);
 pj_storage_recovery_action_t pj_storage_recovery_action(const char *filename, int target_exists);
+/*
+ * Resolve an interrupted replacement transaction. A valid backup is
+ * authoritative and is restored even when the target also validates.
+ */
+pj_storage_backup_recovery_result_t pj_storage_recover_backup(
+    const char *backup_path, const char *target_path,
+    pj_storage_path_validator_t validate, void *validate_context);
 /* Stops after max_entries plus one match, closes the directory, then removes snapshots. */
 pj_storage_delete_result_t pj_storage_delete_matching(const char *dir_path,
                                                        pj_storage_name_match_fn matches,
