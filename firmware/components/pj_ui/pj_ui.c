@@ -26,6 +26,7 @@
 #define PJ_UI_MAX_DURATION_SECONDS 86400
 #define PJ_UI_NOTES_PER_PAGE 3
 #define PJ_UI_NOTE_PAGER_TOP 150
+#define PJ_UI_NOTE_MIN_TEXT_SCALE 3
 #define PJ_UI_BUTTON_BORDER_WIDTH 3
 #define PJ_UI_TIME_CONTROLS_TOP 100
 #define PJ_UI_ALARM_TOGGLE_TOP 72
@@ -1965,6 +1966,7 @@ static void draw_notes_list(const pj_ui_context_t *ctx, pj_framebuffer_t *fb, co
         int scale = largest_text_scale_that_fits(
             label, PJ_DISPLAY_WIDTH - 10,
             row_height - 2 * (PJ_UI_BUTTON_BORDER_WIDTH + 2));
+        scale = max_int(scale, PJ_UI_NOTE_MIN_TEXT_SCALE);
         draw_rect(fb, 0, y, PJ_DISPLAY_WIDTH, next_y - y);
         draw_text_centered_ellipsized(
             fb, 100, (y + next_y) / 2, label, scale, 190);
@@ -2180,11 +2182,18 @@ static void render_scene(const pj_ui_context_t *ctx, pj_framebuffer_t *fb)
         break;
     case PJ_UI_STATE_INTERVAL:
         (void)snprintf(text, sizeof(text), "%d", ctx->interval_round);
-        draw_text_center_at_double(fb, 100, 20, text, 3);
+        {
+            int round_scale = PJ_FONT_SPACE_MONO_SIZE_COUNT;
+            while (round_scale > 1 &&
+                   2 * text_width(text, round_scale) > PJ_DISPLAY_WIDTH - 10) {
+                round_scale--;
+            }
+            draw_text_center_at_double(fb, 100, 23, text, round_scale);
+        }
         format_duration(text, sizeof(text),
                         !ctx->interval_running && ctx->interval_seconds == 0
                             ? ctx->interval_preset_seconds : ctx->interval_seconds);
-        draw_duration_value(fb, 70, text);
+        draw_duration_value(fb, 76, text);
         draw_timer_controls(fb, ctx->interval_running ? "PAUSE" : "START");
         break;
     case PJ_UI_STATE_CALENDAR:

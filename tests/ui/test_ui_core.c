@@ -2,6 +2,7 @@
 #include "pj_default_static_art.h"
 
 #include <assert.h>
+#include <limits.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -73,6 +74,22 @@ static int black_row_span_in_region(const pj_framebuffer_t *fb,
     int last = -1;
     for (int row = y; row < y + height; row++) {
         if (count_black_pixels_in_region(fb, 0, row, PJ_DISPLAY_WIDTH, 1) > 0) {
+            if (first < 0) {
+                first = row;
+            }
+            last = row;
+        }
+    }
+    return first < 0 ? 0 : last - first + 1;
+}
+
+static int black_row_span_in_box(const pj_framebuffer_t *fb,
+                                 int x, int y, int width, int height)
+{
+    int first = -1;
+    int last = -1;
+    for (int row = y; row < y + height; row++) {
+        if (count_black_pixels_in_region(fb, x, row, width, 1) > 0) {
             if (first < 0) {
                 first = row;
             }
@@ -450,6 +467,7 @@ static void test_interval_round_is_rendered_zero_indexed(void)
     pj_ui_context_t ui;
     pj_framebuffer_t zero;
     pj_framebuffer_t one;
+    pj_framebuffer_t large;
     pj_ui_init(&ui);
     assert(ui.interval_round == 0);
     ui.state = PJ_UI_STATE_INTERVAL;
@@ -460,6 +478,15 @@ static void test_interval_round_is_rendered_zero_indexed(void)
     assert(memcmp(&zero, &one, sizeof(zero)) != 0);
     assert(count_black_pixels_in_region(&zero, 0, 0, 200, 60) >
            count_black_pixels_in_region(&one, 0, 0, 200, 60));
+    assert(black_row_span_in_box(&zero, 0, 0, 200, 50) >= 40);
+    assert(black_row_span_in_box(&zero, 0, 0, 200, 50) ==
+           black_row_span_in_box(&zero, 0, 50, 200, 50));
+    assert(count_black_pixels_in_region(&zero, 0, 45, 200, 10) == 0);
+
+    ui.interval_round = INT_MAX;
+    pj_ui_render(&ui, &large);
+    assert(count_black_pixels_in_region(&large, 0, 0, 1, 100) == 0);
+    assert(count_black_pixels_in_region(&large, 199, 0, 1, 100) == 0);
 }
 
 static void test_aux_double_is_direct_quick_record_only(void)
@@ -2370,17 +2397,29 @@ static void test_compiled_static_art_is_immutable(void)
 static void test_long_note_label_stays_inside_editorial_row(void)
 {
     pj_ui_context_t ui;
+    pj_ui_context_t clipped_ui;
     pj_framebuffer_t fb;
+    pj_framebuffer_t clipped_fb;
     const char labels[][PJ_UI_NOTE_LABEL_LEN] = {
-        "MAXIMUM-LABEL-TXT",
+        "Walked by the river after the rain and remembered the cedar trees.",
+    };
+    const char clipped_labels[][PJ_UI_NOTE_LABEL_LEN] = {
+        "WALKED BY T...",
     };
     pj_ui_init(&ui);
+    pj_ui_init(&clipped_ui);
     pj_ui_set_notes(&ui, 1, labels);
+    pj_ui_set_notes(&clipped_ui, 1, clipped_labels);
     ui.state = PJ_UI_STATE_LISTEN;
+    clipped_ui.state = PJ_UI_STATE_LISTEN;
 
     pj_ui_render(&ui, &fb);
+    pj_ui_render(&clipped_ui, &clipped_fb);
     assert(count_black_pixels(&fb) > 0);
-    assert(count_black_pixels_in_region(&fb, 5, 5, 190, 40) > 100);
+    assert(memcmp(&fb, &clipped_fb, sizeof(fb)) == 0);
+    assert(black_row_span_in_box(&fb, 5, 5, 190, 40) >= 15);
+    assert(count_black_pixels_in_region(&fb, 3, 5, 1, 40) == 0);
+    assert(count_black_pixels_in_region(&fb, 196, 5, 1, 40) == 0);
 }
 
 static void test_note_detail_title_respects_side_margins(void)
