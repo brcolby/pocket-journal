@@ -1634,9 +1634,70 @@ static void test_interaction_generation_tracks_hit_identity(void)
         .stopwatch_elapsed_ms = 42000,
     };
     pj_ui_set_time_projection(&ui, &projection);
+    assert(pj_ui_interaction_generation(&ui) != generation);
+    generation = pj_ui_interaction_generation(&ui);
+    projection.stopwatch_elapsed_ms = 43000;
+    pj_ui_set_time_projection(&ui, &projection);
     assert(pj_ui_interaction_generation(&ui) == generation);
 
+    ui.state = PJ_UI_STATE_TIMER;
+    projection = (pj_ui_time_projection_t) {
+        .timer_remaining_ms = 330000,
+    };
+    pj_ui_set_time_projection(&ui, &projection);
+    assert(pj_ui_interaction_generation(&ui) != generation);
+    generation = pj_ui_interaction_generation(&ui);
+    projection.timer_running = 1;
+    pj_ui_set_time_projection(&ui, &projection);
+    assert(pj_ui_interaction_generation(&ui) != generation);
+    generation = pj_ui_interaction_generation(&ui);
+    projection.timer_remaining_ms = 329000;
+    pj_ui_set_time_projection(&ui, &projection);
+    assert(pj_ui_interaction_generation(&ui) == generation);
+
+    ui.state = PJ_UI_STATE_INTERVAL;
+    projection = (pj_ui_time_projection_t) {
+        .interval_running = 1,
+        .interval_remaining_ms = 90000,
+    };
+    pj_ui_set_time_projection(&ui, &projection);
+    assert(pj_ui_interaction_generation(&ui) != generation);
+    generation = pj_ui_interaction_generation(&ui);
+    projection.interval_remaining_ms = 89000;
+    pj_ui_set_time_projection(&ui, &projection);
+    assert(pj_ui_interaction_generation(&ui) == generation);
+    projection.interval_running = 0;
+    pj_ui_set_time_projection(&ui, &projection);
+    assert(pj_ui_interaction_generation(&ui) != generation);
+    generation = pj_ui_interaction_generation(&ui);
+    assert(pj_ui_handle_touch(&ui, 150, 175, PJ_TOUCH_TAP));
+    assert(pj_ui_interaction_generation(&ui) != generation);
+    pj_ui_time_command_t command;
+    assert(pj_ui_consume_time_command(&ui, &command));
+    assert(command.type == PJ_UI_TIME_COMMAND_INTERVAL_SET);
+
+    ui.state = PJ_UI_STATE_NOTE_DETAIL;
+    pj_ui_set_audio_state(&ui, 0, 1);
+    assert(pj_ui_interaction_generation(&ui) != generation);
+    generation = pj_ui_interaction_generation(&ui);
+    assert(pj_ui_handle_touch(&ui, 100, 100, PJ_TOUCH_TAP));
+    assert(pj_ui_interaction_generation(&ui) != generation);
+
+    ui.state = PJ_UI_STATE_ALARM;
+    generation = pj_ui_interaction_generation(&ui);
+    assert(pj_ui_handle_aux_short(&ui));
+    assert(pj_ui_interaction_generation(&ui) != generation);
+
+    ui.state = PJ_UI_STATE_SETTINGS;
+    generation = pj_ui_interaction_generation(&ui);
+    assert(pj_ui_handle_touch(&ui, 150, 50, PJ_TOUCH_TAP));
+    assert(pj_ui_interaction_generation(&ui) != generation);
+    generation = pj_ui_interaction_generation(&ui);
+    assert(pj_ui_handle_touch(&ui, 50, 150, PJ_TOUCH_TAP));
+    assert(pj_ui_interaction_generation(&ui) != generation);
+
     ui.state = PJ_UI_STATE_SYNC;
+    generation = pj_ui_interaction_generation(&ui);
     pj_ui_set_sync_detail(&ui, "failed", 1, "offline", 0);
     assert(pj_ui_interaction_generation(&ui) != generation);
 }

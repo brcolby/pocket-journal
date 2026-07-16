@@ -12,6 +12,7 @@ typedef struct {
     pj_framebuffer_t panel;
     pj_display_refresh_policy_t refresh;
     int panel_valid;
+    uint64_t committed_at_ms;
 } pipeline_t;
 
 static void pipeline_init(pipeline_t *pipeline)
@@ -60,7 +61,9 @@ static uint32_t pipeline_commit_next(pipeline_t *pipeline,
     assert(pj_display_refresh_complete(
         &pipeline->refresh, &pipeline->panel, &pipeline->panel_valid,
         &pipeline->frames[slot], &plan, 1, 600000, 580000));
-    pj_display_worker_model_complete(&pipeline->worker, slot, 1);
+    pipeline->committed_at_ms += 100U;
+    pj_display_worker_model_complete_at(
+        &pipeline->worker, slot, 1, pipeline->committed_at_ms);
     assert(memcmp(&pipeline->frames[slot], &pipeline->panel,
                   sizeof(pipeline->panel)) == 0);
     if (scene_epoch != NULL) {
@@ -93,10 +96,13 @@ static void assert_frame_delta_covered(const pj_framebuffer_t *before,
 }
 
 static int guarded_touch(pipeline_t *pipeline, pj_ui_context_t *ui,
-                         uint32_t scene_epoch, int x, int y)
+                         uint32_t scene_epoch, uint64_t captured_at_ms,
+                         int x, int y)
 {
-    if (!pj_display_worker_model_scene_presented(
-            &pipeline->worker, scene_epoch)) {
+    pj_display_worker_status_t status =
+        pj_display_worker_model_status(&pipeline->worker);
+    if (!pj_display_worker_status_accepts_input(
+            &status, scene_epoch, captured_at_ms)) {
         pj_display_worker_model_note_input_deferred(&pipeline->worker);
         return 0;
     }
@@ -128,14 +134,14 @@ static void test_hidden_new_scene_controls_are_inert_until_commit(void)
     (void)pipeline_submit(&pipeline, &ui, 2, NULL);
     assert(!pj_display_worker_model_scene_presented(&pipeline.worker, 2));
 
-    assert(!guarded_touch(&pipeline, &ui, 2, 50, 150));
+    assert(!guarded_touch(&pipeline, &ui, 2, 101, 50, 150));
     assert(ui.state == PJ_UI_STATE_TIME);
     assert(pipeline.worker.input_deferred_events == 1);
 
     uint32_t committed_epoch = 0;
     (void)pipeline_commit_next(&pipeline, &committed_epoch);
     assert(committed_epoch == 2);
-    assert(guarded_touch(&pipeline, &ui, 2, 50, 150));
+    assert(guarded_touch(&pipeline, &ui, 2, 201, 50, 150));
     assert(ui.state == PJ_UI_STATE_TIMER);
 }
 
@@ -254,11 +260,69 @@ static void test_note_page_identity_waits_for_page_commit(void)
     assert(second_page != first_page);
     (void)pipeline_submit(&pipeline, &ui, second_page, NULL);
 
-    assert(!guarded_touch(&pipeline, &ui, second_page, 100, 20));
+    assert(!guarded_touch(&pipeline, &ui, second_page, 101, 100, 20));
     assert(ui.state == PJ_UI_STATE_LISTEN && ui.selected_note == 0);
     (void)pipeline_commit_next(&pipeline, NULL);
-    assert(guarded_touch(&pipeline, &ui, second_page, 100, 20));
+    assert(guarded_touch(&pipeline, &ui, second_page, 201, 100, 20));
     assert(ui.state == PJ_UI_STATE_NOTE_DETAIL && ui.selected_note == 3);
+}
+
+static void test_same_scene_semantics_wait_for_commit(void)
+{
+    pipeline_t pipeline;
+    pipeline_init(&pipeline);
+    pj_ui_context_t ui;
+    pj_ui_init(&ui);
+    ui.state = PJ_UI_STATE_TIMER;
+    pj_ui_request_full_refresh(&ui);
+
+    uint32_t original_epoch = pj_ui_interaction_generation(&ui);
+    (void)pipeline_submit(&pipeline, &ui, original_epoch, NULL);
+    (void)pipeline_commit_next(&pipeline, NULL);
+
+    assert(guarded_touch(&pipeline, &ui, original_epoch, 101, 150, 175));
+    pj_ui_time_command_t command;
+    assert(pj_ui_consume_time_command(&ui, &command));
+    assert(command.type == PJ_UI_TIME_COMMAND_TIMER_SET);
+    assert(command.duration_ms == 330000U);
+    uint32_t adjusted_epoch = pj_ui_interaction_generation(&ui);
+    assert(adjusted_epoch != original_epoch);
+    (void)pipeline_submit(&pipeline, &ui, adjusted_epoch, NULL);
+
+    assert(!guarded_touch(&pipeline, &ui, adjusted_epoch, 102, 50, 120));
+    assert(ui.time_command.type == PJ_UI_TIME_COMMAND_NONE);
+    (void)pipeline_commit_next(&pipeline, NULL);
+    assert(guarded_touch(&pipeline, &ui, adjusted_epoch, 201, 50, 120));
+    assert(pj_ui_consume_time_command(&ui, &command));
+    assert(command.type == PJ_UI_TIME_COMMAND_TIMER_START);
+    assert(command.duration_ms == 330000U);
+}
+
+static void test_passive_ticks_keep_controls_live(void)
+{
+    pipeline_t pipeline;
+    pipeline_init(&pipeline);
+    pj_ui_context_t ui;
+    pj_ui_init(&ui);
+    ui.state = PJ_UI_STATE_TIMER;
+    pj_ui_time_projection_t projection = {
+        .timer_running = 1,
+        .timer_remaining_ms = 300000U,
+    };
+    pj_ui_set_time_projection(&ui, &projection);
+    uint32_t running_epoch = pj_ui_interaction_generation(&ui);
+    (void)pipeline_submit(&pipeline, &ui, running_epoch, NULL);
+    (void)pipeline_commit_next(&pipeline, NULL);
+
+    projection.timer_remaining_ms = 299000U;
+    pj_ui_set_time_projection(&ui, &projection);
+    assert(pj_ui_interaction_generation(&ui) == running_epoch);
+    (void)pipeline_submit(&pipeline, &ui, running_epoch, NULL);
+
+    assert(guarded_touch(&pipeline, &ui, running_epoch, 101, 50, 120));
+    pj_ui_time_command_t command;
+    assert(pj_ui_consume_time_command(&ui, &command));
+    assert(command.type == PJ_UI_TIME_COMMAND_TIMER_PAUSE);
 }
 
 int main(void)
@@ -268,6 +332,8 @@ int main(void)
     test_every_stopwatch_second_has_complete_dirty_coverage();
     test_scene_churn_commits_latest_full_frame_in_order();
     test_note_page_identity_waits_for_page_commit();
+    test_same_scene_semantics_wait_for_commit();
+    test_passive_ticks_keep_controls_live();
     puts("display pipeline tests passed");
     return 0;
 }

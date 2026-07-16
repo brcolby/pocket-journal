@@ -1041,9 +1041,16 @@ void pj_ui_set_preferences(pj_ui_context_t *ctx, int clock_24h,
         ctx->transcript_font_size == transcript_font_size) {
         return;
     }
+    int settings_semantics_changed =
+        ctx->clock_24h != clock_24h &&
+        (ctx->state == PJ_UI_STATE_SETTINGS ||
+         ctx->state == PJ_UI_STATE_DISPLAY);
     ctx->clock_24h = clock_24h;
     ctx->temperature_fahrenheit = temperature_fahrenheit;
     ctx->transcript_font_size = transcript_font_size;
+    if (settings_semantics_changed) {
+        interaction_changed(ctx);
+    }
     mark_full(ctx);
 }
 
@@ -1279,6 +1286,11 @@ void pj_ui_set_audio_state(pj_ui_context_t *ctx, int recording, int playback_act
     if (next_playback == PJ_PLAYBACK_IDLE) {
         ctx->playback_exit_pending = 0;
     }
+    if (previous_playback != next_playback &&
+        (ctx->state == PJ_UI_STATE_NOTE_DETAIL ||
+         ctx->state == PJ_UI_STATE_LISTEN)) {
+        interaction_changed(ctx);
+    }
     if (ctx->state == PJ_UI_STATE_RECORD) {
         mark_partial(ctx, 0, 0, PJ_DISPLAY_WIDTH, PJ_DISPLAY_HEIGHT);
     } else if (ctx->state == PJ_UI_STATE_NOTE_DETAIL || ctx->state == PJ_UI_STATE_LISTEN) {
@@ -1328,7 +1340,9 @@ void pj_ui_set_time_projection(pj_ui_context_t *ctx, const pj_ui_time_projection
     int next_interval_seconds = countdown_seconds_from_ms(projection->interval_remaining_ms);
     int next_interval_round = projection->interval_phase > INT_MAX ?
         INT_MAX : (int)projection->interval_phase;
-    int alarm_changed = ctx->alarm_on != (projection->alarm_enabled != 0) ||
+    int alarm_enabled_changed =
+        ctx->alarm_on != (projection->alarm_enabled != 0);
+    int alarm_changed = alarm_enabled_changed ||
         ctx->alarm_hour != projection->alarm_hour ||
         ctx->alarm_minute != projection->alarm_minute;
     int stopwatch_running_changed =
@@ -1340,12 +1354,37 @@ void pj_ui_set_time_projection(pj_ui_context_t *ctx, const pj_ui_time_projection
     int timer_seconds_changed = ctx->timer_seconds != next_timer_seconds;
     int interval_value_changed = ctx->interval_seconds != next_interval_seconds ||
         ctx->interval_round != next_interval_round;
+    int current_timer_visible = !ctx->timer_running && ctx->timer_seconds == 0 ?
+        ctx->timer_preset_seconds : ctx->timer_seconds;
+    int next_timer_visible = !projection->timer_running && next_timer_seconds == 0 ?
+        ctx->timer_preset_seconds : next_timer_seconds;
+    int current_interval_visible =
+        !ctx->interval_running && ctx->interval_seconds == 0 ?
+        ctx->interval_preset_seconds : ctx->interval_seconds;
+    int next_interval_visible =
+        !projection->interval_running && next_interval_seconds == 0 ?
+        ctx->interval_preset_seconds : next_interval_seconds;
     int stopwatch_changed = ctx->stopwatch_running != (projection->stopwatch_running != 0) ||
         stopwatch_seconds_changed;
     int timer_changed = ctx->timer_running != (projection->timer_running != 0) ||
         timer_seconds_changed;
     int interval_changed = ctx->interval_running != (projection->interval_running != 0) ||
         interval_value_changed;
+    int timer_set_value_changed = !ctx->timer_running &&
+        !projection->timer_running &&
+        current_timer_visible != next_timer_visible;
+    int interval_set_value_changed = !ctx->interval_running &&
+        !projection->interval_running &&
+        current_interval_visible != next_interval_visible;
+
+    if ((ctx->state == PJ_UI_STATE_ALARM && alarm_enabled_changed) ||
+        (ctx->state == PJ_UI_STATE_STOPWATCH && stopwatch_running_changed) ||
+        (ctx->state == PJ_UI_STATE_TIMER &&
+         (timer_running_changed || timer_set_value_changed)) ||
+        (ctx->state == PJ_UI_STATE_INTERVAL &&
+         (interval_running_changed || interval_set_value_changed))) {
+        interaction_changed(ctx);
+    }
 
     ctx->alarm_on = projection->alarm_enabled != 0;
     ctx->alarm_hour = projection->alarm_hour;
@@ -1504,8 +1543,10 @@ static int activate_focused_control(pj_ui_context_t *ctx)
 {
     switch (ctx->state) {
     case PJ_UI_STATE_ALARM:
-        if (ctx->focus_index == 0) ctx->alarm_on = !ctx->alarm_on;
-        else if (ctx->focus_index == 1) ctx->alarm_hour = (ctx->alarm_hour + 23) % 24;
+        if (ctx->focus_index == 0) {
+            ctx->alarm_on = !ctx->alarm_on;
+            interaction_changed(ctx);
+        } else if (ctx->focus_index == 1) ctx->alarm_hour = (ctx->alarm_hour + 23) % 24;
         else if (ctx->focus_index == 2) ctx->alarm_hour = (ctx->alarm_hour + 1) % 24;
         else if (ctx->focus_index == 3) ctx->alarm_minute = (ctx->alarm_minute + 45) % 60;
         else ctx->alarm_minute = (ctx->alarm_minute + 15) % 60;
@@ -1543,6 +1584,7 @@ static int activate_focused_control(pj_ui_context_t *ctx)
                                (uint64_t)preset * 1000u, 0);
             ctx->timer_seconds = preset;
             ctx->timer_preset_seconds = preset;
+            interaction_changed(ctx);
             mark_dynamic_partial(ctx, 0, 0, PJ_DISPLAY_WIDTH,
                                  PJ_UI_TIME_CONTROLS_TOP);
         }
@@ -1572,6 +1614,7 @@ static int activate_focused_control(pj_ui_context_t *ctx)
                                (uint64_t)preset * 1000u);
             ctx->interval_seconds = preset;
             ctx->interval_preset_seconds = preset;
+            interaction_changed(ctx);
             mark_dynamic_partial(ctx, 0, 0, PJ_DISPLAY_WIDTH,
                                  PJ_UI_TIME_CONTROLS_TOP);
         }
@@ -1585,8 +1628,10 @@ static int activate_focused_control(pj_ui_context_t *ctx)
         }
         if (ctx->focus_index == 1) {
             ctx->dark_mode = !ctx->dark_mode;
+            interaction_changed(ctx);
         } else if (ctx->focus_index == 2) {
             ctx->clock_24h = !ctx->clock_24h;
+            interaction_changed(ctx);
         } else {
             set_state(ctx, PJ_UI_STATE_SYNC);
             return 1;
@@ -1620,12 +1665,14 @@ int pj_ui_handle_aux_short(pj_ui_context_t *ctx)
         ctx->playback_state = ctx->playback_state == PJ_PLAYBACK_ACTIVE ?
             PJ_PLAYBACK_STOPPING : PJ_PLAYBACK_ACTIVE;
         ctx->playback_exit_pending = 0;
+        interaction_changed(ctx);
         mark_full(ctx);
         return 1;
     case PJ_UI_STATE_RECORD:
         return stop_record_and_return(ctx);
     case PJ_UI_STATE_ALARM:
         ctx->alarm_on = !ctx->alarm_on;
+        interaction_changed(ctx);
         mark_partial(ctx, 0, 0, PJ_DISPLAY_WIDTH, PJ_UI_ALARM_CONTROLS_TOP);
         return 1;
     case PJ_UI_STATE_STOPWATCH:
@@ -1804,6 +1851,7 @@ int pj_ui_handle_touch(pj_ui_context_t *ctx, int x, int y, pj_touch_kind_t kind)
             ctx->playback_state = ctx->playback_state == PJ_PLAYBACK_ACTIVE ?
                 PJ_PLAYBACK_STOPPING : PJ_PLAYBACK_ACTIVE;
             ctx->playback_exit_pending = 0;
+            interaction_changed(ctx);
             mark_full(ctx);
             return 1;
         }
