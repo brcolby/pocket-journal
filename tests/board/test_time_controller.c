@@ -1211,6 +1211,87 @@ static void test_idempotent_interval_reset_is_persistence_barrier(void)
     assert(restored.state.active_alert.source == PJ_TIME_ALERT_NONE);
 }
 
+static void test_authoritative_sets_preserve_activity_and_survive_save_order(void)
+{
+    fixture_t fixture;
+    fixture_defaults(&fixture);
+    pj_time_controller_t controller = init_default(&fixture);
+    pj_time_controller_result_t result = apply(
+        &controller, &fixture, PJ_TIME_CONTROLLER_COMMAND_TIMER_START, 120000, 0);
+    assert(result.command_applied && controller.state.timer.running);
+
+    fixture.clock.monotonic_ms += 2000;
+    fixture.clock.wall_utc_ms += 2000;
+    clear_observations(&fixture);
+    result = apply(&controller, &fixture,
+                   PJ_TIME_CONTROLLER_COMMAND_TIMER_SET, 90000, 0);
+    assert(result.command_applied && controller.state.timer.running);
+    assert(controller.state.timer.remaining_ms == 90000);
+    assert(fixture.saved_state.timer.running);
+    assert(fixture.saved_state.timer.remaining_ms == 90000);
+
+    result = apply(&controller, &fixture,
+                   PJ_TIME_CONTROLLER_COMMAND_TIMER_PAUSE, 0, 0);
+    assert(result.command_applied && !controller.state.timer.running);
+    result = apply(&controller, &fixture,
+                   PJ_TIME_CONTROLLER_COMMAND_TIMER_SET, 47000, 0);
+    assert(result.command_applied && !controller.state.timer.running);
+    assert(controller.state.timer.remaining_ms == 47000);
+    assert(!fixture.saved_state.timer.running);
+    assert(fixture.saved_state.timer.remaining_ms == 47000);
+
+    clear_observations(&fixture);
+    fixture.save_plan[0] = PJ_TIME_CONTROLLER_SAVE_TRANSIENT_ERROR;
+    fixture.save_plan[1] = PJ_TIME_CONTROLLER_SAVE_OK;
+    fixture.save_plan_count = 2;
+    result = apply(&controller, &fixture,
+                   PJ_TIME_CONTROLLER_COMMAND_TIMER_SET, 77000, 0);
+    assert(result.command_applied && result.dirty);
+    assert(result.save_result == PJ_TIME_CONTROLLER_SAVE_TRANSIENT_ERROR);
+    assert(controller.state.timer.remaining_ms == 77000);
+    result = apply(&controller, &fixture,
+                   PJ_TIME_CONTROLLER_COMMAND_TIMER_SET, 107000, 0);
+    assert(result.command_applied && !result.dirty);
+    assert(controller.state.timer.remaining_ms == 107000);
+    assert(fixture.saved_state.timer.remaining_ms == 107000);
+
+    result = apply(&controller, &fixture,
+                   PJ_TIME_CONTROLLER_COMMAND_INTERVAL_START, 90000, 90000);
+    assert(result.command_applied && controller.state.interval.running);
+    controller.state.interval_phase = 3;
+    result = apply(&controller, &fixture,
+                   PJ_TIME_CONTROLLER_COMMAND_INTERVAL_SET, 60000, 60000);
+    assert(result.command_applied && controller.state.interval.running);
+    assert(controller.state.interval.remaining_ms == 60000);
+    assert(controller.state.interval_work_ms == 60000);
+    assert(controller.state.interval_rest_ms == 60000);
+    assert(controller.state.interval_phase == 3);
+
+    result = apply(&controller, &fixture,
+                   PJ_TIME_CONTROLLER_COMMAND_INTERVAL_PAUSE, 0, 0);
+    assert(result.command_applied && !controller.state.interval.running);
+    result = apply(&controller, &fixture,
+                   PJ_TIME_CONTROLLER_COMMAND_INTERVAL_SET, 130000, 130000);
+    assert(result.command_applied && !controller.state.interval.running);
+    assert(controller.state.interval.remaining_ms == 130000);
+    assert(controller.state.interval_work_ms == 130000);
+    assert(controller.state.interval_rest_ms == 130000);
+    assert(controller.state.interval_phase == 3);
+    assert(!fixture.saved_state.interval.running);
+    assert(fixture.saved_state.interval.remaining_ms == 130000);
+
+    pj_time_state_t before = controller.state;
+    clear_observations(&fixture);
+    result = apply(&controller, &fixture,
+                   PJ_TIME_CONTROLLER_COMMAND_TIMER_SET, 0, 0);
+    assert(!result.command_applied && !result.persistence_attempted);
+    assert(memcmp(&before, &controller.state, sizeof(before)) == 0);
+    result = apply(&controller, &fixture,
+                   PJ_TIME_CONTROLLER_COMMAND_INTERVAL_SET, 60000, 0);
+    assert(!result.command_applied && !result.persistence_attempted);
+    assert(memcmp(&before, &controller.state, sizeof(before)) == 0);
+}
+
 int main(void)
 {
     test_argument_validation_and_load_classes();
@@ -1234,6 +1315,7 @@ int main(void)
     test_staged_save_failures_preserve_latest_state();
     test_untrusted_time_disarms_and_retrusted_time_rearms();
     test_idempotent_interval_reset_is_persistence_barrier();
+    test_authoritative_sets_preserve_activity_and_survive_save_order();
     puts("time controller tests passed");
     return 0;
 }

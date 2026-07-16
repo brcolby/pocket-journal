@@ -75,10 +75,19 @@ typedef enum {
     PJ_UI_TIME_COMMAND_TIMER_START,
     PJ_UI_TIME_COMMAND_TIMER_PAUSE,
     PJ_UI_TIME_COMMAND_TIMER_RESET,
+    PJ_UI_TIME_COMMAND_TIMER_SET,
     PJ_UI_TIME_COMMAND_INTERVAL_START,
     PJ_UI_TIME_COMMAND_INTERVAL_PAUSE,
-    PJ_UI_TIME_COMMAND_INTERVAL_RESET
+    PJ_UI_TIME_COMMAND_INTERVAL_RESET,
+    PJ_UI_TIME_COMMAND_INTERVAL_SET
 } pj_ui_time_command_type_t;
+
+typedef enum {
+    PJ_UI_SYNC_INVENTORY_UNKNOWN = 0,
+    PJ_UI_SYNC_INVENTORY_PENDING,
+    PJ_UI_SYNC_INVENTORY_READY,
+    PJ_UI_SYNC_INVENTORY_OFFLINE,
+} pj_ui_sync_inventory_state_t;
 
 typedef struct {
     pj_ui_time_command_type_t type;
@@ -120,6 +129,15 @@ typedef struct {
     int sync_online;
     int sync_failed;
     int sync_request_pending;
+    pj_ui_sync_inventory_state_t sync_inventory_state;
+    uint32_t sync_session_generation;
+    uint32_t sync_presentation_generation;
+    uint32_t sync_inventory_presentation_generation;
+    uint32_t sync_success_presentation_generation;
+    uint32_t sync_transfer_requested_generation;
+    int sync_preflight_request_pending;
+    int sync_transfer_request_pending;
+    int sync_success_return_pending;
     char sync_phase[PJ_UI_SYNC_PHASE_LEN];
     char sync_error[PJ_UI_SYNC_ERROR_LEN];
     int battery_percent;
@@ -190,6 +208,18 @@ int pj_ui_discard_pending_interval_command(pj_ui_context_t *ctx);
 void pj_ui_set_sync_state(pj_ui_context_t *ctx, int pending, int transferred, int online);
 void pj_ui_set_sync_detail(pj_ui_context_t *ctx, const char *phase, int failed,
                            const char *error, int request_pending);
+uint32_t pj_ui_sync_session_generation(const pj_ui_context_t *ctx);
+uint32_t pj_ui_sync_presentation_generation(const pj_ui_context_t *ctx);
+int pj_ui_consume_sync_preflight_request(pj_ui_context_t *ctx, uint32_t *generation);
+void pj_ui_set_sync_inventory(pj_ui_context_t *ctx, uint32_t generation,
+                              pj_ui_sync_inventory_state_t state, int pending,
+                              int transferred, int online);
+void pj_ui_set_sync_detail_for_generation(pj_ui_context_t *ctx, uint32_t generation,
+                                          const char *phase, int failed,
+                                          const char *error, int request_pending);
+int pj_ui_sync_presentation_committed(pj_ui_context_t *ctx, uint32_t generation);
+int pj_ui_consume_sync_transfer_request(pj_ui_context_t *ctx, uint32_t *generation);
+int pj_ui_consume_sync_success_return(pj_ui_context_t *ctx);
 int pj_ui_set_home_layout(pj_ui_context_t *ctx, const pj_home_layout_t *layout);
 void pj_ui_restore_default_home(pj_ui_context_t *ctx);
 int pj_ui_tick(pj_ui_context_t *ctx);

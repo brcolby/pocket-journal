@@ -218,10 +218,49 @@ static void mark_dynamic_partial(pj_ui_context_t *ctx, int x, int y, int width, 
     mark_partial(ctx, x, y, width, height);
 }
 
+static uint32_t next_generation(uint32_t generation)
+{
+    generation++;
+    return generation == 0 ? 1 : generation;
+}
+
+static void sync_presentation_changed(pj_ui_context_t *ctx)
+{
+    ctx->sync_presentation_generation =
+        next_generation(ctx->sync_presentation_generation);
+}
+
+static void begin_sync_session(pj_ui_context_t *ctx)
+{
+    ctx->sync_session_generation = next_generation(ctx->sync_session_generation);
+    ctx->sync_inventory_state = PJ_UI_SYNC_INVENTORY_PENDING;
+    ctx->sync_pending = 0;
+    ctx->sync_transferred = 0;
+    ctx->sync_failed = 0;
+    ctx->sync_request_pending = 0;
+    ctx->sync_inventory_presentation_generation = 0;
+    ctx->sync_success_presentation_generation = 0;
+    ctx->sync_transfer_requested_generation = 0;
+    ctx->sync_preflight_request_pending = 1;
+    ctx->sync_transfer_request_pending = 0;
+    ctx->sync_success_return_pending = 0;
+    (void)snprintf(ctx->sync_phase, sizeof(ctx->sync_phase), "%s", "inventory");
+    ctx->sync_error[0] = '\0';
+    sync_presentation_changed(ctx);
+}
+
 static void set_state(pj_ui_context_t *ctx, pj_ui_state_t state)
 {
     if (state >= 0 && state < PJ_UI_STATE_COUNT) {
+        pj_ui_state_t previous = ctx->state;
         ctx->state = state;
+        if (state == PJ_UI_STATE_SYNC && previous != PJ_UI_STATE_SYNC) {
+            begin_sync_session(ctx);
+        } else if (state != PJ_UI_STATE_SYNC && previous == PJ_UI_STATE_SYNC) {
+            ctx->sync_preflight_request_pending = 0;
+            ctx->sync_transfer_request_pending = 0;
+            ctx->sync_success_return_pending = 0;
+        }
         ctx->focus_index = (state == PJ_UI_STATE_LISTEN || state == PJ_UI_STATE_READ) ?
             ctx->note_page * PJ_UI_NOTES_PER_PAGE : 0;
         ctx->focus_idle_ticks = 0;
@@ -989,6 +1028,9 @@ void pj_ui_set_preferences(pj_ui_context_t *ctx, int clock_24h,
 
 void pj_ui_set_sync_state(pj_ui_context_t *ctx, int pending, int transferred, int online)
 {
+    if (ctx == NULL) {
+        return;
+    }
     if (pending < 0) {
         pending = 0;
     }
@@ -1004,16 +1046,14 @@ void pj_ui_set_sync_state(pj_ui_context_t *ctx, int pending, int transferred, in
     ctx->sync_transferred = transferred;
     ctx->sync_online = online;
     if (ctx->state == PJ_UI_STATE_SYNC) {
+        sync_presentation_changed(ctx);
         mark_partial(ctx, 0, 0, PJ_DISPLAY_WIDTH, PJ_DISPLAY_HEIGHT);
     }
 }
 
-void pj_ui_set_sync_detail(pj_ui_context_t *ctx, const char *phase, int failed,
-                           const char *error, int request_pending)
+static void set_sync_detail(pj_ui_context_t *ctx, const char *phase, int failed,
+                            const char *error, int request_pending)
 {
-    if (ctx == NULL) {
-        return;
-    }
     failed = failed < 0 ? 0 : failed;
     request_pending = request_pending != 0;
     const char *safe_phase = phase == NULL ? "idle" : phase;
@@ -1029,8 +1069,139 @@ void pj_ui_set_sync_detail(pj_ui_context_t *ctx, const char *phase, int failed,
     (void)snprintf(ctx->sync_phase, sizeof(ctx->sync_phase), "%s", safe_phase);
     (void)snprintf(ctx->sync_error, sizeof(ctx->sync_error), "%s", safe_error);
     if (ctx->state == PJ_UI_STATE_SYNC) {
+        sync_presentation_changed(ctx);
+        if (strcmp(safe_phase, "succeeded") == 0) {
+            ctx->sync_success_presentation_generation =
+                ctx->sync_presentation_generation;
+        } else {
+            ctx->sync_success_presentation_generation = 0;
+            ctx->sync_success_return_pending = 0;
+        }
         mark_partial(ctx, 0, 0, PJ_DISPLAY_WIDTH, PJ_DISPLAY_HEIGHT);
     }
+}
+
+void pj_ui_set_sync_detail(pj_ui_context_t *ctx, const char *phase, int failed,
+                           const char *error, int request_pending)
+{
+    if (ctx == NULL) {
+        return;
+    }
+    set_sync_detail(ctx, phase, failed, error, request_pending);
+}
+
+uint32_t pj_ui_sync_session_generation(const pj_ui_context_t *ctx)
+{
+    return ctx == NULL ? 0 : ctx->sync_session_generation;
+}
+
+uint32_t pj_ui_sync_presentation_generation(const pj_ui_context_t *ctx)
+{
+    return ctx == NULL ? 0 : ctx->sync_presentation_generation;
+}
+
+int pj_ui_consume_sync_preflight_request(pj_ui_context_t *ctx, uint32_t *generation)
+{
+    if (ctx == NULL || generation == NULL || ctx->state != PJ_UI_STATE_SYNC ||
+        !ctx->sync_preflight_request_pending) {
+        return 0;
+    }
+    ctx->sync_preflight_request_pending = 0;
+    *generation = ctx->sync_session_generation;
+    return 1;
+}
+
+void pj_ui_set_sync_inventory(pj_ui_context_t *ctx, uint32_t generation,
+                              pj_ui_sync_inventory_state_t state, int pending,
+                              int transferred, int online)
+{
+    if (ctx == NULL || ctx->state != PJ_UI_STATE_SYNC || generation == 0 ||
+        generation != ctx->sync_session_generation || state < PJ_UI_SYNC_INVENTORY_UNKNOWN ||
+        state > PJ_UI_SYNC_INVENTORY_OFFLINE) {
+        return;
+    }
+    if (pending < 0) {
+        pending = 0;
+    }
+    if (transferred < 0) {
+        transferred = 0;
+    }
+    online = online != 0;
+    const char *phase = state == PJ_UI_SYNC_INVENTORY_READY ? "ready" :
+        state == PJ_UI_SYNC_INVENTORY_OFFLINE ? "offline" :
+        state == PJ_UI_SYNC_INVENTORY_PENDING ? "inventory" : "unknown";
+    int changed = ctx->sync_inventory_state != state || ctx->sync_pending != pending ||
+        ctx->sync_transferred != transferred || ctx->sync_online != online ||
+        strcmp(ctx->sync_phase, phase) != 0 || ctx->sync_failed != 0 ||
+        ctx->sync_request_pending != 0 || ctx->sync_error[0] != '\0';
+    if (!changed) {
+        return;
+    }
+    ctx->sync_inventory_state = state;
+    ctx->sync_pending = pending;
+    ctx->sync_transferred = transferred;
+    ctx->sync_online = online;
+    ctx->sync_failed = 0;
+    ctx->sync_request_pending = 0;
+    (void)snprintf(ctx->sync_phase, sizeof(ctx->sync_phase), "%s", phase);
+    ctx->sync_error[0] = '\0';
+    sync_presentation_changed(ctx);
+    ctx->sync_inventory_presentation_generation =
+        ctx->sync_presentation_generation;
+    mark_partial(ctx, 0, 0, PJ_DISPLAY_WIDTH, PJ_DISPLAY_HEIGHT);
+}
+
+void pj_ui_set_sync_detail_for_generation(pj_ui_context_t *ctx, uint32_t generation,
+                                          const char *phase, int failed,
+                                          const char *error, int request_pending)
+{
+    if (ctx == NULL || ctx->state != PJ_UI_STATE_SYNC || generation == 0 ||
+        generation != ctx->sync_session_generation) {
+        return;
+    }
+    set_sync_detail(ctx, phase, failed, error, request_pending);
+}
+
+int pj_ui_sync_presentation_committed(pj_ui_context_t *ctx, uint32_t generation)
+{
+    if (ctx == NULL || ctx->state != PJ_UI_STATE_SYNC || generation == 0 ||
+        generation != ctx->sync_presentation_generation) {
+        return 0;
+    }
+    if (ctx->sync_inventory_state == PJ_UI_SYNC_INVENTORY_READY &&
+        ctx->sync_inventory_presentation_generation != 0 &&
+        strcmp(ctx->sync_phase, "ready") == 0 &&
+        ctx->sync_transfer_requested_generation != ctx->sync_session_generation) {
+        ctx->sync_transfer_request_pending = 1;
+    }
+    if (ctx->sync_success_presentation_generation != 0 &&
+        strcmp(ctx->sync_phase, "succeeded") == 0) {
+        ctx->sync_success_return_pending = 1;
+    }
+    return 1;
+}
+
+int pj_ui_consume_sync_transfer_request(pj_ui_context_t *ctx, uint32_t *generation)
+{
+    if (ctx == NULL || generation == NULL || ctx->state != PJ_UI_STATE_SYNC ||
+        !ctx->sync_transfer_request_pending) {
+        return 0;
+    }
+    ctx->sync_transfer_request_pending = 0;
+    ctx->sync_transfer_requested_generation = ctx->sync_session_generation;
+    *generation = ctx->sync_session_generation;
+    return 1;
+}
+
+int pj_ui_consume_sync_success_return(pj_ui_context_t *ctx)
+{
+    if (ctx == NULL || ctx->state != PJ_UI_STATE_SYNC ||
+        !ctx->sync_success_return_pending) {
+        return 0;
+    }
+    ctx->sync_success_return_pending = 0;
+    set_state(ctx, pj_ui_parent_state(PJ_UI_STATE_SYNC));
+    return 1;
 }
 
 void pj_ui_set_time(pj_ui_context_t *ctx, int hour, int minute, int year, int month, int day)
@@ -1213,7 +1384,8 @@ int pj_ui_discard_pending_interval_command(pj_ui_context_t *ctx)
     if (ctx == NULL ||
         (ctx->time_command.type != PJ_UI_TIME_COMMAND_INTERVAL_START &&
          ctx->time_command.type != PJ_UI_TIME_COMMAND_INTERVAL_PAUSE &&
-         ctx->time_command.type != PJ_UI_TIME_COMMAND_INTERVAL_RESET)) {
+         ctx->time_command.type != PJ_UI_TIME_COMMAND_INTERVAL_RESET &&
+         ctx->time_command.type != PJ_UI_TIME_COMMAND_INTERVAL_SET)) {
         return 0;
     }
     memset(&ctx->time_command, 0, sizeof(ctx->time_command));
@@ -1346,10 +1518,9 @@ static int activate_focused_control(pj_ui_context_t *ctx)
             int base = ctx->timer_seconds > 0 ?
                 ctx->timer_seconds : ctx->timer_preset_seconds;
             int preset = max_int(30, min_int(PJ_UI_MAX_DURATION_SECONDS, base + delta));
-            queue_time_command(ctx, ctx->timer_running ?
-                               PJ_UI_TIME_COMMAND_TIMER_START :
-                               PJ_UI_TIME_COMMAND_TIMER_RESET,
+            queue_time_command(ctx, PJ_UI_TIME_COMMAND_TIMER_SET,
                                (uint64_t)preset * 1000u, 0);
+            ctx->timer_seconds = preset;
             ctx->timer_preset_seconds = preset;
             mark_dynamic_partial(ctx, 0, 0, PJ_DISPLAY_WIDTH,
                                  PJ_UI_TIME_CONTROLS_TOP);
@@ -1375,11 +1546,10 @@ static int activate_focused_control(pj_ui_context_t *ctx)
             int base = ctx->interval_seconds > 0 ?
                 ctx->interval_seconds : ctx->interval_preset_seconds;
             int preset = max_int(60, min_int(PJ_UI_MAX_DURATION_SECONDS, base + delta));
-            queue_time_command(ctx, ctx->interval_running ?
-                               PJ_UI_TIME_COMMAND_INTERVAL_START :
-                               PJ_UI_TIME_COMMAND_INTERVAL_RESET,
+            queue_time_command(ctx, PJ_UI_TIME_COMMAND_INTERVAL_SET,
                                (uint64_t)preset * 1000u,
                                (uint64_t)preset * 1000u);
+            ctx->interval_seconds = preset;
             ctx->interval_preset_seconds = preset;
             mark_dynamic_partial(ctx, 0, 0, PJ_DISPLAY_WIDTH,
                                  PJ_UI_TIME_CONTROLS_TOP);
@@ -1472,6 +1642,15 @@ int pj_ui_handle_aux_short(pj_ui_context_t *ctx)
         ctx->focus_idle_ticks = 0;
         return 1;
     }
+    case PJ_UI_STATE_SYNC:
+        if (ctx->sync_inventory_state == PJ_UI_SYNC_INVENTORY_UNKNOWN ||
+            ctx->sync_inventory_state == PJ_UI_SYNC_INVENTORY_OFFLINE ||
+            ctx->sync_failed > 0) {
+            begin_sync_session(ctx);
+            mark_full(ctx);
+            return 1;
+        }
+        return 0;
     default:
         return 0;
     }
@@ -1703,6 +1882,10 @@ static void draw_record(const pj_ui_context_t *ctx, pj_framebuffer_t *fb)
 
 static void audio_note_display_label(char *out, size_t out_size, const char *label)
 {
+    static const char *const months[] = {
+        "JAN", "FEB", "MAR", "APR", "MAY", "JUN",
+        "JUL", "AUG", "SEP", "OCT", "NOV", "DEC",
+    };
     int year = 0;
     int month = 0;
     int day = 0;
@@ -1715,14 +1898,27 @@ static void audio_note_display_label(char *out, size_t out_size, const char *lab
         day >= 1 && day <= 31 && hour >= 0 && hour <= 23 &&
         minute >= 0 && minute <= 59) {
         (void)sequence;
-        (void)snprintf(out, out_size, "%04d-%02d-%02d %02d:%02d",
-                       year, month, day, hour, minute);
+        (void)snprintf(out, out_size, "%s %02d %02d:%02d",
+                       months[month - 1], day, hour, minute);
         return;
     }
     while (strncmp(label, "REC ", 4) == 0) {
         label += 4;
     }
     (void)snprintf(out, out_size, "%s", label);
+}
+
+static int largest_text_scale_that_fits(const char *text, int max_width, int max_height)
+{
+    int scale = PJ_FONT_SPACE_MONO_SIZE_COUNT;
+    while (scale > 1) {
+        const pj_font_size_t *font = font_size_for_scale(scale);
+        if (text_width(text, scale) <= max_width && font->line_height <= max_height) {
+            break;
+        }
+        scale--;
+    }
+    return scale;
 }
 
 static void draw_notes_list(const pj_ui_context_t *ctx, pj_framebuffer_t *fb, const char *kind)
@@ -1745,10 +1941,10 @@ static void draw_notes_list(const pj_ui_context_t *ctx, pj_framebuffer_t *fb, co
             audio_note_display_label(audio_label, sizeof(audio_label), label);
             label = audio_label;
         }
-        int scale = 4;
-        while (scale > 2 && text_width(label, scale) > 190) {
-            scale--;
-        }
+        int row_height = next_y - y;
+        int scale = largest_text_scale_that_fits(
+            label, PJ_DISPLAY_WIDTH - 10,
+            row_height - 2 * (PJ_UI_BUTTON_BORDER_WIDTH + 2));
         draw_rect(fb, 0, y, PJ_DISPLAY_WIDTH, next_y - y);
         draw_text_centered_ellipsized(
             fb, 100, (y + next_y) / 2, label, scale, 190);
@@ -1804,7 +2000,9 @@ static void draw_volume(const pj_ui_context_t *ctx, pj_framebuffer_t *fb)
 
 static void draw_sync(const pj_ui_context_t *ctx, pj_framebuffer_t *fb)
 {
-    const char *status = "IDLE";
+    const char *status = ctx->sync_inventory_state == PJ_UI_SYNC_INVENTORY_PENDING ?
+        "CHECKING" : ctx->sync_inventory_state == PJ_UI_SYNC_INVENTORY_UNKNOWN ?
+        "UNKNOWN" : "IDLE";
     if (strcmp(ctx->sync_phase, "succeeded") == 0) {
         status = "COMPLETE";
     } else if (strcmp(ctx->sync_phase, "offline") == 0) {
@@ -1835,7 +2033,11 @@ static void draw_sync(const pj_ui_context_t *ctx, pj_framebuffer_t *fb)
     char pending[24];
     char sent[24];
     char failed[24];
-    (void)snprintf(pending, sizeof(pending), "PENDING %d", ctx->sync_pending);
+    if (ctx->sync_inventory_state == PJ_UI_SYNC_INVENTORY_READY) {
+        (void)snprintf(pending, sizeof(pending), "PENDING %d", ctx->sync_pending);
+    } else {
+        (void)snprintf(pending, sizeof(pending), "%s", "PENDING ?");
+    }
     (void)snprintf(sent, sizeof(sent), "SENT %d", ctx->sync_transferred);
     (void)snprintf(failed, sizeof(failed), "FAIL %d", ctx->sync_failed);
     const char *lines[] = {status, pending, sent, failed, detail};

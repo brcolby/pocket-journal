@@ -433,6 +433,16 @@ static int apply_command(pj_time_controller_t *controller,
     case PJ_TIME_CONTROLLER_COMMAND_TIMER_RESET:
         pj_time_timer_reset(&controller->state);
         break;
+    case PJ_TIME_CONTROLLER_COMMAND_TIMER_SET: {
+        int was_running = controller->state.timer.running != 0;
+        if (!pj_time_timer_start(&controller->state, command->duration_ms, clock)) {
+            return 0;
+        }
+        if (!was_running && !pj_time_timer_pause(&controller->state, clock)) {
+            return 0;
+        }
+        break;
+    }
     case PJ_TIME_CONTROLLER_COMMAND_INTERVAL_START:
         if (!controller->state.interval.running &&
             controller->state.interval.remaining_ms != 0 &&
@@ -453,6 +463,19 @@ static int apply_command(pj_time_controller_t *controller,
     case PJ_TIME_CONTROLLER_COMMAND_INTERVAL_RESET:
         pj_time_interval_reset(&controller->state);
         break;
+    case PJ_TIME_CONTROLLER_COMMAND_INTERVAL_SET: {
+        int was_running = controller->state.interval.running != 0;
+        uint64_t phase = controller->state.interval_phase;
+        if (!pj_time_interval_start(&controller->state, command->duration_ms,
+                                    command->secondary_duration_ms, clock)) {
+            return 0;
+        }
+        controller->state.interval_phase = phase;
+        if (!was_running && !pj_time_interval_pause(&controller->state, clock)) {
+            return 0;
+        }
+        break;
+    }
     default:
         return 0;
     }
@@ -479,8 +502,15 @@ int pj_time_controller_apply(pj_time_controller_t *controller,
         memcmp(&before, &controller->state, sizeof(before)) != 0;
     result->transition = result->transition ||
         transition_changed(&before, &controller->state);
+    int valid_set_barrier =
+        (command->type == PJ_TIME_CONTROLLER_COMMAND_TIMER_SET &&
+         command->duration_ms > 0 && command->duration_ms <= PJ_TIME_MAX_DURATION_MS) ||
+        (command->type == PJ_TIME_CONTROLLER_COMMAND_INTERVAL_SET &&
+         command->duration_ms > 0 && command->duration_ms <= PJ_TIME_MAX_DURATION_MS &&
+         command->secondary_duration_ms > 0 &&
+         command->secondary_duration_ms <= PJ_TIME_MAX_DURATION_MS);
     int persistence_barrier =
-        command->type == PJ_TIME_CONTROLLER_COMMAND_INTERVAL_RESET;
+        command->type == PJ_TIME_CONTROLLER_COMMAND_INTERVAL_RESET || valid_set_barrier;
     if (result->command_applied || result->transition || persistence_barrier) {
         persist(controller, &clock, 1, result);
         schedule_wake(controller, &clock, result);
