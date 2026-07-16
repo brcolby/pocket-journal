@@ -222,6 +222,7 @@
 /* PJ_AUDIO_READ holds 1024 raw bytes plus 2049 hex bytes on this task's stack. */
 #define PJ_SERIAL_COMMAND_TASK_STACK 9216
 #define PJ_SERIAL_RX_BUFFER_BYTES 1024U
+#define PJ_SYNC_INVENTORY_TASK_STACK 8192
 #define PJ_SERIAL_TX_BUFFER_BYTES 4096U
 #define PJ_STORAGE_WIPE_TASK_STACK 4096
 #define PJ_STORAGE_WIPE_BATCH_ENTRIES 64U
@@ -403,6 +404,9 @@ static TaskHandle_t g_audio_process_task;
 static TaskHandle_t g_playback_task;
 static TaskHandle_t g_alert_audio_task;
 static TaskHandle_t g_storage_wipe_task;
+static TaskHandle_t g_sync_inventory_task;
+static SemaphoreHandle_t g_sync_inventory_lock;
+static StaticSemaphore_t g_sync_inventory_lock_storage;
 static int g_record_audio_owned;
 static int g_record_storage_owned;
 static int g_playback_storage_owned;
@@ -427,6 +431,15 @@ static pj_storage_coordinator_t g_storage_coordinator;
 static uint32_t g_runtime_boot_id;
 static int g_cached_pending_sync;
 static int g_cached_transferred_sync;
+typedef enum {
+    PJ_SYNC_INVENTORY_IDLE = 0,
+    PJ_SYNC_INVENTORY_REQUESTED,
+    PJ_SYNC_INVENTORY_RUNNING,
+    PJ_SYNC_INVENTORY_RESULT,
+} sync_inventory_worker_state_t;
+static sync_inventory_worker_state_t g_sync_inventory_worker_state;
+static int g_sync_inventory_discard;
+static pj_board_sync_inventory_t g_sync_inventory_result;
 static pj_recording_t g_recording;
 static pj_audio_lifecycle_t g_audio_lifecycle;
 static pj_usb_upload_t g_usb_upload;
@@ -3581,9 +3594,25 @@ static void note_sidecar_path(char *out, size_t out_size, const char *filename)
     (void)snprintf(out, out_size, PJ_NOTE_DIR "/%s.json", filename);
 }
 
-static void transcript_path_for_audio(char *out, size_t out_size, const char *filename)
+static int transcript_path_for_audio(char *out, size_t out_size,
+                                     const char *filename)
 {
-    (void)snprintf(out, out_size, PJ_TRANSCRIPT_DIR "/%s.json", filename);
+    if (out == NULL || out_size == 0U || filename == NULL) {
+        return 0;
+    }
+    const char *end = memchr(filename, '\0', PJ_NOTE_FILENAME_LEN);
+    if (end == NULL) {
+        out[0] = '\0';
+        return 0;
+    }
+    size_t filename_len = (size_t)(end - filename);
+    int written = snprintf(out, out_size, PJ_TRANSCRIPT_DIR "/%.*s.json",
+                           (int)filename_len, filename);
+    if (written < 0 || (size_t)written >= out_size) {
+        out[0] = '\0';
+        return 0;
+    }
+    return 1;
 }
 
 static cJSON *json_read_file(const char *path, size_t max_bytes)
@@ -3762,7 +3791,9 @@ static int note_metadata_load(pj_note_metadata_t *note)
 static int transcript_label_for_audio(const char *filename, char *label, size_t label_size,
                                       char *path, size_t path_size)
 {
-    transcript_path_for_audio(path, path_size, filename);
+    if (!transcript_path_for_audio(path, path_size, filename)) {
+        return 0;
+    }
     size_t body_size = 0U;
     char *body = text_read_file(path, PJ_TRANSCRIPT_MAX_BODY_BYTES, &body_size);
     if (body == NULL) {
@@ -3994,6 +4025,52 @@ static pj_board_sync_inventory_state_t collect_sync_counts_fresh(
     return PJ_BOARD_SYNC_INVENTORY_READY;
 }
 
+static void sync_inventory_worker_task(void *context)
+{
+    (void)context;
+    for (;;) {
+        (void)ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        xSemaphoreTake(g_sync_inventory_lock, portMAX_DELAY);
+        if (g_sync_inventory_worker_state != PJ_SYNC_INVENTORY_REQUESTED) {
+            xSemaphoreGive(g_sync_inventory_lock);
+            continue;
+        }
+        g_sync_inventory_worker_state = PJ_SYNC_INVENTORY_RUNNING;
+        xSemaphoreGive(g_sync_inventory_lock);
+
+        pj_board_sync_inventory_t result = {0};
+        result.state = collect_sync_counts_fresh(
+            &result.pending, &result.transferred);
+
+        xSemaphoreTake(g_sync_inventory_lock, portMAX_DELAY);
+        if (g_sync_inventory_discard) {
+            g_sync_inventory_discard = 0;
+            g_sync_inventory_worker_state = PJ_SYNC_INVENTORY_IDLE;
+        } else {
+            g_sync_inventory_result = result;
+            g_sync_inventory_worker_state = PJ_SYNC_INVENTORY_RESULT;
+        }
+        xSemaphoreGive(g_sync_inventory_lock);
+    }
+}
+
+static int sync_inventory_worker_ensure(void)
+{
+    if (g_sync_inventory_lock == NULL) {
+        g_sync_inventory_lock = xSemaphoreCreateMutexStatic(
+            &g_sync_inventory_lock_storage);
+        if (g_sync_inventory_lock == NULL) {
+            return 0;
+        }
+    }
+    if (g_sync_inventory_task != NULL) {
+        return 1;
+    }
+    return xTaskCreate(sync_inventory_worker_task, "pj-sync-inventory",
+                       PJ_SYNC_INVENTORY_TASK_STACK, NULL, 1,
+                       &g_sync_inventory_task) == pdPASS;
+}
+
 static void collect_sync_counts(int *pending, int *transferred)
 {
     storage_sync_counts_snapshot(pending, transferred);
@@ -4008,6 +4085,9 @@ static void collect_sync_counts(int *pending, int *transferred)
 
 static void refresh_ui_sync_state(pj_ui_context_t *ui)
 {
+    if (ui == NULL || pj_ui_current_state(ui) == PJ_UI_STATE_SYNC) {
+        return;
+    }
     int pending = 0;
     int transferred = 0;
     collect_sync_counts(&pending, &transferred);
@@ -4524,6 +4604,8 @@ static int touch_poll_filtered_event(pj_board_event_t *event, TickType_t now)
                 event->type = PJ_BOARD_EVENT_TOUCH_TAP;
                 event->x = (int)g_touch_press_x;
                 event->y = (int)g_touch_press_y;
+                event->captured_at_ms =
+                    (uint32_t)(now * portTICK_PERIOD_MS);
                 g_display_warning_logged = 1;
                 ESP_LOGI(TAG, "Touch tap x=%u y=%u stable=%d", (unsigned)event->x, (unsigned)event->y,
                          g_touch_candidate_samples);
@@ -4615,6 +4697,7 @@ static void aux_poll_task(void *arg)
                 .type = PJ_BOARD_EVENT_POWER,
                 .x = 0,
                 .y = 0,
+                .captured_at_ms = 0,
             };
             ESP_LOGI(TAG, "PWR press");
             board_queue_event(&power_event);
@@ -4627,6 +4710,9 @@ static void aux_poll_task(void *arg)
                     PJ_BOARD_EVENT_NONE,
             .x = 0,
             .y = 0,
+            .captured_at_ms = gesture == PJ_AUX_GESTURE_SHORT ||
+                    gesture == PJ_AUX_GESTURE_DOUBLE ?
+                pj_aux_input_gesture_started_ms(&g_aux_input) : 0,
         };
         if (event.type != PJ_BOARD_EVENT_NONE) {
             ESP_LOGI(TAG, "AUX %s", event.type == PJ_BOARD_EVENT_AUX_SHORT ? "short" :
@@ -4675,6 +4761,7 @@ static void touch_poll_task(void *arg)
             .type = PJ_BOARD_EVENT_NONE,
             .x = 0,
             .y = 0,
+            .captured_at_ms = 0,
         };
         if (touch_poll_filtered_event(&event, xTaskGetTickCount())) {
             board_queue_event(&event);
@@ -7250,12 +7337,50 @@ int pj_board_sync_inventory_snapshot(pj_board_sync_inventory_t *inventory)
     pj_board_status_t status = board_status_snapshot_base();
     inventory->online = status.wifi == PJ_BOARD_SERVICE_READY;
     if (status.storage != PJ_BOARD_SERVICE_READY) {
+        pj_board_sync_inventory_cancel();
         return 1;
     }
-    inventory->state = collect_sync_counts_fresh(
-        &inventory->pending, &inventory->transferred);
+    if (!sync_inventory_worker_ensure()) {
+        return 1;
+    }
+
+    int notify_worker = 0;
+    xSemaphoreTake(g_sync_inventory_lock, portMAX_DELAY);
+    if (g_sync_inventory_worker_state == PJ_SYNC_INVENTORY_RESULT) {
+        *inventory = g_sync_inventory_result;
+        inventory->online = status.wifi == PJ_BOARD_SERVICE_READY;
+        g_sync_inventory_worker_state = PJ_SYNC_INVENTORY_IDLE;
+    } else {
+        inventory->state = PJ_BOARD_SYNC_INVENTORY_BUSY;
+        if (g_sync_inventory_worker_state == PJ_SYNC_INVENTORY_IDLE) {
+            g_sync_inventory_discard = 0;
+            g_sync_inventory_worker_state = PJ_SYNC_INVENTORY_REQUESTED;
+            notify_worker = 1;
+        }
+    }
+    xSemaphoreGive(g_sync_inventory_lock);
+    if (notify_worker) {
+        xTaskNotifyGive(g_sync_inventory_task);
+    }
 #endif
     return 1;
+}
+
+void pj_board_sync_inventory_cancel(void)
+{
+#ifdef ESP_PLATFORM
+    if (g_sync_inventory_lock == NULL) {
+        return;
+    }
+    xSemaphoreTake(g_sync_inventory_lock, portMAX_DELAY);
+    if (g_sync_inventory_worker_state == PJ_SYNC_INVENTORY_RUNNING) {
+        g_sync_inventory_discard = 1;
+    } else {
+        g_sync_inventory_discard = 0;
+        g_sync_inventory_worker_state = PJ_SYNC_INVENTORY_IDLE;
+    }
+    xSemaphoreGive(g_sync_inventory_lock);
+#endif
 }
 
 void pj_board_refresh_status(pj_ui_context_t *ui)
@@ -7610,6 +7735,7 @@ int pj_board_poll_event(pj_board_event_t *event)
     event->type = PJ_BOARD_EVENT_NONE;
     event->x = 0;
     event->y = 0;
+    event->captured_at_ms = 0;
 #ifdef ESP_PLATFORM
     if (!g_aux_task_started) {
         esp_err_t aux_err = aux_task_start();
@@ -9898,7 +10024,13 @@ static void serial_transcript_commit(char *line)
             return;
         }
         char path[PJ_NOTE_TRANSCRIPT_PATH_LEN];
-        transcript_path_for_audio(path, sizeof(path), g_usb_upload.audio_id);
+        if (!transcript_path_for_audio(path, sizeof(path),
+                                       g_usb_upload.audio_id)) {
+            free(body);
+            serial_sync_error(command, request_id, "invalid audio id",
+                              "invalid_arguments", 0);
+            return;
+        }
         esp_err_t write_error = json_write_file_atomic(path, body, body_size);
         free(body);
         if (write_error != ESP_OK) {
@@ -11077,7 +11209,9 @@ static esp_err_t audio_download_handler(httpd_req_t *req)
         return send_json(req, "{\"error\":\"storage unavailable; run storage recovery\"}");
     }
     const char *id = strrchr(req->uri, '/');
-    if (id == NULL || id[1] == '\0' || strstr(id + 1, "..") != NULL || strchr(id + 1, '/') != NULL) {
+    if (id == NULL || id[1] == '\0' ||
+        memchr(id + 1, '\0', PJ_NOTE_FILENAME_LEN) == NULL ||
+        strstr(id + 1, "..") != NULL || strchr(id + 1, '/') != NULL) {
         httpd_resp_set_status(req, "400 Bad Request");
         return send_json(req, "{\"error\":\"invalid audio id\"}");
     }
@@ -11128,7 +11262,10 @@ static esp_err_t transcript_put_handler(httpd_req_t *req)
         return send_json(req, "{\"error\":\"storage unavailable; run storage recovery\"}");
     }
     const char *id = strrchr(req->uri, '/');
-    if (id == NULL || id[1] == '\0' || strstr(id + 1, "..") != NULL || strchr(id + 1, '/') != NULL) {
+    if (id == NULL || id[1] == '\0' ||
+        memchr(id + 1, '\0', PJ_NOTE_FILENAME_LEN) == NULL ||
+        strstr(id + 1, "..") != NULL || strchr(id + 1, '/') != NULL ||
+        strchr(id + 1, '\\') != NULL) {
         httpd_resp_set_status(req, "400 Bad Request");
         drain_body(req);
         return send_json(req, "{\"error\":\"invalid transcript id\"}");
@@ -11179,7 +11316,12 @@ static esp_err_t transcript_put_handler(httpd_req_t *req)
         return send_json(req, "{\"error\":\"audio not found\"}");
     }
     char path[PJ_NOTE_TRANSCRIPT_PATH_LEN];
-    transcript_path_for_audio(path, sizeof(path), id + 1);
+    if (!transcript_path_for_audio(path, sizeof(path), id + 1)) {
+        storage_shared_release();
+        free(body);
+        httpd_resp_set_status(req, "400 Bad Request");
+        return send_json(req, "{\"error\":\"invalid transcript id\"}");
+    }
     esp_err_t write_err = json_write_file_atomic(path, body, (size_t)req->content_len);
     free(body);
     status = board_status_snapshot_base();

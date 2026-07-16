@@ -7,12 +7,15 @@
 #include "pj_board.h"
 #include "pj_display_worker.h"
 #include "pj_loop_schedule.h"
+#include "pj_sync_inventory_gate.h"
 #include "pj_ui.h"
 
 static const char *TAG = "pocket-journal";
 static pj_ui_context_t g_ui;
 static pj_framebuffer_t g_framebuffer;
+static pj_sync_inventory_gate_t g_sync_inventory_gate;
 static uint32_t g_sync_active_ui_session;
+static uint32_t g_sync_active_target_generation;
 
 typedef struct {
     uint32_t display_generation;
@@ -23,6 +26,7 @@ typedef struct {
 static sync_presentation_t g_sync_presentation;
 
 #define PJ_MAIN_LOOP_PERIOD_MS 50
+#define PJ_SYNC_INVENTORY_RETRY_MS UINT64_C(200)
 
 static uint64_t monotonic_ms(void)
 {
@@ -30,13 +34,22 @@ static uint64_t monotonic_ms(void)
     return now_us <= 0 ? 0 : (uint64_t)now_us / 1000u;
 }
 
+static void clear_sync_bindings(void)
+{
+    if (pj_sync_inventory_gate_reset(&g_sync_inventory_gate)) {
+        pj_board_sync_inventory_cancel();
+    }
+    g_sync_active_ui_session = 0;
+    g_sync_active_target_generation = 0;
+    g_sync_presentation = (sync_presentation_t) {0};
+}
+
 static int render_and_submit_if_dirty(pj_ui_context_t *ui)
 {
     pj_ui_state_t current = pj_ui_current_state(ui);
     uint32_t scene_epoch = pj_ui_interaction_generation(ui);
     if (current != PJ_UI_STATE_SYNC) {
-        g_sync_active_ui_session = 0;
-        g_sync_presentation = (sync_presentation_t) {0};
+        clear_sync_bindings();
     }
     if (!pj_ui_is_dirty(ui)) {
         return 1;
@@ -114,35 +127,94 @@ static void apply_board_state_effects(pj_ui_state_t previous, pj_ui_state_t curr
     sync_ui_audio_from_board(&g_ui);
 }
 
-static int prepare_sync_inventory(pj_ui_context_t *ui)
+static int prepare_sync_inventory(pj_ui_context_t *ui, uint64_t now_ms)
 {
-    uint32_t session = 0;
-    if (pj_ui_current_state(ui) != PJ_UI_STATE_SYNC ||
-        !pj_ui_consume_sync_preflight_request(ui, &session)) {
+    if (pj_ui_current_state(ui) != PJ_UI_STATE_SYNC) {
+        clear_sync_bindings();
         return 0;
     }
 
-    pj_board_refresh_status(ui);
-    pj_board_status_t status = pj_board_status();
-    int online = status.wifi == PJ_BOARD_SERVICE_READY;
-    pj_ui_sync_inventory_state_t state = PJ_UI_SYNC_INVENTORY_UNKNOWN;
-    if (status.storage == PJ_BOARD_SERVICE_READY) {
-        state = online ? PJ_UI_SYNC_INVENTORY_READY :
-                         PJ_UI_SYNC_INVENTORY_OFFLINE;
+    uint32_t current_session = pj_ui_sync_session_generation(ui);
+    if (pj_sync_inventory_gate_reconcile(
+            &g_sync_inventory_gate, current_session)) {
+        pj_board_sync_inventory_cancel();
     }
-    pj_ui_set_sync_inventory(ui, session, state, ui->sync_pending,
-                             ui->sync_transferred, online);
+    if (g_sync_inventory_gate.session == 0) {
+        uint32_t requested_session = 0;
+        if (!pj_ui_consume_sync_preflight_request(ui, &requested_session)) {
+            return 0;
+        }
+        if (!pj_sync_inventory_gate_bind(
+                &g_sync_inventory_gate, requested_session, now_ms)) {
+            return 0;
+        }
+    }
+    if (!pj_sync_inventory_gate_poll_due(
+            &g_sync_inventory_gate, current_session, now_ms)) {
+        return 0;
+    }
+
+    pj_board_sync_inventory_t inventory;
+    if (!pj_board_sync_inventory_snapshot(&inventory)) {
+        inventory = (pj_board_sync_inventory_t) {
+            .state = PJ_BOARD_SYNC_INVENTORY_ERROR,
+        };
+    }
+    if (inventory.state == PJ_BOARD_SYNC_INVENTORY_BUSY) {
+        pj_sync_inventory_gate_defer(
+            &g_sync_inventory_gate, now_ms, PJ_SYNC_INVENTORY_RETRY_MS);
+        return 0;
+    }
+
+    uint32_t session = pj_sync_inventory_gate_take(&g_sync_inventory_gate);
+    pj_ui_sync_inventory_state_t state = PJ_UI_SYNC_INVENTORY_UNKNOWN;
+    if (inventory.state == PJ_BOARD_SYNC_INVENTORY_READY) {
+        state = inventory.online ? PJ_UI_SYNC_INVENTORY_READY :
+                                   PJ_UI_SYNC_INVENTORY_OFFLINE;
+    }
+    pj_ui_set_sync_inventory(
+        ui, session, state,
+        inventory.state == PJ_BOARD_SYNC_INVENTORY_READY ? inventory.pending : 0,
+        inventory.state == PJ_BOARD_SYNC_INVENTORY_READY ?
+            inventory.transferred : 0,
+        inventory.online);
     return 1;
 }
 
 static int consume_active_sync_update(pj_ui_context_t *ui)
 {
+    uint32_t current_session = pj_ui_sync_session_generation(ui);
     if (pj_ui_current_state(ui) != PJ_UI_STATE_SYNC ||
-        g_sync_active_ui_session == 0 ||
-        g_sync_active_ui_session != pj_ui_sync_session_generation(ui)) {
+        g_sync_active_ui_session != current_session) {
+        g_sync_active_ui_session = 0;
+        g_sync_active_target_generation = 0;
         return 0;
     }
-    return pj_board_consume_companion_sync_update(ui);
+    if (g_sync_active_ui_session == 0 ||
+        g_sync_active_target_generation == 0) {
+        return 0;
+    }
+
+    pj_companion_sync_state_t snapshot;
+    if (!pj_board_consume_companion_sync_update_snapshot(&snapshot) ||
+        !pj_board_companion_sync_snapshot_matches_target(
+            &snapshot, g_sync_active_target_generation)) {
+        return 0;
+    }
+    int succeeded = pj_board_companion_sync_snapshot_target_succeeded(
+        &snapshot, g_sync_active_target_generation);
+    if (snapshot.phase == PJ_COMPANION_SYNC_SUCCEEDED && !succeeded) {
+        return 0;
+    }
+    pj_ui_set_sync_state(ui, snapshot.pending, snapshot.transferred,
+                         snapshot.online);
+    pj_ui_set_sync_detail_for_generation(
+        ui, g_sync_active_ui_session,
+        succeeded ? "succeeded" :
+            pj_companion_sync_phase_name(snapshot.phase),
+        snapshot.failed, snapshot.error,
+        pj_companion_sync_state_pending(&snapshot));
+    return 1;
 }
 
 static int service_sync_presentation(pj_ui_context_t *ui)
@@ -167,16 +239,21 @@ static int service_sync_presentation(pj_ui_context_t *ui)
     int changed = 0;
     uint32_t session = 0;
     if (pj_ui_consume_sync_transfer_request(ui, &session)) {
-        g_sync_active_ui_session = session;
-        if (!pj_board_companion_sync_start()) {
+        pj_companion_sync_state_t started;
+        if (!pj_board_companion_sync_start_snapshot(&started) ||
+            started.requested_generation == 0) {
             g_sync_active_ui_session = 0;
+            g_sync_active_target_generation = 0;
             pj_ui_set_sync_detail_for_generation(
                 ui, session, "failed", 1, "START FAILED", 0);
             changed = 1;
+        } else {
+            g_sync_active_ui_session = session;
+            g_sync_active_target_generation = started.requested_generation;
         }
     }
     if (pj_ui_consume_sync_success_return(ui)) {
-        g_sync_active_ui_session = 0;
+        clear_sync_bindings();
         changed = 1;
     }
     return changed;
@@ -185,18 +262,23 @@ static int service_sync_presentation(pj_ui_context_t *ui)
 static void handle_board_event(pj_ui_context_t *ui, const pj_board_event_t *event)
 {
     uint32_t scene_epoch = pj_ui_interaction_generation(ui);
-    if (event_requires_presented_scene(event->type) &&
-        !pj_display_worker_scene_presented(scene_epoch)) {
-        pj_display_worker_note_input_deferred();
+    if (event_requires_presented_scene(event->type)) {
         pj_display_worker_status_t status = pj_display_worker_status();
-        ESP_LOGI(TAG,
-                 "UI deferred input type=%d logical_scene=%" PRIu32
-                 " presented_scene=%" PRIu32 " accepted=%" PRIu32
-                 " committed=%" PRIu32,
-                 (int)event->type, scene_epoch,
-                 status.committed_scene_epoch, status.accepted_generation,
-                 status.committed_generation);
-        return;
+        if (!pj_display_worker_status_accepts_input(
+                &status, scene_epoch, event->captured_at_ms)) {
+            pj_display_worker_note_input_deferred();
+            ESP_LOGI(TAG,
+                     "UI deferred input type=%d logical_scene=%" PRIu32
+                     " presented_scene=%" PRIu32 " accepted=%" PRIu32
+                     " committed=%" PRIu32 " captured_ms=%" PRIu32
+                     " scene_started_ms=%" PRIu32,
+                     (int)event->type, scene_epoch,
+                     status.committed_scene_epoch,
+                     status.accepted_generation,
+                     status.committed_generation, event->captured_at_ms,
+                     status.committed_scene_started_ms);
+            return;
+        }
     }
     pj_ui_state_t previous = pj_ui_current_state(ui);
     int handled = 0;
@@ -355,7 +437,7 @@ void app_main(void)
             render_and_submit_if_dirty(&g_ui);
         }
 
-        if (prepare_sync_inventory(&g_ui)) {
+        if (prepare_sync_inventory(&g_ui, monotonic_ms())) {
             render_and_submit_if_dirty(&g_ui);
         }
 

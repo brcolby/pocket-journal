@@ -33,6 +33,7 @@ typedef struct {
     uint32_t started_scene_epoch;
     uint32_t committed_generation;
     uint32_t committed_scene_epoch;
+    uint32_t committed_scene_started_ms;
     uint32_t superseded_frames;
     uint32_t rate_deferred_frames;
     uint32_t input_deferred_events;
@@ -53,6 +54,7 @@ typedef struct {
     uint32_t started_scene_epoch;
     uint32_t committed_generation;
     uint32_t committed_scene_epoch;
+    uint32_t committed_scene_started_ms;
     uint32_t superseded_frames;
     uint32_t rate_deferred_frames;
     uint32_t input_deferred_events;
@@ -79,6 +81,9 @@ int pj_display_worker_model_take(pj_display_worker_model_t *model,
 void pj_display_worker_model_complete(pj_display_worker_model_t *model,
                                       int slot_index,
                                       int success);
+void pj_display_worker_model_complete_at(pj_display_worker_model_t *model,
+                                         int slot_index, int success,
+                                         uint32_t committed_at_ms);
 void pj_display_worker_model_shutdown(pj_display_worker_model_t *model);
 int pj_display_worker_model_is_idle(const pj_display_worker_model_t *model);
 int pj_display_worker_model_scene_presented(
@@ -89,6 +94,9 @@ void pj_display_worker_model_note_rate_deferred(
     pj_display_worker_model_t *model);
 void pj_display_worker_model_note_input_deferred(
     pj_display_worker_model_t *model);
+int pj_display_worker_status_accepts_input(
+    const pj_display_worker_status_t *status, uint32_t scene_epoch,
+    uint32_t captured_at_ms);
 
 void pj_display_worker_rate_init(pj_display_worker_rate_limiter_t *limiter,
                                  uint32_t minimum_interval_ms);

@@ -301,6 +301,79 @@ static void test_slow_display_keeps_generations_and_final_scene_ordered(void)
     assert(status.ordering_errors == 0);
 }
 
+static void commit_scene_at(pj_display_worker_model_t *model,
+                            uint32_t scene_epoch, uint32_t committed_at_ms)
+{
+    pj_ui_dirty_region_t dirty = full_region();
+    int slot;
+    (void)submit_scene(model, &dirty, scene_epoch, &slot);
+    assert(pj_display_worker_model_take(
+        model, &slot, &dirty, NULL, NULL));
+    pj_display_worker_model_complete_at(
+        model, slot, 1, committed_at_ms);
+}
+
+static void test_input_requires_capture_after_first_scene_commit(void)
+{
+    pj_display_worker_model_t model;
+    pj_display_worker_model_init(&model);
+    pj_display_worker_status_t status =
+        pj_display_worker_model_status(&model);
+    assert(!pj_display_worker_status_accepts_input(&status, 1U, 1U));
+
+    commit_scene_at(&model, 41U, 100U);
+    status = pj_display_worker_model_status(&model);
+    assert(status.committed_scene_started_ms == 100U);
+    assert(!pj_display_worker_status_accepts_input(&status, 40U, 101U));
+    assert(!pj_display_worker_status_accepts_input(&status, 41U, 99U));
+    assert(!pj_display_worker_status_accepts_input(&status, 41U, 100U));
+    assert(pj_display_worker_status_accepts_input(&status, 41U, 101U));
+
+    commit_scene_at(&model, 41U, 500U);
+    status = pj_display_worker_model_status(&model);
+    assert(status.committed_scene_started_ms == 100U);
+    assert(pj_display_worker_status_accepts_input(&status, 41U, 200U));
+
+    commit_scene_at(&model, 42U, 600U);
+    status = pj_display_worker_model_status(&model);
+    assert(status.committed_scene_started_ms == 600U);
+    assert(!pj_display_worker_status_accepts_input(&status, 42U, 599U));
+    assert(pj_display_worker_status_accepts_input(&status, 42U, 601U));
+
+    pj_ui_dirty_region_t dirty = full_region();
+    int slot;
+    (void)submit_scene(&model, &dirty, 43U, &slot);
+    assert(pj_display_worker_model_take(
+        &model, &slot, &dirty, NULL, NULL));
+    pj_display_worker_model_complete_at(&model, slot, 0, 700U);
+    status = pj_display_worker_model_status(&model);
+    assert(status.committed_scene_epoch == 42U);
+    assert(status.committed_scene_started_ms == 600U);
+
+    assert(pj_display_worker_model_take(
+        &model, &slot, &dirty, NULL, NULL));
+    pj_display_worker_model_complete_at(&model, slot, 1, 800U);
+    status = pj_display_worker_model_status(&model);
+    assert(status.committed_scene_epoch == 43U);
+    assert(status.committed_scene_started_ms == 800U);
+}
+
+static void test_input_capture_comparison_survives_millisecond_wrap(void)
+{
+    pj_display_worker_status_t status = {
+        .committed_scene_epoch = 7U,
+        .committed_scene_started_ms = UINT32_MAX - 5U,
+    };
+    assert(!pj_display_worker_status_accepts_input(
+        &status, 7U, UINT32_MAX - 6U));
+    assert(!pj_display_worker_status_accepts_input(
+        &status, 7U, UINT32_MAX - 5U));
+    assert(pj_display_worker_status_accepts_input(&status, 7U, 2U));
+    assert(!pj_display_worker_status_accepts_input(
+        &status, 7U, status.committed_scene_started_ms +
+            UINT32_C(0x80000000)));
+}
+
 static void test_partial_rate_limit_is_global_and_size_independent(void)
 {
     pj_display_worker_rate_limiter_t limiter;
@@ -380,6 +453,8 @@ int main(void)
     test_scene_is_not_presented_until_physical_commit();
     test_new_scene_supersedes_pending_hit_map_as_full();
     test_slow_display_keeps_generations_and_final_scene_ordered();
+    test_input_requires_capture_after_first_scene_commit();
+    test_input_capture_comparison_survives_millisecond_wrap();
     test_partial_rate_limit_is_global_and_size_independent();
     test_deferred_metrics_are_explicit();
     test_generation_order_survives_wrap();

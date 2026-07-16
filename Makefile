@@ -1,4 +1,4 @@
-.PHONY: test test-firmware-tools test-ui test-input test-display-worker test-display-pipeline test-partner test-simulator test-simulator-runtime test-ui-images ui-gallery check-lvgl-managed check-static-art generate-static-art generate-font-assets generate-icon-assets generate-simulator-wasm simulator clean
+.PHONY: test test-firmware-tools test-ui test-input test-display-worker test-sync-inventory-gate test-display-pipeline test-partner test-simulator test-simulator-runtime test-ui-images ui-gallery check-lvgl-managed check-static-art generate-static-art generate-font-assets generate-icon-assets generate-simulator-wasm simulator clean
 
 CC ?= cc
 CFLAGS ?= -std=c11 -Wall -Wextra -Werror -pedantic
@@ -21,6 +21,7 @@ STORAGE_COORDINATOR_TEST_BIN := build/test_storage_coordinator
 RUNTIME_DIAGNOSTICS_TEST_BIN := build/test_runtime_diagnostics
 LOOP_SCHEDULE_TEST_BIN := build/test_loop_schedule
 DISPLAY_WORKER_TEST_BIN := build/test_display_worker
+SYNC_INVENTORY_GATE_TEST_BIN := build/test_sync_inventory_gate
 DISPLAY_PIPELINE_TEST_BIN := build/test_display_pipeline
 DISPLAY_REFRESH_TEST_BIN := build/test_display_refresh
 TIME_CIVIL_TEST_BIN := build/test_time_civil
@@ -91,6 +92,15 @@ test-display-worker:
 		-o $(DISPLAY_WORKER_TEST_BIN)
 	$(DISPLAY_WORKER_TEST_BIN)
 
+test-sync-inventory-gate:
+	mkdir -p build
+	$(CC) $(CFLAGS) \
+		-Ifirmware/main \
+		firmware/main/pj_sync_inventory_gate.c \
+		tests/board/test_sync_inventory_gate.c \
+		-o $(SYNC_INVENTORY_GATE_TEST_BIN)
+	$(SYNC_INVENTORY_GATE_TEST_BIN)
+
 test-display-pipeline: check-static-art
 	mkdir -p build
 	$(CC) $(CFLAGS) \
@@ -106,7 +116,7 @@ test-display-pipeline: check-static-art
 		-o $(DISPLAY_PIPELINE_TEST_BIN)
 	$(DISPLAY_PIPELINE_TEST_BIN)
 
-test-input: test-display-worker test-display-pipeline
+test-input: test-display-worker test-sync-inventory-gate test-display-pipeline
 	mkdir -p build
 	$(CC) $(CFLAGS) \
 		-Ifirmware/components/pj_board/include \

@@ -27,6 +27,7 @@ static void test_single_click_is_deferred(void)
     uint32_t released_at = short_press(&input, 100, 180);
     assert(pj_aux_input_update(&input, 1, released_at + PJ_AUX_DOUBLE_CLICK_MS) == PJ_AUX_GESTURE_NONE);
     assert(pj_aux_input_update(&input, 1, released_at + PJ_AUX_DOUBLE_CLICK_MS + 1U) == PJ_AUX_GESTURE_SHORT);
+    assert(pj_aux_input_gesture_started_ms(&input) == 100U);
     assert(pj_aux_input_update(&input, 1, 1000) == PJ_AUX_GESTURE_NONE);
 }
 
@@ -38,6 +39,7 @@ static void test_double_click_replaces_pending_short(void)
     short_press(&input, 100, 180);
     assert(settle_level(&input, 0, 300) == PJ_AUX_GESTURE_NONE);
     assert(settle_level(&input, 1, 380) == PJ_AUX_GESTURE_DOUBLE);
+    assert(pj_aux_input_gesture_started_ms(&input) == 100U);
     assert(pj_aux_input_update(&input, 1, 1000) == PJ_AUX_GESTURE_NONE);
 }
 
@@ -48,9 +50,11 @@ static void test_late_second_click_preserves_both_singles(void)
 
     short_press(&input, 100, 180);
     assert(settle_level(&input, 0, 600) == PJ_AUX_GESTURE_SHORT);
+    assert(pj_aux_input_gesture_started_ms(&input) == 100U);
     assert(settle_level(&input, 1, 680) == PJ_AUX_GESTURE_NONE);
     uint32_t released_at = 680 + PJ_AUX_DEBOUNCE_MS;
     assert(pj_aux_input_update(&input, 1, released_at + PJ_AUX_DOUBLE_CLICK_MS + 1U) == PJ_AUX_GESTURE_SHORT);
+    assert(pj_aux_input_gesture_started_ms(&input) == 600U);
 }
 
 static void test_long_press_is_not_a_double_click(void)
@@ -153,6 +157,7 @@ static void test_millisecond_counter_wrap(void)
 
     uint32_t released_at = short_press(&input, start + 50U, start + 130U);
     assert(pj_aux_input_update(&input, 1, released_at + PJ_AUX_DOUBLE_CLICK_MS + 1U) == PJ_AUX_GESTURE_SHORT);
+    assert(pj_aux_input_gesture_started_ms(&input) == start + 50U);
 }
 
 int main(void)

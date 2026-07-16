@@ -50,6 +50,7 @@ typedef struct {
     pj_board_event_type_t type;
     int x;
     int y;
+    uint32_t captured_at_ms;
 } pj_board_event_t;
 
 typedef struct {
@@ -130,8 +131,10 @@ int pj_board_playback_toggle_index(int note_index);
 int pj_board_wipe_recordings(pj_ui_context_t *ui);
 int pj_board_storage_recover(void);
 int pj_board_http_start(void);
-/* Returns a fresh storage scan. BUSY and ERROR never contain cached counts. */
+/* Starts or polls a fresh async scan. BUSY and ERROR never contain cached counts. */
 int pj_board_sync_inventory_snapshot(pj_board_sync_inventory_t *inventory);
+/* Discards an in-flight or unread inventory result when its UI session ends. */
+void pj_board_sync_inventory_cancel(void);
 /* Creates a durable request and starts or attaches to asynchronous sync. */
 int pj_board_companion_sync_start(void);
 /* Atomically returns the newly persisted request snapshot before task progress. */
