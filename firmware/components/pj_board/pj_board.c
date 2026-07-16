@@ -183,6 +183,9 @@
 #define PJ_AUDIO_MIC_GAIN_DB 42.0f
 #define PJ_AUDIO_RECORD_TASK_STACK 6144
 #define PJ_AUDIO_PROCESS_TASK_STACK 6144
+#define PJ_AUDIO_PROCESS_QUEUE_LENGTH 4U
+#define PJ_AUDIO_PROCESS_SWAP_WAIT_MS 30000U
+#define PJ_AUDIO_PROCESS_SWAP_POLL_MS 20U
 #define PJ_AUDIO_PLAYBACK_TASK_STACK 6144
 #define PJ_ALERT_AUDIO_TASK_STACK 4096
 #define PJ_ALERT_AUDIO_FAILURE_ACK_THRESHOLD 3
@@ -297,6 +300,15 @@ static int valid_time_date(int hour, int minute, int year, int month, int day)
 }
 
 #ifdef ESP_PLATFORM
+typedef struct {
+    char final_path[128];
+    uint32_t data_bytes;
+    uint32_t raw_peak;
+    uint32_t raw_avg;
+    uint32_t raw_clipped;
+    int input_channel;
+} audio_process_args_t;
+
 static httpd_handle_t g_http_server;
 static const char *TAG = "pj-board";
 static spi_device_handle_t g_epd_spi;
@@ -315,6 +327,10 @@ static adc_oneshot_unit_handle_t g_adc1_handle;
 static adc_cali_handle_t g_adc_cali_handle;
 static QueueHandle_t g_board_event_queue;
 static QueueHandle_t g_aux_event_queue;
+static QueueHandle_t g_audio_process_queue;
+static StaticQueue_t g_audio_process_queue_storage;
+static uint8_t g_audio_process_queue_buffer[
+    PJ_AUDIO_PROCESS_QUEUE_LENGTH * sizeof(audio_process_args_t)];
 static SemaphoreHandle_t g_i2c_lock;
 static SemaphoreHandle_t g_rtc_sequence_lock;
 static SemaphoreHandle_t g_audio_lock;
@@ -388,7 +404,6 @@ static TaskHandle_t g_alert_audio_task;
 static TaskHandle_t g_storage_wipe_task;
 static int g_record_audio_owned;
 static int g_record_storage_owned;
-static int g_record_storage_processing;
 static int g_playback_storage_owned;
 static int g_alert_audio_output_owned;
 static char g_active_recording_path[128];
@@ -733,7 +748,6 @@ static int record_storage_try_acquire(void)
     portENTER_CRITICAL(&g_storage_coordinator_lock);
     if (!g_record_storage_owned && pj_storage_shared_try_acquire(&g_storage_coordinator)) {
         g_record_storage_owned = 1;
-        g_record_storage_processing = 0;
         acquired = 1;
     }
     portEXIT_CRITICAL(&g_storage_coordinator_lock);
@@ -745,9 +759,25 @@ static void record_storage_release(void)
     portENTER_CRITICAL(&g_storage_coordinator_lock);
     if (g_record_storage_owned) {
         g_record_storage_owned = 0;
-        g_record_storage_processing = 0;
         pj_storage_shared_release(&g_storage_coordinator);
     }
+    portEXIT_CRITICAL(&g_storage_coordinator_lock);
+}
+
+static int storage_audio_publication_try_begin(void)
+{
+    int acquired;
+    portENTER_CRITICAL(&g_storage_coordinator_lock);
+    acquired = pj_storage_audio_publication_try_begin(
+        &g_storage_coordinator);
+    portEXIT_CRITICAL(&g_storage_coordinator_lock);
+    return acquired;
+}
+
+static void storage_audio_publication_finish(void)
+{
+    portENTER_CRITICAL(&g_storage_coordinator_lock);
+    pj_storage_audio_publication_finish(&g_storage_coordinator);
     portEXIT_CRITICAL(&g_storage_coordinator_lock);
 }
 
@@ -884,13 +914,6 @@ static void recording_state_finish_capture(int succeeded)
     portEXIT_CRITICAL(&g_recording_lock);
 }
 
-static void recording_state_finish_processing(int succeeded)
-{
-    portENTER_CRITICAL(&g_recording_lock);
-    (void)pj_recording_finish_processing(&g_recording, succeeded);
-    portEXIT_CRITICAL(&g_recording_lock);
-}
-
 static void recording_publish_completion(void)
 {
     int succeeded = 0;
@@ -935,16 +958,6 @@ typedef struct {
     uint32_t read_errors;
     int input_channel;
 } audio_mic_check_result_t;
-typedef struct {
-    char temporary_path[144];
-    char final_path[128];
-    uint32_t data_bytes;
-    uint32_t raw_peak;
-    uint32_t raw_avg;
-    uint32_t raw_clipped;
-    int input_channel;
-} audio_process_args_t;
-
 static esp_err_t audio_play_tone_ms(uint32_t duration_ms, const audio_tone_diag_opts_t *opts);
 static esp_err_t audio_mic_check_ms(uint32_t duration_ms, int gain_db, audio_mic_check_result_t *result);
 static esp_err_t serial_command_task_start(void);
@@ -5741,11 +5754,138 @@ static int wav_filter_pcm16(FILE *file, uint32_t data_bytes, uint32_t *peak, uin
     return fseek(file, 44L + (long)data_bytes, SEEK_SET) == 0;
 }
 
-static int audio_process_recording(audio_process_args_t *args)
+static int recording_copy_for_processing(const char *source_path,
+                                         const char *temporary_path,
+                                         uint32_t data_bytes)
 {
-    FILE *file = fopen(args->temporary_path, "rb+");
+    if (!recording_file_valid(source_path, data_bytes)) {
+        ESP_LOGE(TAG, "Audio processing source is not a valid recording: %s",
+                 source_path);
+        return 0;
+    }
+    if (remove(temporary_path) != 0 && errno != ENOENT) {
+        ESP_LOGE(TAG, "Audio processing stale temp removal failed: %s errno=%d",
+                 temporary_path, errno);
+        return 0;
+    }
+    FILE *source = fopen(source_path, "rb");
+    FILE *temporary = source != NULL ? fopen(temporary_path, "wb") : NULL;
+    if (source == NULL || temporary == NULL) {
+        ESP_LOGE(TAG, "Audio processing copy open failed: %s -> %s",
+                 source_path, temporary_path);
+        if (source != NULL) {
+            fclose(source);
+        }
+        if (temporary != NULL) {
+            fclose(temporary);
+        }
+        remove(temporary_path);
+        return 0;
+    }
+
+    uint8_t buffer[PJ_AUDIO_IO_BUFFER_BYTES];
+    int copied = 1;
+    size_t bytes_read;
+    while ((bytes_read = fread(buffer, 1, sizeof(buffer), source)) > 0U) {
+        if (fwrite(buffer, 1, bytes_read, temporary) != bytes_read) {
+            copied = 0;
+            break;
+        }
+        taskYIELD();
+    }
+    copied = copied && !ferror(source) && fflush(temporary) == 0 &&
+             fsync(fileno(temporary)) == 0;
+    copied = fclose(source) == 0 && copied;
+    copied = fclose(temporary) == 0 && copied;
+    if (!copied || !recording_file_valid(temporary_path, data_bytes)) {
+        ESP_LOGE(TAG, "Audio processing copy failed validation: %s",
+                 temporary_path);
+        remove(temporary_path);
+        return 0;
+    }
+    return 1;
+}
+
+static int recording_replace_with_processed(const char *temporary_path,
+                                            const char *final_path,
+                                            uint32_t data_bytes)
+{
+    char backup_path[144];
+    int backup_length = snprintf(backup_path, sizeof(backup_path), "%s.bak",
+                                 final_path);
+    if (backup_length < 0 || backup_length >= (int)sizeof(backup_path) ||
+        !recording_file_valid(temporary_path, data_bytes)) {
+        return 0;
+    }
+    memset(&g_usb_audio_identity, 0, sizeof(g_usb_audio_identity));
+    if (remove(backup_path) != 0 && errno != ENOENT) {
+        ESP_LOGE(TAG, "Audio processing stale backup removal failed: %s errno=%d",
+                 backup_path, errno);
+        return 0;
+    }
+    if (rename(final_path, backup_path) != 0) {
+        ESP_LOGW(TAG, "Audio processing raw backup failed: %s errno=%d",
+                 final_path, errno);
+        return 0;
+    }
+    if (rename(temporary_path, final_path) != 0) {
+        int publish_errno = errno;
+        if (rename(backup_path, final_path) != 0) {
+            ESP_LOGE(TAG, "Raw recording retained at %s; restore failed errno=%d",
+                     backup_path, errno);
+        }
+        ESP_LOGE(TAG, "Audio processing publication failed: %s errno=%d",
+                 final_path, publish_errno);
+        return 0;
+    }
+    if (!recording_file_valid(final_path, data_bytes)) {
+        ESP_LOGE(TAG, "Processed recording failed post-publication validation: %s",
+                 final_path);
+        remove(final_path);
+        if (rename(backup_path, final_path) != 0) {
+            ESP_LOGE(TAG, "Raw recording retained at %s; restore failed errno=%d",
+                     backup_path, errno);
+        }
+        return 0;
+    }
+    if (remove(backup_path) != 0 && errno != ENOENT) {
+        ESP_LOGW(TAG, "Processed recording published; raw backup cleanup failed: %s errno=%d",
+                 backup_path, errno);
+    }
+    return 1;
+}
+
+static int audio_process_wait_for_publication(void)
+{
+    TickType_t started = xTaskGetTickCount();
+    TickType_t max_wait = pdMS_TO_TICKS(PJ_AUDIO_PROCESS_SWAP_WAIT_MS);
+    do {
+        if (storage_audio_publication_try_begin()) {
+            return 1;
+        }
+        vTaskDelay(pdMS_TO_TICKS(PJ_AUDIO_PROCESS_SWAP_POLL_MS));
+    } while ((TickType_t)(xTaskGetTickCount() - started) < max_wait);
+    return storage_audio_publication_try_begin();
+}
+
+static int audio_process_recording(const audio_process_args_t *args,
+                                   int *publication_owned)
+{
+    char temporary_path[144];
+    int path_length = snprintf(temporary_path, sizeof(temporary_path),
+                               "%s.tmp", args->final_path);
+    if (publication_owned == NULL || path_length < 0 ||
+        path_length >= (int)sizeof(temporary_path) ||
+        !recording_copy_for_processing(args->final_path, temporary_path,
+                                       args->data_bytes)) {
+        return 0;
+    }
+    *publication_owned = 0;
+
+    FILE *file = fopen(temporary_path, "rb+");
     if (file == NULL) {
-        ESP_LOGE(TAG, "Audio processing open failed: %s", args->temporary_path);
+        ESP_LOGE(TAG, "Audio processing open failed: %s", temporary_path);
+        remove(temporary_path);
         return 0;
     }
 
@@ -5764,11 +5904,22 @@ static int audio_process_recording(audio_process_args_t *args)
     int flush_ok = fflush(file) == 0 && fsync(fileno(file)) == 0;
     int close_ok = fclose(file) == 0;
     int ready = filter_ok && normalize_ok && flush_ok && close_ok &&
-                recording_publish_file(args->temporary_path, args->final_path,
-                                       args->data_bytes);
+                recording_file_valid(temporary_path, args->data_bytes);
     if (!ready) {
-        ESP_LOGE(TAG, "Audio processing failed: %s", args->temporary_path);
-        remove(args->temporary_path);
+        ESP_LOGE(TAG, "Audio processing failed: %s", temporary_path);
+        remove(temporary_path);
+        return 0;
+    }
+    if (!audio_process_wait_for_publication()) {
+        ESP_LOGW(TAG, "Audio processing publication timed out; raw retained: %s",
+                 args->final_path);
+        remove(temporary_path);
+        return 0;
+    }
+    *publication_owned = 1;
+    if (!recording_replace_with_processed(temporary_path, args->final_path,
+                                          args->data_bytes)) {
+        remove(temporary_path);
         return 0;
     }
 
@@ -5785,22 +5936,71 @@ static int audio_process_recording(audio_process_args_t *args)
 
 static void audio_process_task(void *arg)
 {
-    audio_process_args_t *args = arg;
-    int note_ready = audio_process_recording(args);
-    free(args);
-    if (!note_ready) {
-        board_status_set_error(
-            "recording post-processing or publication failed");
+    (void)arg;
+    audio_process_args_t args;
+    for (;;) {
+        if (xQueueReceive(g_audio_process_queue, &args, portMAX_DELAY) != pdTRUE) {
+            continue;
+        }
+        int lifecycle_started = 0;
+        if (audio_lifecycle_take()) {
+            lifecycle_started =
+                pj_audio_lifecycle_begin_processing(&g_audio_lifecycle);
+            audio_lifecycle_give();
+        }
+        if (!lifecycle_started) {
+            ESP_LOGW(TAG, "Audio processing job skipped: lifecycle unavailable; raw retained: %s",
+                     args.final_path);
+            continue;
+        }
+
+        int storage_owned = storage_shared_try_acquire();
+        int publication_owned = 0;
+        int enhanced = storage_owned &&
+                       audio_process_recording(&args, &publication_owned);
+        if (publication_owned) {
+            storage_audio_publication_finish();
+            board_update_publish(BOARD_UPDATE_NOTES);
+        } else if (storage_owned) {
+            storage_shared_release();
+        }
+        if (!enhanced) {
+            ESP_LOGW(TAG, "Audio enhancement skipped or failed; raw note retained: %s",
+                     args.final_path);
+        }
+        if (audio_lifecycle_take()) {
+            pj_audio_lifecycle_finish_processing(&g_audio_lifecycle);
+            audio_lifecycle_give();
+        }
     }
-    recording_state_finish_processing(note_ready);
-    recording_publish_completion();
-    record_storage_release();
-    if (audio_lifecycle_take()) {
-        g_audio_process_task = NULL;
-        pj_audio_lifecycle_finish_processing(&g_audio_lifecycle);
-        audio_lifecycle_give();
+}
+
+static int audio_process_worker_start(void)
+{
+    if (g_audio_process_queue == NULL) {
+        g_audio_process_queue = xQueueCreateStatic(
+            PJ_AUDIO_PROCESS_QUEUE_LENGTH, sizeof(audio_process_args_t),
+            g_audio_process_queue_buffer, &g_audio_process_queue_storage);
     }
-    vTaskDelete(NULL);
+    if (g_audio_process_queue == NULL) {
+        return 0;
+    }
+    if (g_audio_process_task == NULL) {
+        BaseType_t created = xTaskCreate(
+            audio_process_task, "pj-audio-process", PJ_AUDIO_PROCESS_TASK_STACK,
+            NULL, 1, &g_audio_process_task);
+        if (created != pdPASS) {
+            g_audio_process_task = NULL;
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static int audio_process_enqueue(const audio_process_args_t *args)
+{
+    return args != NULL && audio_process_worker_start() &&
+           xQueueSend(g_audio_process_queue, args, 0) == pdTRUE;
 }
 
 static esp_err_t audio_i2s_init(void)
@@ -5928,6 +6128,9 @@ static esp_err_t audio_init(void)
     ESP_RETURN_ON_ERROR(i2s_channel_enable(g_i2s_tx_chan), TAG, "i2s tx enable for codec init failed");
     ESP_RETURN_ON_ERROR(i2s_channel_enable(g_i2s_rx_chan), TAG, "i2s rx enable for codec init failed");
     ESP_RETURN_ON_ERROR(audio_codec_init(), TAG, "es8311 codec init failed");
+    if (!audio_process_worker_start()) {
+        ESP_LOGW(TAG, "Audio processing worker unavailable; raw recordings will be retained");
+    }
     g_audio_ready = 1;
     ESP_LOGI(TAG, "ES8311 audio initialized via esp_codec_dev");
     return ESP_OK;
@@ -5939,13 +6142,7 @@ static void record_task_exit(void)
         g_record_audio_owned = 0;
         xSemaphoreGive(g_audio_lock);
     }
-    int processing;
-    portENTER_CRITICAL(&g_storage_coordinator_lock);
-    processing = g_record_storage_processing;
-    portEXIT_CRITICAL(&g_storage_coordinator_lock);
-    if (!processing) {
-        record_storage_release();
-    }
+    record_storage_release();
     recording_publish_completion();
     board_audio_state_set(0, -1);
     alert_audio_set_recording(0);
@@ -6099,8 +6296,8 @@ static void record_task(void *arg)
     int flush_ok = fflush(file) == 0 && fsync(fileno(file)) == 0;
     int close_ok = fclose(file) == 0;
     int finalized = header_ok && flush_ok && close_ok && !capture_failed && data_bytes > 0;
-    recording_state_finish_capture(finalized);
     if (!finalized) {
+        recording_state_finish_capture(0);
         ESP_LOGE(TAG, "Recording finalization failed or produced no audio: %s", temporary_path);
         board_status_set_error(
             "recording capture or WAV finalization failed");
@@ -6109,62 +6306,38 @@ static void record_task(void *arg)
         return;
     }
 
+    int note_ready = recording_publish_file(temporary_path,
+                                            g_active_recording_path,
+                                            data_bytes);
+    recording_state_finish_capture(note_ready);
+    if (!note_ready) {
+        board_status_set_error("recording raw publication failed");
+        record_task_exit();
+        return;
+    }
+
     struct stat st;
-    long file_size = stat(temporary_path, &st) == 0 ? (long)st.st_size : -1;
-    ESP_LOGI(TAG, "Recording capture stopped: %s bytes=%u file_size=%ld read_errors=%u "
-             "raw_peak=%u raw_avg_abs=%u raw_clipped=%u; processing asynchronously",
+    long file_size = stat(g_active_recording_path, &st) == 0 ?
+                     (long)st.st_size : -1;
+    ESP_LOGI(TAG, "Recording raw note published: %s bytes=%u file_size=%ld read_errors=%u "
+             "raw_peak=%u raw_avg_abs=%u raw_clipped=%u",
              g_active_recording_path, (unsigned)data_bytes, file_size, (unsigned)read_errors,
              (unsigned)peak, (unsigned)raw_avg, (unsigned)clipped_samples);
 
-    audio_process_args_t *process_args = malloc(sizeof(*process_args));
-    int note_ready = 0;
-    int processing_started = 0;
-    if (process_args != NULL) {
-        (void)snprintf(process_args->temporary_path, sizeof(process_args->temporary_path), "%s", temporary_path);
-        (void)snprintf(process_args->final_path, sizeof(process_args->final_path), "%s", g_active_recording_path);
-        process_args->data_bytes = data_bytes;
-        process_args->raw_peak = peak;
-        process_args->raw_avg = raw_avg;
-        process_args->raw_clipped = clipped_samples;
-        process_args->input_channel = input_channel;
-        portENTER_CRITICAL(&g_storage_coordinator_lock);
-        g_record_storage_processing = 1;
-        portEXIT_CRITICAL(&g_storage_coordinator_lock);
-        BaseType_t created = pdFAIL;
-        if (audio_lifecycle_take()) {
-            if (pj_audio_lifecycle_begin_processing(&g_audio_lifecycle)) {
-                created = xTaskCreate(audio_process_task, "pj-audio-process",
-                                      PJ_AUDIO_PROCESS_TASK_STACK, process_args,
-                                      1, &g_audio_process_task);
-                processing_started = created == pdPASS;
-                if (created != pdPASS) {
-                    g_audio_process_task = NULL;
-                    pj_audio_lifecycle_cancel_processing(&g_audio_lifecycle);
-                }
-            }
-            audio_lifecycle_give();
-        }
-        if (created != pdPASS) {
-            portENTER_CRITICAL(&g_storage_coordinator_lock);
-            g_record_storage_processing = 0;
-            portEXIT_CRITICAL(&g_storage_coordinator_lock);
-            ESP_LOGW(TAG, "Audio processing task start failed; preserving raw recording");
-            note_ready = recording_publish_file(temporary_path,
-                                                g_active_recording_path,
-                                                data_bytes);
-            recording_state_finish_processing(note_ready);
-            free(process_args);
-        }
+    audio_process_args_t process_args = {
+        .data_bytes = data_bytes,
+        .raw_peak = peak,
+        .raw_avg = raw_avg,
+        .raw_clipped = clipped_samples,
+        .input_channel = input_channel,
+    };
+    (void)snprintf(process_args.final_path, sizeof(process_args.final_path),
+                   "%s", g_active_recording_path);
+    if (audio_process_enqueue(&process_args)) {
+        ESP_LOGI(TAG, "Audio enhancement queued: %s", process_args.final_path);
     } else {
-        ESP_LOGW(TAG, "Audio processing task allocation failed; preserving raw recording");
-        note_ready = recording_publish_file(temporary_path,
-                                            g_active_recording_path,
-                                            data_bytes);
-        recording_state_finish_processing(note_ready);
-    }
-    if (!processing_started && !note_ready) {
-        board_status_set_error(
-            "recording post-processing or publication failed");
+        ESP_LOGW(TAG, "Audio enhancement queue unavailable or full; raw note retained: %s",
+                 process_args.final_path);
     }
     record_task_exit();
 }

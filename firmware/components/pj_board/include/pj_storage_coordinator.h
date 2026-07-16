@@ -13,6 +13,7 @@ typedef enum {
     PJ_STORAGE_MAINTENANCE_RECOVERY,
     PJ_STORAGE_MAINTENANCE_SLEEP,
     PJ_STORAGE_MAINTENANCE_OTA,
+    PJ_STORAGE_MAINTENANCE_AUDIO_PUBLICATION,
 } pj_storage_maintenance_t;
 
 typedef enum {
@@ -66,6 +67,11 @@ typedef struct {
 void pj_storage_coordinator_init(pj_storage_coordinator_t *coordinator);
 int pj_storage_shared_try_acquire(pj_storage_coordinator_t *coordinator);
 void pj_storage_shared_release(pj_storage_coordinator_t *coordinator);
+/* Promotes the caller's sole shared lease into a short exclusive mutation. */
+int pj_storage_audio_publication_try_begin(
+    pj_storage_coordinator_t *coordinator);
+void pj_storage_audio_publication_finish(
+    pj_storage_coordinator_t *coordinator);
 int pj_storage_idle(const pj_storage_coordinator_t *coordinator);
 pj_wipe_start_result_t pj_storage_wipe_request(pj_storage_coordinator_t *coordinator,
                                                 int storage_ready, int audio_active,

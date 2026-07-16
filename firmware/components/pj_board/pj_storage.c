@@ -90,7 +90,8 @@ pj_storage_recovery_action_t pj_storage_recovery_action(const char *filename, in
     if (has_suffix(filename, ".wav.tmp") || has_suffix(filename, ".json.tmp")) {
         return PJ_STORAGE_RECOVERY_DELETE_TEMP;
     }
-    if (has_suffix(filename, ".json.bak")) {
+    if (has_suffix(filename, ".json.bak") ||
+        has_suffix(filename, ".wav.bak")) {
         return target_exists ? PJ_STORAGE_RECOVERY_DELETE_BACKUP : PJ_STORAGE_RECOVERY_RESTORE_BACKUP;
     }
     return PJ_STORAGE_RECOVERY_IGNORE;

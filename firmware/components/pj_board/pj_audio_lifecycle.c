@@ -18,7 +18,7 @@ int pj_audio_lifecycle_active(const pj_audio_lifecycle_t *state)
 
 int pj_audio_lifecycle_begin_record(pj_audio_lifecycle_t *state)
 {
-    if (state == NULL || pj_audio_lifecycle_active(state)) {
+    if (state == NULL || state->record_worker || state->playback_worker) {
         return 0;
     }
     state->record_worker = 1;
@@ -41,8 +41,7 @@ pj_audio_stop_result_t pj_audio_lifecycle_request_record_stop(
 
 int pj_audio_lifecycle_begin_processing(pj_audio_lifecycle_t *state)
 {
-    if (state == NULL || !state->record_worker || state->process_worker ||
-        state->playback_worker) {
+    if (state == NULL || state->process_worker) {
         return 0;
     }
     state->process_worker = 1;
@@ -71,7 +70,7 @@ void pj_audio_lifecycle_finish_processing(pj_audio_lifecycle_t *state)
 
 int pj_audio_lifecycle_begin_playback(pj_audio_lifecycle_t *state)
 {
-    if (state == NULL || pj_audio_lifecycle_active(state)) {
+    if (state == NULL || state->record_worker || state->playback_worker) {
         return 0;
     }
     state->playback_worker = 1;

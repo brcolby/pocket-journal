@@ -31,6 +31,30 @@ static void test_shared_and_maintenance_exclusion(void)
     pj_storage_shared_release(&coordinator);
 }
 
+static void test_audio_publication_promotes_only_the_sole_shared_owner(void)
+{
+    pj_storage_coordinator_t coordinator;
+    pj_storage_coordinator_init(&coordinator);
+
+    assert(!pj_storage_audio_publication_try_begin(&coordinator));
+    assert(pj_storage_shared_try_acquire(&coordinator));
+    assert(pj_storage_shared_try_acquire(&coordinator));
+    assert(!pj_storage_audio_publication_try_begin(&coordinator));
+
+    pj_storage_shared_release(&coordinator);
+    assert(pj_storage_audio_publication_try_begin(&coordinator));
+    assert(coordinator.shared_users == 0U);
+    assert(coordinator.maintenance ==
+           PJ_STORAGE_MAINTENANCE_AUDIO_PUBLICATION);
+    assert(!pj_storage_shared_try_acquire(&coordinator));
+    assert(!pj_storage_sleep_try_begin(&coordinator));
+
+    pj_storage_audio_publication_finish(&coordinator);
+    assert(pj_storage_idle(&coordinator));
+    assert(pj_storage_shared_try_acquire(&coordinator));
+    pj_storage_shared_release(&coordinator);
+}
+
 static void test_wipe_duplicate_and_repeated_starts(void)
 {
     pj_storage_coordinator_t coordinator;
@@ -110,6 +134,7 @@ static void test_wipe_rejections_and_failure(void)
 int main(void)
 {
     test_shared_and_maintenance_exclusion();
+    test_audio_publication_promotes_only_the_sole_shared_owner();
     test_wipe_duplicate_and_repeated_starts();
     test_wipe_rejections_and_failure();
     return 0;

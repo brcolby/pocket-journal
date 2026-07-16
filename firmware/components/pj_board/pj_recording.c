@@ -39,8 +39,7 @@ int pj_recording_start(pj_recording_t *recording, uint32_t sample_rate,
         !format_valid(sample_rate, channels, bits_per_sample) ||
         recording->completion_pending ||
         recording->phase == PJ_RECORDING_CAPTURING ||
-        recording->phase == PJ_RECORDING_STOPPING ||
-        recording->phase == PJ_RECORDING_PROCESSING) {
+        recording->phase == PJ_RECORDING_STOPPING) {
         return 0;
     }
     recording->captured_bytes = 0;
@@ -92,20 +91,7 @@ int pj_recording_finish_capture(pj_recording_t *recording, int succeeded)
          recording->phase != PJ_RECORDING_STOPPING)) {
         return 0;
     }
-    if (!succeeded || recording->captured_bytes == 0) {
-        complete(recording, 0);
-    } else {
-        recording->phase = PJ_RECORDING_PROCESSING;
-    }
-    return 1;
-}
-
-int pj_recording_finish_processing(pj_recording_t *recording, int succeeded)
-{
-    if (recording == NULL || recording->phase != PJ_RECORDING_PROCESSING) {
-        return 0;
-    }
-    complete(recording, succeeded);
+    complete(recording, succeeded && recording->captured_bytes != 0);
     return 1;
 }
 

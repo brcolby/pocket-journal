@@ -256,6 +256,8 @@ static void test_recovery_policy(void)
     assert(pj_storage_recovery_action("note.json.tmp", 0) == PJ_STORAGE_RECOVERY_DELETE_TEMP);
     assert(pj_storage_recovery_action("note.json.bak", 0) == PJ_STORAGE_RECOVERY_RESTORE_BACKUP);
     assert(pj_storage_recovery_action("note.json.bak", 1) == PJ_STORAGE_RECOVERY_DELETE_BACKUP);
+    assert(pj_storage_recovery_action("rec.wav.bak", 0) == PJ_STORAGE_RECOVERY_RESTORE_BACKUP);
+    assert(pj_storage_recovery_action("rec.wav.bak", 1) == PJ_STORAGE_RECOVERY_DELETE_BACKUP);
     assert(pj_storage_recovery_action("valid.wav", 0) == PJ_STORAGE_RECOVERY_IGNORE);
     assert(pj_storage_recovery_action("similar.wav.TMP", 0) == PJ_STORAGE_RECOVERY_IGNORE);
 }

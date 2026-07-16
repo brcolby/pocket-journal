@@ -3,7 +3,7 @@
 #include <assert.h>
 #include <stdio.h>
 
-static void test_record_stop_and_processing_handoff(void)
+static void test_long_processing_does_not_hold_capture_or_playback_admission(void)
 {
     pj_audio_lifecycle_t state;
     pj_audio_lifecycle_init(&state);
@@ -24,8 +24,15 @@ static void test_record_stop_and_processing_handoff(void)
     assert(!pj_audio_lifecycle_begin_processing(&state));
     pj_audio_lifecycle_finish_record(&state);
     assert(pj_audio_lifecycle_active(&state));
-    assert(!pj_audio_lifecycle_begin_record(&state));
+
+    /* Optional processing remains active across immediate capture re-entry. */
+    assert(pj_audio_lifecycle_begin_record(&state));
     assert(!pj_audio_lifecycle_begin_playback(&state));
+    pj_audio_lifecycle_finish_record(&state);
+    assert(pj_audio_lifecycle_begin_playback(&state));
+    assert(!pj_audio_lifecycle_begin_record(&state));
+    pj_audio_lifecycle_finish_playback(&state);
+    assert(pj_audio_lifecycle_active(&state));
 
     pj_audio_lifecycle_finish_processing(&state);
     assert(!pj_audio_lifecycle_active(&state));
@@ -37,10 +44,8 @@ static void test_failed_processing_start_can_be_rolled_back(void)
 {
     pj_audio_lifecycle_t state;
     pj_audio_lifecycle_init(&state);
-    assert(pj_audio_lifecycle_begin_record(&state));
     assert(pj_audio_lifecycle_begin_processing(&state));
     pj_audio_lifecycle_cancel_processing(&state);
-    pj_audio_lifecycle_finish_record(&state);
     assert(!pj_audio_lifecycle_active(&state));
 }
 
@@ -62,7 +67,7 @@ static void test_playback_stop_is_idempotent(void)
 
 int main(void)
 {
-    test_record_stop_and_processing_handoff();
+    test_long_processing_does_not_hold_capture_or_playback_admission();
     test_failed_processing_start_can_be_rolled_back();
     test_playback_stop_is_idempotent();
     puts("audio lifecycle tests passed");

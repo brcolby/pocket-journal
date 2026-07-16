@@ -57,6 +57,28 @@ void pj_storage_shared_release(pj_storage_coordinator_t *coordinator)
     }
 }
 
+int pj_storage_audio_publication_try_begin(
+    pj_storage_coordinator_t *coordinator)
+{
+    if (coordinator == NULL ||
+        coordinator->maintenance != PJ_STORAGE_MAINTENANCE_NONE ||
+        coordinator->shared_users != 1U) {
+        return 0;
+    }
+    coordinator->shared_users = 0U;
+    coordinator->maintenance = PJ_STORAGE_MAINTENANCE_AUDIO_PUBLICATION;
+    return 1;
+}
+
+void pj_storage_audio_publication_finish(
+    pj_storage_coordinator_t *coordinator)
+{
+    if (coordinator != NULL &&
+        coordinator->maintenance == PJ_STORAGE_MAINTENANCE_AUDIO_PUBLICATION) {
+        coordinator->maintenance = PJ_STORAGE_MAINTENANCE_NONE;
+    }
+}
+
 int pj_storage_idle(const pj_storage_coordinator_t *coordinator)
 {
     return coordinator != NULL &&
