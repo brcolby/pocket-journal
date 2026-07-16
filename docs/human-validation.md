@@ -5,7 +5,7 @@ low-frequency, large-batch hardware pass. Notes may be mildly lossy: record what
 you actually observed, including blockers, and agents will map it to the exact
 acceptance criteria.
 
-Last synchronized with `bd human list`: 2026-07-15 (32 open/in-progress beads).
+Last synchronized with `bd human list`: 2026-07-15 (31 open/in-progress beads).
 Do not repeat a failed check on unchanged firmware.
 
 ## Nominated Build
@@ -45,8 +45,11 @@ Do not repeat a failed check on unchanged firmware.
 - The retained 993,324-byte note has SHA-256
   `5c04a1ce64a73c8c6a34da0f29ed95d48826f963f0efd4d6aaeb3f752f9dd385`.
   A full USB reprocess completed through one descriptor in 67.79 seconds versus
-  the 257.09-second baseline, then released the port with no partial file. Keep
-  this note until the device-initiated Sync check completes.
+  the 257.09-second baseline, then released the port with no partial file. A
+  subsequent device-initiated generation-4 Sync transferred this file and a new
+  286,764-byte note through the isolated companion, acknowledged the exact
+  generation with zero failures, and released USB. `pocket-journal-nqa` is
+  closed.
 - `firmware/02a.log` and the second-round notes are failure baselines from older
   `4aca539-dirty` firmware, not evidence about this nominated build.
 
@@ -116,11 +119,15 @@ will verify no process already owns `/dev/cu.usbmodem1101`.
   the fixed local model produces useful readable text for speech and does not
   fabricate a transcript for noise. Preserve both samples for later enclosure
   comparison (`pocket-journal-zon`).
-- [ ] With the isolated companion running, open Settings and select Sync once.
-  Observe pending, active, and complete without blocking navigation. The retained
-  large note must reach exact terminal acknowledgement with requested generation
-  equal to acknowledged generation, one transfer, zero failures, and no held USB
-  descriptor (`pocket-journal-nqa`, `pocket-journal-kin`).
+- [x] Agent protocol proof: the isolated companion resumed offline generation 4,
+  observed active USB transfer, transferred both queued notes, and reached
+  requested generation = acknowledged generation = 4 with zero failures. Both
+  WAV digests verified; companion shutdown was immediate and left no USB holder
+  (`pocket-journal-nqa`, closed).
+- [ ] Confirm the generation-4 Sync screen visibly showed actionable offline,
+  active, and complete states without blocking navigation. If those transitions
+  were not observed, run one additional Sync while the companion is online
+  (`pocket-journal-kin`).
 - [ ] Stop the companion, request Sync again, and confirm an actionable offline
   state survives navigation and reboot. Restart the companion and confirm that
   exact operation resumes once, without duplicate audio, transcript, or title.
