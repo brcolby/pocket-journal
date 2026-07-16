@@ -9,6 +9,7 @@ import subprocess
 import sys
 from tempfile import TemporaryDirectory
 import threading
+import time
 import tty
 import unittest
 
@@ -245,6 +246,38 @@ class BlockingAudioConnection(FakeConnection):
         self.cancelled.set()
 
 
+class BlockingInputResetConnection(FakeConnection):
+    def __init__(self) -> None:
+        super().__init__()
+        self.reset_started = threading.Event()
+        self.reset_released = threading.Event()
+        self.reset_finished = threading.Event()
+
+    def reset_input_buffer(self) -> None:
+        self.reset_started.set()
+        self.reset_released.wait(2)
+        self.reset_finished.set()
+
+    def close(self) -> None:
+        self.reset_released.set()
+        super().close()
+
+
+class BlockingOutputDrainConnection(FakeConnection):
+    def __init__(self, lines: list[bytes | BaseException]) -> None:
+        super().__init__(lines)
+        self.drain_started = threading.Event()
+        self.drain_released = threading.Event()
+
+    def flush(self) -> None:
+        self.drain_started.set()
+        self.drain_released.wait(2)
+
+    def close(self) -> None:
+        self.drain_released.set()
+        super().close()
+
+
 class BlockingOpenConnection(FakeConnection):
     def __init__(self) -> None:
         super().__init__()
@@ -261,6 +294,22 @@ class BlockingOpenConnection(FakeConnection):
     def close(self) -> None:
         self.open_cancelled.set()
         super().close()
+
+
+class LateSuccessfulOpenConnection(FakeConnection):
+    def __init__(self) -> None:
+        super().__init__()
+        self.open_started = threading.Event()
+        self.allow_open = threading.Event()
+        self.open_finished = threading.Event()
+
+    def open(self) -> None:
+        self.open_control_lines = (self.dtr, self.rts)
+        self.open_count += 1
+        self.open_started.set()
+        self.allow_open.wait(2)
+        self.is_open = True
+        self.open_finished.set()
 
 
 class SteppingClock:
@@ -501,6 +550,53 @@ class SerialLifecycleTests(unittest.TestCase):
         self.assertEqual(connection.close_count, 1)
         self.assertFalse(connection.is_open)
 
+    def test_request_deadline_cancels_blocked_input_reset_and_releases_port(self) -> None:
+        connection = BlockingInputResetConnection()
+        serial_module = FakeSerialModule(connection)
+        client = SerialDeviceClient("/dev/cu.test", timeout=0.05)
+
+        started = time.monotonic()
+        with patch.dict(sys.modules, {"serial": serial_module}):
+            with patch("pocket_journal_partner.device.time.sleep"):
+                with self.assertRaisesRegex(DeviceRequestTimeout, "port was released"):
+                    client.status()
+        elapsed = time.monotonic() - started
+
+        self.assertTrue(connection.reset_started.is_set())
+        self.assertTrue(connection.reset_finished.wait(0.25))
+        self.assertLess(elapsed, 0.75)
+        self.assertEqual(connection.close_count, 1)
+        self.assertFalse(connection.is_open)
+
+    def test_status_does_not_wait_for_unbounded_posix_output_drain(self) -> None:
+        connection = BlockingOutputDrainConnection([
+            b'PJ_OK {"device_id":"pj-test"}\n',
+        ])
+
+        result, _ = self._request(connection)
+
+        self.assertEqual(result, {"device_id": "pj-test"})
+        self.assertFalse(connection.drain_started.is_set())
+        self.assertEqual(connection.close_count, 1)
+        self.assertFalse(connection.is_open)
+
+    def test_request_deadline_cancels_blocked_open_and_releases_port(self) -> None:
+        connection = BlockingOpenConnection()
+        serial_module = FakeSerialModule(connection)
+        client = SerialDeviceClient("/dev/cu.test", timeout=0.05)
+
+        started = time.monotonic()
+        with patch.dict(sys.modules, {"serial": serial_module}):
+            with self.assertRaisesRegex(DeviceRequestTimeout, "port was released"):
+                client.status()
+        elapsed = time.monotonic() - started
+
+        self.assertTrue(connection.open_started.is_set())
+        self.assertLess(elapsed, 0.75)
+        self.assertEqual(connection.open_count, 1)
+        self.assertEqual(connection.close_count, 1)
+        self.assertFalse(connection.is_open)
+
     def test_close_cancels_connection_while_open_is_in_progress(self) -> None:
         connection = BlockingOpenConnection()
         serial_module = FakeSerialModule(connection)
@@ -526,6 +622,26 @@ class SerialLifecycleTests(unittest.TestCase):
         self.assertIn("cancelled", str(errors[0]))
         self.assertEqual(connection.open_count, 1)
         self.assertEqual(connection.close_count, 1)
+        self.assertFalse(connection.is_open)
+
+    def test_timed_out_open_that_finishes_late_is_closed_again(self) -> None:
+        connection = LateSuccessfulOpenConnection()
+        serial_module = FakeSerialModule(connection)
+        client = SerialDeviceClient("/dev/cu.test", timeout=0.05)
+
+        with patch.dict(sys.modules, {"serial": serial_module}):
+            with self.assertRaisesRegex(DeviceRequestTimeout, "port was released"):
+                client.status()
+
+        self.assertTrue(connection.open_started.is_set())
+        connection.allow_open.set()
+        self.assertTrue(connection.open_finished.wait(0.25))
+        deadline = time.monotonic() + 0.25
+        while connection.is_open and time.monotonic() < deadline:
+            time.sleep(0.005)
+
+        self.assertEqual(connection.open_count, 1)
+        self.assertGreaterEqual(connection.close_count, 2)
         self.assertFalse(connection.is_open)
 
     def test_posix_connection_clears_hupcl_without_redundant_line_writes(self) -> None:

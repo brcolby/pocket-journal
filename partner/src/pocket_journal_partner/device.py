@@ -66,6 +66,10 @@ class DeviceRequestTimeout(DeviceError):
     pass
 
 
+class _SerialDeadlineExpired(TimeoutError):
+    pass
+
+
 class _SerialCommandRejected(DeviceError):
     def __init__(self, command: str, code: str | None) -> None:
         suffix = f" ({code})" if code is not None else ""
@@ -124,6 +128,7 @@ USB_SERIAL_LINE_BYTES = 768
 USB_MAX_SETTINGS_BODY_BYTES = 256
 _USB_READ_RETRY_INTERVAL_SECONDS = 1.0
 _USB_READ_MAX_ATTEMPTS = 2
+_USB_SERIAL_CANCEL_GRACE_SECONDS = 0.25
 
 _SETTINGS_INTEGER_RANGES = {
     "volume": (0, 10),
@@ -711,6 +716,49 @@ class SerialDeviceClient:
         except Exception:
             pass
 
+    def _run_serial_primitive(
+        self,
+        connection: Any,
+        operation: Callable[[], Any],
+        *,
+        deadline: float,
+    ) -> Any:
+        """Bound driver calls that do not honor pyserial read/write timeouts."""
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            self._cancel_connection(connection)
+            raise _SerialDeadlineExpired
+
+        completed = threading.Event()
+        abandoned = threading.Event()
+        result: list[Any] = []
+        failure: list[BaseException] = []
+
+        def invoke() -> None:
+            try:
+                result.append(operation())
+            except BaseException as exc:
+                failure.append(exc)
+            finally:
+                if abandoned.is_set() and getattr(connection, "is_open", True):
+                    self._cancel_connection(connection)
+                completed.set()
+
+        worker = threading.Thread(
+            target=invoke,
+            name="pj-usb-serial-primitive",
+            daemon=True,
+        )
+        worker.start()
+        if not completed.wait(remaining):
+            abandoned.set()
+            self._cancel_connection(connection)
+            completed.wait(_USB_SERIAL_CANCEL_GRACE_SECONDS)
+            raise _SerialDeadlineExpired
+        if failure:
+            raise failure[0]
+        return result[0] if result else None
+
     def _ensure_open(self) -> None:
         if self._closed.is_set():
             raise DeviceError(f"USB serial client for {self.port} is closed")
@@ -722,6 +770,7 @@ class SerialDeviceClient:
         *,
         read_timeout: float = 0.2,
         idle_on_close: bool = False,
+        deadline: float | None = None,
     ) -> Iterator[Any]:
         connection = None
         try:
@@ -748,7 +797,14 @@ class SerialDeviceClient:
             # public cancel/close methods while open is in progress.
             _idle_serial_control_lines(connection)
             self._ensure_open()
-            _open_serial_without_modem_control(connection)
+            if deadline is None:
+                _open_serial_without_modem_control(connection)
+            else:
+                self._run_serial_primitive(
+                    connection,
+                    lambda: _open_serial_without_modem_control(connection),
+                    deadline=deadline,
+                )
             if self._closed.is_set():
                 raise DeviceError(
                     f"USB serial transfer on {self.port} was cancelled"
@@ -787,9 +843,12 @@ class SerialDeviceClient:
         wire_payload = f"{wire_command}\n".encode("ascii")
         attempts = 0
         next_retry_at: float | None = None
-        if time.monotonic() < deadline:
+        remaining = deadline - time.monotonic()
+        if remaining > 0:
+            connection.write_timeout = max(0.001, min(2.0, remaining))
             connection.write(wire_payload)
-            connection.flush()
+            # POSIX Serial.flush() calls tcdrain(), which has no timeout and can
+            # retain the descriptor indefinitely when USB re-enumerates.
             attempts = 1
             if retry_interval is not None:
                 next_retry_at = time.monotonic() + retry_interval
@@ -830,8 +889,8 @@ class SerialDeviceClient:
                 and now >= next_retry_at
                 and now < deadline
             ):
+                connection.write_timeout = max(0.001, min(2.0, deadline - now))
                 connection.write(wire_payload)
-                connection.flush()
                 attempts += 1
                 assert retry_interval is not None
                 next_retry_at = now + retry_interval
@@ -906,11 +965,19 @@ class SerialDeviceClient:
             raise ValueError("serial retries require a request ID and positive retry interval")
         evidence = _SerialEvidence()
         try:
-            with self._connection(serial, read_timeout=min(0.2, request_timeout)) as connection:
+            with self._connection(
+                serial,
+                read_timeout=min(0.2, request_timeout),
+                deadline=deadline,
+            ) as connection:
                 remaining = deadline - time.monotonic()
                 if remaining > 0:
                     time.sleep(min(0.1, remaining))
-                connection.reset_input_buffer()
+                self._run_serial_primitive(
+                    connection,
+                    connection.reset_input_buffer,
+                    deadline=deadline,
+                )
                 response = self._request_on_connection(
                     connection,
                     command,
@@ -922,6 +989,8 @@ class SerialDeviceClient:
                 )
                 if response is not None:
                     return response
+        except _SerialDeadlineExpired:
+            raise self._request_timeout(evidence)
         except (serial.SerialException, OSError) as exc:
             if self._closed.is_set():
                 raise DeviceError(
@@ -944,16 +1013,22 @@ class SerialDeviceClient:
         with self._request_lock:
             self._ensure_open()
             request_body_started = False
+            startup_deadline = time.monotonic() + max(0.0, self.timeout)
             try:
                 with self._connection(
-                    serial, read_timeout=min(0.2, max(0.0, self.timeout)),
+                    serial,
+                    read_timeout=min(0.2, max(0.0, self.timeout)),
+                    deadline=startup_deadline,
                 ) as connection:
-                    settle_deadline = time.monotonic() + max(0.0, self.timeout)
-                    remaining = settle_deadline - time.monotonic()
+                    remaining = startup_deadline - time.monotonic()
                     if remaining > 0:
                         time.sleep(min(0.1, remaining))
                     self._ensure_open()
-                    connection.reset_input_buffer()
+                    self._run_serial_primitive(
+                        connection,
+                        connection.reset_input_buffer,
+                        deadline=startup_deadline,
+                    )
 
                     def request_command(
                         command: str,
@@ -999,6 +1074,8 @@ class SerialDeviceClient:
 
                     request_body_started = True
                     yield request_command
+            except _SerialDeadlineExpired:
+                raise self._request_timeout(_SerialEvidence())
             except (serial.SerialException, OSError) as exc:
                 if request_body_started and not self._closed.is_set():
                     raise
@@ -1471,7 +1548,11 @@ class SerialDeviceClient:
         evidence = _SerialEvidence()
         operation_id: int | None = None
         try:
-            with self._connection(serial, read_timeout=min(0.2, self.timeout)) as connection:
+            with self._connection(
+                serial,
+                read_timeout=min(0.2, self.timeout),
+                deadline=deadline,
+            ) as connection:
                 remaining = deadline - time.monotonic()
                 if remaining > 0:
                     time.sleep(min(0.1, remaining))
@@ -1539,6 +1620,15 @@ class SerialDeviceClient:
                     remaining = deadline - time.monotonic()
                     if remaining > 0 and operation["state"] not in {"succeeded", "failed"}:
                         time.sleep(min(0.1, remaining))
+        except _SerialDeadlineExpired:
+            if operation_id is not None:
+                raise DeviceOperationTimeout(
+                    f"USB recording wipe operation {operation_id} timed out; it may still be running",
+                    operation_id,
+                    code="operation_timeout",
+                    retryable=True,
+                )
+            raise self._request_timeout(evidence)
         except (serial.SerialException, OSError) as exc:
             if operation_id is not None:
                 raise DeviceOperationError(
@@ -1684,25 +1774,34 @@ class SerialDeviceClient:
         return report
 
     def _probe_usb_state(self, serial_module: Any, deadline: float) -> dict[str, Any]:
-        with self._connection(serial_module, read_timeout=0.1) as connection:
-            connection.write(b"PJ_STATUS\n")
-            connection.flush()
-            while time.monotonic() < deadline:
-                raw = connection.readline()
-                if not raw:
-                    continue
-                line = raw.decode("utf-8", errors="replace").strip()
-                lowered = line.lower()
-                if line.startswith("PJ_OK "):
-                    try:
-                        status = json.loads(line[6:])
-                    except json.JSONDecodeError:
-                        return {"state": "application", "evidence": "PJ_OK_INVALID_JSON"}
-                    return {"state": "application", "evidence": "PJ_OK", "status": status}
-                if line.startswith("PJ_ERR "):
-                    return {"state": "application", "evidence": "PJ_ERR"}
-                if any(marker in lowered for marker in _USB_ROM_DOWNLOAD_MARKERS):
-                    return {"state": "rom_download", "evidence": "rom_boot_log"}
+        try:
+            with self._connection(
+                serial_module,
+                read_timeout=0.1,
+                deadline=deadline,
+            ) as connection:
+                remaining = deadline - time.monotonic()
+                if remaining > 0:
+                    connection.write_timeout = max(0.001, min(2.0, remaining))
+                    connection.write(b"PJ_STATUS\n")
+                while time.monotonic() < deadline:
+                    raw = connection.readline()
+                    if not raw:
+                        continue
+                    line = raw.decode("utf-8", errors="replace").strip()
+                    lowered = line.lower()
+                    if line.startswith("PJ_OK "):
+                        try:
+                            status = json.loads(line[6:])
+                        except json.JSONDecodeError:
+                            return {"state": "application", "evidence": "PJ_OK_INVALID_JSON"}
+                        return {"state": "application", "evidence": "PJ_OK", "status": status}
+                    if line.startswith("PJ_ERR "):
+                        return {"state": "application", "evidence": "PJ_ERR"}
+                    if any(marker in lowered for marker in _USB_ROM_DOWNLOAD_MARKERS):
+                        return {"state": "rom_download", "evidence": "rom_boot_log"}
+        except _SerialDeadlineExpired:
+            pass
         return {"state": "unresponsive", "evidence": "no_protocol_or_rom_response"}
 
     def _watchdog_reset_usb_serial_jtag(self, *, connect_mode: str, timeout: float) -> str:
