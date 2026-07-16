@@ -221,7 +221,8 @@
 #define PJ_AUDIO_COLLECT_NO_MEMORY (-3)
 #define PJ_AUDIO_COLLECT_OPEN_FAILED (-4)
 /* PJ_AUDIO_READ holds 1024 raw bytes plus 2049 hex bytes on this task's stack. */
-#define PJ_SERIAL_COMMAND_TASK_STACK 9216
+#define PJ_SERIAL_COMMAND_TASK_STACK 12288
+#define PJ_SERIAL_MIN_FREE_STACK_BYTES 2048U
 #define PJ_SERIAL_RX_BUFFER_BYTES 1024U
 #define PJ_SYNC_INVENTORY_TASK_STACK 8192
 #define PJ_SERIAL_TX_BUFFER_BYTES 4096U
@@ -4067,6 +4068,36 @@ static void collect_sync_counts(int *pending, int *transferred)
     }
 }
 
+static void sync_inventory_worker_request_nonblocking(void)
+{
+    if (g_sync_inventory_lock == NULL || g_sync_inventory_task == NULL) {
+        return;
+    }
+    int notify_worker = 0;
+    if (xSemaphoreTake(g_sync_inventory_lock, 0) != pdTRUE) {
+        return;
+    }
+    if (g_sync_inventory_worker_state == PJ_SYNC_INVENTORY_IDLE) {
+        /* Fresh counts are cached by the worker; only the Sync UI owns results. */
+        g_sync_inventory_discard = 1;
+        g_sync_inventory_worker_state = PJ_SYNC_INVENTORY_REQUESTED;
+        notify_worker = 1;
+    }
+    xSemaphoreGive(g_sync_inventory_lock);
+    if (notify_worker) {
+        xTaskNotifyGive(g_sync_inventory_task);
+    }
+}
+
+static void collect_sync_counts_nonblocking(int *pending, int *transferred,
+                                            int storage_ready)
+{
+    storage_sync_counts_snapshot(pending, transferred);
+    if (storage_ready) {
+        sync_inventory_worker_request_nonblocking();
+    }
+}
+
 static void refresh_ui_sync_state(pj_ui_context_t *ui)
 {
     if (ui == NULL || pj_ui_current_state(ui) == PJ_UI_STATE_SYNC) {
@@ -7268,6 +7299,10 @@ int pj_board_start_services(const pj_board_profile_t *profile)
             services_ready = 0;
         }
     }
+    if (!sync_inventory_worker_ensure()) {
+        ESP_LOGE(TAG, "Sync inventory worker failed to start");
+        services_ready = 0;
+    }
     esp_err_t serial_err = serial_command_task_start();
     if (serial_err != ESP_OK) {
         ESP_LOGE(TAG, "USB-C command task failed to start: %s",
@@ -9045,8 +9080,10 @@ static void serial_print_status(const char *request_id)
 {
     int pending_sync = 0;
     int transferred_sync = 0;
-    collect_sync_counts(&pending_sync, &transferred_sync);
     pj_board_status_t status = pj_board_status();
+    collect_sync_counts_nonblocking(
+        &pending_sync, &transferred_sync,
+        status.storage == PJ_BOARD_SERVICE_READY);
     cJSON *json = cJSON_CreateObject();
     if (json == NULL) {
         printf("PJ_ERR {\"error\":\"status allocation failed\"}\n");
@@ -9085,6 +9122,21 @@ static void serial_print_status(const char *request_id)
     }
     serial_print_json("PJ_OK", json);
     cJSON_Delete(json);
+}
+
+static void serial_stack_margin_check(const char *command)
+{
+    static UBaseType_t warned_margin = UINT_MAX;
+    UBaseType_t minimum_free = uxTaskGetStackHighWaterMark(NULL);
+    if (minimum_free < PJ_SERIAL_MIN_FREE_STACK_BYTES &&
+        minimum_free < warned_margin) {
+        warned_margin = minimum_free;
+        ESP_LOGW(TAG,
+                 "USB command stack margin low: command=%s minimum_free=%u "
+                 "configured=%u",
+                 command, (unsigned)minimum_free,
+                 (unsigned)PJ_SERIAL_COMMAND_TASK_STACK);
+    }
 }
 
 static void serial_print_wipe_start(pj_wipe_start_result_t result,
@@ -10402,6 +10454,7 @@ static void serial_command_task(void *arg)
         if (serial_request_matches(line, "PJ_STATUS", &request_id)) {
             serial_print_status(request_id);
             fflush(stdout);
+            serial_stack_margin_check("PJ_STATUS");
             continue;
         }
         if (serial_request_matches(line, "PJ_WIPE_RECORDINGS", &request_id)) {
