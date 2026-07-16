@@ -18,11 +18,11 @@ typedef enum {
 } pj_aux_gesture_t;
 
 typedef struct {
-    uint32_t raw_changed_ms;
-    uint32_t press_started_ms;
-    uint32_t first_release_ms;
-    uint32_t gesture_started_ms;
-    uint32_t emitted_gesture_started_ms;
+    uint64_t raw_changed_ms;
+    uint64_t press_started_ms;
+    uint64_t first_release_ms;
+    uint64_t gesture_started_ms;
+    uint64_t emitted_gesture_started_ms;
     int raw_level;
     int stable_level;
     int pressed;
@@ -31,10 +31,10 @@ typedef struct {
     int second_press;
 } pj_aux_input_t;
 
-void pj_aux_input_init(pj_aux_input_t *input, int initial_level, uint32_t now_ms);
-void pj_aux_input_resume_pressed(pj_aux_input_t *input, uint32_t now_ms);
-pj_aux_gesture_t pj_aux_input_update(pj_aux_input_t *input, int raw_level, uint32_t now_ms);
-uint32_t pj_aux_input_gesture_started_ms(const pj_aux_input_t *input);
+void pj_aux_input_init(pj_aux_input_t *input, int initial_level, uint64_t now_ms);
+void pj_aux_input_resume_pressed(pj_aux_input_t *input, uint64_t now_ms);
+pj_aux_gesture_t pj_aux_input_update(pj_aux_input_t *input, int raw_level, uint64_t now_ms);
+uint64_t pj_aux_input_gesture_started_ms(const pj_aux_input_t *input);
 int pj_aux_input_is_released(const pj_aux_input_t *input);
 
 #ifdef __cplusplus

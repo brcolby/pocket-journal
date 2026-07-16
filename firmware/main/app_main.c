@@ -270,8 +270,8 @@ static void handle_board_event(pj_ui_context_t *ui, const pj_board_event_t *even
             ESP_LOGI(TAG,
                      "UI deferred input type=%d logical_scene=%" PRIu32
                      " presented_scene=%" PRIu32 " accepted=%" PRIu32
-                     " committed=%" PRIu32 " captured_ms=%" PRIu32
-                     " scene_started_ms=%" PRIu32,
+                     " committed=%" PRIu32 " captured_ms=%" PRIu64
+                     " scene_started_ms=%" PRIu64,
                      (int)event->type, scene_epoch,
                      status.committed_scene_epoch,
                      status.accepted_generation,

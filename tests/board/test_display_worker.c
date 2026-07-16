@@ -1,4 +1,5 @@
 #include "pj_display_worker.h"
+#include "pj_touch_candidate.h"
 
 #include <assert.h>
 #include <stdio.h>
@@ -302,7 +303,7 @@ static void test_slow_display_keeps_generations_and_final_scene_ordered(void)
 }
 
 static void commit_scene_at(pj_display_worker_model_t *model,
-                            uint32_t scene_epoch, uint32_t committed_at_ms)
+                            uint32_t scene_epoch, uint64_t committed_at_ms)
 {
     pj_ui_dirty_region_t dirty = full_region();
     int slot;
@@ -326,6 +327,7 @@ static void test_input_requires_capture_after_first_scene_commit(void)
     assert(status.committed_scene_started_ms == 100U);
     assert(!pj_display_worker_status_accepts_input(&status, 40U, 101U));
     assert(!pj_display_worker_status_accepts_input(&status, 41U, 99U));
+    /* Millisecond equality cannot prove the contact followed the commit. */
     assert(!pj_display_worker_status_accepts_input(&status, 41U, 100U));
     assert(pj_display_worker_status_accepts_input(&status, 41U, 101U));
 
@@ -358,20 +360,51 @@ static void test_input_requires_capture_after_first_scene_commit(void)
     assert(status.committed_scene_started_ms == 800U);
 }
 
-static void test_input_capture_comparison_survives_millisecond_wrap(void)
+static void test_input_capture_remains_ordered_after_32_bit_uptime(void)
 {
     pj_display_worker_status_t status = {
         .committed_scene_epoch = 7U,
-        .committed_scene_started_ms = UINT32_MAX - 5U,
+        .committed_scene_started_ms = 100U,
     };
+    assert(pj_display_worker_status_accepts_input(
+        &status, 7U, (UINT64_C(1) << 40)));
+}
+
+static void test_touch_contact_before_commit_is_rejected_after_stabilizing(void)
+{
+    pj_touch_candidate_t candidate = {0};
+    uint64_t captured_at_ms = 0;
+    assert(!pj_touch_candidate_update(
+        &candidate, 50U, 50U, 100U, 8U, 2U, &captured_at_ms));
+
+    pj_display_worker_model_t model;
+    pj_display_worker_model_init(&model);
+    commit_scene_at(&model, 8U, 101U);
+
+    assert(pj_touch_candidate_update(
+        &candidate, 51U, 50U, 102U, 8U, 2U, &captured_at_ms));
+    assert(captured_at_ms == 100U);
+    pj_display_worker_status_t status =
+        pj_display_worker_model_status(&model);
     assert(!pj_display_worker_status_accepts_input(
-        &status, 7U, UINT32_MAX - 6U));
-    assert(!pj_display_worker_status_accepts_input(
-        &status, 7U, UINT32_MAX - 5U));
-    assert(pj_display_worker_status_accepts_input(&status, 7U, 2U));
-    assert(!pj_display_worker_status_accepts_input(
-        &status, 7U, status.committed_scene_started_ms +
-            UINT32_C(0x80000000)));
+        &status, 8U, captured_at_ms));
+
+    pj_touch_candidate_reset(&candidate);
+    assert(!pj_touch_candidate_update(
+        &candidate, 50U, 50U, 103U, 8U, 2U, &captured_at_ms));
+    assert(pj_touch_candidate_update(
+        &candidate, 51U, 50U, 104U, 8U, 2U, &captured_at_ms));
+    assert(pj_display_worker_status_accepts_input(
+        &status, 8U, captured_at_ms));
+
+    pj_touch_candidate_reset(&candidate);
+    assert(!pj_touch_candidate_update(
+        &candidate, 10U, 10U, 105U, 8U, 2U, &captured_at_ms));
+    assert(!pj_touch_candidate_update(
+        &candidate, 30U, 30U, 106U, 8U, 2U, &captured_at_ms));
+    assert(pj_touch_candidate_update(
+        &candidate, 31U, 30U, 107U, 8U, 2U, &captured_at_ms));
+    assert(captured_at_ms == 106U);
 }
 
 static void test_partial_rate_limit_is_global_and_size_independent(void)
@@ -454,7 +487,8 @@ int main(void)
     test_new_scene_supersedes_pending_hit_map_as_full();
     test_slow_display_keeps_generations_and_final_scene_ordered();
     test_input_requires_capture_after_first_scene_commit();
-    test_input_capture_comparison_survives_millisecond_wrap();
+    test_input_capture_remains_ordered_after_32_bit_uptime();
+    test_touch_contact_before_commit_is_rejected_after_stabilizing();
     test_partial_rate_limit_is_global_and_size_independent();
     test_deferred_metrics_are_explicit();
     test_generation_order_survives_wrap();

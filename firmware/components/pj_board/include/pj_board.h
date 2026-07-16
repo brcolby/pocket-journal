@@ -50,7 +50,7 @@ typedef struct {
     pj_board_event_type_t type;
     int x;
     int y;
-    uint32_t captured_at_ms;
+    uint64_t captured_at_ms;
 } pj_board_event_t;
 
 typedef struct {

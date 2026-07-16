@@ -87,7 +87,9 @@ test-display-worker:
 	$(CC) $(CFLAGS) \
 		-Ifirmware/main \
 		-Ifirmware/components/pj_ui/include \
+		-Ifirmware/components/pj_board/include \
 		firmware/main/pj_display_worker.c \
+		firmware/components/pj_board/pj_touch_candidate.c \
 		tests/board/test_display_worker.c \
 		-o $(DISPLAY_WORKER_TEST_BIN)
 	$(DISPLAY_WORKER_TEST_BIN)

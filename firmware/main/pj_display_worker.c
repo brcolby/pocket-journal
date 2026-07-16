@@ -21,12 +21,6 @@ static int generation_is_newer(uint32_t candidate, uint32_t reference)
         (reference == 0 || (int32_t)(candidate - reference) > 0);
 }
 
-static int wrapping_counter_is_after(uint32_t candidate, uint32_t reference)
-{
-    uint32_t delta = candidate - reference;
-    return delta != 0U && delta < UINT32_C(0x80000000);
-}
-
 static int normalize_region(const pj_ui_dirty_region_t *input,
                             pj_ui_dirty_region_t *output)
 {
@@ -294,7 +288,7 @@ int pj_display_worker_model_take(pj_display_worker_model_t *model,
 
 void pj_display_worker_model_complete_at(pj_display_worker_model_t *model,
                                          int slot_index, int success,
-                                         uint32_t committed_at_ms)
+                                         uint64_t committed_at_ms)
 {
     if (model == NULL || slot_index < 0 ||
         slot_index >= PJ_DISPLAY_WORKER_SLOT_COUNT ||
@@ -407,12 +401,11 @@ pj_display_worker_status_t pj_display_worker_model_status(
 
 int pj_display_worker_status_accepts_input(
     const pj_display_worker_status_t *status, uint32_t scene_epoch,
-    uint32_t captured_at_ms)
+    uint64_t captured_at_ms)
 {
     return status != NULL && scene_epoch != 0U &&
         status->committed_scene_epoch == scene_epoch &&
-        wrapping_counter_is_after(
-            captured_at_ms, status->committed_scene_started_ms);
+        captured_at_ms > status->committed_scene_started_ms;
 }
 
 void pj_display_worker_model_note_rate_deferred(
@@ -593,8 +586,7 @@ static void display_worker_task(void *argument)
         configASSERT(rate_allowed);
 
         int success = pj_board_display_framebuffer(&g_slots[slot], &dirty);
-        uint32_t committed_at_ms =
-            (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
+        uint64_t committed_at_ms = monotonic_ms();
         portENTER_CRITICAL(&g_lock);
         pj_display_worker_model_complete_at(
             &g_model, slot, success, committed_at_ms);

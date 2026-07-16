@@ -19,6 +19,7 @@
 #include "pj_time_controller.h"
 #include "pj_time_sync.h"
 #include "pj_time_transaction.h"
+#include "pj_touch_candidate.h"
 #include "pj_transcript_upload.h"
 #include "pj_usb_sync.h"
 #include "pj_wifi_state.h"
@@ -395,9 +396,7 @@ static int g_touch_pressed;
 static uint16_t g_touch_press_x;
 static uint16_t g_touch_press_y;
 static TickType_t g_touch_last_event_tick;
-static int g_touch_candidate_samples;
-static uint16_t g_touch_candidate_x;
-static uint16_t g_touch_candidate_y;
+static pj_touch_candidate_t g_touch_candidate;
 static uint8_t g_touch_raw_event;
 static TaskHandle_t g_record_task;
 static TaskHandle_t g_audio_process_task;
@@ -4575,26 +4574,18 @@ done:
     return active;
 }
 
-static int touch_poll_filtered_event(pj_board_event_t *event, TickType_t now)
+static int touch_poll_filtered_event(pj_board_event_t *event, TickType_t now,
+                                     uint64_t now_ms)
 {
     uint16_t x = 0;
     uint16_t y = 0;
     int touch_active = touch_read(&x, &y);
     if (touch_active) {
-        if (g_touch_candidate_samples == 0 ||
-            abs((int)x - (int)g_touch_candidate_x) > PJ_TOUCH_MOVE_TOLERANCE ||
-            abs((int)y - (int)g_touch_candidate_y) > PJ_TOUCH_MOVE_TOLERANCE) {
-            g_touch_candidate_samples = 1;
-            g_touch_candidate_x = x;
-            g_touch_candidate_y = y;
-        } else {
-            if (g_touch_candidate_samples < PJ_TOUCH_STABLE_SAMPLES) {
-                g_touch_candidate_samples++;
-            }
-            g_touch_candidate_x = x;
-            g_touch_candidate_y = y;
-        }
-        if (!g_touch_pressed && g_touch_candidate_samples >= PJ_TOUCH_STABLE_SAMPLES) {
+        uint64_t candidate_started_ms = 0;
+        int candidate_stable = pj_touch_candidate_update(
+            &g_touch_candidate, x, y, now_ms, PJ_TOUCH_MOVE_TOLERANCE,
+            PJ_TOUCH_STABLE_SAMPLES, &candidate_started_ms);
+        if (!g_touch_pressed && candidate_stable) {
             uint32_t since_last_ms = (uint32_t)((now - g_touch_last_event_tick) * portTICK_PERIOD_MS);
             if (since_last_ms >= PJ_TOUCH_EVENT_GUARD_MS) {
                 g_touch_pressed = 1;
@@ -4604,11 +4595,10 @@ static int touch_poll_filtered_event(pj_board_event_t *event, TickType_t now)
                 event->type = PJ_BOARD_EVENT_TOUCH_TAP;
                 event->x = (int)g_touch_press_x;
                 event->y = (int)g_touch_press_y;
-                event->captured_at_ms =
-                    (uint32_t)(now * portTICK_PERIOD_MS);
+                event->captured_at_ms = candidate_started_ms;
                 g_display_warning_logged = 1;
                 ESP_LOGI(TAG, "Touch tap x=%u y=%u stable=%d", (unsigned)event->x, (unsigned)event->y,
-                         g_touch_candidate_samples);
+                         g_touch_candidate.samples);
                 return 1;
             }
         } else if (g_touch_pressed) {
@@ -4617,9 +4607,9 @@ static int touch_poll_filtered_event(pj_board_event_t *event, TickType_t now)
         }
     } else if (g_touch_pressed) {
         g_touch_pressed = 0;
-        g_touch_candidate_samples = 0;
+        pj_touch_candidate_reset(&g_touch_candidate);
     } else {
-        g_touch_candidate_samples = 0;
+        pj_touch_candidate_reset(&g_touch_candidate);
     }
     return 0;
 }
@@ -4682,7 +4672,7 @@ static void aux_poll_task(void *arg)
     (void)arg;
     while (1) {
         int level = gpio_get_level(BOOT_BUTTON_PIN);
-        uint32_t now_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
+        uint64_t now_ms = board_monotonic_ms();
         pj_aux_gesture_t gesture = pj_aux_input_update(&g_aux_input, level, now_ms);
         aux_released_set(pj_aux_input_is_released(&g_aux_input));
 
@@ -4738,11 +4728,14 @@ static esp_err_t aux_task_start(void)
     ESP_RETURN_ON_ERROR(board_event_queue_ensure(), TAG,
                         "board event queue allocation failed");
     int level = gpio_get_level(BOOT_BUTTON_PIN);
-    uint32_t now_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
-    pj_aux_input_init(&g_aux_input, level, now_ms);
+    uint64_t aux_now_ms = board_monotonic_ms();
+    uint32_t button_now_ms =
+        (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
+    pj_aux_input_init(&g_aux_input, level, aux_now_ms);
     aux_released_set(pj_aux_input_is_released(&g_aux_input));
     portENTER_CRITICAL(&g_aux_state_lock);
-    pj_power_input_init(&g_power_input, gpio_get_level(PWR_BUTTON_PIN), now_ms);
+    pj_power_input_init(&g_power_input, gpio_get_level(PWR_BUTTON_PIN),
+                        button_now_ms);
     g_power_released = pj_power_input_is_released(&g_power_input);
     portEXIT_CRITICAL(&g_aux_state_lock);
     if (xTaskCreate(aux_poll_task, "pj-aux", 3072, NULL, 7, NULL) != pdPASS) {
@@ -4763,7 +4756,9 @@ static void touch_poll_task(void *arg)
             .y = 0,
             .captured_at_ms = 0,
         };
-        if (touch_poll_filtered_event(&event, xTaskGetTickCount())) {
+        TickType_t now = xTaskGetTickCount();
+        if (touch_poll_filtered_event(
+                &event, now, board_monotonic_ms())) {
             board_queue_event(&event);
         }
         vTaskDelay(pdMS_TO_TICKS(PJ_TOUCH_POLL_MS));
