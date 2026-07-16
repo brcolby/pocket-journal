@@ -187,6 +187,26 @@ static int restore_audio(const char *backup_path, const char *published_path)
     return pj_recording_fs_rename(backup_path, published_path) == 0;
 }
 
+pj_recording_raw_publish_result_t pj_recording_publish_raw(
+    const char *temporary_path, const char *published_path,
+    pj_recording_path_validator_t validate, void *validate_context)
+{
+    if (temporary_path == NULL || published_path == NULL || validate == NULL ||
+        temporary_path[0] == '\0' || published_path[0] == '\0' ||
+        strcmp(temporary_path, published_path) == 0 ||
+        validate(temporary_path, validate_context) <= 0) {
+        return PJ_RECORDING_RAW_PUBLISH_FAILED;
+    }
+    if (pj_recording_fs_rename(temporary_path, published_path) != 0) {
+        return PJ_RECORDING_RAW_PUBLISH_RETRYABLE;
+    }
+    if (validate(published_path, validate_context) > 0) {
+        return PJ_RECORDING_RAW_PUBLISH_SUCCEEDED;
+    }
+    (void)pj_recording_fs_rename(published_path, temporary_path);
+    return PJ_RECORDING_RAW_PUBLISH_RETRYABLE;
+}
+
 int pj_recording_replace_processed(
     const char *processed_path, const char *published_path,
     const char *transcript_marker_path,
@@ -200,8 +220,8 @@ int pj_recording_replace_processed(
                               published_path, ".bak") ||
         !format_artifact_path(marker_temporary, sizeof(marker_temporary),
                               transcript_marker_path, ".tmp") ||
-        !validate(processed_path, validate_context) ||
-        !validate(published_path, validate_context) ||
+        validate(processed_path, validate_context) <= 0 ||
+        validate(published_path, validate_context) <= 0 ||
         !path_absent(audio_backup) || !path_absent(marker_temporary)) {
         return 0;
     }
@@ -224,7 +244,7 @@ int pj_recording_replace_processed(
         }
         return 0;
     }
-    if (!validate(published_path, validate_context)) {
+    if (validate(published_path, validate_context) <= 0) {
         int audio_restored = restore_audio(audio_backup, published_path);
         if (audio_restored) {
             (void)restore_marker(marker_temporary, transcript_marker_path,

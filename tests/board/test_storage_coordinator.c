@@ -1,6 +1,7 @@
 #include "pj_storage_coordinator.h"
 
 #include <assert.h>
+#include <string.h>
 
 static void test_shared_and_maintenance_exclusion(void)
 {
@@ -128,7 +129,22 @@ static void test_wipe_rejections_and_failure(void)
     pj_wipe_status_t retry;
     assert(pj_storage_wipe_request(&coordinator, 1, 0, NULL, &retry) == PJ_WIPE_START_STARTED);
     assert(retry.id != failed.id);
-    pj_storage_wipe_finish(&coordinator, 0U, 0U, 0U, PJ_WIPE_CODE_NONE, 0);
+    pj_storage_wipe_finish(
+        &coordinator, 0U, 0U, 0U,
+        PJ_WIPE_CODE_SYNC_STATE_FAILED, 1);
+    pj_wipe_status_t sync_failed = pj_storage_wipe_status(&coordinator);
+    assert(sync_failed.state == PJ_WIPE_STATE_FAILED);
+    assert(sync_failed.audio_deleted == 0U);
+    assert(sync_failed.transcripts_deleted == 0U);
+    assert(sync_failed.notes_deleted == 0U);
+    assert(sync_failed.retryable);
+    assert(strcmp(pj_wipe_code_name(sync_failed.code),
+                  "wipe_sync_state_failed") == 0);
+
+    assert(pj_storage_wipe_request(
+        &coordinator, 1, 0, NULL, &retry) == PJ_WIPE_START_STARTED);
+    pj_storage_wipe_finish(
+        &coordinator, 0U, 0U, 0U, PJ_WIPE_CODE_NONE, 0);
 }
 
 int main(void)

@@ -209,6 +209,106 @@ static void test_invalid_transitions_and_overflow_are_rejected(void)
     assert(!pj_recording_commit(&recording, 4));
 }
 
+static void test_raw_publish_success_moves_one_valid_copy(void)
+{
+    static const char temporary[] = "build/raw-publish.wav.tmp";
+    static const char published[] = "build/raw-publish.wav";
+    static const uint8_t raw[] = "finalized microphone capture";
+    (void)remove(temporary);
+    (void)remove(published);
+    reset_fs_faults();
+    assert(write_bytes(temporary, raw, sizeof(raw)));
+    replacement_validation_t validation = {
+        .accepted = {raw, NULL},
+        .accepted_size = {sizeof(raw), 0U},
+    };
+    assert(pj_recording_publish_raw(
+        temporary, published, replacement_validate, &validation) ==
+        PJ_RECORDING_RAW_PUBLISH_SUCCEEDED);
+    assert(validation.calls == 2U);
+    assert(!file_exists(temporary));
+    assert(file_hash(published) != 0U);
+    (void)remove(published);
+}
+
+static void test_raw_publish_rename_failure_preserves_temporary(void)
+{
+    static const char temporary[] = "build/raw-rename-fail.wav.tmp";
+    static const char published[] = "build/raw-rename-fail.wav";
+    static const uint8_t raw[] = "capture retained across rename fault";
+    (void)remove(temporary);
+    (void)remove(published);
+    reset_fs_faults();
+    assert(write_bytes(temporary, raw, sizeof(raw)));
+    uint64_t expected_hash = file_hash(temporary);
+    replacement_validation_t validation = {
+        .accepted = {raw, NULL},
+        .accepted_size = {sizeof(raw), 0U},
+    };
+    g_fail_rename_old_path = temporary;
+    g_fail_rename_new_path = published;
+    assert(pj_recording_publish_raw(
+        temporary, published, replacement_validate, &validation) ==
+        PJ_RECORDING_RAW_PUBLISH_RETRYABLE);
+    assert(file_exists(temporary));
+    assert(file_hash(temporary) == expected_hash);
+    assert(!file_exists(published));
+    (void)remove(temporary);
+    reset_fs_faults();
+}
+
+static void test_raw_publish_post_rename_validation_fault_rolls_back(void)
+{
+    static const char temporary[] = "build/raw-validation-fail.wav.tmp";
+    static const char published[] = "build/raw-validation-fail.wav";
+    static const uint8_t raw[] = "capture retained across transient read fault";
+    (void)remove(temporary);
+    (void)remove(published);
+    reset_fs_faults();
+    assert(write_bytes(temporary, raw, sizeof(raw)));
+    uint64_t expected_hash = file_hash(temporary);
+    replacement_validation_t validation = {
+        .accepted = {raw, NULL},
+        .accepted_size = {sizeof(raw), 0U},
+        .fail_on_call = 2U,
+    };
+    assert(pj_recording_publish_raw(
+        temporary, published, replacement_validate, &validation) ==
+        PJ_RECORDING_RAW_PUBLISH_RETRYABLE);
+    assert(validation.calls == 2U);
+    assert(file_exists(temporary));
+    assert(file_hash(temporary) == expected_hash);
+    assert(!file_exists(published));
+    (void)remove(temporary);
+}
+
+static void test_raw_publish_rollback_failure_leaves_published_copy(void)
+{
+    static const char temporary[] = "build/raw-rollback-fail.wav.tmp";
+    static const char published[] = "build/raw-rollback-fail.wav";
+    static const uint8_t raw[] = "capture remains visible when rollback fails";
+    (void)remove(temporary);
+    (void)remove(published);
+    reset_fs_faults();
+    assert(write_bytes(temporary, raw, sizeof(raw)));
+    uint64_t expected_hash = file_hash(temporary);
+    replacement_validation_t validation = {
+        .accepted = {raw, NULL},
+        .accepted_size = {sizeof(raw), 0U},
+        .fail_on_call = 2U,
+    };
+    g_fail_rename_old_path = published;
+    g_fail_rename_new_path = temporary;
+    assert(pj_recording_publish_raw(
+        temporary, published, replacement_validate, &validation) ==
+        PJ_RECORDING_RAW_PUBLISH_RETRYABLE);
+    assert(!file_exists(temporary));
+    assert(file_exists(published));
+    assert(file_hash(published) == expected_hash);
+    (void)remove(published);
+    reset_fs_faults();
+}
+
 static void test_raw_synced_processed_swap_becomes_pending_with_new_hash(void)
 {
     static const char published[] = "build/recording-swap.wav";
@@ -443,6 +543,10 @@ int main(void)
     test_capture_failures_never_publish_success();
     test_restart_has_no_phantom_completion();
     test_invalid_transitions_and_overflow_are_rejected();
+    test_raw_publish_success_moves_one_valid_copy();
+    test_raw_publish_rename_failure_preserves_temporary();
+    test_raw_publish_post_rename_validation_fault_rolls_back();
+    test_raw_publish_rollback_failure_leaves_published_copy();
     test_raw_synced_processed_swap_becomes_pending_with_new_hash();
     test_failed_processed_swap_restores_raw_and_sync_marker();
     test_failed_validation_remove_keeps_raw_backup();

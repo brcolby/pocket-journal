@@ -54,6 +54,13 @@ typedef struct {
 } pj_board_event_t;
 
 typedef struct {
+    int locked;
+    int start_pending;
+    char device_id[32];
+    uint64_t requested_ms;
+} pj_board_sync_inventory_mutation_t;
+
+typedef struct {
     pj_board_service_state_t display;
     pj_board_service_state_t storage;
     pj_board_service_state_t audio;
@@ -150,6 +157,15 @@ int pj_board_companion_sync_usb_progress(
     uint32_t generation, const char *operation_id, const char *phase,
     int total, int pending, int transferred, int failed, const char *error,
     pj_companion_sync_state_t *snapshot);
+/*
+ * Serializes an out-of-band inventory mutation with terminal Sync progress.
+ * The possible mutation is durably queued before publication is permitted.
+ */
+int pj_board_companion_sync_inventory_mutation_begin(
+    pj_board_sync_inventory_mutation_t *mutation,
+    int queue_when_inactive);
+int pj_board_companion_sync_inventory_mutation_finish(
+    pj_board_sync_inventory_mutation_t *mutation);
 int pj_board_companion_sync_scoped_auth_valid(const char *authorization,
                                                const char *method,
                                                const char *uri,
@@ -162,6 +178,8 @@ int pj_board_consume_companion_sync_update(pj_ui_context_t *ui);
 int pj_board_companion_sync_snapshot_matches_target(
     const pj_companion_sync_state_t *snapshot, uint32_t target_generation);
 int pj_board_companion_sync_snapshot_target_succeeded(
+    const pj_companion_sync_state_t *snapshot, uint32_t target_generation);
+uint32_t pj_board_companion_sync_snapshot_reconcile_target(
     const pj_companion_sync_state_t *snapshot, uint32_t target_generation);
 
 #ifdef __cplusplus

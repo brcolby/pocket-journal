@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/stat.h>
 
 #if defined(__GNUC__)
@@ -32,6 +33,17 @@ static int has_suffix(const char *value, const char *suffix)
     size_t value_len = strlen(value);
     size_t suffix_len = strlen(suffix);
     return value_len >= suffix_len && strcmp(value + value_len - suffix_len, suffix) == 0;
+}
+
+static int has_suffix_case(const char *value, const char *suffix)
+{
+    if (value == NULL || suffix == NULL) {
+        return 0;
+    }
+    size_t value_len = strlen(value);
+    size_t suffix_len = strlen(suffix);
+    return value_len >= suffix_len &&
+           strcasecmp(value + value_len - suffix_len, suffix) == 0;
 }
 
 static uint16_t read_le16(const uint8_t *data)
@@ -105,7 +117,10 @@ pj_storage_recovery_action_t pj_storage_recovery_action(const char *filename, in
     if (filename == NULL || filename[0] == '\0') {
         return PJ_STORAGE_RECOVERY_IGNORE;
     }
-    if (has_suffix(filename, ".wav.tmp") || has_suffix(filename, ".json.tmp")) {
+    if (has_suffix(filename, ".wav.tmp")) {
+        return PJ_STORAGE_RECOVERY_VALIDATE_TEMP;
+    }
+    if (has_suffix(filename, ".json.tmp")) {
         return PJ_STORAGE_RECOVERY_DELETE_TEMP;
     }
     if (has_suffix(filename, ".wav.bak")) {
@@ -159,6 +174,73 @@ pj_storage_backup_recovery_result_t pj_storage_recover_backup(
                    PJ_STORAGE_BACKUP_RECOVERY_FAILED;
     }
     return PJ_STORAGE_BACKUP_RECOVERY_NONE;
+}
+
+pj_storage_backup_recovery_result_t pj_storage_recover_temporary(
+    const char *temporary_path, const char *target_path,
+    pj_storage_path_validator_t validate, void *validate_context)
+{
+    if (temporary_path == NULL || target_path == NULL || validate == NULL ||
+        temporary_path[0] == '\0' || target_path[0] == '\0' ||
+        strcmp(temporary_path, target_path) == 0) {
+        return PJ_STORAGE_BACKUP_RECOVERY_FAILED;
+    }
+
+    struct stat temporary_stat;
+    if (stat(temporary_path, &temporary_stat) != 0) {
+        return errno == ENOENT ? PJ_STORAGE_BACKUP_RECOVERY_NONE :
+                                PJ_STORAGE_BACKUP_RECOVERY_FAILED;
+    }
+
+    char backup_path[512];
+    int backup_length = snprintf(
+        backup_path, sizeof(backup_path), "%s.bak", target_path);
+    if (backup_length < 0 || backup_length >= (int)sizeof(backup_path)) {
+        return PJ_STORAGE_BACKUP_RECOVERY_FAILED;
+    }
+    struct stat backup_stat;
+    errno = 0;
+    if (stat(backup_path, &backup_stat) == 0 || errno != ENOENT) {
+        return PJ_STORAGE_BACKUP_RECOVERY_FAILED;
+    }
+
+    int target_validity = validate(target_path, validate_context);
+    int temporary_validity = validate(temporary_path, validate_context);
+    if (target_validity < 0 || temporary_validity < 0) {
+        return PJ_STORAGE_BACKUP_RECOVERY_FAILED;
+    }
+    if (target_validity > 0 || temporary_validity == 0) {
+        return pj_storage_fs_remove(temporary_path) == 0 || errno == ENOENT ?
+                   PJ_STORAGE_BACKUP_RECOVERY_REMOVED :
+                   PJ_STORAGE_BACKUP_RECOVERY_FAILED;
+    }
+
+    if (pj_storage_fs_remove(target_path) != 0 && errno != ENOENT) {
+        return PJ_STORAGE_BACKUP_RECOVERY_FAILED;
+    }
+    if (pj_storage_fs_rename(temporary_path, target_path) != 0) {
+        return PJ_STORAGE_BACKUP_RECOVERY_FAILED;
+    }
+    int restored_validity = validate(target_path, validate_context);
+    if (restored_validity <= 0) {
+        (void)pj_storage_fs_rename(target_path, temporary_path);
+        return PJ_STORAGE_BACKUP_RECOVERY_FAILED;
+    }
+    return PJ_STORAGE_BACKUP_RECOVERY_RESTORED;
+}
+
+int pj_storage_audio_wipe_artifact(const char *filename)
+{
+    return has_suffix_case(filename, ".wav") ||
+           has_suffix_case(filename, ".wav.tmp") ||
+           has_suffix_case(filename, ".wav.bak");
+}
+
+int pj_storage_json_wipe_artifact(const char *filename)
+{
+    return has_suffix_case(filename, ".json") ||
+           has_suffix_case(filename, ".json.tmp") ||
+           has_suffix_case(filename, ".json.bak");
 }
 
 pj_storage_delete_result_t pj_storage_delete_matching(const char *dir_path,

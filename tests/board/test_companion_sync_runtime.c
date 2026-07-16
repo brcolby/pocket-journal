@@ -39,6 +39,58 @@ static void test_target_generation_binding(void)
     assert(!pj_board_companion_sync_snapshot_target_succeeded(&snapshot, 2U));
 }
 
+static void test_target_generation_reconciliation(void)
+{
+    pj_companion_sync_state_t snapshot = {0};
+    assert(pj_board_companion_sync_snapshot_reconcile_target(NULL, 1U) == 1U);
+    assert(pj_board_companion_sync_snapshot_reconcile_target(&snapshot, 0U) ==
+           0U);
+
+    snapshot.requested_generation = 2U;
+    snapshot.active_generation = 1U;
+    snapshot.acknowledged_generation = 0U;
+    assert(pj_board_companion_sync_snapshot_reconcile_target(&snapshot, 1U) ==
+           1U);
+
+    snapshot.active_generation = 0U;
+    snapshot.acknowledged_generation = 1U;
+    snapshot.phase = PJ_COMPANION_SYNC_PENDING;
+    assert(pj_board_companion_sync_snapshot_reconcile_target(&snapshot, 1U) ==
+           2U);
+
+    snapshot.active_generation = 2U;
+    snapshot.phase = PJ_COMPANION_SYNC_RUNNING;
+    assert(pj_board_companion_sync_snapshot_reconcile_target(&snapshot, 1U) ==
+           2U);
+
+    snapshot.requested_generation = 5U;
+    snapshot.acknowledged_generation = 0U;
+    snapshot.active_generation = 0U;
+    assert(pj_board_companion_sync_snapshot_reconcile_target(&snapshot, 1U) ==
+           1U);
+
+    snapshot.requested_generation = 1U;
+    snapshot.acknowledged_generation = 1U;
+    assert(pj_board_companion_sync_snapshot_reconcile_target(&snapshot, 2U) ==
+           2U);
+
+    snapshot.requested_generation = 3U;
+    snapshot.acknowledged_generation = 1U;
+    snapshot.active_generation = 1U;
+    assert(pj_board_companion_sync_snapshot_reconcile_target(&snapshot, 1U) ==
+           1U);
+
+    snapshot.requested_generation = 2U;
+    snapshot.acknowledged_generation = 2U;
+    snapshot.active_generation = 0U;
+    snapshot.phase = PJ_COMPANION_SYNC_SUCCEEDED;
+    assert(pj_board_companion_sync_snapshot_reconcile_target(&snapshot, 1U) ==
+           1U);
+    snapshot.acknowledged_phase = PJ_COMPANION_SYNC_SUCCEEDED;
+    assert(pj_board_companion_sync_snapshot_reconcile_target(&snapshot, 1U) ==
+           2U);
+}
+
 static void test_host_stubs_fail_closed_and_clear_outputs(void)
 {
     pj_companion_sync_state_t snapshot;
@@ -55,6 +107,7 @@ static void test_host_stubs_fail_closed_and_clear_outputs(void)
 int main(void)
 {
     test_target_generation_binding();
+    test_target_generation_reconciliation();
     test_host_stubs_fail_closed_and_clear_outputs();
     return 0;
 }

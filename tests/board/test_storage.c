@@ -348,7 +348,8 @@ static void test_recovery_policy(void)
 {
     assert(pj_storage_recovery_action(NULL, 0) == PJ_STORAGE_RECOVERY_IGNORE);
     assert(pj_storage_recovery_action("", 0) == PJ_STORAGE_RECOVERY_IGNORE);
-    assert(pj_storage_recovery_action("rec.wav.tmp", 0) == PJ_STORAGE_RECOVERY_DELETE_TEMP);
+    assert(pj_storage_recovery_action("rec.wav.tmp", 0) ==
+           PJ_STORAGE_RECOVERY_VALIDATE_TEMP);
     assert(pj_storage_recovery_action("note.json.tmp", 0) == PJ_STORAGE_RECOVERY_DELETE_TEMP);
     assert(pj_storage_recovery_action("note.json.bak", 0) == PJ_STORAGE_RECOVERY_RESTORE_BACKUP);
     assert(pj_storage_recovery_action("note.json.bak", 1) == PJ_STORAGE_RECOVERY_DELETE_BACKUP);
@@ -358,6 +359,216 @@ static void test_recovery_policy(void)
            PJ_STORAGE_RECOVERY_VALIDATE_BACKUP);
     assert(pj_storage_recovery_action("valid.wav", 0) == PJ_STORAGE_RECOVERY_IGNORE);
     assert(pj_storage_recovery_action("similar.wav.TMP", 0) == PJ_STORAGE_RECOVERY_IGNORE);
+}
+
+static void test_wav_temporary_recovery_matrix(void)
+{
+    char dir[TEST_PATH_BYTES];
+    char target[TEST_PATH_BYTES];
+    char temporary[TEST_PATH_BYTES];
+    make_temp_dir(dir);
+    join_path(target, dir, "rec.wav");
+    join_path(temporary, dir, "rec.wav.tmp");
+
+    create_wav(temporary, 0x10U);
+    assert(pj_storage_recover_temporary(
+        temporary, target, wav_path_valid, NULL) ==
+        PJ_STORAGE_BACKUP_RECOVERY_RESTORED);
+    assert(path_exists(target));
+    assert(!path_exists(temporary));
+    assert(wav_sample(target) == 0x10U);
+    assert(pj_storage_recover_temporary(
+        temporary, target, wav_path_valid, NULL) ==
+        PJ_STORAGE_BACKUP_RECOVERY_NONE);
+
+    create_wav(temporary, 0x20U);
+    assert(pj_storage_recover_temporary(
+        temporary, target, wav_path_valid, NULL) ==
+        PJ_STORAGE_BACKUP_RECOVERY_REMOVED);
+    assert(wav_sample(target) == 0x10U);
+    assert(!path_exists(temporary));
+
+    assert(unlink(target) == 0);
+    create_file(target);
+    create_wav(temporary, 0x30U);
+    assert(pj_storage_recover_temporary(
+        temporary, target, wav_path_valid, NULL) ==
+        PJ_STORAGE_BACKUP_RECOVERY_RESTORED);
+    assert(wav_sample(target) == 0x30U);
+
+    create_file(temporary);
+    assert(pj_storage_recover_temporary(
+        temporary, target, wav_path_valid, NULL) ==
+        PJ_STORAGE_BACKUP_RECOVERY_REMOVED);
+    assert(!path_exists(temporary));
+    assert(wav_sample(target) == 0x30U);
+
+    assert(unlink(target) == 0);
+    assert(rmdir(dir) == 0);
+}
+
+static void test_wav_temporary_recovery_preserves_audio_on_faults(void)
+{
+    char dir[TEST_PATH_BYTES];
+    char target[TEST_PATH_BYTES];
+    char temporary[TEST_PATH_BYTES];
+    make_temp_dir(dir);
+    join_path(target, dir, "rec.wav");
+    join_path(temporary, dir, "rec.wav.tmp");
+
+    create_wav(temporary, 0x41U);
+    g_validation_error_path = temporary;
+    g_validation_error_on_match = 1U;
+    assert(pj_storage_recover_temporary(
+        temporary, target, wav_path_valid, NULL) ==
+        PJ_STORAGE_BACKUP_RECOVERY_FAILED);
+    assert(path_exists(temporary));
+    assert(!path_exists(target));
+
+    reset_fs_faults();
+    g_fail_rename_old_path = temporary;
+    g_fail_rename_new_path = target;
+    assert(pj_storage_recover_temporary(
+        temporary, target, wav_path_valid, NULL) ==
+        PJ_STORAGE_BACKUP_RECOVERY_FAILED);
+    assert(path_exists(temporary));
+    assert(!path_exists(target));
+
+    reset_fs_faults();
+    g_validation_error_path = target;
+    g_validation_error_on_match = 2U;
+    assert(pj_storage_recover_temporary(
+        temporary, target, wav_path_valid, NULL) ==
+        PJ_STORAGE_BACKUP_RECOVERY_FAILED);
+    assert(path_exists(temporary));
+    assert(!path_exists(target));
+    assert(wav_sample(temporary) == 0x41U);
+
+    reset_fs_faults();
+    assert(unlink(temporary) == 0);
+    create_file(target);
+    create_wav(temporary, 0x42U);
+    g_fail_remove_path = target;
+    assert(pj_storage_recover_temporary(
+        temporary, target, wav_path_valid, NULL) ==
+        PJ_STORAGE_BACKUP_RECOVERY_FAILED);
+    assert(path_exists(temporary));
+    assert(path_exists(target));
+
+    reset_fs_faults();
+    assert(unlink(target) == 0);
+    assert(unlink(temporary) == 0);
+    assert(rmdir(dir) == 0);
+}
+
+static void test_wav_backup_remains_authoritative_over_temporary(void)
+{
+    char dir[TEST_PATH_BYTES];
+    char target[TEST_PATH_BYTES];
+    char temporary[TEST_PATH_BYTES];
+    char backup[TEST_PATH_BYTES];
+    make_temp_dir(dir);
+    join_path(target, dir, "rec.wav");
+    join_path(temporary, dir, "rec.wav.tmp");
+    join_path(backup, dir, "rec.wav.bak");
+
+    create_wav(temporary, 0x51U);
+    create_wav(backup, 0x52U);
+    assert(pj_storage_recover_temporary(
+        temporary, target, wav_path_valid, NULL) ==
+        PJ_STORAGE_BACKUP_RECOVERY_FAILED);
+    assert(!path_exists(target));
+    assert(path_exists(temporary));
+    assert(path_exists(backup));
+    assert(pj_storage_recover_backup(
+        backup, target, wav_path_valid, NULL) ==
+        PJ_STORAGE_BACKUP_RECOVERY_RESTORED);
+    assert(pj_storage_recover_temporary(
+        temporary, target, wav_path_valid, NULL) ==
+        PJ_STORAGE_BACKUP_RECOVERY_REMOVED);
+    assert(wav_sample(target) == 0x52U);
+
+    assert(unlink(target) == 0);
+    create_wav(temporary, 0x61U);
+    create_wav(backup, 0x62U);
+    assert(pj_storage_recover_backup(
+        backup, target, wav_path_valid, NULL) ==
+        PJ_STORAGE_BACKUP_RECOVERY_RESTORED);
+    assert(pj_storage_recover_temporary(
+        temporary, target, wav_path_valid, NULL) ==
+        PJ_STORAGE_BACKUP_RECOVERY_REMOVED);
+    assert(wav_sample(target) == 0x62U);
+
+    assert(unlink(target) == 0);
+    create_wav(temporary, 0x71U);
+    create_wav(backup, 0x72U);
+    g_validation_error_path = backup;
+    g_validation_error_on_match = 1U;
+    assert(pj_storage_recover_backup(
+        backup, target, wav_path_valid, NULL) ==
+        PJ_STORAGE_BACKUP_RECOVERY_FAILED);
+    reset_fs_faults();
+    assert(pj_storage_recover_temporary(
+        temporary, target, wav_path_valid, NULL) ==
+        PJ_STORAGE_BACKUP_RECOVERY_FAILED);
+    assert(!path_exists(target));
+    assert(path_exists(temporary));
+    assert(path_exists(backup));
+
+    assert(unlink(temporary) == 0);
+    assert(unlink(backup) == 0);
+    assert(rmdir(dir) == 0);
+}
+
+static void test_wipe_matchers_remove_recoverable_artifacts(void)
+{
+    assert(pj_storage_audio_wipe_artifact("rec.wav"));
+    assert(pj_storage_audio_wipe_artifact("rec.WAV.TMP"));
+    assert(pj_storage_audio_wipe_artifact("rec.wav.bak"));
+    assert(!pj_storage_audio_wipe_artifact("rec.wav.tmp.keep"));
+    assert(pj_storage_json_wipe_artifact("rec.json"));
+    assert(pj_storage_json_wipe_artifact("rec.JSON.TMP"));
+    assert(pj_storage_json_wipe_artifact("rec.json.bak"));
+    assert(!pj_storage_json_wipe_artifact("rec.wav"));
+
+    char audio_dir[TEST_PATH_BYTES];
+    char json_dir[TEST_PATH_BYTES];
+    char path[TEST_PATH_BYTES];
+    char target[TEST_PATH_BYTES];
+    char temporary[TEST_PATH_BYTES];
+    char backup[TEST_PATH_BYTES];
+    make_temp_dir(audio_dir);
+    make_temp_dir(json_dir);
+    join_path(target, audio_dir, "rec.wav");
+    join_path(temporary, audio_dir, "rec.wav.tmp");
+    join_path(backup, audio_dir, "rec.wav.bak");
+    create_wav(target, 0x71U);
+    create_wav(temporary, 0x72U);
+    create_wav(backup, 0x73U);
+    pj_storage_delete_result_t audio = pj_storage_delete_matching(
+        audio_dir, pj_storage_audio_wipe_artifact, 8U);
+    assert(audio.deleted == 3U);
+    assert(audio.remove_failures == 0U);
+    assert(pj_storage_recover_temporary(
+        temporary, target, wav_path_valid, NULL) ==
+        PJ_STORAGE_BACKUP_RECOVERY_NONE);
+    assert(pj_storage_recover_backup(
+        backup, target, wav_path_valid, NULL) ==
+        PJ_STORAGE_BACKUP_RECOVERY_NONE);
+
+    join_path(path, json_dir, "rec.json");
+    create_file(path);
+    join_path(path, json_dir, "rec.json.tmp");
+    create_file(path);
+    join_path(path, json_dir, "rec.json.bak");
+    create_file(path);
+    pj_storage_delete_result_t json = pj_storage_delete_matching(
+        json_dir, pj_storage_json_wipe_artifact, 8U);
+    assert(json.deleted == 3U);
+    assert(json.remove_failures == 0U);
+
+    assert(rmdir(audio_dir) == 0);
+    assert(rmdir(json_dir) == 0);
 }
 
 static void test_wav_backup_recovery_crash_points(void)
@@ -607,6 +818,10 @@ int main(void)
     test_delete_matching_reports_allocation_error();
     test_capacity_policy();
     test_recovery_policy();
+    test_wav_temporary_recovery_matrix();
+    test_wav_temporary_recovery_preserves_audio_on_faults();
+    test_wav_backup_remains_authoritative_over_temporary();
+    test_wipe_matchers_remove_recoverable_artifacts();
     test_wav_backup_recovery_crash_points();
     test_wav_backup_recovery_discards_only_invalid_backup();
     test_wav_backup_recovery_preserves_raw_on_remove_failure();

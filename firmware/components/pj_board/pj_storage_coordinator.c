@@ -260,6 +260,7 @@ const char *pj_wipe_code_name(pj_wipe_code_t code)
     switch (code) {
     case PJ_WIPE_CODE_INCOMPLETE: return "wipe_incomplete";
     case PJ_WIPE_CODE_TASK_START_FAILED: return "wipe_task_start_failed";
+    case PJ_WIPE_CODE_SYNC_STATE_FAILED: return "wipe_sync_state_failed";
     case PJ_WIPE_CODE_NONE:
     default: return "none";
     }

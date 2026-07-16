@@ -196,8 +196,13 @@ static int consume_active_sync_update(pj_ui_context_t *ui)
     }
 
     pj_companion_sync_state_t snapshot;
-    if (!pj_board_consume_companion_sync_update_snapshot(&snapshot) ||
-        !pj_board_companion_sync_snapshot_matches_target(
+    if (!pj_board_consume_companion_sync_update_snapshot(&snapshot)) {
+        return 0;
+    }
+    g_sync_active_target_generation =
+        pj_board_companion_sync_snapshot_reconcile_target(
+            &snapshot, g_sync_active_target_generation);
+    if (!pj_board_companion_sync_snapshot_matches_target(
             &snapshot, g_sync_active_target_generation)) {
         return 0;
     }

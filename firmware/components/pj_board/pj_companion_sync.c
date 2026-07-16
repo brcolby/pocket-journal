@@ -373,6 +373,146 @@ int pj_companion_sync_state_attempt_failed(
     return 1;
 }
 
+int pj_companion_sync_state_queue_inventory_mutation(
+    pj_companion_sync_state_t *state, const char *device_id,
+    uint64_t requested_ms)
+{
+    if (state == NULL || requested_ms > 9007199254740991ULL) {
+        return -1;
+    }
+    if (state->active_generation != 0U) {
+        if (state->requested_generation > state->active_generation) {
+            return 0;
+        }
+        if (state->requested_generation != state->active_generation) {
+            return -1;
+        }
+    } else if (pj_companion_sync_state_pending(state)) {
+        return 0;
+    }
+    return pj_companion_sync_state_request(state, device_id, requested_ms) ?
+           1 : -1;
+}
+
+pj_companion_sync_apply_result_t
+pj_companion_sync_restore_active_successor_transactional(
+    pj_companion_sync_state_t *state, uint64_t requested_ms,
+    pj_companion_sync_persist_fn persist, void *persist_context)
+{
+    if (state == NULL || requested_ms > 9007199254740991ULL) {
+        return PJ_COMPANION_SYNC_APPLY_REJECTED;
+    }
+    if (state->active_generation == 0U ||
+        state->requested_generation > state->active_generation) {
+        return PJ_COMPANION_SYNC_APPLY_REPLAY;
+    }
+    if (state->requested_generation != state->active_generation ||
+        state->active_generation <= state->acknowledged_generation ||
+        state->active_generation == UINT32_MAX) {
+        return PJ_COMPANION_SYNC_APPLY_REJECTED;
+    }
+
+    pj_companion_sync_state_t before = *state;
+    if (pj_companion_sync_state_queue_inventory_mutation(
+            state, NULL, requested_ms) != 1) {
+        *state = before;
+        return PJ_COMPANION_SYNC_APPLY_REJECTED;
+    }
+    if (persist == NULL || !persist(persist_context)) {
+        *state = before;
+        return PJ_COMPANION_SYNC_APPLY_STORE_FAILED;
+    }
+    return PJ_COMPANION_SYNC_APPLY_CHANGED;
+}
+
+pj_companion_sync_apply_result_t
+pj_companion_sync_prepare_inventory_mutation_transactional(
+    pj_companion_sync_mutation_barrier_t *barrier,
+    pj_companion_sync_state_t *state, int queue_when_inactive,
+    const char *device_id, uint64_t requested_ms,
+    pj_companion_sync_persist_fn persist, void *persist_context)
+{
+    if (barrier == NULL || barrier->version == 0U || state == NULL) {
+        return PJ_COMPANION_SYNC_APPLY_REJECTED;
+    }
+    pj_companion_sync_mutation_barrier_t barrier_before = *barrier;
+    pj_companion_sync_state_t state_before = *state;
+    pj_companion_sync_mutation_barrier_advance(barrier);
+    if (state->active_generation == 0U && !queue_when_inactive) {
+        return PJ_COMPANION_SYNC_APPLY_CHANGED;
+    }
+    int queued = pj_companion_sync_state_queue_inventory_mutation(
+        state, device_id, requested_ms);
+    if (queued < 0) {
+        *barrier = barrier_before;
+        *state = state_before;
+        return PJ_COMPANION_SYNC_APPLY_STORE_FAILED;
+    }
+    if (queued > 0 && (persist == NULL || !persist(persist_context))) {
+        *barrier = barrier_before;
+        *state = state_before;
+        return PJ_COMPANION_SYNC_APPLY_STORE_FAILED;
+    }
+    return PJ_COMPANION_SYNC_APPLY_CHANGED;
+}
+
+void pj_companion_sync_mutation_barrier_init(
+    pj_companion_sync_mutation_barrier_t *barrier)
+{
+    if (barrier == NULL) {
+        return;
+    }
+    memset(barrier, 0, sizeof(*barrier));
+    barrier->version = 1U;
+}
+
+int pj_companion_sync_mutation_barrier_bind(
+    pj_companion_sync_mutation_barrier_t *barrier, uint32_t generation)
+{
+    if (barrier == NULL || barrier->version == 0U || generation == 0U ||
+        (barrier->active_generation != 0U &&
+         barrier->active_generation != generation)) {
+        return 0;
+    }
+    if (barrier->active_generation == 0U) {
+        barrier->active_generation = generation;
+        barrier->active_version = barrier->version;
+    }
+    return 1;
+}
+
+void pj_companion_sync_mutation_barrier_advance(
+    pj_companion_sync_mutation_barrier_t *barrier)
+{
+    if (barrier == NULL || barrier->version == 0U) {
+        return;
+    }
+    barrier->version++;
+    if (barrier->version == 0U) {
+        barrier->version = 1U;
+    }
+}
+
+int pj_companion_sync_mutation_barrier_terminal_current(
+    const pj_companion_sync_mutation_barrier_t *barrier,
+    uint32_t generation)
+{
+    return barrier != NULL && generation != 0U &&
+           barrier->active_generation == generation &&
+           barrier->active_version == barrier->version;
+}
+
+void pj_companion_sync_mutation_barrier_release(
+    pj_companion_sync_mutation_barrier_t *barrier, uint32_t generation)
+{
+    if (barrier == NULL || generation == 0U ||
+        barrier->active_generation != generation) {
+        return;
+    }
+    barrier->active_generation = 0U;
+    barrier->active_version = 0U;
+}
+
 void pj_companion_sync_record_from_state(
     const pj_companion_sync_state_t *state,
     pj_companion_sync_record_t *record)

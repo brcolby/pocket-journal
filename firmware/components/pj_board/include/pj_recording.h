@@ -25,7 +25,14 @@ typedef struct {
     uint8_t completion_succeeded;
 } pj_recording_t;
 
+/* Returns positive for valid, zero for invalid/missing, negative for I/O error. */
 typedef int (*pj_recording_path_validator_t)(const char *path, void *context);
+
+typedef enum {
+    PJ_RECORDING_RAW_PUBLISH_FAILED = 0,
+    PJ_RECORDING_RAW_PUBLISH_SUCCEEDED,
+    PJ_RECORDING_RAW_PUBLISH_RETRYABLE,
+} pj_recording_raw_publish_result_t;
 
 void pj_recording_init(pj_recording_t *recording);
 int pj_recording_start(pj_recording_t *recording, uint32_t sample_rate,
@@ -38,6 +45,14 @@ uint64_t pj_recording_elapsed_ms(const pj_recording_t *recording);
 
 /* Returns one completion event at most once for each start. */
 int pj_recording_take_completion(pj_recording_t *recording, int *succeeded);
+
+/*
+ * Publishes a prevalidated finalized WAV without deleting the only copy on an
+ * I/O fault. A failed post-rename validation is rolled back when possible.
+ */
+pj_recording_raw_publish_result_t pj_recording_publish_raw(
+    const char *temporary_path, const char *published_path,
+    pj_recording_path_validator_t validate, void *validate_context);
 
 /*
  * Atomically replace a published raw recording with processed audio. Any

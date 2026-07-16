@@ -24,6 +24,31 @@ int pj_board_companion_sync_snapshot_target_succeeded(
            snapshot->acknowledged_phase == PJ_COMPANION_SYNC_SUCCEEDED;
 }
 
+uint32_t pj_board_companion_sync_snapshot_reconcile_target(
+    const pj_companion_sync_state_t *snapshot, uint32_t target_generation)
+{
+    if (snapshot == NULL || target_generation == 0U ||
+        snapshot->requested_generation <= target_generation ||
+        snapshot->acknowledged_generation < target_generation ||
+        (snapshot->active_generation != 0U &&
+         snapshot->active_generation <= target_generation)) {
+        return target_generation;
+    }
+    if (snapshot->acknowledged_generation <
+        snapshot->requested_generation) {
+        return snapshot->requested_generation;
+    }
+    int completed_successor =
+        snapshot->acknowledged_generation ==
+            snapshot->requested_generation &&
+        snapshot->active_generation == 0U &&
+        (snapshot->phase == PJ_COMPANION_SYNC_SUCCEEDED ||
+         snapshot->phase == PJ_COMPANION_SYNC_FAILED) &&
+        snapshot->acknowledged_phase == snapshot->phase;
+    return completed_successor ? snapshot->requested_generation :
+           target_generation;
+}
+
 #ifdef ESP_PLATFORM
 
 #include <ctype.h>
@@ -77,6 +102,9 @@ static int g_sync_update_pending;
 static int g_sync_persisted_record_valid;
 static pj_companion_sync_record_t g_sync_persisted_record;
 static int g_sync_auth_self_test_state;
+static pj_companion_sync_mutation_barrier_t g_sync_mutation_barrier;
+
+static uint64_t current_requested_ms(void);
 
 static int sync_mutex_init(void)
 {
@@ -87,6 +115,13 @@ static int sync_mutex_init(void)
     int initialized = g_sync_mutex != NULL;
     portEXIT_CRITICAL(&g_sync_mutex_init_lock);
     return initialized;
+}
+
+static void sync_mutation_barrier_ensure_locked(void)
+{
+    if (g_sync_mutation_barrier.version == 0U) {
+        pj_companion_sync_mutation_barrier_init(&g_sync_mutation_barrier);
+    }
 }
 
 static int persist_state_locked(void)
@@ -176,6 +211,33 @@ static int initialize_state_locked(void)
     } else {
         g_sync_persisted_record = record;
         g_sync_persisted_record_valid = 1;
+        if (g_sync_state.active_generation != 0U &&
+            g_sync_state.requested_generation ==
+                g_sync_state.active_generation) {
+            pj_companion_sync_mutation_barrier_t barrier_before =
+                g_sync_mutation_barrier;
+            sync_mutation_barrier_ensure_locked();
+            if (!pj_companion_sync_mutation_barrier_bind(
+                    &g_sync_mutation_barrier,
+                    g_sync_state.active_generation) ||
+                pj_companion_sync_restore_active_successor_transactional(
+                    &g_sync_state,
+                    current_requested_ms(), persist_state_callback, NULL) !=
+                    PJ_COMPANION_SYNC_APPLY_CHANGED) {
+                g_sync_mutation_barrier = barrier_before;
+                ESP_LOGE(TAG,
+                         "Unable to durably fence restored active sync generation=%" PRIu32,
+                         g_sync_state.active_generation);
+                return 0;
+            }
+            pj_companion_sync_mutation_barrier_advance(
+                &g_sync_mutation_barrier);
+            ESP_LOGW(TAG,
+                     "Restored active sync generation=%" PRIu32
+                     " with durable successor=%" PRIu32,
+                     g_sync_state.active_generation,
+                     g_sync_state.requested_generation);
+        }
     }
     if (pj_companion_sync_state_pending(&g_sync_state)) {
         ESP_LOGI(TAG, "Restored pending sync generation=%" PRIu32,
@@ -339,6 +401,22 @@ static void request_nonce(char output[PJ_COMPANION_AUTH_NONCE_BYTES])
     output[32] = '\0';
 }
 
+static uint64_t current_requested_ms(void)
+{
+    struct timeval now = {0};
+    if (gettimeofday(&now, NULL) != 0 || now.tv_sec < 0) {
+        return 0U;
+    }
+    uint64_t seconds = (uint64_t)now.tv_sec;
+    if (seconds > PJ_COMPANION_AUTH_MAX_REQUESTED_MS / 1000U) {
+        return 0U;
+    }
+    uint64_t milliseconds =
+        seconds * 1000U + (uint64_t)(now.tv_usec / 1000);
+    return milliseconds <= PJ_COMPANION_AUTH_MAX_REQUESTED_MS ?
+           milliseconds : 0U;
+}
+
 static void attempt_failed(uint32_t generation,
                            pj_companion_sync_phase_t failure_phase,
                            const char *message)
@@ -376,12 +454,32 @@ static pj_companion_sync_apply_result_t apply_lan_progress(
     const char *device_id, pj_companion_sync_phase_t *resulting_phase)
 {
     xSemaphoreTake(g_sync_mutex, portMAX_DELAY);
+    sync_mutation_barrier_ensure_locked();
+    int stale_success =
+        strcmp(phase == NULL ? "" : phase, "succeeded") == 0 &&
+        g_sync_state.active_generation == generation &&
+        g_sync_state.transport == PJ_COMPANION_SYNC_TRANSPORT_LAN &&
+        operation_id != NULL &&
+        strcmp(operation_id, g_sync_state.operation_id) == 0 &&
+        !pj_companion_sync_mutation_barrier_terminal_current(
+            &g_sync_mutation_barrier, generation);
     pj_companion_sync_apply_result_t applied =
+        stale_success && g_sync_state.requested_generation <= generation ?
+        PJ_COMPANION_SYNC_APPLY_REJECTED :
         pj_companion_sync_state_progress_transactional(
-        &g_sync_state, generation, operation_id,
-        PJ_COMPANION_SYNC_TRANSPORT_LAN, phase, total, pending, transferred,
-        failed, error, device_id, persist_state_callback, NULL);
+            &g_sync_state, generation, operation_id,
+            PJ_COMPANION_SYNC_TRANSPORT_LAN, phase, total, pending,
+            transferred, failed, error, device_id, persist_state_callback,
+            NULL);
     if (applied == PJ_COMPANION_SYNC_APPLY_CHANGED) {
+        if (strcmp(phase == NULL ? "" : phase, "succeeded") == 0 ||
+            strcmp(phase == NULL ? "" : phase, "failed") == 0) {
+            pj_companion_sync_mutation_barrier_release(
+                &g_sync_mutation_barrier, generation);
+        }
+        if (stale_success && g_sync_task_running) {
+            g_sync_restart_requested = 1;
+        }
         g_sync_update_pending = 1;
     }
     *resulting_phase = g_sync_state.phase;
@@ -435,15 +533,28 @@ static int run_one_lan_sync(void)
     (void)snprintf(operation_id, sizeof(operation_id), "%s",
                    g_sync_state.operation_id);
     pj_companion_sync_state_t before = g_sync_state;
+    pj_companion_sync_mutation_barrier_t barrier_before =
+        g_sync_mutation_barrier;
     pj_companion_sync_claim_result_t claim = pj_companion_sync_state_claim(
         &g_sync_state, generation, operation_id,
         PJ_COMPANION_SYNC_TRANSPORT_LAN);
-    if (claim == PJ_COMPANION_SYNC_CLAIM_STARTED && !persist_state_locked()) {
-        g_sync_state = before;
-        set_runtime_error_locked("Unable to save the sync claim");
-        claim = PJ_COMPANION_SYNC_CLAIM_STORE_FAILED;
-    } else if (claim == PJ_COMPANION_SYNC_CLAIM_STARTED ||
-               claim == PJ_COMPANION_SYNC_CLAIM_ATTACHED) {
+    if (claim == PJ_COMPANION_SYNC_CLAIM_STARTED ||
+        claim == PJ_COMPANION_SYNC_CLAIM_ATTACHED) {
+        sync_mutation_barrier_ensure_locked();
+        int barrier_bound = pj_companion_sync_mutation_barrier_bind(
+            &g_sync_mutation_barrier, generation);
+        int persisted = barrier_bound &&
+            (claim != PJ_COMPANION_SYNC_CLAIM_STARTED ||
+             persist_state_locked());
+        if (!barrier_bound || !persisted) {
+            g_sync_mutation_barrier = barrier_before;
+            g_sync_state = before;
+            set_runtime_error_locked("Unable to save the sync claim");
+            claim = PJ_COMPANION_SYNC_CLAIM_STORE_FAILED;
+        }
+    }
+    if (claim == PJ_COMPANION_SYNC_CLAIM_STARTED ||
+        claim == PJ_COMPANION_SYNC_CLAIM_ATTACHED) {
         requested_ms = g_sync_state.active_requested_ms;
         g_sync_update_pending = 1;
     }
@@ -684,6 +795,69 @@ static int start_task_if_pending(void)
     return 0;
 }
 
+int pj_board_companion_sync_inventory_mutation_begin(
+    pj_board_sync_inventory_mutation_t *mutation,
+    int queue_when_inactive)
+{
+    if (mutation == NULL) {
+        return 0;
+    }
+    memset(mutation, 0, sizeof(*mutation));
+    if (!sync_mutex_init()) {
+        return 0;
+    }
+    pj_board_status_t status = pj_board_status();
+    (void)snprintf(mutation->device_id, sizeof(mutation->device_id), "%s",
+                   status.device_id);
+    mutation->requested_ms = current_requested_ms();
+
+    xSemaphoreTake(g_sync_mutex, portMAX_DELAY);
+    if (!initialize_state_locked()) {
+        xSemaphoreGive(g_sync_mutex);
+        return 0;
+    }
+    sync_mutation_barrier_ensure_locked();
+    if (g_sync_state.active_generation != 0U &&
+        !pj_companion_sync_mutation_barrier_bind(
+            &g_sync_mutation_barrier, g_sync_state.active_generation)) {
+        xSemaphoreGive(g_sync_mutex);
+        return 0;
+    }
+    uint32_t requested_before = g_sync_state.requested_generation;
+    pj_companion_sync_apply_result_t prepared =
+        pj_companion_sync_prepare_inventory_mutation_transactional(
+            &g_sync_mutation_barrier, &g_sync_state,
+            queue_when_inactive, mutation->device_id,
+            mutation->requested_ms, persist_state_callback, NULL);
+    if (prepared != PJ_COMPANION_SYNC_APPLY_CHANGED) {
+        xSemaphoreGive(g_sync_mutex);
+        return 0;
+    }
+    if (g_sync_state.requested_generation != requested_before) {
+        g_sync_update_pending = 1;
+        if (g_sync_task_running) {
+            g_sync_restart_requested = 1;
+        }
+    }
+    mutation->start_pending =
+        pj_companion_sync_state_pending(&g_sync_state) &&
+        !(g_sync_state.active_generation != 0U &&
+          g_sync_state.transport == PJ_COMPANION_SYNC_TRANSPORT_USB);
+    mutation->locked = 1;
+    return 1;
+}
+
+int pj_board_companion_sync_inventory_mutation_finish(
+    pj_board_sync_inventory_mutation_t *mutation)
+{
+    if (mutation == NULL || !mutation->locked || g_sync_mutex == NULL) {
+        return 0;
+    }
+    mutation->locked = 0;
+    xSemaphoreGive(g_sync_mutex);
+    return 1;
+}
+
 int pj_board_companion_sync_start_snapshot(
     pj_companion_sync_state_t *snapshot)
 {
@@ -696,20 +870,7 @@ int pj_board_companion_sync_start_snapshot(
         return 0;
     }
     pj_board_status_t status = pj_board_status();
-    struct timeval now = {0};
-    uint64_t requested_ms = 0U;
-    if (gettimeofday(&now, NULL) == 0 && now.tv_sec >= 0) {
-        uint64_t seconds = (uint64_t)now.tv_sec;
-        uint64_t milliseconds = 0U;
-        if (seconds <= PJ_COMPANION_AUTH_MAX_REQUESTED_MS / 1000U) {
-            milliseconds = seconds * 1000U +
-                           (uint64_t)(now.tv_usec / 1000);
-        }
-        if (milliseconds > 0U &&
-            milliseconds <= PJ_COMPANION_AUTH_MAX_REQUESTED_MS) {
-            requested_ms = milliseconds;
-        }
-    }
+    uint64_t requested_ms = current_requested_ms();
     xSemaphoreTake(g_sync_mutex, portMAX_DELAY);
     if (!initialize_state_locked()) {
         xSemaphoreGive(g_sync_mutex);
@@ -780,12 +941,24 @@ int pj_board_companion_sync_usb_claim(
         return -1;
     }
     pj_companion_sync_state_t before = g_sync_state;
+    pj_companion_sync_mutation_barrier_t barrier_before =
+        g_sync_mutation_barrier;
     pj_companion_sync_claim_result_t result = pj_companion_sync_state_claim(
         &g_sync_state, generation, operation_id,
         PJ_COMPANION_SYNC_TRANSPORT_USB);
-    if (result == PJ_COMPANION_SYNC_CLAIM_STARTED && !persist_state_locked()) {
-        g_sync_state = before;
-        result = PJ_COMPANION_SYNC_CLAIM_STORE_FAILED;
+    if (result == PJ_COMPANION_SYNC_CLAIM_STARTED ||
+        result == PJ_COMPANION_SYNC_CLAIM_ATTACHED) {
+        sync_mutation_barrier_ensure_locked();
+        int barrier_bound = pj_companion_sync_mutation_barrier_bind(
+            &g_sync_mutation_barrier, generation);
+        int persisted = barrier_bound &&
+            (result != PJ_COMPANION_SYNC_CLAIM_STARTED ||
+             persist_state_locked());
+        if (!barrier_bound || !persisted) {
+            g_sync_mutation_barrier = barrier_before;
+            g_sync_state = before;
+            result = PJ_COMPANION_SYNC_CLAIM_STORE_FAILED;
+        }
     }
     if (result == PJ_COMPANION_SYNC_CLAIM_STARTED ||
         result == PJ_COMPANION_SYNC_CLAIM_ATTACHED) {
@@ -812,12 +985,29 @@ int pj_board_companion_sync_usb_progress(
         xSemaphoreGive(g_sync_mutex);
         return -1;
     }
+    sync_mutation_barrier_ensure_locked();
+    int stale_success =
+        strcmp(phase == NULL ? "" : phase, "succeeded") == 0 &&
+        g_sync_state.active_generation == generation &&
+        g_sync_state.transport == PJ_COMPANION_SYNC_TRANSPORT_USB &&
+        operation_id != NULL &&
+        strcmp(operation_id, g_sync_state.operation_id) == 0 &&
+        !pj_companion_sync_mutation_barrier_terminal_current(
+            &g_sync_mutation_barrier, generation);
     pj_companion_sync_apply_result_t result =
+        stale_success && g_sync_state.requested_generation <= generation ?
+        PJ_COMPANION_SYNC_APPLY_REJECTED :
         pj_companion_sync_state_progress_transactional(
-        &g_sync_state, generation, operation_id,
-        PJ_COMPANION_SYNC_TRANSPORT_USB, phase, total, pending, transferred,
-        failed, error, status.device_id, persist_state_callback, NULL);
+            &g_sync_state, generation, operation_id,
+            PJ_COMPANION_SYNC_TRANSPORT_USB, phase, total, pending,
+            transferred, failed, error, status.device_id,
+            persist_state_callback, NULL);
     if (result == PJ_COMPANION_SYNC_APPLY_CHANGED) {
+        if (strcmp(phase == NULL ? "" : phase, "succeeded") == 0 ||
+            strcmp(phase == NULL ? "" : phase, "failed") == 0) {
+            pj_companion_sync_mutation_barrier_release(
+                &g_sync_mutation_barrier, generation);
+        }
         g_sync_update_pending = 1;
     }
     if (snapshot != NULL) {
@@ -941,6 +1131,24 @@ int pj_board_companion_sync_usb_progress(
     (void)error;
     (void)snapshot;
     return -1;
+}
+
+int pj_board_companion_sync_inventory_mutation_begin(
+    pj_board_sync_inventory_mutation_t *mutation,
+    int queue_when_inactive)
+{
+    (void)queue_when_inactive;
+    if (mutation != NULL) {
+        memset(mutation, 0, sizeof(*mutation));
+    }
+    return 0;
+}
+
+int pj_board_companion_sync_inventory_mutation_finish(
+    pj_board_sync_inventory_mutation_t *mutation)
+{
+    (void)mutation;
+    return 0;
 }
 
 int pj_board_companion_sync_scoped_auth_valid(const char *authorization,

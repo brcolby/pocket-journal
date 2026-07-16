@@ -3554,15 +3554,6 @@ static int is_audio_filename(const char *name)
     return strcasecmp(dot, ".wav") == 0;
 }
 
-static int is_transcript_filename(const char *name)
-{
-    const char *dot = strrchr(name, '.');
-    if (dot == NULL) {
-        return 0;
-    }
-    return strcasecmp(dot, ".json") == 0;
-}
-
 static void label_from_filename(char *out, size_t out_size, const char *filename)
 {
     if (out_size == 0) {
@@ -3802,27 +3793,56 @@ static int recording_file_valid(const char *path, uint32_t expected_data_bytes)
            wav.data_bytes == expected_data_bytes;
 }
 
-static int recording_publish_file(const char *temporary_path, const char *final_path,
-                                  uint32_t data_bytes)
+static int recording_file_valid_for_replace(const char *path, void *context);
+
+static pj_recording_raw_publish_result_t recording_publish_file(
+    const char *temporary_path, const char *final_path,
+    uint32_t data_bytes, int *sync_resume_needed)
 {
+    if (sync_resume_needed == NULL) {
+        return PJ_RECORDING_RAW_PUBLISH_FAILED;
+    }
+    *sync_resume_needed = 0;
     if (!recording_file_valid(temporary_path, data_bytes)) {
-        ESP_LOGE(TAG, "Recording rejected before publish: %s", temporary_path);
-        remove(temporary_path);
-        return 0;
+        ESP_LOGE(TAG,
+                 "Recording validation unavailable before publish; "
+                 "preserving temporary for recovery: %s",
+                 temporary_path);
+        return PJ_RECORDING_RAW_PUBLISH_RETRYABLE;
     }
-    if (rename(temporary_path, final_path) != 0) {
-        ESP_LOGE(TAG, "Recording publish rename failed: %s -> %s errno=%d",
+
+    pj_board_sync_inventory_mutation_t sync_mutation;
+    if (!pj_board_companion_sync_inventory_mutation_begin(
+            &sync_mutation, 0)) {
+        ESP_LOGE(TAG,
+                 "Recording publication blocked by unavailable Sync state; "
+                 "preserving finalized temporary: %s",
+                 temporary_path);
+        return PJ_RECORDING_RAW_PUBLISH_RETRYABLE;
+    }
+
+    uint32_t expected_data_bytes = data_bytes;
+    pj_recording_raw_publish_result_t result = pj_recording_publish_raw(
+        temporary_path, final_path, recording_file_valid_for_replace,
+        &expected_data_bytes);
+    if (result == PJ_RECORDING_RAW_PUBLISH_RETRYABLE) {
+        ESP_LOGE(TAG,
+                 "Recording publication incomplete; recoverable audio remains "
+                 "at %s or %s errno=%d",
                  temporary_path, final_path, errno);
-        remove(temporary_path);
-        return 0;
     }
-    if (!recording_file_valid(final_path, data_bytes)) {
-        ESP_LOGE(TAG, "Recording rejected after publish: %s", final_path);
-        remove(final_path);
-        return 0;
+
+    *sync_resume_needed = sync_mutation.start_pending;
+    if (!pj_board_companion_sync_inventory_mutation_finish(&sync_mutation)) {
+        ESP_LOGE(TAG, "Recording publication could not release the Sync barrier");
+        return PJ_RECORDING_RAW_PUBLISH_FAILED;
     }
+    if (result != PJ_RECORDING_RAW_PUBLISH_SUCCEEDED) {
+        return result;
+    }
+
     write_recording_metadata(final_path, data_bytes);
-    return 1;
+    return PJ_RECORDING_RAW_PUBLISH_SUCCEEDED;
 }
 
 static int probe_audio_entry_unlocked(const char *filename, pj_audio_entry_t *entry)
@@ -4113,17 +4133,46 @@ static void recording_wipe_worker(void *arg)
                   " stack_hwm=%u",
              wipe_status.id, (unsigned)uxTaskGetStackHighWaterMark(NULL));
 
+    pj_board_sync_inventory_mutation_t sync_mutation;
+    if (!pj_board_companion_sync_inventory_mutation_begin(
+            &sync_mutation, 0)) {
+        board_status_set_error(
+            "recording wipe blocked by unavailable Sync state");
+        portENTER_CRITICAL(&g_storage_coordinator_lock);
+        pj_storage_wipe_finish(
+            &g_storage_coordinator, 0U, 0U, 0U,
+            PJ_WIPE_CODE_SYNC_STATE_FAILED, 1);
+        g_storage_wipe_task = NULL;
+        portEXIT_CRITICAL(&g_storage_coordinator_lock);
+        ESP_LOGE(TAG,
+                 "Recording wipe blocked before deletion: operation=%" PRIu32,
+                 wipe_status.id);
+        vTaskDelete(NULL);
+        return;
+    }
+
     int incomplete = 0;
-    size_t audio_deleted = delete_dir_entries(PJ_AUDIO_DIR, is_audio_filename, &incomplete);
+    size_t audio_deleted = delete_dir_entries(
+        PJ_AUDIO_DIR, pj_storage_audio_wipe_artifact, &incomplete);
     size_t transcripts_deleted =
-        delete_dir_entries(PJ_TRANSCRIPT_DIR, is_transcript_filename, &incomplete);
-    size_t notes_deleted = delete_dir_entries(PJ_NOTE_DIR, is_transcript_filename, &incomplete);
+        delete_dir_entries(
+            PJ_TRANSCRIPT_DIR, pj_storage_json_wipe_artifact, &incomplete);
+    size_t notes_deleted = delete_dir_entries(
+        PJ_NOTE_DIR, pj_storage_json_wipe_artifact, &incomplete);
+    int sync_resume_needed = sync_mutation.start_pending;
+    if (!pj_board_companion_sync_inventory_mutation_finish(
+            &sync_mutation)) {
+        ESP_LOGE(TAG,
+                 "Recording wipe could not release the Sync mutation barrier");
+    }
 
     if (incomplete) {
         board_status_set_error("recording wipe incomplete");
     } else {
         storage_sync_counts_cache(0, 0);
         board_status_clear_error_if_equal("recording wipe incomplete");
+        board_status_clear_error_if_equal(
+            "recording wipe blocked by unavailable Sync state");
     }
     ESP_LOGI(TAG, "Wiped recordings: operation=%" PRIu32
                   " audio=%zu transcripts=%zu metadata=%zu complete=%d stack_hwm=%u",
@@ -4138,6 +4187,9 @@ static void recording_wipe_worker(void *arg)
     g_storage_wipe_task = NULL;
     portEXIT_CRITICAL(&g_storage_coordinator_lock);
 
+    if (sync_resume_needed && !pj_board_companion_sync_resume()) {
+        ESP_LOGW(TAG, "Unable to resume queued Sync after recording wipe");
+    }
     g_ui_note_audio_count = 0;
     g_ui_note_transcript_view = 0;
     board_update_publish(BOARD_UPDATE_NOTES);
@@ -4202,6 +4254,42 @@ static pj_wipe_start_result_t recording_wipe_start(const char *request_id,
     return PJ_WIPE_START_STARTED;
 }
 
+static int storage_recovery_wav_validate(const char *path, void *context)
+{
+    (void)context;
+    struct stat st;
+    errno = 0;
+    if (stat(path, &st) != 0) {
+        return errno == ENOENT ? 0 : -1;
+    }
+    if (st.st_size < (off_t)PJ_STORAGE_WAV_HEADER_BYTES) {
+        return 0;
+    }
+
+    FILE *file = fopen(path, "rb");
+    if (file == NULL) {
+        return errno == ENOENT ? 0 : -1;
+    }
+    uint8_t header[PJ_STORAGE_WAV_HEADER_BYTES];
+    size_t read = fread(header, 1, sizeof(header), file);
+    int read_failed = ferror(file);
+    int close_failed = fclose(file) != 0;
+    if (read_failed || close_failed) {
+        return -1;
+    }
+    if (read != sizeof(header)) {
+        return 0;
+    }
+
+    pj_storage_wav_info_t wav;
+    int valid = pj_storage_wav_validate(header, sizeof(header),
+                                        (uint64_t)st.st_size,
+                                        PJ_AUDIO_SAMPLE_RATE,
+                                        PJ_AUDIO_BITS_PER_SAMPLE, &wav) &&
+                wav.channels == PJ_AUDIO_CHANNELS;
+    return valid ? 1 : 0;
+}
+
 static int recover_dir_artifacts(const char *dir_path)
 {
     DIR *dir = opendir(dir_path);
@@ -4209,35 +4297,70 @@ static int recover_dir_artifacts(const char *dir_path)
         return 0;
     }
     int recovered = 0;
-    struct dirent *entry;
-    while ((entry = readdir(dir)) != NULL) {
-        size_t name_len = strlen(entry->d_name);
-        if (entry->d_name[0] == '.' || name_len < 5U) {
-            continue;
-        }
-        char artifact_path[384];
-        char target_path[384];
-        int artifact_len = snprintf(artifact_path, sizeof(artifact_path), "%s/%s",
-                                    dir_path, entry->d_name);
-        if (artifact_len < 0 || artifact_len >= (int)sizeof(artifact_path)) {
-            continue;
-        }
-        size_t suffix_len = 4U;
-        if (name_len - suffix_len + strlen(dir_path) + 2U > sizeof(target_path)) {
-            continue;
-        }
-        (void)snprintf(target_path, sizeof(target_path), "%s/%.*s", dir_path,
-                       (int)(name_len - suffix_len), entry->d_name);
-        struct stat target_stat;
-        int target_exists = stat(target_path, &target_stat) == 0;
-        pj_storage_recovery_action_t action =
-            pj_storage_recovery_action(entry->d_name, target_exists);
-        if ((action == PJ_STORAGE_RECOVERY_DELETE_TEMP ||
-             action == PJ_STORAGE_RECOVERY_DELETE_BACKUP) && remove(artifact_path) == 0) {
-            recovered++;
-        } else if (action == PJ_STORAGE_RECOVERY_RESTORE_BACKUP &&
-                   rename(artifact_path, target_path) == 0) {
-            recovered++;
+    for (int recovery_pass = 0; recovery_pass < 2; recovery_pass++) {
+        rewinddir(dir);
+        struct dirent *entry;
+        while ((entry = readdir(dir)) != NULL) {
+            size_t name_len = strlen(entry->d_name);
+            if (entry->d_name[0] == '.' || name_len < 5U) {
+                continue;
+            }
+            char artifact_path[384];
+            char target_path[384];
+            int artifact_len = snprintf(
+                artifact_path, sizeof(artifact_path), "%s/%s",
+                dir_path, entry->d_name);
+            if (artifact_len < 0 ||
+                artifact_len >= (int)sizeof(artifact_path)) {
+                continue;
+            }
+            size_t suffix_len = 4U;
+            if (name_len - suffix_len + strlen(dir_path) + 2U >
+                sizeof(target_path)) {
+                continue;
+            }
+            (void)snprintf(
+                target_path, sizeof(target_path), "%s/%.*s", dir_path,
+                (int)(name_len - suffix_len), entry->d_name);
+            struct stat target_stat;
+            int target_exists = stat(target_path, &target_stat) == 0;
+            pj_storage_recovery_action_t action =
+                pj_storage_recovery_action(entry->d_name, target_exists);
+            int backup_action =
+                action == PJ_STORAGE_RECOVERY_DELETE_BACKUP ||
+                action == PJ_STORAGE_RECOVERY_RESTORE_BACKUP ||
+                action == PJ_STORAGE_RECOVERY_VALIDATE_BACKUP;
+            if ((recovery_pass == 0) != backup_action) {
+                continue;
+            }
+            if (action == PJ_STORAGE_RECOVERY_VALIDATE_BACKUP ||
+                action == PJ_STORAGE_RECOVERY_VALIDATE_TEMP) {
+                pj_storage_backup_recovery_result_t result =
+                    action == PJ_STORAGE_RECOVERY_VALIDATE_BACKUP ?
+                    pj_storage_recover_backup(
+                        artifact_path, target_path,
+                        storage_recovery_wav_validate, NULL) :
+                    pj_storage_recover_temporary(
+                        artifact_path, target_path,
+                        storage_recovery_wav_validate, NULL);
+                if (result == PJ_STORAGE_BACKUP_RECOVERY_RESTORED ||
+                    result == PJ_STORAGE_BACKUP_RECOVERY_REMOVED) {
+                    recovered++;
+                } else if (result == PJ_STORAGE_BACKUP_RECOVERY_FAILED) {
+                    ESP_LOGW(
+                        TAG, "Leaving uncertain WAV recovery artifacts: %s",
+                        artifact_path);
+                }
+                continue;
+            }
+            if ((action == PJ_STORAGE_RECOVERY_DELETE_TEMP ||
+                 action == PJ_STORAGE_RECOVERY_DELETE_BACKUP) &&
+                remove(artifact_path) == 0) {
+                recovered++;
+            } else if (action == PJ_STORAGE_RECOVERY_RESTORE_BACKUP &&
+                       rename(artifact_path, target_path) == 0) {
+                recovered++;
+            }
         }
     }
     closedir(dir);
@@ -4271,10 +4394,36 @@ static int audio_filename_for_index(int target_index, char *out, size_t out_size
     return 1;
 }
 
-static void next_recording_path(char *out, size_t out_size)
+static int recording_path_available(const char *path)
+{
+    char temporary_path[160];
+    char backup_path[160];
+    int temporary_length = snprintf(
+        temporary_path, sizeof(temporary_path), "%s.tmp", path);
+    int backup_length = snprintf(
+        backup_path, sizeof(backup_path), "%s.bak", path);
+    if (temporary_length < 0 ||
+        temporary_length >= (int)sizeof(temporary_path) ||
+        backup_length < 0 || backup_length >= (int)sizeof(backup_path)) {
+        return 0;
+    }
+    struct stat st;
+    errno = 0;
+    if (stat(path, &st) == 0 || errno != ENOENT) {
+        return 0;
+    }
+    errno = 0;
+    if (stat(temporary_path, &st) == 0 || errno != ENOENT) {
+        return 0;
+    }
+    errno = 0;
+    return stat(backup_path, &st) != 0 && errno == ENOENT;
+}
+
+static int next_recording_path(char *out, size_t out_size)
 {
     if (out_size == 0) {
-        return;
+        return 0;
     }
     board_time_snapshot_t time = board_time_snapshot();
     for (int attempt = 0; attempt < 1000; attempt++) {
@@ -4284,16 +4433,12 @@ static void next_recording_path(char *out, size_t out_size)
                        time.year, time.month, time.day,
                        time.hour, time.minute,
                        (unsigned)(sequence % 1000u));
-        struct stat st;
-        if (stat(out, &st) != 0) {
-            return;
+        if (recording_path_available(out)) {
+            return 1;
         }
     }
-    (void)snprintf(out, out_size,
-                   PJ_AUDIO_DIR "/rec-%04d%02d%02d-%02d%02d-%lu.wav",
-                   time.year, time.month, time.day,
-                   time.hour, time.minute,
-                   (unsigned long)xTaskGetTickCount());
+    out[0] = '\0';
+    return 0;
 }
 
 static void refresh_ui_notes_from_sd(pj_ui_context_t *ui)
@@ -5879,8 +6024,13 @@ static int recording_file_valid_for_replace(const char *path, void *context)
 
 static int recording_replace_with_processed(const char *temporary_path,
                                             const char *final_path,
-                                            uint32_t data_bytes)
+                                            uint32_t data_bytes,
+                                            int *sync_resume_needed)
 {
+    if (sync_resume_needed == NULL) {
+        return 0;
+    }
+    *sync_resume_needed = 0;
     const char *filename = strrchr(final_path, '/');
     char transcript_path[PJ_NOTE_TRANSCRIPT_PATH_LEN];
     if (filename == NULL || filename[1] == '\0' ||
@@ -5888,13 +6038,31 @@ static int recording_replace_with_processed(const char *temporary_path,
                                    filename + 1)) {
         return 0;
     }
+    char transcript_label[PJ_UI_NOTE_LABEL_LEN];
+    int invalidated_synced_note = pj_transcript_marker_load(
+        transcript_path, transcript_label, sizeof(transcript_label));
+    pj_board_sync_inventory_mutation_t sync_mutation;
+    if (!pj_board_companion_sync_inventory_mutation_begin(
+            &sync_mutation, invalidated_synced_note)) {
+        ESP_LOGE(TAG, "Audio processing publication blocked by Sync barrier: %s",
+                 final_path);
+        return 0;
+    }
     memset(&g_usb_audio_identity, 0, sizeof(g_usb_audio_identity));
     uint32_t expected_data_bytes = data_bytes;
-    if (!pj_recording_replace_processed(
+    int replaced = pj_recording_replace_processed(
             temporary_path, final_path, transcript_path,
-            recording_file_valid_for_replace, &expected_data_bytes)) {
+            recording_file_valid_for_replace, &expected_data_bytes);
+    *sync_resume_needed = sync_mutation.start_pending;
+    int sync_ready =
+        pj_board_companion_sync_inventory_mutation_finish(&sync_mutation);
+    if (!replaced) {
         ESP_LOGE(TAG, "Audio processing publication failed: %s", final_path);
         return 0;
+    }
+    if (!sync_ready) {
+        ESP_LOGW(TAG, "Processed audio published with durable Sync retry pending: %s",
+                 final_path);
     }
     return 1;
 }
@@ -5913,18 +6081,21 @@ static int audio_process_wait_for_publication(void)
 }
 
 static int audio_process_recording(const audio_process_args_t *args,
-                                   int *publication_owned)
+                                   int *publication_owned,
+                                   int *sync_resume_needed)
 {
     char temporary_path[144];
     int path_length = snprintf(temporary_path, sizeof(temporary_path),
                                "%s.tmp", args->final_path);
-    if (publication_owned == NULL || path_length < 0 ||
+    if (publication_owned == NULL || sync_resume_needed == NULL ||
+        path_length < 0 ||
         path_length >= (int)sizeof(temporary_path) ||
         !recording_copy_for_processing(args->final_path, temporary_path,
                                        args->data_bytes)) {
         return 0;
     }
     *publication_owned = 0;
+    *sync_resume_needed = 0;
 
     FILE *file = fopen(temporary_path, "rb+");
     if (file == NULL) {
@@ -5961,8 +6132,9 @@ static int audio_process_recording(const audio_process_args_t *args,
         return 0;
     }
     *publication_owned = 1;
-    if (!recording_replace_with_processed(temporary_path, args->final_path,
-                                          args->data_bytes)) {
+    if (!recording_replace_with_processed(
+            temporary_path, args->final_path, args->data_bytes,
+            sync_resume_needed)) {
         remove(temporary_path);
         return 0;
     }
@@ -6000,10 +6172,16 @@ static void audio_process_task(void *arg)
 
         int storage_owned = storage_shared_try_acquire();
         int publication_owned = 0;
+        int sync_resume_needed = 0;
         int enhanced = storage_owned &&
-                       audio_process_recording(&args, &publication_owned);
+                       audio_process_recording(
+                           &args, &publication_owned, &sync_resume_needed);
         if (publication_owned) {
             storage_audio_publication_finish();
+            if (sync_resume_needed &&
+                !pj_board_companion_sync_resume()) {
+                ESP_LOGW(TAG, "Unable to resume queued Sync after audio publication");
+            }
             board_update_publish(BOARD_UPDATE_NOTES);
         } else if (storage_owned) {
             storage_shared_release();
@@ -6180,13 +6358,17 @@ static esp_err_t audio_init(void)
     return ESP_OK;
 }
 
-static void record_task_exit(void)
+static void record_task_exit(int sync_resume_needed)
 {
     if (g_record_audio_owned) {
         g_record_audio_owned = 0;
         xSemaphoreGive(g_audio_lock);
     }
     record_storage_release();
+    if (sync_resume_needed && !pj_board_companion_sync_resume()) {
+        ESP_LOGW(TAG,
+                 "Unable to resume queued Sync after recording publication");
+    }
     recording_publish_completion();
     board_audio_state_set(0, -1);
     alert_audio_set_recording(0);
@@ -6220,7 +6402,7 @@ static void record_task(void *arg)
         ESP_LOGE(TAG, "Recording could not acquire audio ownership");
         board_status_set_error("recording could not acquire audio ownership");
         recording_state_finish_capture(0);
-        record_task_exit();
+        record_task_exit(0);
         return;
     }
     g_record_audio_owned = 1;
@@ -6237,13 +6419,12 @@ static void record_task(void *arg)
     uint32_t clipped_samples = 0;
     char temporary_path[144];
     (void)snprintf(temporary_path, sizeof(temporary_path), "%s.tmp", g_active_recording_path);
-    remove(temporary_path);
     FILE *file = fopen(temporary_path, "wb+");
     if (file == NULL) {
         ESP_LOGE(TAG, "Recording open failed: %s", temporary_path);
         board_status_set_error("recording file open failed");
         recording_state_finish_capture(0);
-        record_task_exit();
+        record_task_exit(0);
         return;
     }
     if (!wav_write_header(file, 0, PJ_AUDIO_CHANNELS, PJ_AUDIO_SAMPLE_RATE)) {
@@ -6252,7 +6433,7 @@ static void record_task(void *arg)
         remove(temporary_path);
         board_status_set_error("recording WAV header creation failed");
         recording_state_finish_capture(0);
-        record_task_exit();
+        record_task_exit(0);
         return;
     }
     int gain_ret = esp_codec_dev_set_in_gain(g_audio_record_codec, PJ_AUDIO_MIC_GAIN_DB);
@@ -6262,7 +6443,7 @@ static void record_task(void *arg)
         remove(temporary_path);
         board_status_set_error("recording input gain setup failed");
         recording_state_finish_capture(0);
-        record_task_exit();
+        record_task_exit(0);
         return;
     }
     ESP_LOGI(TAG,
@@ -6346,17 +6527,22 @@ static void record_task(void *arg)
         board_status_set_error(
             "recording capture or WAV finalization failed");
         remove(temporary_path);
-        record_task_exit();
+        record_task_exit(0);
         return;
     }
 
-    int note_ready = recording_publish_file(temporary_path,
-                                            g_active_recording_path,
-                                            data_bytes);
+    int sync_resume_needed = 0;
+    pj_recording_raw_publish_result_t publish_result =
+        recording_publish_file(temporary_path, g_active_recording_path,
+                               data_bytes, &sync_resume_needed);
+    int note_ready = publish_result == PJ_RECORDING_RAW_PUBLISH_SUCCEEDED;
     recording_state_finish_capture(note_ready);
     if (!note_ready) {
-        board_status_set_error("recording raw publication failed");
-        record_task_exit();
+        board_status_set_error(
+            publish_result == PJ_RECORDING_RAW_PUBLISH_RETRYABLE ?
+            "recording publication deferred; finalized audio retained for recovery" :
+            "recording raw publication failed");
+        record_task_exit(sync_resume_needed);
         return;
     }
 
@@ -6383,7 +6569,7 @@ static void record_task(void *arg)
         ESP_LOGW(TAG, "Audio enhancement queue unavailable or full; raw note retained: %s",
                  process_args.final_path);
     }
-    record_task_exit();
+    record_task_exit(sync_resume_needed);
 }
 
 static int wav_read_header(FILE *file, uint16_t *channels, uint32_t *sample_rate, uint16_t *bits, uint32_t *data_bytes)
@@ -7912,7 +8098,15 @@ int pj_board_record_set_active(int active)
         audio_lifecycle_give();
         return 0;
     }
-    next_recording_path(g_active_recording_path, sizeof(g_active_recording_path));
+    if (!next_recording_path(
+            g_active_recording_path, sizeof(g_active_recording_path))) {
+        board_status_set_error(
+            "recording path allocation failed; run storage recovery");
+        record_storage_release();
+        pj_audio_lifecycle_finish_record(&g_audio_lifecycle);
+        audio_lifecycle_give();
+        return 0;
+    }
     if (!recording_state_start()) {
         ESP_LOGE(TAG, "Record start failed: invalid lifecycle transition");
         board_status_set_error("recording lifecycle was busy");
@@ -8093,16 +8287,34 @@ int pj_board_storage_recover(void)
             "storage recovery blocked by active storage work");
         return 0;
     }
+    pj_board_sync_inventory_mutation_t sync_mutation;
+    if (!pj_board_companion_sync_inventory_mutation_begin(
+            &sync_mutation, 0)) {
+        board_status_set_error(
+            "storage recovery blocked by unavailable Sync state");
+        portENTER_CRITICAL(&g_storage_coordinator_lock);
+        pj_storage_recovery_finish(&g_storage_coordinator);
+        portEXIT_CRITICAL(&g_storage_coordinator_lock);
+        return 0;
+    }
+    int sync_resume_needed = sync_mutation.start_pending;
     pj_board_status_t status = board_status_snapshot_base();
     if (g_sd_card != NULL) {
         esp_err_t unmount_err = esp_vfs_fat_sdcard_unmount(status.storage_path,
                                                           g_sd_card);
         if (unmount_err != ESP_OK) {
+            (void)pj_board_companion_sync_inventory_mutation_finish(
+                &sync_mutation);
             board_status_set_error("microSD unmount failed: %s",
                                    esp_err_to_name(unmount_err));
             portENTER_CRITICAL(&g_storage_coordinator_lock);
             pj_storage_recovery_finish(&g_storage_coordinator);
             portEXIT_CRITICAL(&g_storage_coordinator_lock);
+            if (sync_resume_needed &&
+                !pj_board_companion_sync_resume()) {
+                ESP_LOGW(TAG,
+                         "Unable to resume queued Sync after storage recovery failure");
+            }
             return 0;
         }
         g_sd_card = NULL;
@@ -8113,6 +8325,10 @@ int pj_board_storage_recover(void)
     g_status.storage_health = PJ_STORAGE_HEALTH_UNMOUNTED;
     board_status_give();
     esp_err_t err = storage_init();
+    if (!pj_board_companion_sync_inventory_mutation_finish(
+            &sync_mutation)) {
+        ESP_LOGE(TAG, "Storage recovery could not release the Sync barrier");
+    }
     if (err != ESP_OK) {
         board_status_set_service(BOARD_SERVICE_STORAGE,
                                  PJ_BOARD_SERVICE_ERROR);
@@ -8122,6 +8338,10 @@ int pj_board_storage_recover(void)
         portENTER_CRITICAL(&g_storage_coordinator_lock);
         pj_storage_recovery_finish(&g_storage_coordinator);
         portEXIT_CRITICAL(&g_storage_coordinator_lock);
+        if (sync_resume_needed && !pj_board_companion_sync_resume()) {
+            ESP_LOGW(TAG,
+                     "Unable to resume queued Sync after storage recovery failure");
+        }
         return 0;
     }
     board_status_set_service(BOARD_SERVICE_STORAGE, PJ_BOARD_SERVICE_READY);
@@ -8142,6 +8362,9 @@ int pj_board_storage_recover(void)
     portENTER_CRITICAL(&g_storage_coordinator_lock);
     pj_storage_recovery_finish(&g_storage_coordinator);
     portEXIT_CRITICAL(&g_storage_coordinator_lock);
+    if (sync_resume_needed && !pj_board_companion_sync_resume()) {
+        ESP_LOGW(TAG, "Unable to resume queued Sync after storage recovery");
+    }
     board_update_publish(BOARD_UPDATE_NOTES);
     return 1;
 #else

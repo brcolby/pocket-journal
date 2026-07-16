@@ -28,6 +28,7 @@ typedef enum {
     PJ_WIPE_CODE_NONE = 0,
     PJ_WIPE_CODE_INCOMPLETE,
     PJ_WIPE_CODE_TASK_START_FAILED,
+    PJ_WIPE_CODE_SYNC_STATE_FAILED,
 } pj_wipe_code_t;
 
 typedef enum {

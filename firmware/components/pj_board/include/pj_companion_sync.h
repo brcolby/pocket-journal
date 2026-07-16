@@ -49,6 +49,12 @@ typedef enum {
 typedef int (*pj_companion_sync_persist_fn)(void *context);
 
 typedef struct {
+    uint64_t version;
+    uint64_t active_version;
+    uint32_t active_generation;
+} pj_companion_sync_mutation_barrier_t;
+
+typedef struct {
     pj_companion_sync_phase_t phase;
     pj_companion_sync_transport_t transport;
     int total;
@@ -124,12 +130,41 @@ int pj_companion_sync_state_attempt_failed(
     pj_companion_sync_state_t *state, uint32_t generation,
     pj_companion_sync_transport_t transport,
     pj_companion_sync_phase_t failure_phase, const char *error);
+/*
+ * Returns 1 when a new generation was queued, 0 when an existing pending
+ * generation already covers the mutation, and -1 when no generation can be
+ * queued.
+ */
+int pj_companion_sync_state_queue_inventory_mutation(
+    pj_companion_sync_state_t *state, const char *device_id,
+    uint64_t requested_ms);
+pj_companion_sync_apply_result_t
+pj_companion_sync_restore_active_successor_transactional(
+    pj_companion_sync_state_t *state, uint64_t requested_ms,
+    pj_companion_sync_persist_fn persist, void *persist_context);
+pj_companion_sync_apply_result_t
+pj_companion_sync_prepare_inventory_mutation_transactional(
+    pj_companion_sync_mutation_barrier_t *barrier,
+    pj_companion_sync_state_t *state, int queue_when_inactive,
+    const char *device_id, uint64_t requested_ms,
+    pj_companion_sync_persist_fn persist, void *persist_context);
 int pj_companion_sync_error_valid(const char *error);
 int pj_companion_sync_scope_allowed(const char *method, const char *uri);
 int pj_companion_sync_state_pending(const pj_companion_sync_state_t *state);
 int pj_companion_sync_state_active(const pj_companion_sync_state_t *state);
 uint32_t pj_companion_sync_state_claim_generation(
     const pj_companion_sync_state_t *state);
+void pj_companion_sync_mutation_barrier_init(
+    pj_companion_sync_mutation_barrier_t *barrier);
+int pj_companion_sync_mutation_barrier_bind(
+    pj_companion_sync_mutation_barrier_t *barrier, uint32_t generation);
+void pj_companion_sync_mutation_barrier_advance(
+    pj_companion_sync_mutation_barrier_t *barrier);
+int pj_companion_sync_mutation_barrier_terminal_current(
+    const pj_companion_sync_mutation_barrier_t *barrier,
+    uint32_t generation);
+void pj_companion_sync_mutation_barrier_release(
+    pj_companion_sync_mutation_barrier_t *barrier, uint32_t generation);
 const char *pj_companion_sync_phase_name(pj_companion_sync_phase_t phase);
 const char *pj_companion_sync_transport_name(
     pj_companion_sync_transport_t transport);

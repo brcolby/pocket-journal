@@ -21,8 +21,332 @@ static void restore_after_reboot(pj_companion_sync_state_t *state)
     assert(pj_companion_sync_state_from_record(state, &record));
 }
 
+static void test_upload_swap_terminal_barrier(void)
+{
+    pj_companion_sync_state_t state;
+    pj_companion_sync_state_init(&state);
+    assert(pj_companion_sync_state_request(
+        &state, "pj-mutation", 1000U));
+    assert(pj_companion_sync_state_claim(
+        &state, 1U, "pj-mutation-00000001",
+        PJ_COMPANION_SYNC_TRANSPORT_USB) == PJ_COMPANION_SYNC_CLAIM_STARTED);
+
+    pj_companion_sync_mutation_barrier_t barrier;
+    pj_companion_sync_mutation_barrier_init(&barrier);
+    assert(pj_companion_sync_mutation_barrier_bind(&barrier, 1U));
+    assert(pj_companion_sync_mutation_barrier_terminal_current(
+        &barrier, 1U));
+
+    /* The raw upload finishes before enhancement replaces its source WAV. */
+    assert(pj_companion_sync_state_progress(
+        &state, 1U, "pj-mutation-00000001",
+        PJ_COMPANION_SYNC_TRANSPORT_USB, "running", 1, 0, 1, 0, "",
+        "pj-mutation") == PJ_COMPANION_SYNC_APPLY_CHANGED);
+    persist_calls = 0;
+    persist_result = 1;
+    assert(pj_companion_sync_prepare_inventory_mutation_transactional(
+        &barrier, &state, 1, "pj-mutation", 2000U,
+        persist_test_state, NULL) == PJ_COMPANION_SYNC_APPLY_CHANGED);
+    assert(persist_calls == 1);
+    assert(state.active_generation == 1U);
+    assert(state.requested_generation == 2U);
+    assert(!pj_companion_sync_mutation_barrier_terminal_current(
+        &barrier, 1U));
+
+    /* More swaps coalesce into the already durable next generation. */
+    assert(pj_companion_sync_prepare_inventory_mutation_transactional(
+        &barrier, &state, 1, "pj-mutation", 3000U,
+        persist_test_state, NULL) == PJ_COMPANION_SYNC_APPLY_CHANGED);
+    assert(persist_calls == 1);
+    assert(state.requested_generation == 2U);
+
+    /* A failed stale-terminal commit preserves the active, stale claim. */
+    pj_companion_sync_state_t active_before = state;
+    persist_result = 0;
+    assert(pj_companion_sync_state_progress_transactional(
+        &state, 1U, "pj-mutation-00000001",
+        PJ_COMPANION_SYNC_TRANSPORT_USB, "succeeded", 1, 0, 1, 0, "",
+        "pj-mutation", persist_test_state, NULL) ==
+        PJ_COMPANION_SYNC_APPLY_STORE_FAILED);
+    assert(memcmp(&state, &active_before, sizeof(state)) == 0);
+    assert(state.acknowledged_generation == 0U);
+    assert(!pj_companion_sync_mutation_barrier_terminal_current(
+        &barrier, 1U));
+
+    persist_result = 1;
+    assert(pj_companion_sync_state_progress_transactional(
+        &state, 1U, "pj-mutation-00000001",
+        PJ_COMPANION_SYNC_TRANSPORT_USB, "succeeded", 1, 0, 1, 0, "",
+        "pj-mutation", persist_test_state, NULL) ==
+        PJ_COMPANION_SYNC_APPLY_CHANGED);
+    assert(state.phase == PJ_COMPANION_SYNC_PENDING);
+    assert(state.active_generation == 0U);
+    assert(state.acknowledged_generation == 1U);
+    assert(state.acknowledged_phase == PJ_COMPANION_SYNC_SUCCEEDED);
+    assert(strcmp(state.operation_id, "pj-mutation-00000002") == 0);
+    assert(pj_companion_sync_state_progress_transactional(
+        &state, 1U, "pj-mutation-00000001",
+        PJ_COMPANION_SYNC_TRANSPORT_USB, "succeeded", 1, 0, 1, 0, "",
+        "pj-mutation", persist_test_state, NULL) ==
+        PJ_COMPANION_SYNC_APPLY_REPLAY);
+    restore_after_reboot(&state);
+    assert(state.phase == PJ_COMPANION_SYNC_PENDING);
+    assert(state.requested_generation == 2U);
+
+    pj_companion_sync_mutation_barrier_release(&barrier, 1U);
+    assert(pj_companion_sync_state_claim(
+        &state, 2U, "pj-mutation-00000002",
+        PJ_COMPANION_SYNC_TRANSPORT_USB) == PJ_COMPANION_SYNC_CLAIM_STARTED);
+    assert(pj_companion_sync_mutation_barrier_bind(&barrier, 2U));
+    assert(pj_companion_sync_mutation_barrier_terminal_current(
+        &barrier, 2U));
+    assert(pj_companion_sync_state_progress(
+        &state, 2U, "pj-mutation-00000002",
+        PJ_COMPANION_SYNC_TRANSPORT_USB, "succeeded", 1, 0, 1, 0, "",
+        "pj-mutation") == PJ_COMPANION_SYNC_APPLY_CHANGED);
+    assert(state.phase == PJ_COMPANION_SYNC_SUCCEEDED);
+}
+
+static void test_terminal_then_swap_requeues_once(void)
+{
+    pj_companion_sync_state_t state;
+    pj_companion_sync_state_init(&state);
+    assert(pj_companion_sync_state_request(
+        &state, "pj-after", 1000U));
+    assert(pj_companion_sync_state_claim(
+        &state, 1U, "pj-after-00000001",
+        PJ_COMPANION_SYNC_TRANSPORT_USB) == PJ_COMPANION_SYNC_CLAIM_STARTED);
+    assert(pj_companion_sync_state_progress(
+        &state, 1U, "pj-after-00000001",
+        PJ_COMPANION_SYNC_TRANSPORT_USB, "succeeded", 1, 0, 1, 0, "",
+        "pj-after") == PJ_COMPANION_SYNC_APPLY_CHANGED);
+
+    pj_companion_sync_mutation_barrier_t barrier;
+    pj_companion_sync_mutation_barrier_init(&barrier);
+    persist_calls = 0;
+    persist_result = 1;
+    assert(pj_companion_sync_prepare_inventory_mutation_transactional(
+        &barrier, &state, 1, "pj-after", 2000U,
+        persist_test_state, NULL) == PJ_COMPANION_SYNC_APPLY_CHANGED);
+    assert(persist_calls == 1);
+    assert(state.phase == PJ_COMPANION_SYNC_PENDING);
+    assert(state.requested_generation == 2U);
+    assert(pj_companion_sync_prepare_inventory_mutation_transactional(
+        &barrier, &state, 1, "pj-after", 3000U,
+        persist_test_state, NULL) == PJ_COMPANION_SYNC_APPLY_CHANGED);
+    assert(persist_calls == 1);
+    assert(state.requested_generation == 2U);
+}
+
+static void test_mutation_prepare_persist_failure_blocks_publication(void)
+{
+    pj_companion_sync_state_t state;
+    pj_companion_sync_state_init(&state);
+    assert(pj_companion_sync_state_request(
+        &state, "pj-store", 1000U));
+    assert(pj_companion_sync_state_claim(
+        &state, 1U, "pj-store-00000001",
+        PJ_COMPANION_SYNC_TRANSPORT_USB) == PJ_COMPANION_SYNC_CLAIM_STARTED);
+    pj_companion_sync_mutation_barrier_t barrier;
+    pj_companion_sync_mutation_barrier_init(&barrier);
+    assert(pj_companion_sync_mutation_barrier_bind(&barrier, 1U));
+
+    pj_companion_sync_state_t state_before = state;
+    pj_companion_sync_mutation_barrier_t barrier_before = barrier;
+    persist_calls = 0;
+    persist_result = 0;
+    assert(pj_companion_sync_prepare_inventory_mutation_transactional(
+        &barrier, &state, 1, "pj-store", 2000U,
+        persist_test_state, NULL) == PJ_COMPANION_SYNC_APPLY_STORE_FAILED);
+    assert(persist_calls == 1);
+    assert(memcmp(&state, &state_before, sizeof(state)) == 0);
+    assert(memcmp(&barrier, &barrier_before, sizeof(barrier)) == 0);
+    assert(pj_companion_sync_mutation_barrier_terminal_current(
+        &barrier, 1U));
+}
+
+static void test_idle_inventory_mutations_do_not_autoqueue(void)
+{
+    pj_companion_sync_state_t state;
+    pj_companion_sync_state_init(&state);
+    pj_companion_sync_mutation_barrier_t barrier;
+    pj_companion_sync_mutation_barrier_init(&barrier);
+    uint64_t version = barrier.version;
+    persist_calls = 0;
+    persist_result = 1;
+
+    assert(pj_companion_sync_prepare_inventory_mutation_transactional(
+        &barrier, &state, 0, "pj-idle", 1000U,
+        persist_test_state, NULL) == PJ_COMPANION_SYNC_APPLY_CHANGED);
+    assert(barrier.version == version + 1U);
+    assert(state.requested_generation == 0U);
+    assert(state.active_generation == 0U);
+    assert(persist_calls == 0);
+
+    assert(pj_companion_sync_state_request(&state, "pj-idle", 2000U));
+    version = barrier.version;
+    assert(pj_companion_sync_prepare_inventory_mutation_transactional(
+        &barrier, &state, 0, "pj-idle", 3000U,
+        persist_test_state, NULL) == PJ_COMPANION_SYNC_APPLY_CHANGED);
+    assert(barrier.version == version + 1U);
+    assert(state.requested_generation == 1U);
+    assert(state.active_generation == 0U);
+    assert(state.requested_ms == 2000U);
+    assert(persist_calls == 0);
+}
+
+static void test_restored_active_queues_exactly_one_durable_successor(void)
+{
+    pj_companion_sync_state_t state;
+    pj_companion_sync_state_init(&state);
+    assert(pj_companion_sync_state_request(
+        &state, "pj-restore", 1000U));
+    assert(pj_companion_sync_state_claim(
+        &state, 1U, "pj-restore-00000001",
+        PJ_COMPANION_SYNC_TRANSPORT_USB) ==
+        PJ_COMPANION_SYNC_CLAIM_STARTED);
+    assert(pj_companion_sync_state_progress(
+        &state, 1U, "pj-restore-00000001",
+        PJ_COMPANION_SYNC_TRANSPORT_USB, "running", 2, 1, 1, 0, "",
+        "pj-restore") == PJ_COMPANION_SYNC_APPLY_CHANGED);
+
+    pj_companion_sync_state_t active_before = state;
+    persist_calls = 0;
+    persist_result = 1;
+    assert(pj_companion_sync_restore_active_successor_transactional(
+        &state, 2000U, persist_test_state, NULL) ==
+        PJ_COMPANION_SYNC_APPLY_CHANGED);
+    assert(persist_calls == 1);
+    assert(state.requested_generation == 2U);
+    assert(state.requested_ms == 2000U);
+    assert(state.active_generation == active_before.active_generation);
+    assert(state.active_requested_ms == active_before.active_requested_ms);
+    assert(state.phase == active_before.phase);
+    assert(state.transport == active_before.transport);
+    assert(state.total == active_before.total);
+    assert(state.pending == active_before.pending);
+    assert(state.transferred == active_before.transferred);
+    assert(strcmp(state.operation_id, active_before.operation_id) == 0);
+
+    restore_after_reboot(&state);
+    assert(pj_companion_sync_restore_active_successor_transactional(
+        &state, 3000U, persist_test_state, NULL) ==
+        PJ_COMPANION_SYNC_APPLY_REPLAY);
+    assert(persist_calls == 1);
+    assert(state.requested_generation == 2U);
+    assert(state.requested_ms == 2000U);
+
+    assert(pj_companion_sync_state_claim(
+        &state, 1U, "pj-restore-00000001",
+        PJ_COMPANION_SYNC_TRANSPORT_USB) ==
+        PJ_COMPANION_SYNC_CLAIM_ATTACHED);
+    assert(pj_companion_sync_state_progress_transactional(
+        &state, 1U, "pj-restore-00000001",
+        PJ_COMPANION_SYNC_TRANSPORT_USB, "succeeded", 2, 0, 2, 0, "",
+        "pj-restore", persist_test_state, NULL) ==
+        PJ_COMPANION_SYNC_APPLY_CHANGED);
+    assert(state.acknowledged_generation == 1U);
+    assert(state.requested_generation == 2U);
+    assert(state.phase == PJ_COMPANION_SYNC_PENDING);
+    assert(pj_companion_sync_state_progress_transactional(
+        &state, 1U, "pj-restore-00000001",
+        PJ_COMPANION_SYNC_TRANSPORT_USB, "succeeded", 2, 0, 2, 0, "",
+        "pj-restore", persist_test_state, NULL) ==
+        PJ_COMPANION_SYNC_APPLY_REPLAY);
+}
+
+static void test_restored_active_successor_failures_are_atomic(void)
+{
+    pj_companion_sync_state_t state;
+    pj_companion_sync_state_init(&state);
+    assert(pj_companion_sync_state_request(
+        &state, "pj-restore-fail", 1000U));
+    assert(pj_companion_sync_state_claim(
+        &state, 1U, "pj-restore-fail-00000001",
+        PJ_COMPANION_SYNC_TRANSPORT_USB) ==
+        PJ_COMPANION_SYNC_CLAIM_STARTED);
+    pj_companion_sync_state_t before = state;
+
+    persist_calls = 0;
+    persist_result = 0;
+    assert(pj_companion_sync_restore_active_successor_transactional(
+        &state, 2000U, persist_test_state, NULL) ==
+        PJ_COMPANION_SYNC_APPLY_STORE_FAILED);
+    assert(persist_calls == 1);
+    assert(memcmp(&state, &before, sizeof(state)) == 0);
+    assert(pj_companion_sync_restore_active_successor_transactional(
+        &state, 2000U, NULL, NULL) ==
+        PJ_COMPANION_SYNC_APPLY_STORE_FAILED);
+    assert(memcmp(&state, &before, sizeof(state)) == 0);
+
+    state.requested_generation = UINT32_MAX;
+    state.active_generation = UINT32_MAX;
+    state.acknowledged_generation = UINT32_MAX - 1U;
+    before = state;
+    assert(pj_companion_sync_restore_active_successor_transactional(
+        &state, 2000U, persist_test_state, NULL) ==
+        PJ_COMPANION_SYNC_APPLY_REJECTED);
+    assert(memcmp(&state, &before, sizeof(state)) == 0);
+
+    state.requested_generation = 1U;
+    state.active_generation = 2U;
+    state.acknowledged_generation = 0U;
+    before = state;
+    assert(pj_companion_sync_restore_active_successor_transactional(
+        &state, 2000U, persist_test_state, NULL) ==
+        PJ_COMPANION_SYNC_APPLY_REJECTED);
+    assert(memcmp(&state, &before, sizeof(state)) == 0);
+
+    pj_companion_sync_state_init(&state);
+    assert(pj_companion_sync_restore_active_successor_transactional(
+        &state, 2000U, persist_test_state, NULL) ==
+        PJ_COMPANION_SYNC_APPLY_REPLAY);
+}
+
+static void test_restored_active_claim_rebinds_barrier(void)
+{
+    pj_companion_sync_state_t state;
+    pj_companion_sync_state_init(&state);
+    assert(pj_companion_sync_state_request(
+        &state, "pj-reboot", 1000U));
+    assert(pj_companion_sync_state_claim(
+        &state, 1U, "pj-reboot-00000001",
+        PJ_COMPANION_SYNC_TRANSPORT_USB) == PJ_COMPANION_SYNC_CLAIM_STARTED);
+    assert(pj_companion_sync_state_queue_inventory_mutation(
+        &state, "pj-reboot", 2000U) == 1);
+    assert(pj_companion_sync_state_attempt_failed(
+        &state, 1U, PJ_COMPANION_SYNC_TRANSPORT_USB,
+        PJ_COMPANION_SYNC_OFFLINE, "reboot"));
+    restore_after_reboot(&state);
+    assert(state.active_generation == 1U);
+    assert(state.requested_generation == 2U);
+    assert(pj_companion_sync_state_claim(
+        &state, 1U, "pj-reboot-00000001",
+        PJ_COMPANION_SYNC_TRANSPORT_USB) == PJ_COMPANION_SYNC_CLAIM_ATTACHED);
+
+    pj_companion_sync_mutation_barrier_t barrier;
+    pj_companion_sync_mutation_barrier_init(&barrier);
+    assert(pj_companion_sync_mutation_barrier_bind(&barrier, 1U));
+    assert(pj_companion_sync_mutation_barrier_terminal_current(
+        &barrier, 1U));
+    assert(pj_companion_sync_state_progress(
+        &state, 1U, "pj-reboot-00000001",
+        PJ_COMPANION_SYNC_TRANSPORT_USB, "succeeded", 1, 0, 1, 0, "",
+        "pj-reboot") == PJ_COMPANION_SYNC_APPLY_CHANGED);
+    assert(state.phase == PJ_COMPANION_SYNC_PENDING);
+    assert(state.requested_generation == 2U);
+}
+
 int main(void)
 {
+    test_upload_swap_terminal_barrier();
+    test_terminal_then_swap_requeues_once();
+    test_mutation_prepare_persist_failure_blocks_publication();
+    test_idle_inventory_mutations_do_not_autoqueue();
+    test_restored_active_queues_exactly_one_durable_successor();
+    test_restored_active_successor_failures_are_atomic();
+    test_restored_active_claim_rebinds_barrier();
+
     pj_companion_sync_state_t state;
     pj_companion_sync_state_init(&state);
     assert(strcmp(pj_companion_sync_phase_name(state.phase), "idle") == 0);

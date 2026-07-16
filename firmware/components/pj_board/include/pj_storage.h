@@ -21,6 +21,7 @@ typedef enum {
     PJ_STORAGE_RECOVERY_DELETE_BACKUP,
     PJ_STORAGE_RECOVERY_RESTORE_BACKUP,
     PJ_STORAGE_RECOVERY_VALIDATE_BACKUP,
+    PJ_STORAGE_RECOVERY_VALIDATE_TEMP,
 } pj_storage_recovery_action_t;
 
 typedef struct {
@@ -69,6 +70,15 @@ pj_storage_recovery_action_t pj_storage_recovery_action(const char *filename, in
 pj_storage_backup_recovery_result_t pj_storage_recover_backup(
     const char *backup_path, const char *target_path,
     pj_storage_path_validator_t validate, void *validate_context);
+/*
+ * Restores a valid finalized WAV temporary only when the target is absent or
+ * invalid. A valid target wins over processing temporaries left by a crash.
+ */
+pj_storage_backup_recovery_result_t pj_storage_recover_temporary(
+    const char *temporary_path, const char *target_path,
+    pj_storage_path_validator_t validate, void *validate_context);
+int pj_storage_audio_wipe_artifact(const char *filename);
+int pj_storage_json_wipe_artifact(const char *filename);
 /* Stops after max_entries plus one match, closes the directory, then removes snapshots. */
 pj_storage_delete_result_t pj_storage_delete_matching(const char *dir_path,
                                                        pj_storage_name_match_fn matches,
