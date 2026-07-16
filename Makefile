@@ -1,4 +1,4 @@
-.PHONY: test test-ui test-input test-display-worker test-display-pipeline test-partner test-simulator test-simulator-runtime test-ui-images ui-gallery check-lvgl-managed check-static-art generate-static-art generate-font-assets generate-icon-assets generate-simulator-wasm simulator clean
+.PHONY: test test-firmware-tools test-ui test-input test-display-worker test-display-pipeline test-partner test-simulator test-simulator-runtime test-ui-images ui-gallery check-lvgl-managed check-static-art generate-static-art generate-font-assets generate-icon-assets generate-simulator-wasm simulator clean
 
 CC ?= cc
 CFLAGS ?= -std=c11 -Wall -Wextra -Werror -pedantic
@@ -52,7 +52,10 @@ SIM_WASM_JS := simulator/generated/pj_ui_wasm.js
 SIM_WASM := simulator/generated/pj_ui_wasm.wasm
 SIM_WASM_EXPORTS := ['_pj_sim_init','_pj_sim_reset','_pj_sim_wake','_pj_sim_sleep','_pj_sim_aux_short','_pj_sim_aux_long','_pj_sim_aux_double','_pj_sim_touch_tap','_pj_sim_tick','_pj_sim_set_status','_pj_sim_set_preferences','_pj_sim_set_time','_pj_sim_set_audio_state','_pj_sim_set_alert','_pj_sim_set_alert_detail','_pj_sim_record_state','_pj_sim_playback_state','_pj_sim_set_note_count','_pj_sim_set_note_label','_pj_sim_seed_review_notes','_pj_sim_seed_timestamp_notes','_pj_sim_render','_pj_sim_framebuffer','_pj_sim_framebuffer_bytes','_pj_sim_display_width','_pj_sim_display_height','_pj_sim_state','_pj_sim_state_name','_pj_sim_dirty_x','_pj_sim_dirty_y','_pj_sim_dirty_width','_pj_sim_dirty_height','_pj_sim_dirty_partial']
 
-test: test-ui test-input test-partner test-simulator
+test: test-firmware-tools test-ui test-input test-partner test-simulator
+
+test-firmware-tools:
+	python3 tests/firmware/test_app_size.py
 
 check-lvgl-managed:
 	@if [ ! -d "$(LVGL_DIR)/src" ]; then \
