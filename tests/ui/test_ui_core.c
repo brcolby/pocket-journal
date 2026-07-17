@@ -1,2658 +1,1200 @@
 #include "pj_ui.h"
+#include "pj_ui_presenter.h"
+#include "pj_layout_geometry.h"
 #include "pj_default_static_art.h"
+#include "pj_glyph_carbon.h"
+#include "pj_icon_carbon.h"
+#include "pj_font_ibm_plex_mono_bold.h"
 
 #include <assert.h>
-#include <limits.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 
-static int count_black_pixels(const pj_framebuffer_t *fb)
+#define ARRAY_LEN(values) (sizeof(values) / sizeof((values)[0]))
+
+typedef struct {
+    pj_ui_presenter_t presenter;
+    pj_framebuffer_t accepted;
+} presenter_fixture_t;
+
+static void framebuffer_put(pj_framebuffer_t *framebuffer, int x, int y, int black)
+{
+    size_t index = (size_t)y * PJ_DISPLAY_WIDTH + (size_t)x;
+    uint8_t mask = (uint8_t)(1u << (index & 7u));
+    if (black) {
+        framebuffer->pixels[index >> 3u] |= mask;
+    } else {
+        framebuffer->pixels[index >> 3u] &= (uint8_t)~mask;
+    }
+}
+
+static int count_black_pixels(const pj_framebuffer_t *framebuffer)
 {
     int count = 0;
     for (int y = 0; y < PJ_DISPLAY_HEIGHT; y++) {
         for (int x = 0; x < PJ_DISPLAY_WIDTH; x++) {
-            count += pj_framebuffer_get(fb, x, y);
+            count += pj_framebuffer_get(framebuffer, x, y);
         }
     }
     return count;
 }
 
-static int count_black_pixels_in_region(const pj_framebuffer_t *fb,
+static int count_black_pixels_in_region(const pj_framebuffer_t *framebuffer,
                                         int x, int y, int width, int height)
 {
     int count = 0;
     for (int row = y; row < y + height; row++) {
         for (int column = x; column < x + width; column++) {
-            count += pj_framebuffer_get(fb, column, row);
+            count += pj_framebuffer_get(framebuffer, column, row);
         }
     }
     return count;
 }
 
-static int count_pixel_differences_in_region(const pj_framebuffer_t *left,
-                                             const pj_framebuffer_t *right,
-                                             int x, int y, int width, int height)
+static int framebuffer_differences(const pj_framebuffer_t *left,
+                                   const pj_framebuffer_t *right)
 {
     int count = 0;
-    for (int row = y; row < y + height; row++) {
-        for (int column = x; column < x + width; column++) {
-            count += pj_framebuffer_get(left, column, row) !=
-                pj_framebuffer_get(right, column, row);
+    for (int y = 0; y < PJ_DISPLAY_HEIGHT; y++) {
+        for (int x = 0; x < PJ_DISPLAY_WIDTH; x++) {
+            count += pj_framebuffer_get(left, x, y) !=
+                pj_framebuffer_get(right, x, y);
         }
     }
     return count;
 }
 
-static void assert_frame_changes_are_inside_dirty(
-    const pj_framebuffer_t *before, const pj_framebuffer_t *after,
-    pj_ui_dirty_region_t dirty)
+static pj_ui_dirty_region_t independent_changed_bounds(
+    const pj_framebuffer_t *before, const pj_framebuffer_t *after)
 {
-    int differences = 0;
-    assert(dirty.width > 0 && dirty.height > 0);
+    int min_x = PJ_DISPLAY_WIDTH;
+    int min_y = PJ_DISPLAY_HEIGHT;
+    int max_x = -1;
+    int max_y = -1;
     for (int y = 0; y < PJ_DISPLAY_HEIGHT; y++) {
         for (int x = 0; x < PJ_DISPLAY_WIDTH; x++) {
-            if (pj_framebuffer_get(before, x, y) == pj_framebuffer_get(after, x, y)) {
+            if (pj_framebuffer_get(before, x, y) ==
+                pj_framebuffer_get(after, x, y)) {
                 continue;
             }
-            differences++;
-            if (x < dirty.x || x >= dirty.x + dirty.width ||
-                y < dirty.y || y >= dirty.y + dirty.height) {
-                fprintf(stderr, "pixel (%d,%d) outside dirty (%d,%d %dx%d)\n",
-                        x, y, dirty.x, dirty.y, dirty.width, dirty.height);
-            }
-            assert(x >= dirty.x && x < dirty.x + dirty.width);
-            assert(y >= dirty.y && y < dirty.y + dirty.height);
+            if (x < min_x) min_x = x;
+            if (y < min_y) min_y = y;
+            if (x > max_x) max_x = x;
+            if (y > max_y) max_y = y;
         }
     }
-    assert(differences > 0);
+    if (max_x < min_x) {
+        return (pj_ui_dirty_region_t) {0};
+    }
+    return (pj_ui_dirty_region_t) {
+        .x = min_x,
+        .y = min_y,
+        .width = max_x - min_x + 1,
+        .height = max_y - min_y + 1,
+        .partial = 1,
+    };
 }
 
-static int black_row_span_in_region(const pj_framebuffer_t *fb,
-                                    int y, int height)
+static void assert_regions_equal(pj_ui_dirty_region_t actual,
+                                 pj_ui_dirty_region_t expected)
 {
-    int first = -1;
-    int last = -1;
-    for (int row = y; row < y + height; row++) {
-        if (count_black_pixels_in_region(fb, 0, row, PJ_DISPLAY_WIDTH, 1) > 0) {
-            if (first < 0) {
-                first = row;
-            }
-            last = row;
+    assert(actual.x == expected.x);
+    assert(actual.y == expected.y);
+    assert(actual.width == expected.width);
+    assert(actual.height == expected.height);
+    assert(actual.partial == expected.partial);
+}
+
+static void apply_region(pj_framebuffer_t *destination,
+                         const pj_framebuffer_t *source,
+                         pj_ui_dirty_region_t dirty)
+{
+    for (int y = dirty.y; y < dirty.y + dirty.height; y++) {
+        for (int x = dirty.x; x < dirty.x + dirty.width; x++) {
+            framebuffer_put(destination, x, y,
+                            pj_framebuffer_get(source, x, y));
         }
     }
-    return first < 0 ? 0 : last - first + 1;
 }
 
-static int black_row_span_in_box(const pj_framebuffer_t *fb,
-                                 int x, int y, int width, int height)
+static void presenter_start(presenter_fixture_t *fixture,
+                            const pj_ui_context_t *context)
 {
-    int first = -1;
-    int last = -1;
-    for (int row = y; row < y + height; row++) {
-        if (count_black_pixels_in_region(fb, x, row, width, 1) > 0) {
-            if (first < 0) {
-                first = row;
-            }
-            last = row;
+    pj_ui_presenter_frame_t frame;
+    pj_ui_presenter_init(&fixture->presenter);
+    pj_ui_presenter_revision_t revision = pj_ui_presenter_revision(context);
+    assert(pj_ui_presenter_prepare(&fixture->presenter, context, &revision,
+                                   &frame) == PJ_UI_FRAME_FULL);
+    assert(frame.result == PJ_UI_FRAME_FULL);
+    assert(frame.dirty.x == 0 && frame.dirty.y == 0);
+    assert(frame.dirty.width == PJ_DISPLAY_WIDTH);
+    assert(frame.dirty.height == PJ_DISPLAY_HEIGHT);
+    assert(frame.dirty.partial == 0);
+    fixture->accepted = *frame.framebuffer;
+    assert(pj_ui_presenter_accept(&fixture->presenter, frame.token));
+}
+
+static pj_ui_dirty_region_t presenter_accept_partial(
+    presenter_fixture_t *fixture, const pj_ui_context_t *context)
+{
+    pj_ui_presenter_frame_t frame;
+    pj_framebuffer_t fresh;
+    pj_framebuffer_t reconstructed = fixture->accepted;
+    pj_ui_presenter_revision_t revision = pj_ui_presenter_revision(context);
+    assert(pj_ui_presenter_prepare(&fixture->presenter, context, &revision,
+                                   &frame) == PJ_UI_FRAME_PARTIAL);
+    pj_ui_compose_frame(context, &fresh);
+    assert(memcmp(frame.framebuffer, &fresh, sizeof(fresh)) == 0);
+    pj_ui_dirty_region_t expected = independent_changed_bounds(
+        &fixture->accepted, &fresh);
+    assert(expected.width > 0 && expected.height > 0);
+    assert_regions_equal(frame.dirty, expected);
+    apply_region(&reconstructed, frame.framebuffer, frame.dirty);
+    assert(memcmp(&reconstructed, &fresh, sizeof(fresh)) == 0);
+    pj_ui_dirty_region_t dirty = frame.dirty;
+    assert(pj_ui_presenter_accept(&fixture->presenter, frame.token));
+    fixture->accepted = fresh;
+    return dirty;
+}
+
+static void assert_presenter_full(presenter_fixture_t *fixture,
+                                  const pj_ui_context_t *context)
+{
+    pj_ui_presenter_frame_t frame;
+    pj_framebuffer_t fresh;
+    pj_ui_presenter_revision_t revision = pj_ui_presenter_revision(context);
+    assert(pj_ui_presenter_prepare(&fixture->presenter, context, &revision,
+                                   &frame) == PJ_UI_FRAME_FULL);
+    assert(frame.dirty.x == 0 && frame.dirty.y == 0);
+    assert(frame.dirty.width == PJ_DISPLAY_WIDTH);
+    assert(frame.dirty.height == PJ_DISPLAY_HEIGHT);
+    assert(frame.dirty.partial == 0);
+    pj_ui_compose_frame(context, &fresh);
+    assert(memcmp(frame.framebuffer, &fresh, sizeof(fresh)) == 0);
+    assert(pj_ui_presenter_accept(&fixture->presenter, frame.token));
+    fixture->accepted = fresh;
+}
+
+static pj_ui_preferences_t current_preferences(const pj_ui_context_t *context)
+{
+    return (pj_ui_preferences_t) {
+        .volume = context->volume,
+        .dark_mode = context->dark_mode,
+        .alarm_enabled = context->alarm_on,
+        .alarm_hour = context->alarm_hour,
+        .alarm_minute = context->alarm_minute,
+        .timer_seconds = context->timer_preset_seconds,
+        .interval_seconds = context->interval_preset_seconds,
+        .clock_24h = context->clock_24h,
+        .temperature_fahrenheit = context->temperature_fahrenheit,
+        .transcript_font_size = context->transcript_font_size,
+    };
+}
+
+static const pj_layout_slot_t *find_slot(pj_layout_id_t layout_id,
+                                         pj_layout_slot_id_t slot_id)
+{
+    const pj_layout_geometry_t *geometry = pj_layout_geometry(layout_id);
+    assert(geometry != NULL);
+    for (uint8_t index = 0; index < geometry->slot_count; index++) {
+        if (geometry->slots[index].id == slot_id) {
+            return &geometry->slots[index];
         }
     }
-    return first < 0 ? 0 : last - first + 1;
+    assert(!"missing layout slot");
+    return NULL;
 }
 
-static void seed_notes(pj_ui_context_t *ui)
+static int slot_x(pj_layout_id_t layout_id, pj_layout_slot_id_t slot_id)
 {
-    const char labels[][PJ_UI_NOTE_LABEL_LEN] = {
-        "SAT 09:41",
-        "FRI 18:12",
-        "THU 07:30",
+    const pj_layout_slot_t *slot = find_slot(layout_id, slot_id);
+    return (slot->icon_center.x + PJ_LAYOUT_COORD_SCALE / 2) /
+        PJ_LAYOUT_COORD_SCALE;
+}
+
+static int slot_y(pj_layout_id_t layout_id, pj_layout_slot_id_t slot_id)
+{
+    const pj_layout_slot_t *slot = find_slot(layout_id, slot_id);
+    return (slot->icon_center.y + PJ_LAYOUT_COORD_SCALE / 2) /
+        PJ_LAYOUT_COORD_SCALE;
+}
+
+static int tap_slot(pj_ui_context_t *context, pj_layout_id_t layout_id,
+                    pj_layout_slot_id_t slot_id)
+{
+    return pj_ui_handle_touch(context, slot_x(layout_id, slot_id),
+                              slot_y(layout_id, slot_id), PJ_TOUCH_TAP);
+}
+
+static void seed_notes(pj_ui_context_t *context, int count)
+{
+    const char labels[PJ_UI_MAX_NOTES][PJ_UI_NOTE_LABEL_LEN] = {
+        "REC 20260717 0909 1", "Mixed Case: Alpha!", "Third / note?",
+        "Fourth note", "Fifth note", "Sixth note", "Seventh note",
+        "Eighth note", "Ninth note", "Tenth note", "Eleventh note",
+        "Twelfth note",
     };
-    pj_ui_set_notes(ui, 3, labels);
+    pj_ui_set_notes(context, count, labels);
 }
 
-static void test_state_graph(void)
+static void navigate_home_to(pj_ui_context_t *context,
+                             pj_layout_slot_id_t slot)
 {
-    pj_ui_context_t ui;
-    pj_ui_init(&ui);
-    seed_notes(&ui);
-    assert(pj_ui_current_state(&ui) == PJ_UI_STATE_STATIC);
-
-    pj_ui_wake(&ui);
-    assert(pj_ui_current_state(&ui) == PJ_UI_STATE_HOME);
-
-    assert(pj_ui_handle_aux_long(&ui) == 1);
-    assert(pj_ui_current_state(&ui) == PJ_UI_STATE_TIME_TEMP);
-    assert(pj_ui_handle_aux_long(&ui) == 0);
-    assert(pj_ui_current_state(&ui) == PJ_UI_STATE_TIME_TEMP);
-
-    pj_ui_wake(&ui);
-    assert(pj_ui_current_state(&ui) == PJ_UI_STATE_HOME);
-
-    assert(pj_ui_handle_aux_long(&ui) == 1);
-    assert(pj_ui_handle_touch(&ui, 100, 150, PJ_TOUCH_TAP) == 1);
-    assert(pj_ui_current_state(&ui) == PJ_UI_STATE_HOME);
-
-    assert(pj_ui_handle_touch(&ui, 20, 50, PJ_TOUCH_TAP) == 1);
-    assert(pj_ui_current_state(&ui) == PJ_UI_STATE_NOTES);
-
-    assert(pj_ui_handle_touch(&ui, 100, 100, PJ_TOUCH_TAP) == 1);
-    assert(pj_ui_current_state(&ui) == PJ_UI_STATE_LISTEN);
-
-    assert(pj_ui_handle_touch(&ui, 100, 95, PJ_TOUCH_TAP) == 1);
-    assert(pj_ui_current_state(&ui) == PJ_UI_STATE_NOTE_DETAIL);
-
-    assert(pj_ui_handle_aux_long(&ui) == 1);
-    assert(pj_ui_current_state(&ui) == PJ_UI_STATE_LISTEN);
-
-    assert(pj_ui_handle_aux_long(&ui) == 1);
-    assert(pj_ui_current_state(&ui) == PJ_UI_STATE_NOTES);
-
-    assert(pj_ui_handle_aux_long(&ui) == 1);
-    assert(pj_ui_current_state(&ui) == PJ_UI_STATE_HOME);
-
-    assert(pj_ui_handle_aux_long(&ui) == 1);
-    assert(pj_ui_current_state(&ui) == PJ_UI_STATE_TIME_TEMP);
-    assert(pj_ui_handle_aux_long(&ui) == 0);
-    assert(pj_ui_current_state(&ui) == PJ_UI_STATE_TIME_TEMP);
-
-    ui.state = PJ_UI_STATE_NOTES;
-    assert(pj_ui_handle_aux_long(&ui) == 1);
-    assert(pj_ui_current_state(&ui) == PJ_UI_STATE_HOME);
-
-    ui.state = PJ_UI_STATE_TIMER;
-    assert(pj_ui_handle_aux_long(&ui) == 1);
-    assert(pj_ui_current_state(&ui) == PJ_UI_STATE_TIME);
+    pj_ui_init(context);
+    pj_ui_wake(context);
+    assert(tap_slot(context, PJ_LAYOUT_HOME_3_1, slot));
 }
 
-static void test_empty_notes_do_not_open_detail(void)
+static int asset_pixel(const pj_asset_bitmap_t *asset, int x, int y)
 {
-    pj_ui_context_t ui;
-    pj_ui_init(&ui);
-    ui.state = PJ_UI_STATE_READ;
-    assert(pj_ui_handle_touch(&ui, 100, 95, PJ_TOUCH_TAP) == 0);
-    assert(pj_ui_current_state(&ui) == PJ_UI_STATE_READ);
+    uint8_t byte = asset->data[(size_t)y * asset->stride + (size_t)x / 8u];
+    return (byte & (uint8_t)(0x80u >> (x % 8))) != 0;
 }
 
-static void test_note_paging_tracks_touch_selection_and_swipes(void)
+static void assert_asset_region(const pj_framebuffer_t *framebuffer,
+                                const pj_asset_bitmap_t *asset, int center_x,
+                                int center_y)
 {
-    pj_ui_context_t ui;
-    const char labels[7][PJ_UI_NOTE_LABEL_LEN] = {
-        "One", "Two", "Three", "Four", "Five", "Six", "Seven",
-    };
-    pj_ui_init(&ui);
-    pj_ui_set_notes(&ui, 7, labels);
-    ui.state = PJ_UI_STATE_LISTEN;
-
-    assert(pj_ui_handle_touch(&ui, 175, 175, PJ_TOUCH_TAP) == 1);
-    assert(ui.focus_index == 3 && ui.note_page == 1);
-    assert(pj_ui_handle_touch(&ui, 100, 30, PJ_TOUCH_TAP) == 1);
-    assert(ui.state == PJ_UI_STATE_NOTE_DETAIL);
-    assert(ui.selected_note == 3);
-
-    ui.state = PJ_UI_STATE_READ;
-    ui.note_page = 0;
-    ui.focus_index = 0;
-    assert(pj_ui_handle_touch(&ui, 100, 100, PJ_TOUCH_SWIPE_LEFT) == 1);
-    assert(ui.note_page == 1 && ui.focus_index == 3);
-    assert(pj_ui_handle_touch(&ui, 100, 100, PJ_TOUCH_SWIPE_RIGHT) == 1);
-    assert(ui.note_page == 0 && ui.focus_index == 0);
-
-    ui.note_page = 1;
-    ui.focus_index = 4;
-    assert(pj_ui_handle_aux_long(&ui) == 1);
-    assert(ui.state == PJ_UI_STATE_NOTES);
-    ui.focus_index = 2;
-    assert(pj_ui_handle_aux_short(&ui) == 0);
-    assert(ui.state == PJ_UI_STATE_NOTES);
-}
-
-static void test_note_pager_arrows_move_exactly_three_items_and_stop_at_bounds(void)
-{
-    pj_ui_context_t ui;
-    char labels[7][PJ_UI_NOTE_LABEL_LEN] = {
-        "One", "Two", "Three", "Four", "Five", "Six", "Seven",
-    };
-    pj_ui_init(&ui);
-    pj_ui_set_notes(&ui, 7, labels);
-    ui.state = PJ_UI_STATE_LISTEN;
-
-    assert(pj_ui_handle_touch(&ui, 25, 175, PJ_TOUCH_TAP) == 0);
-    assert(ui.note_page == 0 && ui.focus_index == 0);
-    assert(pj_ui_handle_touch(&ui, 175, 175, PJ_TOUCH_TAP) == 1);
-    assert(ui.note_page == 1 && ui.focus_index == 3);
-    assert(pj_ui_handle_touch(&ui, 175, 175, PJ_TOUCH_TAP) == 1);
-    assert(ui.note_page == 2 && ui.focus_index == 6);
-    assert(pj_ui_handle_touch(&ui, 175, 175, PJ_TOUCH_TAP) == 0);
-    assert(ui.note_page == 2 && ui.focus_index == 6);
-    assert(pj_ui_handle_touch(&ui, 25, 175, PJ_TOUCH_TAP) == 1);
-    assert(ui.note_page == 1 && ui.focus_index == 3);
-}
-
-static void test_note_pager_uses_chevrons_without_arrow_bars(void)
-{
-    pj_ui_context_t ui;
-    pj_framebuffer_t fb;
-    pj_ui_init(&ui);
-    seed_notes(&ui);
-    ui.state = PJ_UI_STATE_LISTEN;
-    ui.focus_index = -1;
-    pj_ui_render(&ui, &fb);
-
-    assert(count_black_pixels_in_region(&fb, 30, 160, 40, 30) > 20);
-    assert(count_black_pixels_in_region(&fb, 130, 160, 40, 30) > 20);
-    assert(count_black_pixels_in_region(&fb, 20, 174, 60, 3) < 20);
-    assert(count_black_pixels_in_region(&fb, 120, 174, 60, 3) < 20);
-}
-
-static void test_read_opens_transcript_detail_without_playback(void)
-{
-    pj_ui_context_t ui;
-    pj_ui_init(&ui);
-    seed_notes(&ui);
-    ui.state = PJ_UI_STATE_READ;
-
-    assert(pj_ui_handle_touch(&ui, 100, 95, PJ_TOUCH_TAP) == 1);
-    assert(ui.state == PJ_UI_STATE_NOTE_DETAIL);
-    assert(ui.note_detail_transcript == 1);
-    assert(ui.playback_state == PJ_PLAYBACK_IDLE);
-    assert(pj_ui_handle_touch(&ui, 100, 90, PJ_TOUCH_TAP) == 0);
-    assert(ui.playback_state == PJ_PLAYBACK_IDLE);
-    assert(pj_ui_handle_aux_long(&ui) == 1);
-    assert(ui.state == PJ_UI_STATE_READ);
-}
-
-static void test_note_detail_play_control_has_touch_parity(void)
-{
-    pj_ui_context_t ui;
-    pj_ui_init(&ui);
-    seed_notes(&ui);
-    ui.state = PJ_UI_STATE_NOTE_DETAIL;
-    ui.note_detail_transcript = 0;
-
-    assert(pj_ui_handle_touch(&ui, 100, 90, PJ_TOUCH_TAP) == 1);
-    assert(ui.playback_state == PJ_PLAYBACK_ACTIVE);
-    assert(pj_ui_handle_touch(&ui, 100, 90, PJ_TOUCH_TAP) == 1);
-    assert(ui.playback_state == PJ_PLAYBACK_STOPPING);
-}
-
-static void test_custom_home_slots_render_and_route_in_order(void)
-{
-    pj_ui_context_t ui;
-    pj_ui_init(&ui);
-    pj_home_layout_t layout = {0};
-    strcpy(layout.title, "Daily tools");
-    layout.slot_count = 4;
-    layout.slots[0] = (pj_home_slot_t) {"Capture", "microphone", "record"};
-    layout.slots[1] = (pj_home_slot_t) {"Read", "read_me", "read"};
-    layout.slots[2] = (pj_home_slot_t) {"Timer", "timer", "timer"};
-    layout.slots[3] = (pj_home_slot_t) {"Network", "wifi", "sync"};
-    assert(pj_ui_set_home_layout(&ui, &layout) == 1);
-
-    ui.state = PJ_UI_STATE_HOME;
-    pj_framebuffer_t fb;
-    pj_ui_render(&ui, &fb);
-    assert(count_black_pixels(&fb) > 1000);
-
-    assert(pj_ui_handle_touch(&ui, 20, 40, PJ_TOUCH_TAP) == 1);
-    assert(pj_ui_current_state(&ui) == PJ_UI_STATE_RECORD);
-    ui.state = PJ_UI_STATE_HOME;
-    assert(pj_ui_handle_touch(&ui, 20, 75, PJ_TOUCH_TAP) == 1);
-    assert(pj_ui_current_state(&ui) == PJ_UI_STATE_READ);
-    ui.state = PJ_UI_STATE_HOME;
-    assert(pj_ui_handle_touch(&ui, 20, 125, PJ_TOUCH_TAP) == 1);
-    assert(pj_ui_current_state(&ui) == PJ_UI_STATE_TIMER);
-    ui.state = PJ_UI_STATE_HOME;
-    assert(pj_ui_handle_touch(&ui, 120, 170, PJ_TOUCH_TAP) == 1);
-    assert(pj_ui_current_state(&ui) == PJ_UI_STATE_SYNC);
-
-    pj_ui_restore_default_home(&ui);
-    assert(strcmp(ui.home_layout.title, "Pocket Journal") == 0);
-    assert(ui.home_layout.slot_count == 3);
-}
-
-static void test_compiled_home_fallback_routes_every_slot(void)
-{
-    pj_ui_context_t ui;
-    pj_ui_init(&ui);
-    ui.state = PJ_UI_STATE_HOME;
-    assert(pj_ui_handle_touch(&ui, 20, 40, PJ_TOUCH_TAP) == 1);
-    assert(pj_ui_current_state(&ui) == PJ_UI_STATE_NOTES);
-    ui.state = PJ_UI_STATE_HOME;
-    assert(pj_ui_handle_touch(&ui, 20, 125, PJ_TOUCH_TAP) == 1);
-    assert(pj_ui_current_state(&ui) == PJ_UI_STATE_TIME);
-    ui.state = PJ_UI_STATE_HOME;
-    assert(pj_ui_handle_touch(&ui, 20, 170, PJ_TOUCH_TAP) == 1);
-    assert(pj_ui_current_state(&ui) == PJ_UI_STATE_SETTINGS);
-}
-
-static void test_every_supported_home_destination_routes(void)
-{
-    static const struct {
-        const char *destination;
-        pj_ui_state_t state;
-    } routes[] = {
-        {"notes", PJ_UI_STATE_NOTES},
-        {"record", PJ_UI_STATE_RECORD},
-        {"listen", PJ_UI_STATE_LISTEN},
-        {"read", PJ_UI_STATE_READ},
-        {"time", PJ_UI_STATE_TIME},
-        {"alarm", PJ_UI_STATE_ALARM},
-        {"stopwatch", PJ_UI_STATE_STOPWATCH},
-        {"timer", PJ_UI_STATE_TIMER},
-        {"interval", PJ_UI_STATE_INTERVAL},
-        {"settings", PJ_UI_STATE_SETTINGS},
-        {"sync", PJ_UI_STATE_SYNC},
-        {"volume", PJ_UI_STATE_VOLUME},
-        {"calendar", PJ_UI_STATE_CALENDAR},
-    };
-    for (size_t i = 0; i < sizeof(routes) / sizeof(routes[0]); i++) {
-        pj_ui_context_t ui;
-        pj_ui_init(&ui);
-        pj_home_layout_t layout = {0};
-        strcpy(layout.title, "Route test");
-        layout.slot_count = 1;
-        layout.slots[0] = (pj_home_slot_t) {"Open", "notebook", ""};
-        strcpy(layout.slots[0].destination, routes[i].destination);
-        assert(pj_ui_set_home_layout(&ui, &layout) == 1);
-        ui.state = PJ_UI_STATE_HOME;
-        assert(pj_ui_handle_touch(&ui, 20, 40, PJ_TOUCH_TAP) == 1);
-        assert(pj_ui_current_state(&ui) == routes[i].state);
+    assert(asset != NULL);
+    int left = center_x - asset->width / 2;
+    int top = center_y - asset->height / 2;
+    for (int y = 0; y < asset->height; y++) {
+        for (int x = 0; x < asset->width; x++) {
+            assert(pj_framebuffer_get(framebuffer, left + x, top + y) ==
+                   asset_pixel(asset, x, y));
+        }
     }
 }
 
-static void test_home_layout_setter_canonicalizes_inactive_slots(void)
+static void assert_frame_is_asset(const pj_framebuffer_t *framebuffer,
+                                  const pj_asset_bitmap_t *asset, int center_x,
+                                  int center_y)
 {
-    pj_ui_context_t ui;
-    pj_ui_init(&ui);
-    pj_home_layout_t layout;
-    memset(&layout, 0xcc, sizeof(layout));
-    memset(layout.title, 0, sizeof(layout.title));
-    strcpy(layout.title, "One tool");
-    layout.slot_count = 1;
-    memset(&layout.slots[0], 0, sizeof(layout.slots[0]));
-    layout.slots[0] = (pj_home_slot_t) {"Notes", "notebook", "notes"};
-    assert(pj_ui_set_home_layout(&ui, &layout) == 1);
-    const uint8_t zero_slot[sizeof(ui.home_layout.slots[1])] = {0};
-    assert(memcmp(&ui.home_layout.slots[1], zero_slot, sizeof(zero_slot)) == 0);
+    int left = center_x - asset->width / 2;
+    int top = center_y - asset->height / 2;
+    for (int y = 0; y < PJ_DISPLAY_HEIGHT; y++) {
+        for (int x = 0; x < PJ_DISPLAY_WIDTH; x++) {
+            int expected = x >= left && x < left + asset->width &&
+                y >= top && y < top + asset->height ?
+                asset_pixel(asset, x - left, y - top) : 0;
+            assert(pj_framebuffer_get(framebuffer, x, y) == expected);
+        }
+    }
 }
 
-static void test_aux_primary_actions_do_not_use_hidden_focus(void)
+static int glyph_pixel(const pj_asset_glyph_t *glyph, int x, int y)
 {
-    pj_ui_context_t ui;
+    uint8_t byte = glyph->data[(size_t)y * glyph->stride + (size_t)x / 8u];
+    return (byte & (uint8_t)(0x80u >> (x % 8))) != 0;
+}
+
+static void assert_glyph_region(const pj_framebuffer_t *framebuffer,
+                                const pj_asset_glyph_t *glyph, int center_x,
+                                int center_y)
+{
+    assert(glyph != NULL);
+    int left = center_x - glyph->width / 2 + glyph->x_offset;
+    int top = center_y - glyph->height / 2 + glyph->y_offset;
+    for (int y = 0; y < glyph->height; y++) {
+        for (int x = 0; x < glyph->width; x++) {
+            assert(pj_framebuffer_get(framebuffer, left + x, top + y) ==
+                   glyph_pixel(glyph, x, y));
+        }
+    }
+}
+
+static void consume_expected_command(pj_ui_context_t *context,
+                                     pj_ui_time_command_type_t type,
+                                     uint64_t duration_ms,
+                                     uint64_t secondary_duration_ms)
+{
     pj_ui_time_command_t command;
-    pj_ui_init(&ui);
-
-    ui.state = PJ_UI_STATE_HOME;
-    assert(pj_ui_handle_aux_short(&ui) == 0);
-    assert(ui.focus_index == 0);
-    assert(pj_ui_handle_aux_double(&ui) == 1);
-    assert(ui.state == PJ_UI_STATE_RECORD);
-    assert(ui.record_state == PJ_RECORD_ACTIVE);
-
-    pj_ui_init(&ui);
-    ui.state = PJ_UI_STATE_SETTINGS;
-    assert(pj_ui_handle_aux_short(&ui) == 0);
-    assert(pj_ui_handle_aux_double(&ui) == 0);
-    assert(ui.state == PJ_UI_STATE_SETTINGS && ui.focus_index == 0);
-
-    ui.state = PJ_UI_STATE_TIMER;
-    ui.focus_index = 3;
-    ui.timer_seconds = 90;
-    assert(pj_ui_handle_aux_short(&ui) == 1);
-    assert(pj_ui_consume_time_command(&ui, &command) == 1);
-    assert(command.type == PJ_UI_TIME_COMMAND_TIMER_START);
-    assert(ui.focus_index == 3);
+    assert(pj_ui_consume_time_command(context, &command));
+    assert(command.type == type);
+    assert(command.duration_ms == duration_ms);
+    assert(command.secondary_duration_ms == secondary_duration_ms);
+    assert(!pj_ui_consume_time_command(context, &command));
 }
 
-static void test_aux_navigation_has_no_hidden_focus(void)
+static pj_ui_time_projection_t time_projection(int stopwatch_seconds,
+                                               int timer_seconds,
+                                               int interval_seconds)
 {
-    pj_ui_context_t ui;
-    pj_framebuffer_t before;
-    pj_framebuffer_t after;
-    pj_ui_init(&ui);
-    ui.state = PJ_UI_STATE_TIME;
-    pj_ui_render(&ui, &before);
-    pj_ui_mark_displayed(&ui);
-
-    assert(pj_ui_handle_aux_double(&ui) == 0);
-    assert(ui.focus_index == 0);
-    assert(pj_ui_is_dirty(&ui) == 0);
-    pj_ui_request_full_refresh(&ui);
-    pj_ui_render(&ui, &after);
-    assert(memcmp(&before, &after, sizeof(before)) == 0);
-}
-
-static void test_time_value_typography_fits_refresh_regions(void)
-{
-    const pj_ui_state_t states[] = {
-        PJ_UI_STATE_STOPWATCH,
-        PJ_UI_STATE_TIMER,
-        PJ_UI_STATE_INTERVAL,
-    };
-    for (size_t i = 0; i < sizeof(states) / sizeof(states[0]); i++) {
-        pj_ui_context_t ui;
-        pj_framebuffer_t fb;
-        pj_ui_init(&ui);
-        ui.state = states[i];
-        ui.stopwatch_seconds = 3661;
-        ui.timer_seconds = 3661;
-        ui.interval_seconds = 3661;
-        pj_ui_render(&ui, &fb);
-
-        int value_top = 0;
-        assert(count_black_pixels_in_region(&fb, 20, value_top, 160, 100) > 0);
-        assert(count_black_pixels_in_region(&fb, 0, 100, 1, 100) +
-               count_black_pixels_in_region(&fb, 199, 100, 1, 100) > 0);
-        assert(pj_framebuffer_get(&fb, PJ_DISPLAY_WIDTH - 1, 130) == 1);
-
-        pj_ui_mark_displayed(&ui);
-        pj_ui_time_projection_t projection = {
-            .alarm_hour = ui.alarm_hour,
-            .alarm_minute = ui.alarm_minute,
-            .stopwatch_running = states[i] == PJ_UI_STATE_STOPWATCH,
-            .stopwatch_elapsed_ms = 3662000,
-            .timer_running = states[i] == PJ_UI_STATE_TIMER,
-            .timer_remaining_ms = 3662000,
-            .interval_running = states[i] == PJ_UI_STATE_INTERVAL,
-            .interval_remaining_ms = 3662000,
-        };
-        pj_ui_set_time_projection(&ui, &projection);
-        assert(ui.dirty.partial == 1);
-        assert(ui.dirty.y <= value_top);
-        assert(ui.dirty.y + ui.dirty.height >= value_top + 100);
-    }
-}
-
-static void test_interval_round_is_rendered_zero_indexed(void)
-{
-    pj_ui_context_t ui;
-    pj_framebuffer_t zero;
-    pj_framebuffer_t one;
-    pj_framebuffer_t large;
-    pj_ui_init(&ui);
-    assert(ui.interval_round == 0);
-    ui.state = PJ_UI_STATE_INTERVAL;
-    pj_ui_render(&ui, &zero);
-
-    ui.interval_round = 1;
-    pj_ui_render(&ui, &one);
-    assert(memcmp(&zero, &one, sizeof(zero)) != 0);
-    assert(count_black_pixels_in_region(&zero, 0, 0, 200, 60) >
-           count_black_pixels_in_region(&one, 0, 0, 200, 60));
-    assert(black_row_span_in_box(&zero, 0, 0, 200, 50) >= 40);
-    assert(black_row_span_in_box(&zero, 0, 0, 200, 50) ==
-           black_row_span_in_box(&zero, 0, 50, 200, 50));
-    assert(count_black_pixels_in_region(&zero, 0, 45, 200, 10) == 0);
-
-    ui.interval_round = INT_MAX;
-    pj_ui_render(&ui, &large);
-    assert(count_black_pixels_in_region(&large, 0, 0, 1, 100) == 0);
-    assert(count_black_pixels_in_region(&large, 199, 0, 1, 100) == 0);
-}
-
-static void test_aux_double_is_direct_quick_record_only(void)
-{
-    pj_ui_context_t ui;
-    const pj_ui_state_t ignored_states[] = {
-        PJ_UI_STATE_STATIC, PJ_UI_STATE_NOTES, PJ_UI_STATE_TIME,
-        PJ_UI_STATE_SETTINGS, PJ_UI_STATE_VOLUME, PJ_UI_STATE_ALARM,
-        PJ_UI_STATE_STOPWATCH, PJ_UI_STATE_TIMER, PJ_UI_STATE_INTERVAL,
-    };
-    for (size_t i = 0; i < sizeof(ignored_states) / sizeof(ignored_states[0]); i++) {
-        pj_ui_init(&ui);
-        ui.state = ignored_states[i];
-        assert(pj_ui_handle_aux_double(&ui) == 0);
-        assert(ui.state == ignored_states[i]);
-        assert(ui.focus_index == 0);
-    }
-
-    const pj_ui_state_t quick_record_states[] = {
-        PJ_UI_STATE_TIME_TEMP, PJ_UI_STATE_HOME,
-    };
-    for (size_t i = 0; i < sizeof(quick_record_states) / sizeof(quick_record_states[0]); i++) {
-        pj_ui_init(&ui);
-        ui.state = quick_record_states[i];
-        assert(pj_ui_handle_aux_double(&ui) == 1);
-        assert(ui.state == PJ_UI_STATE_RECORD);
-        assert(ui.record_state == PJ_RECORD_ACTIVE);
-    }
-
-    pj_ui_init(&ui);
-    ui.state = PJ_UI_STATE_HOME;
-    ui.record_state = PJ_RECORD_STOPPING;
-    assert(pj_ui_handle_aux_double(&ui) == 0);
-    ui.record_state = PJ_RECORD_IDLE;
-    ui.playback_state = PJ_PLAYBACK_ACTIVE;
-    assert(pj_ui_handle_aux_double(&ui) == 0);
-}
-
-static void test_audio_lifecycle_reconciliation(void)
-{
-    pj_ui_context_t ui;
-    pj_ui_init(&ui);
-
-    ui.state = PJ_UI_STATE_RECORD;
-    ui.record_state = PJ_RECORD_ACTIVE;
-    pj_ui_set_audio_state(&ui, 0, 0);
-    assert(ui.record_state == PJ_RECORD_IDLE);
-    assert(pj_ui_current_state(&ui) == PJ_UI_STATE_HOME);
-
-    pj_ui_init(&ui);
-    ui.state = PJ_UI_STATE_NOTE_DETAIL;
-    assert(pj_ui_handle_aux_short(&ui) == 1);
-    assert(ui.playback_state == PJ_PLAYBACK_ACTIVE);
-    pj_ui_set_audio_state(&ui, 0, 1);
-    assert(ui.playback_state == PJ_PLAYBACK_ACTIVE);
-    assert(pj_ui_handle_aux_short(&ui) == 1);
-    assert(ui.playback_state == PJ_PLAYBACK_STOPPING);
-    pj_ui_set_audio_state(&ui, 0, 1);
-    assert(ui.playback_state == PJ_PLAYBACK_STOPPING);
-    pj_ui_set_audio_state(&ui, 0, 0);
-    assert(ui.playback_state == PJ_PLAYBACK_IDLE);
-    assert(pj_ui_current_state(&ui) == PJ_UI_STATE_NOTE_DETAIL);
-
-    pj_ui_set_audio_state(&ui, 0, 1);
-    assert(pj_ui_handle_aux_long(&ui) == 1);
-    assert(ui.playback_state == PJ_PLAYBACK_STOPPING);
-    assert(ui.playback_exit_pending == 1);
-    assert(pj_ui_current_state(&ui) == PJ_UI_STATE_LISTEN);
-    pj_ui_set_audio_state(&ui, 0, 0);
-    assert(ui.playback_state == PJ_PLAYBACK_IDLE);
-    assert(ui.playback_exit_pending == 0);
-    assert(pj_ui_current_state(&ui) == PJ_UI_STATE_LISTEN);
-
-    ui.state = PJ_UI_STATE_LISTEN;
-    ui.playback_state = PJ_PLAYBACK_ACTIVE;
-    pj_ui_set_audio_state(&ui, 0, 0);
-    assert(ui.playback_state == PJ_PLAYBACK_IDLE);
-    assert(pj_ui_current_state(&ui) == PJ_UI_STATE_LISTEN);
-
-    pj_ui_init(&ui);
-    ui.state = PJ_UI_STATE_RECORD;
-    ui.record_state = PJ_RECORD_ACTIVE;
-    assert(pj_ui_handle_aux_long(&ui) == 1);
-    assert(pj_ui_current_state(&ui) == PJ_UI_STATE_HOME);
-    assert(ui.record_state == PJ_RECORD_STOPPING);
-    pj_ui_set_audio_state(&ui, 1, 0);
-    assert(ui.record_state == PJ_RECORD_STOPPING);
-    assert(pj_ui_handle_aux_short(&ui) == 0);
-    assert(pj_ui_handle_aux_double(&ui) == 0);
-    assert(pj_ui_current_state(&ui) == PJ_UI_STATE_HOME);
-    assert(ui.record_state == PJ_RECORD_STOPPING);
-    pj_ui_set_audio_state(&ui, 0, 0);
-    assert(ui.record_state == PJ_RECORD_IDLE);
-
-    pj_ui_init(&ui);
-    ui.state = PJ_UI_STATE_HOME;
-    ui.record_state = PJ_RECORD_STOPPING;
-    assert(pj_ui_handle_aux_double(&ui) == 0);
-    assert(pj_ui_current_state(&ui) == PJ_UI_STATE_HOME);
-    assert(pj_ui_handle_touch(&ui, 20, 50, PJ_TOUCH_TAP) == 1);
-    assert(pj_ui_current_state(&ui) == PJ_UI_STATE_NOTES);
-    assert(pj_ui_handle_touch(&ui, 100, 30, PJ_TOUCH_TAP) == 0);
-    assert(pj_ui_current_state(&ui) == PJ_UI_STATE_NOTES);
-}
-
-static void test_settings_quadrants_control_volume_appearance_clock_and_sync(void)
-{
-    pj_ui_context_t ui;
-    pj_ui_init(&ui);
-    ui.state = PJ_UI_STATE_SETTINGS;
-
-    assert(pj_ui_handle_touch(&ui, 50, 50, PJ_TOUCH_TAP) == 1);
-    assert(pj_ui_current_state(&ui) == PJ_UI_STATE_VOLUME);
-    assert(pj_ui_handle_aux_long(&ui) == 1);
-    assert(pj_ui_current_state(&ui) == PJ_UI_STATE_SETTINGS);
-
-    assert(ui.dark_mode == 0);
-    assert(pj_ui_handle_touch(&ui, 150, 50, PJ_TOUCH_TAP) == 1);
-    assert(pj_ui_current_state(&ui) == PJ_UI_STATE_SETTINGS);
-    assert(ui.dark_mode == 1);
-
-    assert(ui.clock_24h == 1);
-    assert(pj_ui_handle_touch(&ui, 50, 150, PJ_TOUCH_TAP) == 1);
-    assert(pj_ui_current_state(&ui) == PJ_UI_STATE_SETTINGS);
-    assert(ui.clock_24h == 0);
-    assert(ui.dirty.partial == 0);
-
-    pj_ui_init(&ui);
-    ui.state = PJ_UI_STATE_SETTINGS;
-    assert(ui.focus_index == 0);
-    assert(pj_ui_handle_aux_double(&ui) == 0);
-    assert(pj_ui_handle_aux_short(&ui) == 0);
-    assert(ui.focus_index == 0 && ui.state == PJ_UI_STATE_SETTINGS);
-
-    pj_ui_init(&ui);
-    ui.state = PJ_UI_STATE_SETTINGS;
-    assert(pj_ui_handle_touch(&ui, 99, 99, PJ_TOUCH_TAP) == 1);
-    assert(ui.state == PJ_UI_STATE_VOLUME);
-    assert(pj_ui_handle_aux_long(&ui) == 1);
-    assert(pj_ui_handle_touch(&ui, 100, 99, PJ_TOUCH_TAP) == 1);
-    assert(ui.state == PJ_UI_STATE_SETTINGS && ui.dark_mode == 1);
-    assert(pj_ui_handle_touch(&ui, 99, 100, PJ_TOUCH_TAP) == 1);
-    assert(ui.clock_24h == 0);
-    assert(pj_ui_handle_touch(&ui, 100, 100, PJ_TOUCH_TAP) == 1);
-    assert(ui.state == PJ_UI_STATE_SYNC);
-}
-
-static void test_alarm_touch_regions_match_enable_and_adjustment_controls(void)
-{
-    pj_ui_context_t ui;
-    pj_ui_init(&ui);
-    ui.state = PJ_UI_STATE_ALARM;
-
-    assert(ui.alarm_on == 0);
-    assert(pj_ui_handle_touch(&ui, 100, 105, PJ_TOUCH_TAP) == 1);
-    assert(ui.alarm_on == 1 && ui.focus_index == 0);
-
-    assert(pj_ui_handle_touch(&ui, 50, 140, PJ_TOUCH_TAP) == 1);
-    assert(ui.alarm_hour == 6 && ui.focus_index == 1);
-    assert(pj_ui_handle_touch(&ui, 150, 140, PJ_TOUCH_TAP) == 1);
-    assert(ui.alarm_hour == 7 && ui.focus_index == 2);
-    assert(pj_ui_handle_touch(&ui, 50, 180, PJ_TOUCH_TAP) == 1);
-    assert(ui.alarm_minute == 15 && ui.focus_index == 3);
-    assert(pj_ui_handle_touch(&ui, 150, 180, PJ_TOUCH_TAP) == 1);
-    assert(ui.alarm_minute == 30 && ui.focus_index == 4);
-}
-
-static void test_api_preferences_remain_available_after_settings_flattening(void)
-{
-    pj_ui_context_t ui;
-    pj_ui_init(&ui);
-    pj_ui_mark_displayed(&ui);
-
-    pj_ui_set_preferences(&ui, 0, 1, 2);
-    assert(ui.clock_24h == 0);
-    assert(ui.temperature_fahrenheit == 1);
-    assert(ui.transcript_font_size == 2);
-    assert(ui.dirty.partial == 0);
-}
-
-static void test_settings_volume_opens_dedicated_screen(void)
-{
-    pj_ui_context_t ui;
-    pj_ui_init(&ui);
-    ui.state = PJ_UI_STATE_SETTINGS;
-    ui.volume = 4;
-
-    assert(pj_ui_handle_touch(&ui, 50, 50, PJ_TOUCH_TAP) == 1);
-    assert(pj_ui_current_state(&ui) == PJ_UI_STATE_VOLUME);
-    assert(ui.volume == 4);
-}
-
-static void test_volume_only_bottom_controls_adjust_and_clamp(void)
-{
-    pj_ui_context_t ui;
-    pj_ui_init(&ui);
-    ui.state = PJ_UI_STATE_VOLUME;
-    ui.volume = 5;
-
-    assert(pj_ui_handle_touch(&ui, 100, 24, PJ_TOUCH_TAP) == 0);
-    assert(pj_ui_handle_touch(&ui, 100, 76, PJ_TOUCH_TAP) == 0);
-    assert(pj_ui_handle_touch(&ui, 100, 99, PJ_TOUCH_TAP) == 0);
-    assert(ui.volume == 5);
-
-    assert(pj_ui_handle_touch(&ui, 52, 166, PJ_TOUCH_TAP) == 1);
-    assert(ui.volume == 4);
-    assert(pj_ui_handle_touch(&ui, 148, 166, PJ_TOUCH_TAP) == 1);
-    assert(ui.volume == 5);
-
-    ui.volume = 0;
-    assert(pj_ui_handle_touch(&ui, 52, 166, PJ_TOUCH_TAP) == 1);
-    assert(ui.volume == 0);
-    ui.volume = 10;
-    assert(pj_ui_handle_touch(&ui, 148, 166, PJ_TOUCH_TAP) == 1);
-    assert(ui.volume == 10);
-}
-
-static void test_volume_fill_uses_full_top_half_and_controls_have_thick_borders(void)
-{
-    pj_ui_context_t ui;
-    pj_framebuffer_t volume;
-    pj_framebuffer_t timer;
-    pj_ui_init(&ui);
-    ui.state = PJ_UI_STATE_VOLUME;
-    ui.volume = 5;
-    ui.focus_index = -1;
-    pj_ui_render(&ui, &volume);
-
-    assert(count_black_pixels_in_region(&volume, 25, 0, 1, 100) >= 98);
-    assert(count_black_pixels_in_region(&volume, 150, 3, 1, 94) == 0);
-
-    ui.state = PJ_UI_STATE_TIMER;
-    ui.focus_index = -1;
-    pj_ui_render(&ui, &timer);
-    assert(count_black_pixels_in_region(&timer, 99, 153, 3, 3) == 9);
-}
-
-static void test_timer_presets_are_not_runtime_counters(void)
-{
-    pj_ui_context_t ui;
-    pj_ui_time_command_t command;
-    pj_ui_init(&ui);
-    ui.state = PJ_UI_STATE_TIMER;
-
-    assert(pj_ui_handle_touch(&ui, 150, 177, PJ_TOUCH_TAP) == 1);
-    assert(ui.timer_seconds == 330);
-    assert(ui.timer_preset_seconds == 330);
-    assert(pj_ui_handle_touch(&ui, 50, 177, PJ_TOUCH_TAP) == 0);
-    assert(ui.timer_preset_seconds == 330);
-    assert(pj_ui_consume_time_command(&ui, &command) == 1);
-    ui.timer_running = 1;
-    assert(pj_ui_tick(&ui) == 0);
-    assert(ui.timer_seconds == 330);
-    pj_ui_time_projection_t projection = {
-        .timer_running = 1,
-        .timer_remaining_ms = 329000,
-    };
-    pj_ui_set_time_projection(&ui, &projection);
-    assert(ui.timer_seconds == 329);
-    assert(ui.timer_preset_seconds == 330);
-
-    ui.timer_running = 0;
-    ui.timer_seconds = 0;
-    ui.focus_index = 0;
-    assert(pj_ui_handle_aux_short(&ui) == 1);
-    assert(ui.timer_running == 0);
-    assert(ui.timer_seconds == 0);
-    assert(pj_ui_consume_time_command(&ui, &command) == 1);
-    assert(command.type == PJ_UI_TIME_COMMAND_TIMER_START);
-    assert(command.duration_ms == 330000);
-
-    pj_ui_init(&ui);
-    ui.state = PJ_UI_STATE_INTERVAL;
-    assert(pj_ui_handle_touch(&ui, 150, 177, PJ_TOUCH_TAP) == 1);
-    assert(ui.interval_seconds == 150);
-    assert(ui.interval_preset_seconds == 150);
-    assert(pj_ui_consume_time_command(&ui, &command) == 1);
-}
-
-static void test_paused_time_adjustments_use_visible_remainder(void)
-{
-    pj_ui_context_t ui;
-    pj_ui_time_command_t command;
-
-    pj_ui_init(&ui);
-    ui.state = PJ_UI_STATE_TIMER;
-    ui.timer_running = 0;
-    ui.timer_seconds = 17;
-    ui.timer_preset_seconds = 90;
-    assert(pj_ui_handle_touch(&ui, 150, 177, PJ_TOUCH_TAP) == 1);
-    assert(ui.timer_seconds == 47);
-    assert(ui.timer_preset_seconds == 47);
-    assert(pj_ui_consume_time_command(&ui, &command) == 1);
-    assert(command.type == PJ_UI_TIME_COMMAND_TIMER_SET);
-    assert(command.duration_ms == 47000);
-
-    pj_ui_init(&ui);
-    ui.state = PJ_UI_STATE_TIMER;
-    ui.timer_seconds = 0;
-    ui.timer_preset_seconds = 90;
-    assert(pj_ui_handle_touch(&ui, 150, 177, PJ_TOUCH_TAP) == 1);
-    assert(ui.timer_seconds == 120);
-    assert(ui.timer_preset_seconds == 120);
-    assert(pj_ui_consume_time_command(&ui, &command) == 1);
-    assert(command.type == PJ_UI_TIME_COMMAND_TIMER_SET);
-    assert(command.duration_ms == 120000);
-
-    pj_ui_init(&ui);
-    ui.state = PJ_UI_STATE_INTERVAL;
-    ui.interval_running = 0;
-    ui.interval_seconds = 70;
-    ui.interval_preset_seconds = 120;
-    assert(pj_ui_handle_touch(&ui, 150, 177, PJ_TOUCH_TAP) == 1);
-    assert(ui.interval_seconds == 130);
-    assert(ui.interval_preset_seconds == 130);
-    assert(pj_ui_consume_time_command(&ui, &command) == 1);
-    assert(command.type == PJ_UI_TIME_COMMAND_INTERVAL_SET);
-    assert(command.duration_ms == 130000);
-    assert(command.secondary_duration_ms == 130000);
-
-    pj_ui_init(&ui);
-    ui.state = PJ_UI_STATE_INTERVAL;
-    ui.interval_seconds = 0;
-    ui.interval_preset_seconds = 120;
-    assert(pj_ui_handle_touch(&ui, 50, 177, PJ_TOUCH_TAP) == 1);
-    assert(ui.interval_seconds == 60);
-    assert(ui.interval_preset_seconds == 60);
-    assert(pj_ui_consume_time_command(&ui, &command) == 1);
-    assert(command.type == PJ_UI_TIME_COMMAND_INTERVAL_SET);
-    assert(command.duration_ms == 60000);
-    assert(command.secondary_duration_ms == 60000);
-}
-
-static void test_interval_repeats_one_stable_duration_across_rounds(void)
-{
-    pj_ui_context_t ui;
-    pj_ui_init(&ui);
-    ui.state = PJ_UI_STATE_INTERVAL;
-    ui.interval_running = 1;
-    ui.interval_seconds = 2;
-    ui.interval_preset_seconds = 2;
-    pj_ui_mark_displayed(&ui);
-
-    for (int round = 0; round < 4; round++) {
-        assert(ui.interval_round == round);
-        assert(ui.interval_seconds == 2);
-        pj_ui_time_projection_t projection = {
-            .interval_running = 1,
-            .interval_remaining_ms = 1000,
-            .interval_phase = (uint64_t)round,
-        };
-        pj_ui_set_time_projection(&ui, &projection);
-        assert(ui.interval_seconds == 1 && ui.interval_round == round);
-        assert(ui.dirty.partial == 1);
-        pj_ui_mark_displayed(&ui);
-        projection.interval_remaining_ms = 2000;
-        projection.interval_phase = (uint64_t)round + 1u;
-        pj_ui_set_time_projection(&ui, &projection);
-        assert(ui.interval_seconds == 2 && ui.interval_round == round + 1);
-        assert(ui.state == PJ_UI_STATE_INTERVAL);
-        assert(ui.dirty.partial == 1);
-        pj_ui_mark_displayed(&ui);
-    }
-}
-
-static void test_timer_geometry_and_adjustment_focus_timeout(void)
-{
-    pj_ui_context_t ui;
-    pj_ui_time_command_t command;
-    pj_framebuffer_t fb;
-    pj_ui_init(&ui);
-    ui.state = PJ_UI_STATE_TIMER;
-    ui.timer_seconds = 123;
-    ui.timer_preset_seconds = 300;
-    ui.timer_running = 1;
-    ui.focus_index = -1;
-    pj_ui_render(&ui, &fb);
-
-    assert(count_black_pixels_in_region(&fb, 0, 149, PJ_DISPLAY_WIDTH, 2) > 380);
-    assert(pj_ui_handle_touch(&ui, 150, 126, PJ_TOUCH_TAP) == 1);
-    assert(ui.focus_index == 1 && ui.timer_running == 1 && ui.timer_seconds == 123);
-    assert(pj_ui_consume_time_command(&ui, &command) == 1);
-    assert(command.type == PJ_UI_TIME_COMMAND_TIMER_RESET);
-
-    pj_ui_time_projection_t projection = {
-        .timer_remaining_ms = 300000,
-    };
-    pj_ui_set_time_projection(&ui, &projection);
-    assert(ui.timer_running == 0 && ui.timer_seconds == 300);
-
-    assert(pj_ui_handle_touch(&ui, 50, 170, PJ_TOUCH_TAP) == 1);
-    assert(ui.focus_index == 2 && ui.timer_seconds == 270);
-    assert(ui.timer_preset_seconds == 270);
-    assert(pj_ui_consume_time_command(&ui, &command) == 1);
-    assert(command.type == PJ_UI_TIME_COMMAND_TIMER_SET);
-    projection.timer_remaining_ms = 0;
-    pj_ui_set_time_projection(&ui, &projection);
-    assert(ui.timer_seconds == 0 && ui.timer_preset_seconds == 270);
-    assert(pj_ui_handle_touch(&ui, 150, 170, PJ_TOUCH_TAP) == 1);
-    assert(ui.focus_index == 3 && ui.timer_seconds == 300);
-    assert(ui.timer_preset_seconds == 300);
-    assert(pj_ui_consume_time_command(&ui, &command) == 1);
-    assert(command.type == PJ_UI_TIME_COMMAND_TIMER_SET);
-
-    pj_ui_mark_displayed(&ui);
-    for (int tick = 1; tick < PJ_UI_FOCUS_TIMEOUT_TICKS; tick++) {
-        assert(pj_ui_tick(&ui) == 0);
-        assert(ui.focus_index == 3);
-    }
-    assert(pj_ui_tick(&ui) == 0);
-    assert(ui.focus_index == 0);
-    assert(ui.timer_running == 0);
-    assert(pj_ui_is_dirty(&ui) == 0);
-}
-
-static pj_ui_time_projection_t time_projection_with_alert(uint64_t id,
-                                                          pj_time_alert_source_t source)
-{
-    pj_ui_time_projection_t projection = {0};
-    projection.alarm_enabled = 1;
-    projection.alarm_hour = 6;
-    projection.alarm_minute = 45;
-    projection.stopwatch_running = 1;
-    projection.stopwatch_elapsed_ms = 1250;
-    projection.timer_running = 1;
-    projection.timer_remaining_ms = 2501;
-    projection.interval_running = 1;
-    projection.interval_remaining_ms = 60000;
-    projection.interval_phase = 3;
-    projection.active_alert = (pj_time_alert_t) {
-        .id = id,
-        .occurrence = 7,
-        .source = (uint8_t)source,
-        .reason = source == PJ_TIME_ALERT_ALARM ? PJ_TIME_ALERT_SCHEDULED : PJ_TIME_ALERT_EXPIRED,
-    };
+    pj_ui_time_projection_t projection;
+    memset(&projection, 0, sizeof(projection));
+    projection.alarm_hour = 7;
+    projection.alarm_minute = 30;
+    projection.stopwatch_elapsed_ms = (uint64_t)stopwatch_seconds * 1000u;
+    projection.timer_remaining_ms = (uint64_t)timer_seconds * 1000u;
+    projection.interval_remaining_ms = (uint64_t)interval_seconds * 1000u;
+    projection.interval_phase = 1;
     return projection;
 }
 
-static void test_time_projection_updates_values_without_alert_subscreen(void)
+static void test_geometry_is_exhaustive_and_navigation_is_fixed(void)
 {
-    pj_ui_context_t ui;
-    pj_ui_init(&ui);
-    ui.state = PJ_UI_STATE_TIMER;
-    pj_ui_mark_displayed(&ui);
-
-    pj_ui_time_projection_t projection = time_projection_with_alert(41, PJ_TIME_ALERT_TIMER);
-    pj_ui_set_time_projection(&ui, &projection);
-    assert(ui.alarm_on == 1 && ui.alarm_hour == 6 && ui.alarm_minute == 45);
-    assert(ui.stopwatch_running == 1 && ui.stopwatch_seconds == 1);
-    assert(ui.timer_running == 1 && ui.timer_seconds == 3);
-    assert(ui.interval_running == 1 && ui.interval_seconds == 60 && ui.interval_round == 3);
-    assert(ui.active_alert.id == 41);
-    assert(pj_ui_is_dirty(&ui) == 1 && ui.dirty.partial == 1);
-
-    pj_ui_mark_displayed(&ui);
-    pj_ui_set_time_projection(&ui, &projection);
-    assert(pj_ui_is_dirty(&ui) == 0);
-
-    projection.active_alert.skipped_occurrences = 2;
-    pj_ui_set_time_projection(&ui, &projection);
-    assert(pj_ui_is_dirty(&ui) == 0);
-
-    projection.alert_audio_deferred = 1;
-    pj_ui_set_time_projection(&ui, &projection);
-    assert(ui.alert_audio_deferred == 1);
-    assert(pj_ui_is_dirty(&ui) == 0);
-}
-
-static void test_interval_alert_stays_inline_and_aux_long_resets(void)
-{
-    pj_ui_context_t with_alert;
-    pj_ui_context_t without_alert;
-    pj_framebuffer_t with_alert_fb;
-    pj_framebuffer_t without_alert_fb;
-    pj_ui_time_command_t command;
-    pj_ui_init(&with_alert);
-    pj_ui_init(&without_alert);
-    with_alert.state = PJ_UI_STATE_INTERVAL;
-    without_alert.state = PJ_UI_STATE_INTERVAL;
-    pj_ui_mark_displayed(&with_alert);
-    pj_ui_mark_displayed(&without_alert);
-
-    pj_ui_time_projection_t projection =
-        time_projection_with_alert(71, PJ_TIME_ALERT_INTERVAL);
-    projection.active_alert.recovered = 1;
-    pj_ui_time_projection_t quiet_projection = projection;
-    memset(&quiet_projection.active_alert, 0, sizeof(quiet_projection.active_alert));
-    pj_ui_set_time_projection(&with_alert, &projection);
-    pj_ui_set_time_projection(&without_alert, &quiet_projection);
-    assert(with_alert.state == PJ_UI_STATE_INTERVAL);
-    assert(with_alert.active_alert.id == 71);
-    assert(with_alert.interval_running == 1 && with_alert.interval_round == 3);
-    assert(with_alert.dirty.partial == 1);
-    assert(with_alert.dirty.width * with_alert.dirty.height <
-           PJ_DISPLAY_WIDTH * PJ_DISPLAY_HEIGHT);
-
-    memset(&with_alert_fb, 0, sizeof(with_alert_fb));
-    memset(&without_alert_fb, 0, sizeof(without_alert_fb));
-    pj_ui_render(&with_alert, &with_alert_fb);
-    pj_ui_render(&without_alert, &without_alert_fb);
-    assert(memcmp(&with_alert_fb, &without_alert_fb, sizeof(with_alert_fb)) == 0);
-
-    pj_ui_mark_displayed(&with_alert);
-    projection.active_alert.id = 72;
-    projection.active_alert.occurrence = 8;
-    projection.interval_phase = 4;
-    projection.interval_remaining_ms = 45000;
-    pj_ui_set_time_projection(&with_alert, &projection);
-    assert(with_alert.active_alert.id == 72 && with_alert.interval_round == 4);
-    assert(with_alert.interval_seconds == 45);
-    assert(with_alert.dirty.partial == 1);
-
-    assert(pj_ui_handle_aux_long(&with_alert) == 1);
-    assert(with_alert.state == PJ_UI_STATE_TIME);
-    assert(pj_ui_consume_time_command(&with_alert, &command) == 1);
-    assert(command.type == PJ_UI_TIME_COMMAND_INTERVAL_RESET);
-}
-
-static void test_recovered_interval_alert_is_nonmodal_on_every_screen(void)
-{
-    const pj_ui_state_t states[] = {
-        PJ_UI_STATE_STATIC,
-        PJ_UI_STATE_TIME_TEMP,
-        PJ_UI_STATE_HOME,
-        PJ_UI_STATE_SETTINGS,
-        PJ_UI_STATE_TIMER,
+    static const struct {
+        pj_layout_id_t layout;
+        pj_layout_slot_id_t first;
+        pj_layout_slot_id_t last;
+    } layouts[] = {
+        {PJ_LAYOUT_HOME_3_1, PJ_LAYOUT_SLOT_HOME_TIME,
+         PJ_LAYOUT_SLOT_HOME_SETTINGS},
+        {PJ_LAYOUT_NOTES_3_1M, PJ_LAYOUT_SLOT_NOTES_RECORD,
+         PJ_LAYOUT_SLOT_NOTES_READ},
+        {PJ_LAYOUT_TIME_4_1, PJ_LAYOUT_SLOT_TIME_ALARM,
+         PJ_LAYOUT_SLOT_TIME_INTERVAL},
+        {PJ_LAYOUT_SETTINGS_4_0M, PJ_LAYOUT_SLOT_SETTINGS_VOLUME,
+         PJ_LAYOUT_SLOT_SETTINGS_SYNC},
     };
 
-    for (size_t index = 0; index < sizeof(states) / sizeof(states[0]); ++index) {
-        pj_ui_context_t with_alert;
-        pj_ui_context_t without_alert;
-        pj_framebuffer_t with_alert_fb;
-        pj_framebuffer_t without_alert_fb;
-        pj_ui_init(&with_alert);
-        pj_ui_init(&without_alert);
-        with_alert.state = states[index];
-        without_alert.state = states[index];
+    for (size_t layout_index = 0; layout_index < ARRAY_LEN(layouts);
+         layout_index++) {
+        const pj_layout_geometry_t *geometry =
+            pj_layout_geometry(layouts[layout_index].layout);
+        assert(geometry != NULL);
+        assert(geometry->rule_count ==
+               (layouts[layout_index].layout < PJ_LAYOUT_TIME_4_1 ? 3 : 5));
+        assert(!pj_layout_pixel_is_rule(layouts[layout_index].layout, 0, 0));
+        assert(!pj_layout_pixel_is_rule(layouts[layout_index].layout, 199, 0));
+        assert(!pj_layout_pixel_is_rule(layouts[layout_index].layout, 0, 199));
+        assert(!pj_layout_pixel_is_rule(layouts[layout_index].layout, 199, 199));
+        assert(pj_layout_pixel_is_rule(layouts[layout_index].layout, 100, 100));
 
-        pj_ui_time_projection_t projection =
-            time_projection_with_alert(81, PJ_TIME_ALERT_INTERVAL);
-        projection.active_alert.recovered = 1;
-        pj_ui_time_projection_t quiet_projection = projection;
-        memset(&quiet_projection.active_alert, 0, sizeof(quiet_projection.active_alert));
-        pj_ui_set_time_projection(&with_alert, &projection);
-        pj_ui_set_time_projection(&without_alert, &quiet_projection);
-        pj_ui_mark_displayed(&with_alert);
-        pj_ui_mark_displayed(&without_alert);
-
-        pj_ui_render(&with_alert, &with_alert_fb);
-        pj_ui_render(&without_alert, &without_alert_fb);
-        assert(memcmp(&with_alert_fb, &without_alert_fb,
-                      sizeof(with_alert_fb)) == 0);
-
-        projection.active_alert.id = 82;
-        projection.active_alert.occurrence++;
-        pj_ui_set_time_projection(&with_alert, &projection);
-        assert(with_alert.active_alert.id == 82);
-        assert(pj_ui_is_dirty(&with_alert) == 0);
-
-        int alert_handled = pj_ui_handle_aux_short(&with_alert);
-        int quiet_handled = pj_ui_handle_aux_short(&without_alert);
-        assert(alert_handled == quiet_handled);
-        assert(with_alert.state == without_alert.state);
-        assert(with_alert.focus_index == without_alert.focus_index);
+        for (int y = 0; y < PJ_DISPLAY_HEIGHT; y++) {
+            for (int x = 0; x < PJ_DISPLAY_WIDTH; x++) {
+                pj_layout_slot_id_t slot = pj_layout_hit_test(
+                    layouts[layout_index].layout, (uint16_t)x, (uint16_t)y);
+                assert(slot >= layouts[layout_index].first);
+                assert(slot <= layouts[layout_index].last);
+            }
+        }
+        for (uint8_t slot_index = 0; slot_index < geometry->slot_count;
+             slot_index++) {
+            const pj_layout_slot_t *slot = &geometry->slots[slot_index];
+            assert(pj_layout_hit_test(
+                       layouts[layout_index].layout,
+                       (uint16_t)slot_x(layouts[layout_index].layout, slot->id),
+                       (uint16_t)slot_y(layouts[layout_index].layout, slot->id)) ==
+                   slot->id);
+        }
     }
+    assert(pj_layout_geometry(PJ_LAYOUT_COUNT) == NULL);
+    assert(pj_layout_hit_test(PJ_LAYOUT_HOME_3_1, 200, 0) ==
+           PJ_LAYOUT_SLOT_NONE);
 
-    pj_ui_context_t sleeping;
-    pj_ui_init(&sleeping);
-    sleeping.state = PJ_UI_STATE_HOME;
-    pj_ui_time_projection_t recovered =
-        time_projection_with_alert(83, PJ_TIME_ALERT_INTERVAL);
-    recovered.active_alert.recovered = 1;
-    pj_ui_set_time_projection(&sleeping, &recovered);
-    pj_ui_sleep(&sleeping);
-    assert(sleeping.state == PJ_UI_STATE_STATIC);
-    assert(sleeping.interval_running == 1);
-}
-
-static pj_ui_time_projection_t projection_from_ui(const pj_ui_context_t *ui)
-{
-    return (pj_ui_time_projection_t) {
-        .alarm_enabled = ui->alarm_on,
-        .alarm_hour = ui->alarm_hour,
-        .alarm_minute = ui->alarm_minute,
-        .stopwatch_running = ui->stopwatch_running,
-        .stopwatch_elapsed_ms = (uint64_t)ui->stopwatch_seconds * 1000u,
-        .timer_running = ui->timer_running,
-        .timer_remaining_ms = (uint64_t)ui->timer_seconds * 1000u,
-        .interval_running = ui->interval_running,
-        .interval_remaining_ms = (uint64_t)ui->interval_seconds * 1000u,
-        .interval_phase = (uint32_t)ui->interval_round,
-    };
-}
-
-static void test_time_command_buttons_wait_for_authoritative_projection(void)
-{
-    const struct {
+    static const struct {
+        pj_layout_slot_id_t slot;
         pj_ui_state_t state;
-        pj_ui_time_command_type_t command;
-    } cases[] = {
-        {PJ_UI_STATE_STOPWATCH, PJ_UI_TIME_COMMAND_STOPWATCH_RESET},
-        {PJ_UI_STATE_TIMER, PJ_UI_TIME_COMMAND_TIMER_RESET},
-        {PJ_UI_STATE_INTERVAL, PJ_UI_TIME_COMMAND_INTERVAL_RESET},
+    } home_targets[] = {
+        {PJ_LAYOUT_SLOT_HOME_TIME, PJ_UI_STATE_TIME},
+        {PJ_LAYOUT_SLOT_HOME_NOTES, PJ_UI_STATE_NOTES},
+        {PJ_LAYOUT_SLOT_HOME_SETTINGS, PJ_UI_STATE_SETTINGS},
     };
-
-    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
-        pj_ui_context_t ui;
-        pj_framebuffer_t before;
-        pj_framebuffer_t after_command;
-        pj_ui_time_command_t command;
-        pj_ui_init(&ui);
-        ui.state = cases[i].state;
-        ui.focus_index = 1;
-        ui.stopwatch_running = 1;
-        ui.stopwatch_seconds = 42;
-        ui.timer_running = 1;
-        ui.timer_seconds = 17;
-        ui.timer_preset_seconds = 90;
-        ui.interval_running = 1;
-        ui.interval_seconds = 11;
-        ui.interval_preset_seconds = 120;
-        ui.interval_round = 4;
-        pj_ui_render(&ui, &before);
-        pj_ui_mark_displayed(&ui);
-
-        assert(pj_ui_handle_touch(&ui, 150, 110, PJ_TOUCH_TAP) == 1);
-        assert(pj_ui_consume_time_command(&ui, &command) == 1);
-        assert(command.type == cases[i].command);
-        assert(pj_ui_is_dirty(&ui) == 0);
-        assert(ui.stopwatch_running == 1 && ui.stopwatch_seconds == 42);
-        assert(ui.timer_running == 1 && ui.timer_seconds == 17);
-        assert(ui.interval_running == 1 && ui.interval_seconds == 11 &&
-               ui.interval_round == 4);
-
-        pj_ui_context_t full = ui;
-        pj_ui_request_full_refresh(&full);
-        pj_ui_render(&full, &after_command);
-        assert(memcmp(&before, &after_command, sizeof(before)) == 0);
-
-        pj_ui_time_projection_t projection = projection_from_ui(&ui);
-        if (cases[i].state == PJ_UI_STATE_STOPWATCH) {
-            projection.stopwatch_running = 0;
-            projection.stopwatch_elapsed_ms = 0;
-        } else if (cases[i].state == PJ_UI_STATE_TIMER) {
-            projection.timer_running = 0;
-            projection.timer_remaining_ms = 90000;
-        } else {
-            projection.interval_running = 0;
-            projection.interval_remaining_ms = 120000;
-            projection.interval_phase = 0;
-        }
-        pj_ui_set_time_projection(&ui, &projection);
-        assert(pj_ui_is_dirty(&ui) == 1 && ui.dirty.partial == 1);
-    }
-}
-
-static void test_time_projection_refreshes_changed_controls(void)
-{
-    const pj_ui_state_t states[] = {
-        PJ_UI_STATE_STOPWATCH, PJ_UI_STATE_TIMER, PJ_UI_STATE_INTERVAL,
-    };
-    for (size_t i = 0; i < sizeof(states) / sizeof(states[0]); i++) {
-        pj_ui_context_t ui;
-        pj_ui_init(&ui);
-        ui.state = states[i];
-        pj_ui_time_projection_t projection = projection_from_ui(&ui);
-        if (states[i] == PJ_UI_STATE_STOPWATCH) projection.stopwatch_running = 1;
-        if (states[i] == PJ_UI_STATE_TIMER) projection.timer_running = 1;
-        if (states[i] == PJ_UI_STATE_INTERVAL) projection.interval_running = 1;
-        pj_ui_mark_displayed(&ui);
-        pj_ui_set_time_projection(&ui, &projection);
-        assert(pj_ui_is_dirty(&ui) == 1);
-        assert(ui.dirty.partial == 1);
-        assert(ui.dirty.width * ui.dirty.height < PJ_DISPLAY_WIDTH * PJ_DISPLAY_HEIGHT);
+    for (size_t i = 0; i < ARRAY_LEN(home_targets); i++) {
+        pj_ui_context_t context;
+        pj_ui_init(&context);
+        pj_ui_wake(&context);
+        assert(tap_slot(&context, PJ_LAYOUT_HOME_3_1, home_targets[i].slot));
+        assert(context.state == home_targets[i].state);
     }
 
-    pj_ui_context_t timer;
-    pj_ui_init(&timer);
-    timer.state = PJ_UI_STATE_TIMER;
-    timer.timer_running = 1;
-    timer.timer_seconds = 1;
-    pj_ui_mark_displayed(&timer);
-    pj_ui_time_projection_t timer_projection = projection_from_ui(&timer);
-    timer_projection.timer_running = 0;
-    timer_projection.timer_remaining_ms = 0;
-    pj_ui_set_time_projection(&timer, &timer_projection);
-    assert(timer.timer_running == 0 && timer.timer_seconds == 0);
-    assert(timer.dirty.partial == 1);
-
-    pj_ui_context_t alarm;
-    pj_ui_init(&alarm);
-    alarm.state = PJ_UI_STATE_ALARM;
-    pj_ui_time_projection_t alarm_projection = projection_from_ui(&alarm);
-    alarm_projection.alarm_enabled = 1;
-    pj_ui_mark_displayed(&alarm);
-    pj_ui_set_time_projection(&alarm, &alarm_projection);
-    assert(alarm.dirty.partial == 1);
-    assert(alarm.dirty.y == 0);
-    assert(alarm.dirty.y + alarm.dirty.height >= 112);
-}
-
-static void test_active_alert_does_not_create_modal_navigation(void)
-{
-    pj_ui_context_t ui;
-    pj_ui_init(&ui);
-    ui.state = PJ_UI_STATE_HOME;
-    ui.stopwatch_running = 1;
-    ui.timer_running = 1;
-    ui.interval_running = 1;
-    pj_ui_time_projection_t projection = time_projection_with_alert(51, PJ_TIME_ALERT_TIMER);
-    pj_ui_set_time_projection(&ui, &projection);
-
-    pj_ui_sleep(&ui);
-    assert(pj_ui_current_state(&ui) == PJ_UI_STATE_STATIC);
-    assert(ui.stopwatch_running == 1 && ui.timer_running == 1 && ui.interval_running == 1);
-    pj_ui_wake(&ui);
-    assert(pj_ui_current_state(&ui) == PJ_UI_STATE_HOME);
-    assert(pj_ui_handle_aux_long(&ui) == 1);
-    assert(pj_ui_current_state(&ui) == PJ_UI_STATE_TIME_TEMP);
-    pj_ui_time_command_t command;
-    assert(pj_ui_consume_time_command(&ui, &command) == 0);
-
-    projection = time_projection_with_alert(52, PJ_TIME_ALERT_ALARM);
-    pj_ui_set_time_projection(&ui, &projection);
-    assert(pj_ui_handle_aux_double(&ui) == 1);
-    assert(ui.state == PJ_UI_STATE_RECORD);
-    assert(ui.record_state == PJ_RECORD_ACTIVE);
-    assert(pj_ui_consume_time_command(&ui, &command) == 0);
-
-    pj_ui_init(&ui);
-    ui.state = PJ_UI_STATE_HOME;
-    projection = time_projection_with_alert(53, PJ_TIME_ALERT_TIMER);
-    pj_ui_set_time_projection(&ui, &projection);
-    assert(pj_ui_handle_touch(&ui, 20, 40, PJ_TOUCH_TAP) == 1);
-    assert(pj_ui_current_state(&ui) == PJ_UI_STATE_NOTES);
-}
-
-static void test_sleep_preserves_durable_time_activity(void)
-{
-    pj_ui_context_t ui;
-    pj_ui_init(&ui);
-    ui.state = PJ_UI_STATE_HOME;
-    ui.stopwatch_running = 1;
-    ui.timer_running = 1;
-    ui.interval_running = 1;
-
-    pj_ui_sleep(&ui);
-    assert(pj_ui_current_state(&ui) == PJ_UI_STATE_STATIC);
-    assert(ui.stopwatch_running == 1);
-    assert(ui.timer_running == 1);
-    assert(ui.interval_running == 1);
-}
-
-static void test_recovery_metadata_does_not_add_subtext_or_touch_target(void)
-{
-    pj_ui_context_t ui;
-    pj_framebuffer_t before;
-    pj_framebuffer_t after;
-    pj_ui_init(&ui);
-    ui.state = PJ_UI_STATE_TIMER;
-    ui.timer_seconds = 30;
-    pj_ui_render(&ui, &before);
-    pj_ui_mark_displayed(&ui);
-    pj_ui_time_projection_t projection = {0};
-    projection.timer_remaining_ms = 30000;
-    projection.recovery_time_uncertain = 1;
-    pj_ui_set_time_projection(&ui, &projection);
-
-    assert(pj_ui_is_dirty(&ui) == 0);
-    pj_ui_request_full_refresh(&ui);
-    pj_ui_render(&ui, &after);
-    assert(memcmp(&before, &after, sizeof(before)) == 0);
-    assert(pj_ui_handle_touch(&ui, 170, 16, PJ_TOUCH_TAP) == 0);
-    pj_ui_time_command_t command;
-    assert(pj_ui_consume_time_command(&ui, &command) == 0);
-}
-
-static void test_time_controls_emit_explicit_commands(void)
-{
-    pj_ui_context_t ui;
-    pj_ui_time_command_t command;
-    pj_ui_init(&ui);
-
-    ui.state = PJ_UI_STATE_STOPWATCH;
-    ui.stopwatch_running = 1;
-    ui.stopwatch_seconds = 42;
-    assert(pj_ui_handle_touch(&ui, 170, 126, PJ_TOUCH_TAP) == 1);
-    assert(pj_ui_consume_time_command(&ui, &command) == 1);
-    assert(command.type == PJ_UI_TIME_COMMAND_STOPWATCH_RESET);
-
-    ui.state = PJ_UI_STATE_TIMER;
-    ui.focus_index = 0;
-    ui.timer_running = 0;
-    ui.timer_seconds = 90;
-    assert(pj_ui_handle_aux_short(&ui) == 1);
-    assert(pj_ui_consume_time_command(&ui, &command) == 1);
-    assert(command.type == PJ_UI_TIME_COMMAND_TIMER_START);
-    assert(command.duration_ms == 90000);
-    pj_ui_time_projection_t projection = projection_from_ui(&ui);
-    projection.timer_running = 1;
-    projection.timer_remaining_ms = 90000;
-    pj_ui_set_time_projection(&ui, &projection);
-    assert(pj_ui_handle_aux_short(&ui) == 1);
-    assert(pj_ui_consume_time_command(&ui, &command) == 1);
-    assert(command.type == PJ_UI_TIME_COMMAND_TIMER_PAUSE);
-    assert(pj_ui_handle_touch(&ui, 170, 126, PJ_TOUCH_TAP) == 1);
-    assert(pj_ui_consume_time_command(&ui, &command) == 1);
-    assert(command.type == PJ_UI_TIME_COMMAND_TIMER_RESET);
-
-    ui.state = PJ_UI_STATE_INTERVAL;
-    ui.focus_index = 0;
-    ui.interval_running = 0;
-    ui.interval_seconds = 120;
-    ui.interval_preset_seconds = 120;
-    assert(pj_ui_handle_aux_short(&ui) == 1);
-    assert(pj_ui_consume_time_command(&ui, &command) == 1);
-    assert(command.type == PJ_UI_TIME_COMMAND_INTERVAL_START);
-    assert(command.duration_ms == 120000);
-    assert(command.secondary_duration_ms == 120000);
-    projection = projection_from_ui(&ui);
-    projection.interval_running = 1;
-    projection.interval_remaining_ms = 120000;
-    pj_ui_set_time_projection(&ui, &projection);
-    assert(pj_ui_handle_aux_short(&ui) == 1);
-    assert(pj_ui_consume_time_command(&ui, &command) == 1);
-    assert(command.type == PJ_UI_TIME_COMMAND_INTERVAL_PAUSE);
-    assert(pj_ui_handle_touch(&ui, 170, 126, PJ_TOUCH_TAP) == 1);
-    assert(pj_ui_consume_time_command(&ui, &command) == 1);
-    assert(command.type == PJ_UI_TIME_COMMAND_INTERVAL_RESET);
-
-    ui.state = PJ_UI_STATE_TIMER;
-    ui.timer_seconds = 86400;
-    ui.timer_preset_seconds = 86400;
-    assert(pj_ui_handle_touch(&ui, 150, 177, PJ_TOUCH_TAP) == 1);
-    assert(ui.timer_seconds == 86400);
-    assert(pj_ui_consume_time_command(&ui, &command) == 1);
-    assert(command.duration_ms == 86400000);
-
-    ui.state = PJ_UI_STATE_INTERVAL;
-    ui.interval_seconds = 86400;
-    ui.interval_preset_seconds = 86400;
-    assert(pj_ui_handle_touch(&ui, 150, 177, PJ_TOUCH_TAP) == 1);
-    assert(ui.interval_seconds == 86400);
-    assert(pj_ui_consume_time_command(&ui, &command) == 1);
-    assert(command.duration_ms == 86400000);
-}
-
-static void test_aux_back_resets_time_pages_before_returning(void)
-{
-    const struct {
+    static const struct {
+        pj_layout_slot_id_t slot;
         pj_ui_state_t state;
-        pj_ui_time_command_type_t command;
-    } cases[] = {
-        {PJ_UI_STATE_STOPWATCH, PJ_UI_TIME_COMMAND_STOPWATCH_RESET},
-        {PJ_UI_STATE_TIMER, PJ_UI_TIME_COMMAND_TIMER_RESET},
-        {PJ_UI_STATE_INTERVAL, PJ_UI_TIME_COMMAND_INTERVAL_RESET},
+    } note_targets[] = {
+        {PJ_LAYOUT_SLOT_NOTES_RECORD, PJ_UI_STATE_RECORD},
+        {PJ_LAYOUT_SLOT_NOTES_LISTEN, PJ_UI_STATE_LISTEN},
+        {PJ_LAYOUT_SLOT_NOTES_READ, PJ_UI_STATE_READ},
     };
-
-    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
-        pj_ui_context_t ui;
-        pj_ui_time_command_t command;
-        pj_ui_init(&ui);
-        ui.state = cases[i].state;
-        ui.stopwatch_running = 1;
-        ui.stopwatch_seconds = 42;
-        ui.timer_running = 1;
-        ui.timer_seconds = 17;
-        ui.timer_preset_seconds = 90;
-        ui.interval_running = 1;
-        ui.interval_seconds = 11;
-        ui.interval_preset_seconds = 120;
-        ui.interval_round = 4;
-
-        assert(pj_ui_handle_aux_long(&ui) == 1);
-        assert(ui.state == PJ_UI_STATE_TIME);
-        assert(pj_ui_consume_time_command(&ui, &command) == 1);
-        assert(command.type == cases[i].command);
-        if (cases[i].state == PJ_UI_STATE_STOPWATCH) {
-            assert(ui.stopwatch_running == 1 && ui.stopwatch_seconds == 42);
-        } else if (cases[i].state == PJ_UI_STATE_TIMER) {
-            assert(ui.timer_running == 1 && ui.timer_seconds == 17);
-        } else {
-            assert(ui.interval_running == 1 && ui.interval_seconds == 11);
-            assert(ui.interval_round == 4);
+    for (size_t i = 0; i < ARRAY_LEN(note_targets); i++) {
+        pj_ui_context_t context;
+        navigate_home_to(&context, PJ_LAYOUT_SLOT_HOME_NOTES);
+        assert(tap_slot(&context, PJ_LAYOUT_NOTES_3_1M,
+                        note_targets[i].slot));
+        assert(context.state == note_targets[i].state);
+        if (context.state == PJ_UI_STATE_RECORD) {
+            assert(context.record_state == PJ_RECORD_ARMING);
         }
     }
 
-    pj_ui_context_t pending;
-    pj_ui_init(&pending);
-    pending.state = PJ_UI_STATE_TIMER;
-    pending.time_command.type = PJ_UI_TIME_COMMAND_TIMER_START;
-    pending.timer_running = 1;
-    pending.timer_seconds = 30;
-    assert(pj_ui_handle_aux_long(&pending) == 0);
-    assert(pending.state == PJ_UI_STATE_TIMER);
-    assert(pending.timer_running == 1 && pending.timer_seconds == 30);
-}
-
-static void test_persistent_interval_reset_discards_stale_ui_command(void)
-{
-    static const pj_ui_time_command_type_t interval_commands[] = {
-        PJ_UI_TIME_COMMAND_INTERVAL_START,
-        PJ_UI_TIME_COMMAND_INTERVAL_PAUSE,
-        PJ_UI_TIME_COMMAND_INTERVAL_RESET,
-        PJ_UI_TIME_COMMAND_INTERVAL_SET,
+    static const struct {
+        pj_layout_slot_id_t slot;
+        pj_ui_state_t state;
+    } time_targets[] = {
+        {PJ_LAYOUT_SLOT_TIME_ALARM, PJ_UI_STATE_ALARM},
+        {PJ_LAYOUT_SLOT_TIME_STOPWATCH, PJ_UI_STATE_STOPWATCH},
+        {PJ_LAYOUT_SLOT_TIME_TIMER, PJ_UI_STATE_TIMER},
+        {PJ_LAYOUT_SLOT_TIME_INTERVAL, PJ_UI_STATE_INTERVAL},
     };
-    for (size_t i = 0; i < sizeof(interval_commands) / sizeof(interval_commands[0]); i++) {
-        pj_ui_context_t ui;
-        pj_ui_time_command_t consumed;
-        pj_ui_init(&ui);
-        ui.time_command.type = interval_commands[i];
-        ui.time_command.duration_ms = 90000;
-        assert(pj_ui_discard_pending_interval_command(&ui) == 1);
-        assert(pj_ui_consume_time_command(&ui, &consumed) == 0);
-    }
-
-    pj_ui_context_t unrelated;
-    pj_ui_init(&unrelated);
-    unrelated.time_command.type = PJ_UI_TIME_COMMAND_TIMER_START;
-    assert(pj_ui_discard_pending_interval_command(&unrelated) == 0);
-    pj_ui_time_command_t consumed;
-    assert(pj_ui_consume_time_command(&unrelated, &consumed) == 1);
-    assert(consumed.type == PJ_UI_TIME_COMMAND_TIMER_START);
-}
-
-static void test_alerts_never_replace_or_intercept_the_active_page(void)
-{
-    pj_ui_context_t ui;
-    pj_ui_time_command_t command;
-    pj_framebuffer_t before;
-    pj_framebuffer_t after;
-    pj_ui_init(&ui);
-    ui.state = PJ_UI_STATE_SETTINGS;
-    pj_ui_render(&ui, &before);
-
-    pj_ui_time_projection_t projection = time_projection_with_alert(61, PJ_TIME_ALERT_ALARM);
-    pj_ui_set_time_projection(&ui, &projection);
-    pj_ui_render(&ui, &after);
-    assert(memcmp(&before, &after, sizeof(before)) == 0);
-
-    assert(pj_ui_handle_touch(&ui, 40, 166, PJ_TOUCH_TAP) == 1);
-    assert(ui.active_alert.id == 61);
-    assert(pj_ui_consume_time_command(&ui, &command) == 0);
-    assert(ui.clock_24h == 0);
-
-    assert(pj_ui_handle_touch(&ui, 150, 166, PJ_TOUCH_TAP) == 1);
-    assert(ui.active_alert.id == 61);
-    assert(ui.state == PJ_UI_STATE_SYNC);
-    assert(pj_ui_consume_time_command(&ui, &command) == 0);
-}
-
-static void test_sync_state_is_board_driven(void)
-{
-    pj_ui_context_t ui;
-    pj_ui_init(&ui);
-    ui.state = PJ_UI_STATE_SYNC;
-    ui.sync_inventory_state = PJ_UI_SYNC_INVENTORY_PENDING;
-    pj_ui_mark_displayed(&ui);
-
-    assert(pj_ui_handle_aux_short(&ui) == 0);
-    assert(ui.state == PJ_UI_STATE_SYNC);
-    assert(pj_ui_handle_aux_long(&ui) == 1);
-    assert(ui.state == PJ_UI_STATE_SETTINGS);
-    ui.state = PJ_UI_STATE_SYNC;
-    pj_ui_mark_displayed(&ui);
-    pj_ui_set_sync_state(&ui, 4, 2, 1);
-    assert(ui.sync_pending == 4);
-    assert(ui.sync_transferred == 2);
-    assert(ui.sync_online == 1);
-    assert(ui.dirty.partial == 1);
-    assert(ui.dirty.y <= 50);
-    assert(ui.dirty.y + ui.dirty.height == PJ_DISPLAY_HEIGHT);
-
-    pj_ui_mark_displayed(&ui);
-    pj_ui_set_sync_state(&ui, -1, -2, 0);
-    assert(ui.sync_pending == 0);
-    assert(ui.sync_transferred == 0);
-    assert(ui.sync_online == 0);
-}
-
-static void test_sync_render_distinguishes_transport_and_failure_states(void)
-{
-    pj_ui_context_t ui;
-    pj_framebuffer_t pending;
-    pj_framebuffer_t active;
-    pj_framebuffer_t offline;
-    pj_framebuffer_t auth_failed;
-    pj_framebuffer_t protocol_failed;
-    pj_framebuffer_t terminal_failed;
-    pj_ui_init(&ui);
-    ui.state = PJ_UI_STATE_SYNC;
-    pj_ui_set_sync_state(&ui, 3, 1, 1);
-
-    pj_ui_set_sync_detail(&ui, "pending", 0, "", 1);
-    pj_ui_render(&ui, &pending);
-    pj_ui_set_sync_detail(&ui, "running", 0, "", 1);
-    pj_ui_render(&ui, &active);
-    pj_ui_set_sync_state(&ui, 3, 1, 0);
-    pj_ui_set_sync_detail(&ui, "offline", 0, "", 1);
-    pj_ui_render(&ui, &offline);
-    pj_ui_set_sync_detail(&ui, "auth_failed", 0, "", 1);
-    pj_ui_render(&ui, &auth_failed);
-    pj_ui_set_sync_detail(&ui, "protocol_failed", 0, "", 1);
-    pj_ui_render(&ui, &protocol_failed);
-    pj_ui_set_sync_detail(&ui, "failed", 1, "", 0);
-    pj_ui_render(&ui, &terminal_failed);
-
-    assert(count_pixel_differences_in_region(
-               &pending, &active, 0, 0, PJ_DISPLAY_WIDTH, 70) > 20);
-    assert(count_pixel_differences_in_region(
-               &offline, &auth_failed, 0, 0, PJ_DISPLAY_WIDTH, 70) > 20);
-    assert(count_pixel_differences_in_region(
-               &auth_failed, &protocol_failed,
-               0, 0, PJ_DISPLAY_WIDTH, 70) == 0);
-    assert(count_pixel_differences_in_region(
-               &auth_failed, &protocol_failed,
-               0, 145, PJ_DISPLAY_WIDTH, 55) > 20);
-    assert(count_pixel_differences_in_region(
-               &protocol_failed, &terminal_failed,
-               0, 145, PJ_DISPLAY_WIDTH, 55) > 20);
-
-    for (int band = 0; band < 5; band++) {
-        assert(count_black_pixels_in_region(&active, 0, band * 40,
-                                            PJ_DISPLAY_WIDTH, 40) > 100);
-        assert(black_row_span_in_region(&active, band * 40, 40) >= 15);
+    for (size_t i = 0; i < ARRAY_LEN(time_targets); i++) {
+        pj_ui_context_t context;
+        navigate_home_to(&context, PJ_LAYOUT_SLOT_HOME_TIME);
+        assert(tap_slot(&context, PJ_LAYOUT_TIME_4_1,
+                        time_targets[i].slot));
+        assert(context.state == time_targets[i].state);
     }
 }
 
-static void test_sync_preflight_and_success_wait_for_exact_physical_presentation(void)
+static void test_state_metadata_and_deterministic_composition(void)
 {
-    pj_ui_context_t ui;
-    uint32_t session = 0;
-    uint32_t action_generation = 0;
-    pj_ui_init(&ui);
-    ui.state = PJ_UI_STATE_SETTINGS;
-
-    assert(pj_ui_handle_touch(&ui, 150, 166, PJ_TOUCH_TAP) == 1);
-    assert(ui.state == PJ_UI_STATE_SYNC);
-    session = pj_ui_sync_session_generation(&ui);
-    assert(session != 0);
-    assert(ui.sync_inventory_state == PJ_UI_SYNC_INVENTORY_PENDING);
-    assert(pj_ui_consume_sync_preflight_request(&ui, &action_generation) == 1);
-    assert(action_generation == session);
-    assert(pj_ui_consume_sync_preflight_request(&ui, &action_generation) == 0);
-
-    uint32_t checking_presentation = pj_ui_sync_presentation_generation(&ui);
-    assert(pj_ui_sync_presentation_committed(&ui, checking_presentation) == 1);
-    assert(pj_ui_consume_sync_transfer_request(&ui, &action_generation) == 0);
-
-    pj_ui_set_sync_inventory(&ui, session, PJ_UI_SYNC_INVENTORY_READY, 4, 2, 1);
-    assert(ui.sync_pending == 4 && ui.sync_transferred == 2 && ui.sync_online == 1);
-    uint32_t inventory_presentation = pj_ui_sync_presentation_generation(&ui);
-    assert(inventory_presentation != checking_presentation);
-    assert(pj_ui_sync_presentation_committed(&ui, checking_presentation) == 0);
-    assert(pj_ui_consume_sync_transfer_request(&ui, &action_generation) == 0);
-    assert(pj_ui_sync_presentation_committed(&ui, inventory_presentation) == 1);
-    assert(pj_ui_sync_presentation_committed(&ui, inventory_presentation) == 1);
-    assert(pj_ui_consume_sync_transfer_request(&ui, &action_generation) == 1);
-    assert(action_generation == session);
-    assert(pj_ui_consume_sync_transfer_request(&ui, &action_generation) == 0);
-    assert(pj_ui_sync_presentation_committed(&ui, inventory_presentation) == 1);
-    assert(pj_ui_consume_sync_transfer_request(&ui, &action_generation) == 0);
-
-    pj_ui_set_sync_detail_for_generation(&ui, session + 1u, "succeeded", 0, "", 0);
-    assert(strcmp(ui.sync_phase, "ready") == 0);
-    pj_ui_set_sync_detail_for_generation(&ui, session, "succeeded", 0, "", 0);
-    uint32_t success_presentation = pj_ui_sync_presentation_generation(&ui);
-    assert(success_presentation != inventory_presentation);
-    assert(pj_ui_consume_sync_success_return(&ui) == 0);
-    assert(pj_ui_sync_presentation_committed(&ui, inventory_presentation) == 0);
-    assert(pj_ui_consume_sync_success_return(&ui) == 0);
-    assert(pj_ui_sync_presentation_committed(&ui, success_presentation) == 1);
-    assert(pj_ui_consume_sync_success_return(&ui) == 1);
-    assert(ui.state == PJ_UI_STATE_SETTINGS);
-    assert(pj_ui_consume_sync_success_return(&ui) == 0);
-
-    assert(pj_ui_handle_touch(&ui, 150, 166, PJ_TOUCH_TAP) == 1);
-    uint32_t newer_session = pj_ui_sync_session_generation(&ui);
-    assert(newer_session != session);
-    pj_ui_set_sync_inventory(&ui, session, PJ_UI_SYNC_INVENTORY_READY, 99, 99, 1);
-    assert(ui.sync_inventory_state == PJ_UI_SYNC_INVENTORY_PENDING);
-    assert(ui.sync_pending == 0 && ui.sync_transferred == 0);
-    assert(pj_ui_consume_sync_preflight_request(&ui, &action_generation) == 1);
-    assert(action_generation == newer_session);
-
-    pj_ui_set_sync_inventory(&ui, newer_session, PJ_UI_SYNC_INVENTORY_UNKNOWN, 0, 2, 1);
-    uint32_t unknown_presentation = pj_ui_sync_presentation_generation(&ui);
-    assert(pj_ui_sync_presentation_committed(&ui, unknown_presentation) == 1);
-    assert(pj_ui_consume_sync_transfer_request(&ui, &action_generation) == 0);
-    assert(pj_ui_handle_aux_short(&ui) == 1);
-    uint32_t retry_session = pj_ui_sync_session_generation(&ui);
-    assert(retry_session != newer_session);
-    assert(pj_ui_consume_sync_preflight_request(&ui, &action_generation) == 1);
-    assert(action_generation == retry_session);
-
-    pj_ui_set_sync_inventory(&ui, retry_session, PJ_UI_SYNC_INVENTORY_OFFLINE, 0, 2, 0);
-    uint32_t offline_presentation = pj_ui_sync_presentation_generation(&ui);
-    assert(pj_ui_sync_presentation_committed(&ui, offline_presentation) == 1);
-    assert(pj_ui_consume_sync_transfer_request(&ui, &action_generation) == 0);
-    assert(pj_ui_handle_aux_short(&ui) == 1);
-    uint32_t ready_session = pj_ui_sync_session_generation(&ui);
-    assert(ready_session != retry_session);
-    assert(pj_ui_consume_sync_preflight_request(&ui, &action_generation) == 1);
-    assert(action_generation == ready_session);
-    pj_ui_set_sync_inventory(&ui, ready_session, PJ_UI_SYNC_INVENTORY_READY, 0, 2, 1);
-    assert(ui.sync_pending == 0);
-    uint32_t zero_presentation = pj_ui_sync_presentation_generation(&ui);
-    assert(pj_ui_sync_presentation_committed(&ui, zero_presentation) == 1);
-    assert(pj_ui_consume_sync_transfer_request(&ui, &action_generation) == 1);
-    assert(action_generation == ready_session);
-}
-
-static void test_interaction_generation_tracks_hit_identity(void)
-{
-    pj_ui_context_t ui;
-    pj_ui_init(&ui);
-    uint32_t generation = pj_ui_interaction_generation(&ui);
-    assert(generation != 0);
-
-    pj_ui_set_status(&ui, 73, 19, 44);
-    assert(pj_ui_interaction_generation(&ui) == generation);
-    pj_ui_wake(&ui);
-    generation = pj_ui_interaction_generation(&ui);
-
-    const char labels[6][PJ_UI_NOTE_LABEL_LEN] = {
-        "JUL 15 08:30", "JUL 15 08:31", "JUL 15 08:32",
-        "JUL 15 08:33", "JUL 15 08:34", "JUL 15 08:35",
+    static const pj_ui_state_t parents[PJ_UI_STATE_COUNT] = {
+        [PJ_UI_STATE_STATIC] = PJ_UI_STATE_STATIC,
+        [PJ_UI_STATE_TIME_TEMP] = PJ_UI_STATE_STATIC,
+        [PJ_UI_STATE_HOME] = PJ_UI_STATE_TIME_TEMP,
+        [PJ_UI_STATE_NOTES] = PJ_UI_STATE_HOME,
+        [PJ_UI_STATE_RECORD] = PJ_UI_STATE_NOTES,
+        [PJ_UI_STATE_LISTEN] = PJ_UI_STATE_NOTES,
+        [PJ_UI_STATE_READ] = PJ_UI_STATE_NOTES,
+        [PJ_UI_STATE_TIME] = PJ_UI_STATE_HOME,
+        [PJ_UI_STATE_ALARM] = PJ_UI_STATE_TIME,
+        [PJ_UI_STATE_STOPWATCH] = PJ_UI_STATE_TIME,
+        [PJ_UI_STATE_TIMER] = PJ_UI_STATE_TIME,
+        [PJ_UI_STATE_INTERVAL] = PJ_UI_STATE_TIME,
+        [PJ_UI_STATE_SETTINGS] = PJ_UI_STATE_HOME,
+        [PJ_UI_STATE_SYNC] = PJ_UI_STATE_SETTINGS,
+        [PJ_UI_STATE_VOLUME] = PJ_UI_STATE_SETTINGS,
+        [PJ_UI_STATE_NOTE_DETAIL] = PJ_UI_STATE_LISTEN,
     };
-    pj_ui_set_notes(&ui, 6, labels);
-    assert(pj_ui_interaction_generation(&ui) == generation);
-
-    ui.state = PJ_UI_STATE_LISTEN;
-    char changed[6][PJ_UI_NOTE_LABEL_LEN];
-    memcpy(changed, labels, sizeof(changed));
-    (void)snprintf(changed[3], sizeof(changed[3]), "%s", "JUL 15 09:33");
-    pj_ui_set_notes(&ui, 6, changed);
-    generation = pj_ui_interaction_generation(&ui);
-    assert(pj_ui_handle_touch(&ui, 150, 160, PJ_TOUCH_TAP));
-    assert(pj_ui_interaction_generation(&ui) != generation);
-
-    ui.state = PJ_UI_STATE_STOPWATCH;
-    generation = pj_ui_interaction_generation(&ui);
-    pj_ui_time_projection_t projection = {
-        .stopwatch_running = 1,
-        .stopwatch_elapsed_ms = 42000,
-    };
-    pj_ui_set_time_projection(&ui, &projection);
-    assert(pj_ui_interaction_generation(&ui) != generation);
-    generation = pj_ui_interaction_generation(&ui);
-    projection.stopwatch_elapsed_ms = 43000;
-    pj_ui_set_time_projection(&ui, &projection);
-    assert(pj_ui_interaction_generation(&ui) == generation);
-
-    ui.state = PJ_UI_STATE_TIMER;
-    projection = (pj_ui_time_projection_t) {
-        .timer_remaining_ms = 330000,
-    };
-    pj_ui_set_time_projection(&ui, &projection);
-    assert(pj_ui_interaction_generation(&ui) != generation);
-    generation = pj_ui_interaction_generation(&ui);
-    projection.timer_running = 1;
-    pj_ui_set_time_projection(&ui, &projection);
-    assert(pj_ui_interaction_generation(&ui) != generation);
-    generation = pj_ui_interaction_generation(&ui);
-    projection.timer_remaining_ms = 329000;
-    pj_ui_set_time_projection(&ui, &projection);
-    assert(pj_ui_interaction_generation(&ui) == generation);
-
-    ui.state = PJ_UI_STATE_INTERVAL;
-    projection = (pj_ui_time_projection_t) {
-        .interval_running = 1,
-        .interval_remaining_ms = 90000,
-    };
-    pj_ui_set_time_projection(&ui, &projection);
-    assert(pj_ui_interaction_generation(&ui) != generation);
-    generation = pj_ui_interaction_generation(&ui);
-    projection.interval_remaining_ms = 89000;
-    pj_ui_set_time_projection(&ui, &projection);
-    assert(pj_ui_interaction_generation(&ui) == generation);
-    projection.interval_running = 0;
-    pj_ui_set_time_projection(&ui, &projection);
-    assert(pj_ui_interaction_generation(&ui) != generation);
-    generation = pj_ui_interaction_generation(&ui);
-    assert(pj_ui_handle_touch(&ui, 150, 175, PJ_TOUCH_TAP));
-    assert(pj_ui_interaction_generation(&ui) != generation);
-    pj_ui_time_command_t command;
-    assert(pj_ui_consume_time_command(&ui, &command));
-    assert(command.type == PJ_UI_TIME_COMMAND_INTERVAL_SET);
-
-    ui.state = PJ_UI_STATE_NOTE_DETAIL;
-    pj_ui_set_audio_state(&ui, 0, 1);
-    assert(pj_ui_interaction_generation(&ui) != generation);
-    generation = pj_ui_interaction_generation(&ui);
-    assert(pj_ui_handle_touch(&ui, 100, 100, PJ_TOUCH_TAP));
-    assert(pj_ui_interaction_generation(&ui) != generation);
-
-    ui.state = PJ_UI_STATE_ALARM;
-    generation = pj_ui_interaction_generation(&ui);
-    assert(pj_ui_handle_aux_short(&ui));
-    assert(pj_ui_interaction_generation(&ui) != generation);
-
-    ui.state = PJ_UI_STATE_SETTINGS;
-    generation = pj_ui_interaction_generation(&ui);
-    assert(pj_ui_handle_touch(&ui, 150, 50, PJ_TOUCH_TAP));
-    assert(pj_ui_interaction_generation(&ui) != generation);
-    generation = pj_ui_interaction_generation(&ui);
-    assert(pj_ui_handle_touch(&ui, 50, 150, PJ_TOUCH_TAP));
-    assert(pj_ui_interaction_generation(&ui) != generation);
-
-    ui.state = PJ_UI_STATE_SYNC;
-    generation = pj_ui_interaction_generation(&ui);
-    pj_ui_set_sync_detail(&ui, "failed", 1, "offline", 0);
-    assert(pj_ui_interaction_generation(&ui) != generation);
-}
-
-static void test_dirty_lifecycle(void)
-{
-    pj_ui_context_t ui;
-    pj_ui_init(&ui);
-
-    assert(pj_ui_is_dirty(&ui) == 1);
-    assert(ui.dirty.partial == 0);
-
-    pj_ui_set_status(&ui, 42, 21, 45);
-    assert(pj_ui_is_dirty(&ui) == 1);
-    assert(ui.dirty.partial == 0);
-
-    pj_ui_mark_displayed(&ui);
-    assert(pj_ui_is_dirty(&ui) == 0);
-
-    pj_ui_wake(&ui);
-    pj_ui_mark_displayed(&ui);
-    pj_ui_set_status(&ui, 43, 22, 46);
-    assert(pj_ui_is_dirty(&ui) == 0);
-    assert(pj_ui_handle_aux_long(&ui) == 1);
-    assert(ui.state == PJ_UI_STATE_TIME_TEMP);
-    pj_ui_mark_displayed(&ui);
-    pj_ui_set_status(&ui, 44, 23, 47);
-    assert(pj_ui_is_dirty(&ui) == 1);
-    assert(ui.dirty.partial == 1);
-    assert(ui.dirty.y == 118);
-
-    pj_ui_mark_displayed(&ui);
-    pj_ui_set_time(&ui, 10, 42, 2026, 6, 6);
-    assert(pj_ui_is_dirty(&ui) == 1);
-    assert(ui.dirty.partial == 1);
-    assert(ui.dirty.x == 0);
-    assert(ui.dirty.y == 0);
-    assert(ui.dirty.width == PJ_DISPLAY_WIDTH);
-    assert(ui.dirty.height == 84);
-
-    pj_ui_mark_displayed(&ui);
-    pj_ui_set_time(&ui, 10, 43, 2026, 6, 7);
-    assert(pj_ui_is_dirty(&ui) == 1);
-    assert(ui.dirty.partial == 0);
-
-    pj_ui_request_full_refresh(&ui);
-    assert(pj_ui_is_dirty(&ui) == 1);
-    assert(ui.dirty.partial == 0);
-}
-
-static void test_dynamic_updates_force_periodic_full_refresh(void)
-{
-    pj_ui_context_t ui;
-    pj_ui_init(&ui);
-    ui.state = PJ_UI_STATE_STOPWATCH;
-    ui.stopwatch_running = 1;
-    pj_ui_mark_displayed(&ui);
-
-    for (int update = 1; update <= 120; update++) {
-        pj_ui_time_projection_t projection = projection_from_ui(&ui);
-        projection.stopwatch_elapsed_ms = (uint64_t)update * 1000u;
-        pj_ui_set_time_projection(&ui, &projection);
-        assert(ui.dirty.partial == 1);
-        assert(ui.dirty.x == 0 && ui.dirty.y == 0);
-        assert(ui.dirty.width == PJ_DISPLAY_WIDTH && ui.dirty.height == 100);
-        pj_ui_mark_displayed(&ui);
-    }
-    assert(ui.partial_refresh_count == 120);
-    assert(pj_ui_is_dirty(&ui) == 0);
-}
-
-static void test_recording_elapsed_projection_is_bounded_and_monotonic_by_seconds(void)
-{
-    pj_ui_context_t ui;
-    pj_ui_init(&ui);
-    ui.state = PJ_UI_STATE_RECORD;
-    ui.record_state = PJ_RECORD_ACTIVE;
-    pj_ui_mark_displayed(&ui);
-
-    pj_ui_set_recording_elapsed(&ui, 1999);
-    assert(ui.recording_seconds == 1);
-    assert(ui.dirty.partial == 1);
-    assert(ui.dirty.y == 55 && ui.dirty.height == 90);
-    pj_ui_mark_displayed(&ui);
-    assert(pj_ui_tick(&ui) == 0);
-    assert(ui.recording_seconds == 1);
-    assert(pj_ui_is_dirty(&ui) == 0);
-    pj_ui_set_recording_elapsed(&ui, 1999);
-    assert(pj_ui_is_dirty(&ui) == 0);
-    pj_ui_set_recording_elapsed(&ui, 2000);
-    assert(ui.recording_seconds == 2);
-    assert(ui.dirty.partial == 1);
-    pj_ui_mark_displayed(&ui);
-    pj_ui_set_recording_elapsed(&ui, 1000);
-    assert(ui.recording_seconds == 2);
-    assert(pj_ui_is_dirty(&ui) == 0);
-
-    ui.record_state = PJ_RECORD_IDLE;
-    pj_ui_set_recording_elapsed(&ui, 0);
-    assert(ui.recording_seconds == 0);
-}
-
-static void test_time_projection_uses_one_hz_model_granularity(void)
-{
-    pj_ui_context_t stopwatch;
-    pj_ui_context_t timer;
-    pj_ui_context_t interval;
-    pj_ui_time_projection_t projection = {0};
-
-    pj_ui_init(&stopwatch);
-    stopwatch.state = PJ_UI_STATE_STOPWATCH;
-    projection.stopwatch_running = 1;
-    projection.stopwatch_elapsed_ms = 1001;
-    pj_ui_set_time_projection(&stopwatch, &projection);
-    assert(stopwatch.stopwatch_seconds == 1);
-    pj_ui_mark_displayed(&stopwatch);
-    projection.stopwatch_elapsed_ms = 1999;
-    pj_ui_set_time_projection(&stopwatch, &projection);
-    assert(stopwatch.stopwatch_seconds == 1 && !pj_ui_is_dirty(&stopwatch));
-    projection.stopwatch_elapsed_ms = 2000;
-    pj_ui_set_time_projection(&stopwatch, &projection);
-    assert(stopwatch.stopwatch_seconds == 2 && pj_ui_is_dirty(&stopwatch));
-
-    memset(&projection, 0, sizeof(projection));
-    pj_ui_init(&timer);
-    timer.state = PJ_UI_STATE_TIMER;
-    projection.timer_running = 1;
-    projection.timer_remaining_ms = 2999;
-    pj_ui_set_time_projection(&timer, &projection);
-    assert(timer.timer_seconds == 3);
-    pj_ui_mark_displayed(&timer);
-    projection.timer_remaining_ms = 2001;
-    pj_ui_set_time_projection(&timer, &projection);
-    assert(timer.timer_seconds == 3 && !pj_ui_is_dirty(&timer));
-    projection.timer_remaining_ms = 2000;
-    pj_ui_set_time_projection(&timer, &projection);
-    assert(timer.timer_seconds == 2 && pj_ui_is_dirty(&timer));
-
-    memset(&projection, 0, sizeof(projection));
-    pj_ui_init(&interval);
-    interval.state = PJ_UI_STATE_INTERVAL;
-    projection.interval_running = 1;
-    projection.interval_remaining_ms = 59999;
-    pj_ui_set_time_projection(&interval, &projection);
-    assert(interval.interval_seconds == 60);
-    pj_ui_mark_displayed(&interval);
-    projection.interval_remaining_ms = 59001;
-    pj_ui_set_time_projection(&interval, &projection);
-    assert(interval.interval_seconds == 60 && !pj_ui_is_dirty(&interval));
-    projection.interval_remaining_ms = 59000;
-    pj_ui_set_time_projection(&interval, &projection);
-    assert(interval.interval_seconds == 59 && pj_ui_is_dirty(&interval));
-}
-
-static void test_time_partial_projection_matches_full_model_render(void)
-{
-    const pj_ui_state_t states[] = {
-        PJ_UI_STATE_STOPWATCH,
-        PJ_UI_STATE_TIMER,
-        PJ_UI_STATE_INTERVAL,
-    };
-    for (size_t i = 0; i < sizeof(states) / sizeof(states[0]); i++) {
-        pj_ui_context_t ui;
-        pj_ui_context_t expected_ui;
-        pj_framebuffer_t actual;
-        pj_framebuffer_t expected;
-        pj_ui_init(&ui);
-        ui.state = states[i];
-        pj_ui_render(&ui, &actual);
-        pj_ui_mark_displayed(&ui);
-
-        pj_ui_time_projection_t projection = {
-            .stopwatch_running = 1,
-            .stopwatch_elapsed_ms = 43000,
-            .timer_running = 1,
-            .timer_remaining_ms = 17000,
-            .interval_running = 1,
-            .interval_remaining_ms = 11000,
-            .interval_phase = 4,
-        };
-        pj_ui_set_time_projection(&ui, &projection);
-        assert(ui.dirty.partial == 1);
-        pj_ui_render(&ui, &actual);
-
-        expected_ui = ui;
-        pj_ui_request_full_refresh(&expected_ui);
-        pj_ui_render(&expected_ui, &expected);
-        assert(memcmp(&actual, &expected, sizeof(actual)) == 0);
-    }
-}
-
-static void set_projected_seconds(pj_ui_time_projection_t *projection,
-                                  pj_ui_state_t state, int seconds, int running)
-{
-    if (state == PJ_UI_STATE_STOPWATCH) {
-        projection->stopwatch_running = running;
-        projection->stopwatch_elapsed_ms = (uint64_t)seconds * 1000u;
-    } else if (state == PJ_UI_STATE_TIMER) {
-        projection->timer_running = running;
-        projection->timer_remaining_ms = (uint64_t)seconds * 1000u;
-    } else {
-        projection->interval_running = running;
-        projection->interval_remaining_ms = (uint64_t)seconds * 1000u;
-    }
-}
-
-static void seed_time_seconds(pj_ui_context_t *ui, pj_ui_state_t state,
-                              int seconds, int running)
-{
-    ui->state = state;
-    if (state == PJ_UI_STATE_STOPWATCH) {
-        ui->stopwatch_seconds = seconds;
-        ui->stopwatch_running = running;
-    } else if (state == PJ_UI_STATE_TIMER) {
-        ui->timer_seconds = seconds;
-        ui->timer_preset_seconds = seconds;
-        ui->timer_running = running;
-    } else {
-        ui->interval_seconds = seconds;
-        ui->interval_preset_seconds = seconds;
-        ui->interval_running = running;
-        ui->interval_round = 4;
-    }
-}
-
-static void assert_seconds_sequence_dirty(const pj_ui_state_t state,
-                                          const int *seconds, size_t count)
-{
-    pj_ui_context_t ui;
-    pj_framebuffer_t before;
-    pj_framebuffer_t after;
-    pj_ui_init(&ui);
-    seed_time_seconds(&ui, state, seconds[0], 1);
-    pj_ui_render(&ui, &before);
-
-    for (size_t i = 1; i < count; i++) {
-        pj_ui_mark_displayed(&ui);
-        pj_ui_time_projection_t projection = projection_from_ui(&ui);
-        set_projected_seconds(&projection, state, seconds[i], 1);
-        pj_ui_set_time_projection(&ui, &projection);
-        pj_ui_dirty_region_t dirty = pj_ui_dirty_region(&ui);
-        assert(dirty.partial == 1);
-        assert(dirty.x == 0 && dirty.y == 0);
-        assert(dirty.width == PJ_DISPLAY_WIDTH && dirty.height == 100);
-        after = before;
-        pj_ui_render(&ui, &after);
-        assert_frame_changes_are_inside_dirty(&before, &after, dirty);
-        assert(count_pixel_differences_in_region(
-                   &before, &after, 0, 100, PJ_DISPLAY_WIDTH, 100) == 0);
-        before = after;
-    }
-}
-
-static void test_time_digit_carries_stay_inside_value_dirty_region(void)
-{
-    static const int stopwatch[] = {9, 10, 19, 20, 40, 41, 42, 59, 60};
-    static const int countdown[] = {10, 9, 20, 19, 42, 41, 40, 60, 59};
-    assert_seconds_sequence_dirty(PJ_UI_STATE_STOPWATCH, stopwatch,
-                                  sizeof(stopwatch) / sizeof(stopwatch[0]));
-    assert_seconds_sequence_dirty(PJ_UI_STATE_TIMER, countdown,
-                                  sizeof(countdown) / sizeof(countdown[0]));
-    assert_seconds_sequence_dirty(PJ_UI_STATE_INTERVAL, countdown,
-                                  sizeof(countdown) / sizeof(countdown[0]));
-}
-
-static void test_play_pause_changes_only_the_declared_control_region(void)
-{
-    static const pj_ui_state_t states[] = {
-        PJ_UI_STATE_STOPWATCH, PJ_UI_STATE_TIMER, PJ_UI_STATE_INTERVAL,
-    };
-    for (size_t i = 0; i < sizeof(states) / sizeof(states[0]); i++) {
-        pj_ui_context_t ui;
-        pj_framebuffer_t before;
-        pj_framebuffer_t after;
-        pj_ui_init(&ui);
-        seed_time_seconds(&ui, states[i], 42, 0);
-        pj_ui_render(&ui, &before);
-
-        for (int running = 1; running >= 0; running--) {
-            pj_ui_mark_displayed(&ui);
-            pj_ui_time_projection_t projection = projection_from_ui(&ui);
-            set_projected_seconds(&projection, states[i], 42, running);
-            pj_ui_set_time_projection(&ui, &projection);
-            pj_ui_dirty_region_t dirty = pj_ui_dirty_region(&ui);
-            assert(dirty.partial == 1 && dirty.x == 0 && dirty.y == 100);
-            assert(dirty.width == 100);
-            assert(dirty.height == (states[i] == PJ_UI_STATE_STOPWATCH ? 100 : 50));
-            after = before;
-            pj_ui_render(&ui, &after);
-            assert_frame_changes_are_inside_dirty(&before, &after, dirty);
-            assert(count_pixel_differences_in_region(
-                       &before, &after, 0, 0, PJ_DISPLAY_WIDTH, 100) == 0);
-            before = after;
-        }
-    }
-}
-
-static void test_rapid_time_adjustments_compose_and_keep_controls_stable(void)
-{
-    pj_ui_context_t ui;
-    pj_ui_time_command_t command;
-    pj_framebuffer_t before;
-    pj_framebuffer_t after;
-    static const int timer_expected[] = {60, 90, 60};
-    static const int timer_x[] = {150, 150, 50};
-
-    pj_ui_init(&ui);
-    seed_time_seconds(&ui, PJ_UI_STATE_TIMER, 30, 0);
-    pj_ui_render(&ui, &before);
-    for (size_t i = 0; i < sizeof(timer_expected) / sizeof(timer_expected[0]); i++) {
-        pj_ui_mark_displayed(&ui);
-        assert(pj_ui_handle_touch(&ui, timer_x[i], 177, PJ_TOUCH_TAP) == 1);
-        assert(ui.timer_seconds == timer_expected[i]);
-        assert(ui.timer_preset_seconds == timer_expected[i]);
-        assert(pj_ui_consume_time_command(&ui, &command) == 1);
-        assert(command.type == PJ_UI_TIME_COMMAND_TIMER_SET);
-        assert(command.duration_ms == (uint64_t)timer_expected[i] * 1000u);
-        pj_ui_dirty_region_t dirty = pj_ui_dirty_region(&ui);
-        after = before;
-        pj_ui_render(&ui, &after);
-        assert_frame_changes_are_inside_dirty(&before, &after, dirty);
-        assert(count_pixel_differences_in_region(
-                   &before, &after, 0, 100, PJ_DISPLAY_WIDTH, 100) == 0);
-        before = after;
-    }
-
-    static const int interval_expected[] = {120, 180, 120};
-    static const int interval_x[] = {150, 150, 50};
-    pj_ui_init(&ui);
-    seed_time_seconds(&ui, PJ_UI_STATE_INTERVAL, 60, 1);
-    pj_ui_render(&ui, &before);
-    for (size_t i = 0; i < sizeof(interval_expected) / sizeof(interval_expected[0]); i++) {
-        pj_ui_mark_displayed(&ui);
-        assert(pj_ui_handle_touch(&ui, interval_x[i], 177, PJ_TOUCH_TAP) == 1);
-        assert(ui.interval_running == 1);
-        assert(ui.interval_seconds == interval_expected[i]);
-        assert(ui.interval_preset_seconds == interval_expected[i]);
-        assert(pj_ui_consume_time_command(&ui, &command) == 1);
-        assert(command.type == PJ_UI_TIME_COMMAND_INTERVAL_SET);
-        assert(command.duration_ms == (uint64_t)interval_expected[i] * 1000u);
-        assert(command.secondary_duration_ms == command.duration_ms);
-        pj_ui_dirty_region_t dirty = pj_ui_dirty_region(&ui);
-        after = before;
-        pj_ui_render(&ui, &after);
-        assert_frame_changes_are_inside_dirty(&before, &after, dirty);
-        assert(count_pixel_differences_in_region(
-                   &before, &after, 0, 100, PJ_DISPLAY_WIDTH, 100) == 0);
-        before = after;
-    }
-}
-
-static void test_inactive_time_pages_render_their_durable_presets(void)
-{
-    pj_ui_context_t preset;
-    pj_ui_context_t projected;
-    pj_framebuffer_t preset_fb;
-    pj_framebuffer_t projected_fb;
-
-    pj_ui_init(&preset);
-    pj_ui_init(&projected);
-    preset.state = projected.state = PJ_UI_STATE_TIMER;
-    preset.timer_seconds = 0;
-    preset.timer_preset_seconds = 330;
-    projected.timer_seconds = 330;
-    projected.timer_preset_seconds = 330;
-    pj_ui_render(&preset, &preset_fb);
-    pj_ui_render(&projected, &projected_fb);
-    assert(memcmp(&preset_fb, &projected_fb, sizeof(preset_fb)) == 0);
-
-    preset.state = projected.state = PJ_UI_STATE_INTERVAL;
-    preset.interval_seconds = 0;
-    preset.interval_preset_seconds = 150;
-    projected.interval_seconds = 150;
-    projected.interval_preset_seconds = 150;
-    pj_ui_render(&preset, &preset_fb);
-    pj_ui_render(&projected, &projected_fb);
-    assert(memcmp(&preset_fb, &projected_fb, sizeof(preset_fb)) == 0);
-}
-
-static void test_partial_render_preserves_outside_region(void)
-{
-    pj_ui_context_t ui;
-    pj_framebuffer_t before;
-    pj_framebuffer_t after;
-    pj_ui_init(&ui);
-    pj_ui_wake(&ui);
-    assert(pj_ui_handle_aux_long(&ui) == 1);
-    pj_ui_render(&ui, &before);
-    after = before;
-    pj_ui_mark_displayed(&ui);
-
-    pj_ui_set_status(&ui, 41, 23, 47);
-    assert(ui.dirty.partial == 1);
-    pj_ui_render(&ui, &after);
-
-    for (int y = 0; y < ui.dirty.y; y++) {
-        for (int x = 0; x < PJ_DISPLAY_WIDTH; x++) {
-            assert(pj_framebuffer_get(&after, x, y) == pj_framebuffer_get(&before, x, y));
-        }
-    }
-}
-
-static void test_record_partial_render_replaces_status_through_bottom_edge(void)
-{
-    pj_ui_context_t ui;
-    pj_ui_context_t expected_ui;
-    pj_framebuffer_t before;
-    pj_framebuffer_t partial;
-    pj_framebuffer_t expected;
-    pj_ui_init(&ui);
-    ui.state = PJ_UI_STATE_RECORD;
-    ui.record_state = PJ_RECORD_IDLE;
-    pj_ui_render(&ui, &partial);
-    before = partial;
-    pj_ui_mark_displayed(&ui);
-
-    pj_ui_set_audio_state(&ui, 1, 0);
-    assert(ui.state == PJ_UI_STATE_RECORD);
-    assert(ui.record_state == PJ_RECORD_ACTIVE);
-    assert(ui.dirty.partial == 1);
-    assert(ui.dirty.x == 0 && ui.dirty.y == 0);
-    assert(ui.dirty.width == PJ_DISPLAY_WIDTH);
-    assert(ui.dirty.y + ui.dirty.height == PJ_DISPLAY_HEIGHT);
-    assert(pj_ui_tick(&ui) == 0);
-    pj_ui_set_recording_elapsed(&ui, 1000);
-    pj_ui_render(&ui, &partial);
-
-    expected_ui = ui;
-    pj_ui_request_full_refresh(&expected_ui);
-    pj_ui_render(&expected_ui, &expected);
-    assert(memcmp(&partial, &expected, sizeof(expected)) == 0);
-    assert(count_pixel_differences_in_region(
-               &before, &partial, 0, 0, PJ_DISPLAY_WIDTH, PJ_DISPLAY_HEIGHT) > 0);
-}
-
-static void test_child_screens_have_no_back_affordance_or_hidden_touch_target(void)
-{
-    pj_ui_context_t ui;
-    pj_ui_init(&ui);
-
-    ui.state = PJ_UI_STATE_TIMER;
-    (void)pj_ui_handle_touch(&ui, 16, 16, PJ_TOUCH_TAP);
-    assert(ui.state == PJ_UI_STATE_TIMER);
-    assert(pj_ui_handle_touch(&ui, 100, 100, PJ_TOUCH_LONG_PRESS) == 0);
-    assert(ui.state == PJ_UI_STATE_TIMER);
-    assert(pj_ui_handle_touch(&ui, 100, 100, PJ_TOUCH_SWIPE_RIGHT) == 0);
-    assert(ui.state == PJ_UI_STATE_TIMER);
-
-    ui.state = PJ_UI_STATE_LISTEN;
-    (void)pj_ui_handle_touch(&ui, 16, 16, PJ_TOUCH_TAP);
-    assert(ui.state == PJ_UI_STATE_LISTEN);
-
-    ui.state = PJ_UI_STATE_READ;
-    (void)pj_ui_handle_touch(&ui, 16, 16, PJ_TOUCH_TAP);
-    assert(ui.state == PJ_UI_STATE_READ);
-
-    ui.state = PJ_UI_STATE_NOTE_DETAIL;
-    ui.note_detail_transcript = 1;
-    (void)pj_ui_handle_touch(&ui, 16, 16, PJ_TOUCH_TAP);
-    assert(ui.state == PJ_UI_STATE_NOTE_DETAIL);
-}
-
-static void test_voice_note_back_paths_are_consistent(void)
-{
-    const pj_ui_state_t states[] = {
-        PJ_UI_STATE_LISTEN, PJ_UI_STATE_READ, PJ_UI_STATE_NOTE_DETAIL,
-    };
-    const pj_ui_state_t parents[] = {
-        PJ_UI_STATE_NOTES, PJ_UI_STATE_NOTES, PJ_UI_STATE_LISTEN,
-    };
-    for (size_t i = 0; i < sizeof(states) / sizeof(states[0]); i++) {
-        pj_ui_context_t ui;
-        pj_ui_init(&ui);
-        ui.state = states[i];
-        assert(pj_ui_handle_aux_long(&ui) == 1);
-        assert(ui.state == parents[i]);
-    }
-
-    pj_ui_context_t ui;
-    pj_ui_init(&ui);
-    ui.state = PJ_UI_STATE_NOTE_DETAIL;
-    ui.note_detail_transcript = 1;
-    assert(pj_ui_handle_aux_long(&ui) == 1);
-    assert(ui.state == PJ_UI_STATE_READ);
-
-    pj_ui_init(&ui);
-    ui.state = PJ_UI_STATE_NOTE_DETAIL;
-    ui.playback_state = PJ_PLAYBACK_ACTIVE;
-    assert(pj_ui_handle_aux_long(&ui) == 1);
-    assert(ui.state == PJ_UI_STATE_LISTEN);
-    assert(ui.playback_state == PJ_PLAYBACK_STOPPING);
-    assert(ui.playback_exit_pending == 1);
-    pj_ui_set_audio_state(&ui, 0, 0);
-    assert(ui.state == PJ_UI_STATE_LISTEN);
-
-    pj_ui_init(&ui);
-    ui.state = PJ_UI_STATE_NOTE_DETAIL;
-    ui.playback_state = PJ_PLAYBACK_ACTIVE;
-    assert(pj_ui_handle_aux_short(&ui) == 1);
-    assert(ui.playback_state == PJ_PLAYBACK_STOPPING);
-    assert(pj_ui_handle_aux_long(&ui) == 1);
-    assert(ui.state == PJ_UI_STATE_LISTEN);
-    assert(ui.playback_exit_pending == 1);
-
-    pj_ui_init(&ui);
-    ui.state = PJ_UI_STATE_RECORD;
-    ui.record_state = PJ_RECORD_ACTIVE;
-    assert(pj_ui_handle_aux_short(&ui) == 1);
-    assert(ui.state == PJ_UI_STATE_HOME);
-    assert(ui.record_state == PJ_RECORD_STOPPING);
-}
-
-static void test_note_detail_back_restores_selected_page(void)
-{
-    const char labels[6][PJ_UI_NOTE_LABEL_LEN] = {
-        "One", "Two", "Three", "Four", "Five", "Six",
-    };
-
-    for (int transcript = 0; transcript < 2; transcript++) {
-        pj_ui_context_t ui;
-        pj_ui_init(&ui);
-        pj_ui_set_notes(&ui, 6, labels);
-        ui.state = transcript ? PJ_UI_STATE_READ : PJ_UI_STATE_LISTEN;
-        ui.note_page = 1;
-        ui.focus_index = 4;
-        assert(pj_ui_handle_touch(&ui, 100, 75, PJ_TOUCH_TAP) == 1);
-        assert(ui.state == PJ_UI_STATE_NOTE_DETAIL && ui.selected_note == 4);
-        assert(pj_ui_handle_aux_long(&ui) == 1);
-        assert(ui.state == (transcript ? PJ_UI_STATE_READ : PJ_UI_STATE_LISTEN));
-        assert(ui.note_page == 1 && ui.focus_index == 4);
-    }
-
-    pj_ui_context_t playback;
-    pj_ui_init(&playback);
-    pj_ui_set_notes(&playback, 6, labels);
-    playback.state = PJ_UI_STATE_LISTEN;
-    playback.note_page = 1;
-    playback.focus_index = 4;
-    assert(pj_ui_handle_touch(&playback, 100, 75, PJ_TOUCH_TAP) == 1);
-    assert(pj_ui_handle_aux_short(&playback) == 1);
-    assert(playback.playback_state == PJ_PLAYBACK_ACTIVE);
-    assert(pj_ui_handle_aux_long(&playback) == 1);
-    assert(playback.state == PJ_UI_STATE_LISTEN);
-    pj_framebuffer_t returned;
-    pj_framebuffer_t settled;
-    pj_ui_render(&playback, &returned);
-    pj_ui_context_t settled_ui = playback;
-    settled_ui.playback_state = PJ_PLAYBACK_IDLE;
-    settled_ui.playback_exit_pending = 0;
-    pj_ui_render(&settled_ui, &settled);
-    assert(memcmp(&returned, &settled, sizeof(returned)) == 0);
-    pj_ui_set_audio_state(&playback, 0, 0);
-    assert(playback.state == PJ_UI_STATE_LISTEN);
-    assert(playback.note_page == 1 && playback.focus_index == 4);
-}
-
-static void test_twelve_hour_alarm_distinguishes_am_and_pm(void)
-{
-    pj_ui_context_t ui;
-    pj_framebuffer_t morning;
-    pj_framebuffer_t evening;
-    pj_ui_init(&ui);
-    ui.state = PJ_UI_STATE_ALARM;
-    ui.clock_24h = 0;
-    ui.alarm_hour = 7;
-    pj_ui_render(&ui, &morning);
-    ui.alarm_hour = 19;
-    pj_ui_render(&ui, &evening);
-    assert(memcmp(&morning, &evening, sizeof(morning)) != 0);
-}
-
-static void test_twelve_hour_time_temp_omits_am_pm_suffix(void)
-{
-    pj_ui_context_t ui;
-    pj_framebuffer_t morning;
-    pj_framebuffer_t evening;
-    pj_ui_init(&ui);
-    ui.state = PJ_UI_STATE_TIME_TEMP;
-    ui.clock_24h = 0;
-    ui.hour = 7;
-    ui.minute = 41;
-    pj_ui_render(&ui, &morning);
-    ui.hour = 19;
-    pj_ui_render(&ui, &evening);
-    assert(memcmp(&morning, &evening, sizeof(morning)) == 0);
-}
-
-static void test_clock_always_shows_celsius_and_fahrenheit(void)
-{
-    pj_ui_context_t celsius_first;
-    pj_ui_context_t fahrenheit_first;
-    pj_framebuffer_t celsius_first_fb;
-    pj_framebuffer_t fahrenheit_first_fb;
-    pj_ui_init(&celsius_first);
-    pj_ui_init(&fahrenheit_first);
-    celsius_first.state = PJ_UI_STATE_TIME_TEMP;
-    fahrenheit_first.state = PJ_UI_STATE_TIME_TEMP;
-    fahrenheit_first.temperature_fahrenheit = 1;
-    pj_ui_render(&celsius_first, &celsius_first_fb);
-    pj_ui_render(&fahrenheit_first, &fahrenheit_first_fb);
-
-    assert(memcmp(&celsius_first_fb, &fahrenheit_first_fb,
-                  sizeof(celsius_first_fb)) != 0);
-    assert(count_black_pixels_in_region(&celsius_first_fb, 0, 118, 200, 44) > 500);
-    assert(count_black_pixels_in_region(&fahrenheit_first_fb, 0, 118, 200, 44) > 500);
-}
-
-static void test_settings_labels_stay_inside_quadrant_borders(void)
-{
-    pj_ui_context_t ui;
-    pj_framebuffer_t fb;
-    pj_ui_init(&ui);
-    ui.state = PJ_UI_STATE_SETTINGS;
-    pj_ui_render(&ui, &fb);
-
-    for (int row = 0; row < 2; row++) {
-        for (int column = 0; column < 2; column++) {
-            int x = column * 100;
-            int y = row * 100;
-            assert(count_black_pixels_in_region(&fb, x + 3, y + 12, 1, 76) == 0);
-            assert(count_black_pixels_in_region(&fb, x + 96, y + 12, 1, 76) == 0);
-            assert(count_black_pixels_in_region(&fb, x + 8, y + 8, 84, 84) > 50);
-        }
-    }
-}
-
-static void test_text_rendering_is_uppercase_at_the_boundary(void)
-{
-    pj_ui_context_t mixed;
-    pj_ui_context_t upper;
-    pj_framebuffer_t mixed_fb;
-    pj_framebuffer_t upper_fb;
-    const char mixed_labels[][PJ_UI_NOTE_LABEL_LEN] = {"Tall Letters Qgj"};
-    const char upper_labels[][PJ_UI_NOTE_LABEL_LEN] = {"TALL LETTERS QGJ"};
-
-    assert(strcmp(pj_ui_default_font_name(), "IBM Plex Mono Bold") == 0);
-
-    pj_ui_init(&mixed);
-    pj_ui_init(&upper);
-    pj_ui_set_notes(&mixed, 1, mixed_labels);
-    pj_ui_set_notes(&upper, 1, upper_labels);
-    mixed.state = PJ_UI_STATE_READ;
-    upper.state = PJ_UI_STATE_READ;
-    pj_ui_render(&mixed, &mixed_fb);
-    pj_ui_render(&upper, &upper_fb);
-    assert(memcmp(&mixed_fb, &upper_fb, sizeof(mixed_fb)) == 0);
-}
-
-static void test_audio_note_rows_render_datetime_without_rec_prefix(void)
-{
-    pj_ui_context_t filename;
-    pj_ui_context_t datetime;
-    pj_ui_context_t prefixed;
-    pj_ui_context_t plain;
-    pj_framebuffer_t filename_fb;
-    pj_framebuffer_t datetime_fb;
-    pj_framebuffer_t prefixed_fb;
-    pj_framebuffer_t plain_fb;
-    const char filename_label[][PJ_UI_NOTE_LABEL_LEN] = {
-        "REC 20260715 0833 001",
-        "REC 20260101 0000 000",
-        "REC 20261231 2359 999",
-    };
-    const char datetime_label[][PJ_UI_NOTE_LABEL_LEN] = {
-        "JUL 15 08:33",
-        "JAN 01 00:00",
-        "DEC 31 23:59",
-    };
-    const char prefixed_label[][PJ_UI_NOTE_LABEL_LEN] = {
-        "REC MORNING IDEA",
-    };
-    const char plain_label[][PJ_UI_NOTE_LABEL_LEN] = {
-        "MORNING IDEA",
-    };
-
-    pj_ui_init(&filename);
-    pj_ui_init(&datetime);
-    pj_ui_init(&prefixed);
-    pj_ui_init(&plain);
-    pj_ui_set_notes(&filename, 3, filename_label);
-    pj_ui_set_notes(&datetime, 3, datetime_label);
-    pj_ui_set_notes(&prefixed, 1, prefixed_label);
-    pj_ui_set_notes(&plain, 1, plain_label);
-    filename.state = datetime.state = prefixed.state = plain.state = PJ_UI_STATE_LISTEN;
-    pj_ui_render(&filename, &filename_fb);
-    pj_ui_render(&datetime, &datetime_fb);
-    pj_ui_render(&prefixed, &prefixed_fb);
-    pj_ui_render(&plain, &plain_fb);
-    assert(memcmp(&filename_fb, &datetime_fb, sizeof(filename_fb)) == 0);
-    assert(memcmp(&prefixed_fb, &plain_fb, sizeof(prefixed_fb)) == 0);
-    for (int row = 0; row < 3; row++) {
-        int interior_pixels = count_black_pixels_in_region(
-            &filename_fb, 5, row * 50 + 5, 190, 40);
-        if (interior_pixels <= 150) {
-            fprintf(stderr, "audio row %d interior pixels=%d\n", row, interior_pixels);
-        }
-        assert(interior_pixels > 150);
-    }
-
-    filename.state = datetime.state = PJ_UI_STATE_READ;
-    pj_ui_render(&filename, &filename_fb);
-    pj_ui_render(&datetime, &datetime_fb);
-    assert(memcmp(&filename_fb, &datetime_fb, sizeof(filename_fb)) != 0);
-}
-
-static void test_alarm_adjustments_are_icon_only(void)
-{
-    const int controls_top = 112;
-    pj_ui_context_t ui;
-    pj_framebuffer_t fb;
-    pj_ui_init(&ui);
-    ui.state = PJ_UI_STATE_ALARM;
-    pj_ui_render(&ui, &fb);
-
-    for (int row = 0; row < 2; row++) {
-        int y = controls_top + row * (PJ_DISPLAY_HEIGHT - controls_top) / 2;
-        int next_y = controls_top +
-            (row + 1) * (PJ_DISPLAY_HEIGHT - controls_top) / 2;
-        assert(count_black_pixels_in_region(&fb, 75, y + 5, 20,
-                                            next_y - y - 10) == 0);
-        assert(count_black_pixels_in_region(&fb, 175, y + 5, 20,
-                                            next_y - y - 10) == 0);
-        assert(count_black_pixels_in_region(&fb, 30, y + 5, 40,
-                                            next_y - y - 10) > 50);
-        assert(count_black_pixels_in_region(&fb, 130, y + 5, 40,
-                                            next_y - y - 10) > 50);
-    }
-}
-
-static void test_compiled_static_art_is_immutable(void)
-{
-    pj_ui_context_t ui;
-    pj_framebuffer_t fallback;
-    pj_framebuffer_t fallback_after_clock_change;
-    pj_framebuffer_t fallback_dark;
-    pj_ui_init(&ui);
-
-    pj_ui_render(&ui, &fallback);
-    assert(PJ_DEFAULT_STATIC_ART_WIDTH == PJ_DISPLAY_WIDTH);
-    assert(PJ_DEFAULT_STATIC_ART_HEIGHT == PJ_DISPLAY_HEIGHT);
-    assert(PJ_DEFAULT_STATIC_ART_BYTES == PJ_FRAMEBUFFER_BYTES);
-    assert(count_black_pixels(&fallback) == PJ_DEFAULT_STATIC_ART_BLACK_PIXELS);
-    assert(memcmp(fallback.pixels, pj_default_static_art, sizeof(fallback.pixels)) == 0);
-    pj_ui_set_time(&ui, 23, 59, 2030, 12, 31);
-    pj_ui_set_status(&ui, 7, -4, 20);
-    pj_ui_render(&ui, &fallback_after_clock_change);
-    assert(memcmp(&fallback, &fallback_after_clock_change, sizeof(fallback)) == 0);
-
-    ui.dark_mode = 1;
-    pj_ui_request_full_refresh(&ui);
-    pj_ui_render(&ui, &fallback_dark);
-    assert(memcmp(&fallback, &fallback_dark, sizeof(fallback)) == 0);
-    ui.dark_mode = 0;
-
-    assert(sizeof(ui) < PJ_FRAMEBUFFER_BYTES);
-}
-
-static void test_long_note_label_stays_inside_editorial_row(void)
-{
-    pj_ui_context_t ui;
-    pj_ui_context_t clipped_ui;
-    pj_framebuffer_t fb;
-    pj_framebuffer_t clipped_fb;
-    const char labels[][PJ_UI_NOTE_LABEL_LEN] = {
-        "Walked by the river after the rain and remembered the cedar trees.",
-    };
-    const char clipped_labels[][PJ_UI_NOTE_LABEL_LEN] = {
-        "WALKED BY T...",
-    };
-    pj_ui_init(&ui);
-    pj_ui_init(&clipped_ui);
-    pj_ui_set_notes(&ui, 1, labels);
-    pj_ui_set_notes(&clipped_ui, 1, clipped_labels);
-    ui.state = PJ_UI_STATE_LISTEN;
-    clipped_ui.state = PJ_UI_STATE_LISTEN;
-
-    pj_ui_render(&ui, &fb);
-    pj_ui_render(&clipped_ui, &clipped_fb);
-    assert(count_black_pixels(&fb) > 0);
-    assert(memcmp(&fb, &clipped_fb, sizeof(fb)) == 0);
-    assert(black_row_span_in_box(&fb, 5, 5, 190, 40) >= 15);
-    assert(count_black_pixels_in_region(&fb, 3, 5, 1, 40) == 0);
-    assert(count_black_pixels_in_region(&fb, 196, 5, 1, 40) == 0);
-}
-
-static void test_note_detail_title_respects_side_margins(void)
-{
-    pj_ui_context_t ui;
-    pj_framebuffer_t fb;
-    const char labels[][PJ_UI_NOTE_LABEL_LEN] = {
-        "WWWWWWWWWWWWWWWWW",
-    };
-    pj_ui_init(&ui);
-    pj_ui_set_notes(&ui, 1, labels);
-    ui.state = PJ_UI_STATE_NOTE_DETAIL;
-    ui.selected_note = 0;
-
-    pj_ui_render(&ui, &fb);
-    assert(count_black_pixels_in_region(&fb, 18, 18, 164, 164) > 500);
-}
-
-static void test_long_home_title_is_ellipsized_inside_header(void)
-{
-    pj_ui_context_t ui;
-    pj_framebuffer_t first;
-    pj_framebuffer_t second;
-    pj_ui_init(&ui);
-    strcpy(ui.home_layout.title, "My long personal journal");
-    ui.state = PJ_UI_STATE_HOME;
-    pj_ui_render(&ui, &first);
-    strcpy(ui.home_layout.title, "Another hidden title");
-    pj_ui_render(&ui, &second);
-    assert(memcmp(&first, &second, sizeof(first)) == 0);
-}
-
-static void test_calendar_divider_stays_above_empty_state(void)
-{
-    pj_ui_context_t ui;
-    pj_framebuffer_t fb;
-    pj_ui_init(&ui);
-    ui.state = PJ_UI_STATE_CALENDAR;
-    pj_ui_render(&ui, &fb);
-
-    assert(count_black_pixels_in_region(&fb, 10, 50, 180, 100) > 500);
-    assert(count_black_pixels_in_region(&fb, 60, 91, 130, 1) < 100);
-}
-
-static void test_polished_scenes_render_stably(void)
-{
-    static const pj_ui_state_t stable_states[] = {
-        PJ_UI_STATE_STATIC,
-        PJ_UI_STATE_CALENDAR,
-        PJ_UI_STATE_NOTE_DETAIL,
-    };
-    pj_ui_context_t ui;
-    pj_framebuffer_t first;
-    pj_framebuffer_t second;
-    pj_framebuffer_t record_frames[3];
-    pj_ui_init(&ui);
-    pj_ui_set_time(&ui, 9, 41, 2026, 7, 11);
-
-    for (size_t i = 0; i < sizeof(stable_states) / sizeof(stable_states[0]); i++) {
-        ui.state = stable_states[i];
-        pj_ui_render(&ui, &first);
-        pj_ui_render(&ui, &second);
-        assert(count_black_pixels(&first) > 0);
-        assert(memcmp(&first, &second, sizeof(first)) == 0);
-    }
-
-    ui.state = PJ_UI_STATE_RECORD;
-    for (int state = PJ_RECORD_IDLE; state <= PJ_RECORD_STOPPING; state++) {
-        ui.record_state = (pj_record_state_t)state;
-        ui.recording_seconds = state * 61;
-        pj_ui_render(&ui, &record_frames[state]);
-        pj_ui_render(&ui, &second);
-        assert(count_black_pixels(&record_frames[state]) > 0);
-        assert(memcmp(&record_frames[state], &second, sizeof(second)) == 0);
-    }
-    assert(memcmp(&record_frames[PJ_RECORD_IDLE],
-                  &record_frames[PJ_RECORD_ACTIVE], sizeof(first)) != 0);
-    assert(memcmp(&record_frames[PJ_RECORD_ACTIVE],
-                  &record_frames[PJ_RECORD_STOPPING], sizeof(first)) != 0);
-}
-
-static void test_render_all_states(void)
-{
-    pj_ui_context_t ui;
-    pj_framebuffer_t fb;
-    pj_ui_init(&ui);
+    pj_ui_context_t context;
+    pj_ui_init(&context);
+    seed_notes(&context, PJ_UI_MAX_NOTES);
+    context.selected_note = 1;
+    context.record_state = PJ_RECORD_ACTIVE;
+    context.recording_seconds = 59;
 
     for (int state = 0; state < PJ_UI_STATE_COUNT; state++) {
-        ui.state = (pj_ui_state_t)state;
-        pj_ui_render(&ui, &fb);
-        int black_pixels = count_black_pixels(&fb);
-        if (black_pixels <= 0) {
-            fprintf(stderr, "empty render for state %d (%s)\n", state, pj_ui_state_name((pj_ui_state_t)state));
-        }
-        assert(black_pixels > 0);
-        assert(pj_ui_state_name((pj_ui_state_t)state) != 0);
+        pj_framebuffer_t first;
+        pj_framebuffer_t second;
+        memset(&first, 0xa5, sizeof(first));
+        memset(&second, 0x5a, sizeof(second));
+        context.state = (pj_ui_state_t)state;
+        context.note_detail_transcript = state == PJ_UI_STATE_NOTE_DETAIL;
+        pj_ui_compose_frame(&context, &first);
+        pj_ui_compose_frame(&context, &second);
+        assert(memcmp(&first, &second, sizeof(first)) == 0);
+        assert(count_black_pixels(&first) > 0);
+        assert(strcmp(pj_ui_state_name((pj_ui_state_t)state), "unknown") != 0);
+        assert(pj_ui_parent_state((pj_ui_state_t)state) == parents[state]);
     }
+    assert(strcmp(pj_ui_state_name(PJ_UI_STATE_COUNT), "unknown") == 0);
+    assert(pj_ui_parent_state(PJ_UI_STATE_COUNT) == PJ_UI_STATE_STATIC);
+    assert(strstr(pj_ui_default_font_name(), "Carbon") != NULL);
+
+    context.state = PJ_UI_STATE_STATIC;
+    pj_framebuffer_t splash;
+    pj_ui_compose_frame(&context, &splash);
+    assert(memcmp(splash.pixels, pj_default_static_art,
+                  sizeof(splash.pixels)) == 0);
+}
+
+static void test_record_arming_and_back_contract(void)
+{
+    pj_ui_context_t context;
+    navigate_home_to(&context, PJ_LAYOUT_SLOT_HOME_NOTES);
+    assert(tap_slot(&context, PJ_LAYOUT_NOTES_3_1M,
+                    PJ_LAYOUT_SLOT_NOTES_RECORD));
+    assert(context.state == PJ_UI_STATE_RECORD);
+    assert(context.record_state == PJ_RECORD_ARMING);
+    assert(context.recording_seconds == 0);
+
+    pj_framebuffer_t arming;
+    pj_ui_compose_frame(&context, &arming);
+    assert(count_black_pixels(&arming) > 0);
+    pj_ui_set_audio_state(&context, 0, 0);
+    assert(context.record_state == PJ_RECORD_ARMING);
+    assert(context.state == PJ_UI_STATE_RECORD);
+    assert(pj_ui_handle_aux_long(&context));
+    assert(context.record_state == PJ_RECORD_IDLE);
+    assert(context.state == PJ_UI_STATE_HOME);
+
+    assert(pj_ui_handle_aux_double(&context));
+    assert(context.state == PJ_UI_STATE_RECORD);
+    assert(context.record_state == PJ_RECORD_ARMING);
+    pj_ui_set_audio_state(&context, 1, 0);
+    assert(context.record_state == PJ_RECORD_ACTIVE);
+    pj_ui_set_recording_elapsed(&context, 59999);
+    assert(context.recording_seconds == 59);
+    pj_ui_set_recording_elapsed(&context, 60000);
+    assert(context.recording_seconds == 60);
+    pj_ui_set_recording_elapsed(&context, 59000);
+    assert(context.recording_seconds == 60);
+    assert(pj_ui_handle_aux_short(&context));
+    assert(context.state == PJ_UI_STATE_HOME);
+    assert(context.record_state == PJ_RECORD_STOPPING);
+    pj_ui_set_audio_state(&context, 0, 0);
+    assert(context.record_state == PJ_RECORD_IDLE);
+}
+
+static void test_playback_uses_only_full_screen_play_and_pause(void)
+{
+    pj_ui_context_t context;
+    navigate_home_to(&context, PJ_LAYOUT_SLOT_HOME_NOTES);
+    seed_notes(&context, 3);
+    assert(tap_slot(&context, PJ_LAYOUT_NOTES_3_1M,
+                    PJ_LAYOUT_SLOT_NOTES_LISTEN));
+    assert(pj_ui_handle_touch(&context, 80, 25, PJ_TOUCH_TAP));
+    assert(context.state == PJ_UI_STATE_NOTE_DETAIL);
+    assert(!context.note_detail_transcript);
+
+    const pj_asset_bitmap_t *play = pj_carbon_icon_lookup(
+        PJ_CARBON_ICON_PLAY_FILLED, 144);
+    const pj_asset_bitmap_t *pause = pj_carbon_icon_lookup(
+        PJ_CARBON_ICON_PAUSE_FILLED, 144);
+    assert(play != NULL && pause != NULL);
+    assert(pj_carbon_icon_lookup(PJ_CARBON_ICON_PLAY_FILLED, 64) == NULL);
+
+    pj_framebuffer_t play_frame;
+    pj_framebuffer_t pause_frame;
+    pj_ui_compose_frame(&context, &play_frame);
+    assert_frame_is_asset(&play_frame, play, 100, 100);
+
+    pj_ui_set_audio_state(&context, 0, 1);
+    assert(context.playback_state == PJ_PLAYBACK_ACTIVE);
+    pj_ui_compose_frame(&context, &pause_frame);
+    assert_frame_is_asset(&pause_frame, pause, 100, 100);
+    assert(framebuffer_differences(&play_frame, &pause_frame) > 0);
+
+    assert(pj_ui_handle_aux_long(&context));
+    assert(context.state == PJ_UI_STATE_LISTEN);
+    assert(context.playback_state == PJ_PLAYBACK_STOPPING);
+    assert(context.playback_exit_pending);
+    pj_ui_set_audio_state(&context, 0, 0);
+    assert(context.state == PJ_UI_STATE_LISTEN);
+    assert(context.playback_state == PJ_PLAYBACK_IDLE);
+    assert(!context.playback_exit_pending);
+
+    assert(pj_ui_handle_touch(&context, 80, 25, PJ_TOUCH_TAP));
+    assert(context.state == PJ_UI_STATE_NOTE_DETAIL);
+    assert(pj_ui_handle_touch(&context, 100, 100, PJ_TOUCH_TAP));
+    assert(context.playback_state == PJ_PLAYBACK_ACTIVE);
+    assert(pj_ui_handle_touch(&context, 100, 100, PJ_TOUCH_TAP));
+    assert(context.playback_state == PJ_PLAYBACK_STOPPING);
+    assert(!pj_ui_handle_touch(&context, 100, 100, PJ_TOUCH_TAP));
+}
+
+static void test_case_punctuation_and_long_transcript(void)
+{
+    static const char punctuation[] =
+        " !\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~";
+    const int sizes[] = {16, 24, 32, 64};
+    for (size_t size_index = 0; size_index < ARRAY_LEN(sizes); size_index++) {
+        for (size_t index = 0; punctuation[index] != '\0'; index++) {
+            assert(pj_ibm_plex_punctuation_lookup(
+                       (uint8_t)punctuation[index],
+                       (uint16_t)sizes[size_index]) != NULL);
+        }
+    }
+    const pj_asset_glyph_t *upper =
+        pj_carbon_glyph_lookup_codepoint('A', 32);
+    const pj_asset_glyph_t *lower =
+        pj_carbon_glyph_lookup_codepoint('a', 32);
+    assert(upper != NULL && lower != NULL);
+    assert(upper->width != lower->width || upper->height != lower->height ||
+           memcmp(upper->data, lower->data,
+                  (size_t)upper->stride * upper->height) != 0);
+    assert(pj_carbon_glyph_lookup_codepoint('?', 32) == NULL);
+
+    const char mixed[][PJ_UI_NOTE_LABEL_LEN] = {
+        "Aa Ii Ll Tt Rr Ff Mm Ww Jj ygj pq!?.,:-/% Mixed Case",
+    };
+    const char upper_only[][PJ_UI_NOTE_LABEL_LEN] = {
+        "AA II LL TT RR FF MM WW JJ YGJ PQ!?.,:-/% MIXED CASE",
+    };
+    pj_ui_context_t context;
+    pj_ui_init(&context);
+    context.state = PJ_UI_STATE_NOTE_DETAIL;
+    context.note_detail_transcript = 1;
+    context.selected_note = 0;
+    pj_ui_set_notes(&context, 1, mixed);
+    pj_framebuffer_t first;
+    pj_framebuffer_t repeat;
+    pj_framebuffer_t uppercase;
+    pj_ui_compose_frame(&context, &first);
+    pj_ui_compose_frame(&context, &repeat);
+    assert(memcmp(&first, &repeat, sizeof(first)) == 0);
+    assert(count_black_pixels(&first) > 100);
+    pj_ui_set_notes(&context, 1, upper_only);
+    pj_ui_compose_frame(&context, &uppercase);
+    assert(framebuffer_differences(&first, &uppercase) > 0);
+}
+
+static void test_note_pages_selection_and_content_partials(void)
+{
+    pj_ui_context_t context;
+    navigate_home_to(&context, PJ_LAYOUT_SLOT_HOME_NOTES);
+    seed_notes(&context, 7);
+    assert(tap_slot(&context, PJ_LAYOUT_NOTES_3_1M,
+                    PJ_LAYOUT_SLOT_NOTES_READ));
+    assert(context.state == PJ_UI_STATE_READ);
+    assert(context.note_page == 0);
+    presenter_fixture_t fixture;
+    presenter_start(&fixture, &context);
+
+    assert(pj_ui_handle_touch(&context, 100, 100, PJ_TOUCH_SWIPE_LEFT));
+    assert(context.note_page == 1);
+    presenter_accept_partial(&fixture, &context);
+    assert(pj_ui_handle_touch(&context, 175, 175, PJ_TOUCH_TAP));
+    assert(context.note_page == 2);
+    presenter_accept_partial(&fixture, &context);
+    assert(!pj_ui_handle_touch(&context, 100, 100, PJ_TOUCH_SWIPE_LEFT));
+    assert(context.note_page == 2);
+    assert(pj_ui_handle_touch(&context, 50, 25, PJ_TOUCH_TAP));
+    assert(context.state == PJ_UI_STATE_NOTE_DETAIL);
+    assert(context.selected_note == 6);
+    assert(context.note_detail_transcript);
+    pj_framebuffer_t detail;
+    pj_ui_compose_frame(&context, &detail);
+    assert(count_black_pixels(&detail) > 0);
+    assert(!pj_ui_handle_touch(&context, 100, 100, PJ_TOUCH_TAP));
+    assert(pj_ui_handle_aux_long(&context));
+    assert(context.state == PJ_UI_STATE_READ);
+    assert(context.note_page == 2);
+
+    const char changed[PJ_UI_MAX_NOTES][PJ_UI_NOTE_LABEL_LEN] = {
+        "REC 20260717 0909 1", "Mixed Case: Alpha!", "Third / note?",
+        "Fourth note", "Fifth note", "Sixth note",
+        "A deliberately long transcript label with punctuation: 09:10!",
+    };
+    presenter_start(&fixture, &context);
+    pj_ui_set_notes(&context, 7, changed);
+    presenter_accept_partial(&fixture, &context);
+    assert(pj_ui_handle_touch(&context, 100, 100, PJ_TOUCH_SWIPE_RIGHT));
+    assert(context.note_page == 1);
+    presenter_accept_partial(&fixture, &context);
+}
+
+static void test_typed_preferences_revisions_and_theme_inversion(void)
+{
+    pj_ui_context_t context;
+    pj_ui_init(&context);
+    context.state = PJ_UI_STATE_SETTINGS;
+    pj_ui_preferences_t preferences = current_preferences(&context);
+    uint32_t visual = context.visual_revision;
+    uint32_t full = context.full_refresh_revision;
+    uint32_t interaction = context.interaction_generation;
+    pj_ui_apply_preferences(&context, &preferences);
+    assert(context.visual_revision == visual);
+    assert(context.full_refresh_revision == full);
+    assert(context.interaction_generation == interaction);
+
+    presenter_fixture_t fixture;
+    presenter_start(&fixture, &context);
+    assert_asset_region(
+        &fixture.accepted,
+        pj_carbon_icon_lookup(PJ_CARBON_ICON_ASLEEP_FILLED, 64),
+        slot_x(PJ_LAYOUT_SETTINGS_4_0M, PJ_LAYOUT_SLOT_SETTINGS_THEME),
+        slot_y(PJ_LAYOUT_SETTINGS_4_0M, PJ_LAYOUT_SLOT_SETTINGS_THEME));
+    assert_glyph_region(
+        &fixture.accepted,
+        pj_carbon_glyph_lookup(PJ_CARBON_GLYPH_SETTINGS_24H, 64),
+        slot_x(PJ_LAYOUT_SETTINGS_4_0M,
+               PJ_LAYOUT_SLOT_SETTINGS_HOUR_FORMAT),
+        slot_y(PJ_LAYOUT_SETTINGS_4_0M,
+               PJ_LAYOUT_SLOT_SETTINGS_HOUR_FORMAT));
+    preferences.clock_24h = 0;
+    pj_ui_apply_preferences(&context, &preferences);
+    assert(context.visual_revision != visual);
+    assert(context.full_refresh_revision == full);
+    assert(context.interaction_generation != interaction);
+    pj_ui_dirty_region_t hour_dirty =
+        presenter_accept_partial(&fixture, &context);
+    assert(hour_dirty.x < 100);
+    assert(hour_dirty.x + hour_dirty.width <= 100);
+    assert(hour_dirty.y >= 100);
+    assert_glyph_region(
+        &fixture.accepted,
+        pj_carbon_glyph_lookup(PJ_CARBON_GLYPH_SETTINGS_12H, 64),
+        slot_x(PJ_LAYOUT_SETTINGS_4_0M,
+               PJ_LAYOUT_SLOT_SETTINGS_HOUR_FORMAT),
+        slot_y(PJ_LAYOUT_SETTINGS_4_0M,
+               PJ_LAYOUT_SLOT_SETTINGS_HOUR_FORMAT));
+
+    pj_framebuffer_t light = fixture.accepted;
+    full = context.full_refresh_revision;
+    preferences.dark_mode = 1;
+    pj_ui_apply_preferences(&context, &preferences);
+    assert(context.full_refresh_revision != full);
+    assert_presenter_full(&fixture, &context);
+    for (size_t index = 0; index < sizeof(light.pixels); index++) {
+        assert(fixture.accepted.pixels[index] ==
+               (uint8_t)~light.pixels[index]);
+    }
+
+    context.state = PJ_UI_STATE_TIME_TEMP;
+    preferences = current_preferences(&context);
+    preferences.volume = -20;
+    preferences.alarm_hour = 99;
+    preferences.alarm_minute = -1;
+    preferences.timer_seconds = 1;
+    preferences.interval_seconds = 1;
+    preferences.transcript_font_size = 99;
+    pj_ui_apply_preferences(&context, &preferences);
+    assert(context.volume == 0);
+    assert(context.alarm_hour == 23);
+    assert(context.alarm_minute == 0);
+    assert(context.timer_preset_seconds == 30);
+    assert(context.interval_preset_seconds == 60);
+    assert(context.transcript_font_size == 3);
+}
+
+static void test_settings_mapping_and_volume_extrema(void)
+{
+    pj_ui_context_t context;
+    navigate_home_to(&context, PJ_LAYOUT_SLOT_HOME_SETTINGS);
+    assert(context.state == PJ_UI_STATE_SETTINGS);
+    uint32_t full = context.full_refresh_revision;
+    assert(tap_slot(&context, PJ_LAYOUT_SETTINGS_4_0M,
+                    PJ_LAYOUT_SLOT_SETTINGS_HOUR_FORMAT));
+    assert(!context.clock_24h);
+    assert(context.full_refresh_revision == full);
+
+    full = context.full_refresh_revision;
+    assert(tap_slot(&context, PJ_LAYOUT_SETTINGS_4_0M,
+                    PJ_LAYOUT_SLOT_SETTINGS_THEME));
+    assert(context.dark_mode);
+    assert(context.full_refresh_revision != full);
+    assert(tap_slot(&context, PJ_LAYOUT_SETTINGS_4_0M,
+                    PJ_LAYOUT_SLOT_SETTINGS_THEME));
+    assert(!context.dark_mode);
+
+    assert(tap_slot(&context, PJ_LAYOUT_SETTINGS_4_0M,
+                    PJ_LAYOUT_SLOT_SETTINGS_VOLUME));
+    assert(context.state == PJ_UI_STATE_VOLUME);
+    pj_ui_preferences_t preferences = current_preferences(&context);
+    preferences.volume = 0;
+    pj_ui_apply_preferences(&context, &preferences);
+    presenter_fixture_t fixture;
+    presenter_start(&fixture, &context);
+    for (int volume = 0; volume <= 10; volume++) {
+        preferences.volume = volume;
+        int previous = context.volume;
+        pj_ui_apply_preferences(&context, &preferences);
+        if (volume != previous) {
+            presenter_accept_partial(&fixture, &context);
+        }
+        pj_framebuffer_t frame;
+        pj_ui_compose_frame(&context, &frame);
+        for (int x = 0; x < PJ_DISPLAY_WIDTH; x++) {
+            assert(pj_framebuffer_get(&frame, x, 50) ==
+                   (x < volume * PJ_DISPLAY_WIDTH / 10));
+        }
+    }
+    for (int volume = 9; volume >= 0; volume--) {
+        preferences.volume = volume;
+        pj_ui_apply_preferences(&context, &preferences);
+        presenter_accept_partial(&fixture, &context);
+    }
+    assert(context.volume == 0);
+    assert(pj_ui_handle_touch(&context, 50, 150, PJ_TOUCH_TAP));
+    assert(context.volume == 0);
+    assert(pj_ui_handle_touch(&context, 150, 150, PJ_TOUCH_TAP));
+    assert(context.volume == 1);
+    assert(!pj_ui_handle_touch(&context, 50, 50, PJ_TOUCH_TAP));
+}
+
+static void test_battery_thresholds_and_clock_partials(void)
+{
+    static const struct {
+        int percent;
+        pj_carbon_icon_id_t icon;
+    } cases[] = {
+        {0, PJ_CARBON_ICON_BATTERY_EMPTY},
+        {10, PJ_CARBON_ICON_BATTERY_EMPTY},
+        {11, PJ_CARBON_ICON_BATTERY_LOW},
+        {39, PJ_CARBON_ICON_BATTERY_LOW},
+        {40, PJ_CARBON_ICON_BATTERY_HALF},
+        {79, PJ_CARBON_ICON_BATTERY_HALF},
+        {80, PJ_CARBON_ICON_BATTERY_FULL},
+        {100, PJ_CARBON_ICON_BATTERY_FULL},
+    };
+    pj_ui_context_t context;
+    pj_ui_init(&context);
+    context.state = PJ_UI_STATE_TIME_TEMP;
+    presenter_fixture_t fixture;
+    presenter_start(&fixture, &context);
+    for (size_t index = 0; index < ARRAY_LEN(cases); index++) {
+        pj_ui_set_status(&context, cases[index].percent, 22, 45);
+        presenter_accept_partial(&fixture, &context);
+        assert_asset_region(&fixture.accepted,
+                            pj_carbon_icon_lookup(cases[index].icon, 28),
+                            65, 180);
+    }
+    pj_ui_set_time(&context, 9, 42, 2026, 7, 17);
+    presenter_accept_partial(&fixture, &context);
+    pj_ui_set_time(&context, 10, 0, 2026, 7, 18);
+    presenter_accept_partial(&fixture, &context);
+    pj_ui_set_status(&context, 200, 24, -20);
+    assert(context.battery_percent == 100);
+    assert(context.humidity_percent == -1);
+    presenter_accept_partial(&fixture, &context);
+}
+
+static void test_alarm_caret_and_toggle_controls(void)
+{
+    pj_ui_context_t context;
+    navigate_home_to(&context, PJ_LAYOUT_SLOT_HOME_TIME);
+    assert(tap_slot(&context, PJ_LAYOUT_TIME_4_1,
+                    PJ_LAYOUT_SLOT_TIME_ALARM));
+    assert(context.state == PJ_UI_STATE_ALARM);
+    assert(context.alarm_hour == 7 && context.alarm_minute == 30);
+    int original_toggle = context.alarm_on;
+    assert(pj_ui_handle_touch(&context, 100, 90, PJ_TOUCH_TAP));
+    assert(context.alarm_on == !original_toggle);
+    assert(pj_ui_handle_touch(&context, 50, 130, PJ_TOUCH_TAP));
+    assert(context.alarm_hour == 8);
+    assert(pj_ui_handle_touch(&context, 50, 180, PJ_TOUCH_TAP));
+    assert(context.alarm_hour == 7);
+    assert(pj_ui_handle_touch(&context, 150, 130, PJ_TOUCH_TAP));
+    assert(context.alarm_minute == 45);
+    assert(pj_ui_handle_touch(&context, 150, 180, PJ_TOUCH_TAP));
+    assert(context.alarm_minute == 30);
+
+    pj_framebuffer_t frame;
+    pj_ui_compose_frame(&context, &frame);
+    assert(count_black_pixels_in_region(&frame, 0, 110, 100, 45) > 0);
+    assert(count_black_pixels_in_region(&frame, 0, 155, 100, 45) > 0);
+    assert(count_black_pixels_in_region(&frame, 100, 110, 100, 45) > 0);
+    assert(count_black_pixels_in_region(&frame, 100, 155, 100, 45) > 0);
+}
+
+static void test_stopwatch_timer_interval_commands(void)
+{
+    pj_ui_context_t context;
+    pj_ui_time_projection_t projection;
+
+    context = (pj_ui_context_t) {0};
+    pj_ui_init(&context);
+    context.state = PJ_UI_STATE_STOPWATCH;
+    assert(pj_ui_handle_touch(&context, 50, 150, PJ_TOUCH_TAP));
+    consume_expected_command(&context, PJ_UI_TIME_COMMAND_STOPWATCH_START, 0, 0);
+    projection = time_projection(1, 300, 90);
+    projection.stopwatch_running = 1;
+    pj_ui_set_time_projection(&context, &projection);
+    assert(pj_ui_handle_touch(&context, 50, 150, PJ_TOUCH_TAP));
+    consume_expected_command(&context, PJ_UI_TIME_COMMAND_STOPWATCH_PAUSE, 0, 0);
+    assert(pj_ui_handle_touch(&context, 150, 150, PJ_TOUCH_TAP));
+    consume_expected_command(&context, PJ_UI_TIME_COMMAND_STOPWATCH_RESET, 0, 0);
+
+    pj_ui_init(&context);
+    context.state = PJ_UI_STATE_TIMER;
+    assert(pj_ui_handle_touch(&context, 50, 125, PJ_TOUCH_TAP));
+    assert(context.timer_seconds == 330);
+    consume_expected_command(&context, PJ_UI_TIME_COMMAND_TIMER_SET, 330000, 0);
+    assert(pj_ui_handle_touch(&context, 50, 175, PJ_TOUCH_TAP));
+    assert(context.timer_seconds == 300);
+    consume_expected_command(&context, PJ_UI_TIME_COMMAND_TIMER_SET, 300000, 0);
+    assert(pj_ui_handle_touch(&context, 150, 125, PJ_TOUCH_TAP));
+    consume_expected_command(&context, PJ_UI_TIME_COMMAND_TIMER_START, 300000, 0);
+    projection = time_projection(0, 299, 90);
+    projection.timer_running = 1;
+    pj_ui_set_time_projection(&context, &projection);
+    assert(pj_ui_handle_touch(&context, 150, 125, PJ_TOUCH_TAP));
+    consume_expected_command(&context, PJ_UI_TIME_COMMAND_TIMER_PAUSE, 299000, 0);
+    assert(pj_ui_handle_touch(&context, 150, 175, PJ_TOUCH_TAP));
+    consume_expected_command(&context, PJ_UI_TIME_COMMAND_TIMER_RESET, 0, 0);
+
+    pj_ui_init(&context);
+    context.state = PJ_UI_STATE_INTERVAL;
+    assert(pj_ui_handle_touch(&context, 50, 125, PJ_TOUCH_TAP));
+    assert(context.interval_seconds == 150);
+    consume_expected_command(&context, PJ_UI_TIME_COMMAND_INTERVAL_SET,
+                             150000, 150000);
+    assert(pj_ui_handle_touch(&context, 50, 175, PJ_TOUCH_TAP));
+    assert(context.interval_seconds == 90);
+    consume_expected_command(&context, PJ_UI_TIME_COMMAND_INTERVAL_SET,
+                             90000, 90000);
+    assert(pj_ui_handle_touch(&context, 150, 125, PJ_TOUCH_TAP));
+    consume_expected_command(&context, PJ_UI_TIME_COMMAND_INTERVAL_START,
+                             90000, 90000);
+    projection = time_projection(0, 300, 89);
+    projection.interval_running = 1;
+    projection.interval_phase = 2;
+    pj_ui_set_time_projection(&context, &projection);
+    assert(pj_ui_handle_touch(&context, 150, 125, PJ_TOUCH_TAP));
+    consume_expected_command(&context, PJ_UI_TIME_COMMAND_INTERVAL_PAUSE,
+                             89000, 90000);
+    assert(pj_ui_handle_touch(&context, 150, 175, PJ_TOUCH_TAP));
+    consume_expected_command(&context, PJ_UI_TIME_COMMAND_INTERVAL_RESET, 0, 0);
+
+    pj_framebuffer_t frame;
+    pj_ui_compose_frame(&context, &frame);
+    assert(count_black_pixels_in_region(&frame, 0, 99, 200, 3) == 0);
+    assert(count_black_pixels_in_region(&frame, 99, 100, 3, 100) == 0);
+}
+
+static void assert_stopwatch_transition(int from, int to)
+{
+    pj_ui_context_t context;
+    pj_ui_init(&context);
+    context.state = PJ_UI_STATE_STOPWATCH;
+    pj_ui_time_projection_t projection = time_projection(from, 300, 90);
+    projection.stopwatch_running = 1;
+    pj_ui_set_time_projection(&context, &projection);
+    presenter_fixture_t fixture;
+    presenter_start(&fixture, &context);
+    projection.stopwatch_elapsed_ms = (uint64_t)to * 1000u;
+    pj_ui_set_time_projection(&context, &projection);
+    presenter_accept_partial(&fixture, &context);
+    projection.stopwatch_elapsed_ms = (uint64_t)from * 1000u;
+    pj_ui_set_time_projection(&context, &projection);
+    presenter_accept_partial(&fixture, &context);
+}
+
+static void assert_timer_transition(int from, int to)
+{
+    pj_ui_context_t context;
+    pj_ui_init(&context);
+    context.state = PJ_UI_STATE_TIMER;
+    pj_ui_time_projection_t projection = time_projection(0, from, 90);
+    projection.timer_running = 1;
+    pj_ui_set_time_projection(&context, &projection);
+    presenter_fixture_t fixture;
+    presenter_start(&fixture, &context);
+    projection.timer_remaining_ms = (uint64_t)to * 1000u;
+    pj_ui_set_time_projection(&context, &projection);
+    presenter_accept_partial(&fixture, &context);
+    projection.timer_remaining_ms = (uint64_t)from * 1000u;
+    pj_ui_set_time_projection(&context, &projection);
+    presenter_accept_partial(&fixture, &context);
+}
+
+static void assert_interval_transition(int from, int to)
+{
+    pj_ui_context_t context;
+    pj_ui_init(&context);
+    context.state = PJ_UI_STATE_INTERVAL;
+    pj_ui_time_projection_t projection = time_projection(0, 300, from);
+    projection.interval_running = 1;
+    pj_ui_set_time_projection(&context, &projection);
+    presenter_fixture_t fixture;
+    presenter_start(&fixture, &context);
+    projection.interval_remaining_ms = (uint64_t)to * 1000u;
+    projection.interval_phase++;
+    pj_ui_set_time_projection(&context, &projection);
+    presenter_accept_partial(&fixture, &context);
+    projection.interval_remaining_ms = (uint64_t)from * 1000u;
+    projection.interval_phase--;
+    pj_ui_set_time_projection(&context, &projection);
+    presenter_accept_partial(&fixture, &context);
+}
+
+static void test_all_digit_carries_in_both_directions(void)
+{
+    static const int transitions[][2] = {
+        {9, 10}, {19, 20}, {39, 40}, {59, 60},
+    };
+    for (size_t index = 0; index < ARRAY_LEN(transitions); index++) {
+        assert_stopwatch_transition(transitions[index][0], transitions[index][1]);
+        assert_timer_transition(transitions[index][0], transitions[index][1]);
+        assert_interval_transition(transitions[index][0], transitions[index][1]);
+    }
+}
+
+static void test_sync_five_line_phases_and_transactions(void)
+{
+    pj_ui_context_t context;
+    navigate_home_to(&context, PJ_LAYOUT_SLOT_HOME_SETTINGS);
+    assert(tap_slot(&context, PJ_LAYOUT_SETTINGS_4_0M,
+                    PJ_LAYOUT_SLOT_SETTINGS_SYNC));
+    assert(context.state == PJ_UI_STATE_SYNC);
+    assert(context.sync_inventory_state == PJ_UI_SYNC_INVENTORY_PENDING);
+    uint32_t generation = pj_ui_sync_session_generation(&context);
+    uint32_t request_generation = 0;
+    assert(generation != 0);
+    assert(pj_ui_consume_sync_preflight_request(&context, &request_generation));
+    assert(request_generation == generation);
+    assert(!pj_ui_consume_sync_preflight_request(&context, &request_generation));
+
+    presenter_fixture_t fixture;
+    presenter_start(&fixture, &context);
+    pj_ui_set_sync_inventory(&context, generation,
+                             PJ_UI_SYNC_INVENTORY_READY, 12, 3, 1);
+    presenter_accept_partial(&fixture, &context);
+    assert(!pj_ui_consume_sync_transfer_request(&context, &request_generation));
+    uint32_t presentation = pj_ui_sync_presentation_generation(&context);
+    assert(pj_ui_sync_presentation_committed(&context, presentation));
+    assert(pj_ui_consume_sync_transfer_request(&context, &request_generation));
+    assert(request_generation == generation);
+
+    static const struct {
+        const char *phase;
+        int failed;
+        const char *error;
+        int request_pending;
+    } phases[] = {
+        {"discovering", 0, "", 0},
+        {"pending", 0, "", 1},
+        {"running", 0, "", 0},
+        {"offline", 0, "network", 0},
+        {"auth_failed", 1, "auth", 0},
+        {"protocol_failed", 2, "protocol", 0},
+        {"failed", 3, "terminal", 0},
+        {"succeeded", 0, "", 0},
+    };
+    for (size_t index = 0; index < ARRAY_LEN(phases); index++) {
+        pj_ui_set_sync_detail_for_generation(
+            &context, generation, phases[index].phase, phases[index].failed,
+            phases[index].error, phases[index].request_pending);
+        presenter_accept_partial(&fixture, &context);
+        assert(count_black_pixels(&fixture.accepted) > 0);
+        for (int band = 0; band < 5; band++) {
+            assert(count_black_pixels_in_region(
+                       &fixture.accepted, 0, band * PJ_DISPLAY_HEIGHT / 5,
+                       PJ_DISPLAY_WIDTH, PJ_DISPLAY_HEIGHT / 5) > 0);
+        }
+    }
+    presentation = pj_ui_sync_presentation_generation(&context);
+    assert(pj_ui_sync_presentation_committed(&context, presentation));
+    assert(pj_ui_consume_sync_success_return(&context));
+    assert(context.state == PJ_UI_STATE_SETTINGS);
+}
+
+static void test_exact_presenter_reconstruction_for_dynamic_screens(void)
+{
+    pj_ui_context_t context;
+    presenter_fixture_t fixture;
+    pj_ui_preferences_t preferences;
+    pj_ui_time_projection_t projection;
+
+    pj_ui_init(&context);
+    context.state = PJ_UI_STATE_TIME_TEMP;
+    presenter_start(&fixture, &context);
+    pj_ui_set_time(&context, 10, 20, 2026, 7, 17);
+    presenter_accept_partial(&fixture, &context);
+    pj_ui_set_status(&context, 39, 20, 50);
+    presenter_accept_partial(&fixture, &context);
+
+    pj_ui_init(&context);
+    context.state = PJ_UI_STATE_RECORD;
+    context.record_state = PJ_RECORD_ACTIVE;
+    presenter_start(&fixture, &context);
+    pj_ui_set_recording_elapsed(&context, 1000);
+    presenter_accept_partial(&fixture, &context);
+
+    pj_ui_init(&context);
+    context.state = PJ_UI_STATE_ALARM;
+    presenter_start(&fixture, &context);
+    preferences = current_preferences(&context);
+    preferences.alarm_enabled = 1;
+    preferences.alarm_minute = 45;
+    pj_ui_apply_preferences(&context, &preferences);
+    presenter_accept_partial(&fixture, &context);
+
+    pj_ui_init(&context);
+    context.state = PJ_UI_STATE_STOPWATCH;
+    presenter_start(&fixture, &context);
+    projection = time_projection(1, 300, 90);
+    projection.stopwatch_running = 1;
+    pj_ui_set_time_projection(&context, &projection);
+    presenter_accept_partial(&fixture, &context);
+
+    pj_ui_init(&context);
+    context.state = PJ_UI_STATE_TIMER;
+    presenter_start(&fixture, &context);
+    projection = time_projection(0, 299, 90);
+    projection.timer_running = 1;
+    pj_ui_set_time_projection(&context, &projection);
+    presenter_accept_partial(&fixture, &context);
+
+    pj_ui_init(&context);
+    context.state = PJ_UI_STATE_INTERVAL;
+    presenter_start(&fixture, &context);
+    projection = time_projection(0, 300, 89);
+    projection.interval_running = 1;
+    projection.interval_phase = 2;
+    pj_ui_set_time_projection(&context, &projection);
+    presenter_accept_partial(&fixture, &context);
+
+    pj_ui_init(&context);
+    context.state = PJ_UI_STATE_NOTE_DETAIL;
+    context.note_detail_transcript = 0;
+    presenter_start(&fixture, &context);
+    pj_ui_set_audio_state(&context, 0, 1);
+    presenter_accept_partial(&fixture, &context);
+
+    pj_ui_init(&context);
+    context.state = PJ_UI_STATE_VOLUME;
+    presenter_start(&fixture, &context);
+    preferences = current_preferences(&context);
+    preferences.volume = 10;
+    pj_ui_apply_preferences(&context, &preferences);
+    presenter_accept_partial(&fixture, &context);
+
+    pj_ui_init(&context);
+    context.state = PJ_UI_STATE_LISTEN;
+    seed_notes(&context, 6);
+    presenter_start(&fixture, &context);
+    assert(pj_ui_handle_touch(&context, 100, 100, PJ_TOUCH_SWIPE_LEFT));
+    presenter_accept_partial(&fixture, &context);
+
+    pj_ui_init(&context);
+    context.state = PJ_UI_STATE_SYNC;
+    presenter_start(&fixture, &context);
+    pj_ui_set_sync_detail(&context, "running", 0, "", 1);
+    presenter_accept_partial(&fixture, &context);
+
+    pj_ui_init(&context);
+    context.state = PJ_UI_STATE_SETTINGS;
+    presenter_start(&fixture, &context);
+    preferences = current_preferences(&context);
+    preferences.clock_24h = 0;
+    pj_ui_apply_preferences(&context, &preferences);
+    presenter_accept_partial(&fixture, &context);
+}
+
+static void test_presenter_idle_barrier_rejection_and_navigation_full(void)
+{
+    pj_ui_context_t context;
+    pj_ui_init(&context);
+    context.state = PJ_UI_STATE_TIME_TEMP;
+    presenter_fixture_t fixture;
+    presenter_start(&fixture, &context);
+
+    pj_ui_presenter_frame_t frame;
+    pj_ui_presenter_revision_t revision = pj_ui_presenter_revision(&context);
+    assert(pj_ui_presenter_prepare(&fixture.presenter, &context, &revision,
+                                   &frame) == PJ_UI_FRAME_IDLE);
+
+    context.interaction_generation++;
+    revision = pj_ui_presenter_revision(&context);
+    assert(pj_ui_presenter_prepare(&fixture.presenter, &context, &revision,
+                                   &frame) == PJ_UI_FRAME_BARRIER);
+    uint32_t token = frame.token;
+    assert(frame.dirty.width == 0 && frame.dirty.height == 0);
+    assert(pj_ui_presenter_reject(&fixture.presenter, token));
+    pj_ui_presenter_frame_t retry;
+    assert(pj_ui_presenter_prepare(&fixture.presenter, &context, &revision,
+                                   &retry) == PJ_UI_FRAME_BARRIER);
+    assert(retry.token == token);
+    assert(retry.framebuffer == frame.framebuffer);
+    assert(pj_ui_presenter_accept(&fixture.presenter, retry.token));
+
+    pj_ui_wake(&context);
+    assert(context.state == PJ_UI_STATE_HOME);
+    assert_presenter_full(&fixture, &context);
+    pj_ui_request_full_presentation(&context);
+    assert_presenter_full(&fixture, &context);
 }
 
 int main(void)
 {
-    test_state_graph();
-    test_empty_notes_do_not_open_detail();
-    test_note_paging_tracks_touch_selection_and_swipes();
-    test_note_pager_arrows_move_exactly_three_items_and_stop_at_bounds();
-    test_note_pager_uses_chevrons_without_arrow_bars();
-    test_read_opens_transcript_detail_without_playback();
-    test_note_detail_play_control_has_touch_parity();
-    test_custom_home_slots_render_and_route_in_order();
-    test_compiled_home_fallback_routes_every_slot();
-    test_every_supported_home_destination_routes();
-    test_home_layout_setter_canonicalizes_inactive_slots();
-    test_aux_primary_actions_do_not_use_hidden_focus();
-    test_aux_navigation_has_no_hidden_focus();
-    test_time_value_typography_fits_refresh_regions();
-    test_interval_round_is_rendered_zero_indexed();
-    test_aux_double_is_direct_quick_record_only();
-    test_audio_lifecycle_reconciliation();
-    test_settings_quadrants_control_volume_appearance_clock_and_sync();
-    test_alarm_touch_regions_match_enable_and_adjustment_controls();
-    test_api_preferences_remain_available_after_settings_flattening();
-    test_settings_volume_opens_dedicated_screen();
-    test_volume_only_bottom_controls_adjust_and_clamp();
-    test_volume_fill_uses_full_top_half_and_controls_have_thick_borders();
-    test_timer_presets_are_not_runtime_counters();
-    test_paused_time_adjustments_use_visible_remainder();
-    test_interval_repeats_one_stable_duration_across_rounds();
-    test_timer_geometry_and_adjustment_focus_timeout();
-    test_time_projection_updates_values_without_alert_subscreen();
-    test_interval_alert_stays_inline_and_aux_long_resets();
-    test_recovered_interval_alert_is_nonmodal_on_every_screen();
-    test_time_command_buttons_wait_for_authoritative_projection();
-    test_time_projection_refreshes_changed_controls();
-    test_active_alert_does_not_create_modal_navigation();
-    test_sleep_preserves_durable_time_activity();
-    test_recovery_metadata_does_not_add_subtext_or_touch_target();
-    test_time_controls_emit_explicit_commands();
-    test_aux_back_resets_time_pages_before_returning();
-    test_persistent_interval_reset_discards_stale_ui_command();
-    test_alerts_never_replace_or_intercept_the_active_page();
-    test_sync_state_is_board_driven();
-    test_sync_render_distinguishes_transport_and_failure_states();
-    test_sync_preflight_and_success_wait_for_exact_physical_presentation();
-    test_interaction_generation_tracks_hit_identity();
-    test_dirty_lifecycle();
-    test_dynamic_updates_force_periodic_full_refresh();
-    test_recording_elapsed_projection_is_bounded_and_monotonic_by_seconds();
-    test_time_projection_uses_one_hz_model_granularity();
-    test_time_partial_projection_matches_full_model_render();
-    test_time_digit_carries_stay_inside_value_dirty_region();
-    test_play_pause_changes_only_the_declared_control_region();
-    test_rapid_time_adjustments_compose_and_keep_controls_stable();
-    test_inactive_time_pages_render_their_durable_presets();
-    test_partial_render_preserves_outside_region();
-    test_record_partial_render_replaces_status_through_bottom_edge();
-    test_child_screens_have_no_back_affordance_or_hidden_touch_target();
-    test_voice_note_back_paths_are_consistent();
-    test_note_detail_back_restores_selected_page();
-    test_twelve_hour_alarm_distinguishes_am_and_pm();
-    test_twelve_hour_time_temp_omits_am_pm_suffix();
-    test_clock_always_shows_celsius_and_fahrenheit();
-    test_settings_labels_stay_inside_quadrant_borders();
-    test_text_rendering_is_uppercase_at_the_boundary();
-    test_audio_note_rows_render_datetime_without_rec_prefix();
-    test_alarm_adjustments_are_icon_only();
-    test_compiled_static_art_is_immutable();
-    test_long_note_label_stays_inside_editorial_row();
-    test_note_detail_title_respects_side_margins();
-    test_long_home_title_is_ellipsized_inside_header();
-    test_calendar_divider_stays_above_empty_state();
-    test_polished_scenes_render_stably();
-    test_render_all_states();
-    puts("ui tests passed");
+    test_geometry_is_exhaustive_and_navigation_is_fixed();
+    test_state_metadata_and_deterministic_composition();
+    test_record_arming_and_back_contract();
+    test_playback_uses_only_full_screen_play_and_pause();
+    test_case_punctuation_and_long_transcript();
+    test_note_pages_selection_and_content_partials();
+    test_typed_preferences_revisions_and_theme_inversion();
+    test_settings_mapping_and_volume_extrema();
+    test_battery_thresholds_and_clock_partials();
+    test_alarm_caret_and_toggle_controls();
+    test_stopwatch_timer_interval_commands();
+    test_all_digit_carries_in_both_directions();
+    test_sync_five_line_phases_and_transactions();
+    test_exact_presenter_reconstruction_for_dynamic_screens();
+    test_presenter_idle_barrier_rejection_and_navigation_full();
+    puts("ui core tests passed");
     return 0;
 }
