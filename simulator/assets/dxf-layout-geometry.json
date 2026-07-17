@@ -1,0 +1,606 @@
+{
+  "boundary_ownership": "first_slot_in_layout_order",
+  "display": {
+    "coordinate_scale": 16,
+    "height": 200,
+    "width": 200
+  },
+  "generator": "tools/generate_dxf_geometry.py",
+  "layouts": [
+    {
+      "discarded_outer_line_count": 4,
+      "id": "home_3_1",
+      "rules": [
+        {
+          "end": {
+            "x": 3200,
+            "y": 2663
+          },
+          "start": {
+            "x": 1600,
+            "y": 1600
+          }
+        },
+        {
+          "end": {
+            "x": 0,
+            "y": 2880
+          },
+          "start": {
+            "x": 1600,
+            "y": 1600
+          }
+        },
+        {
+          "end": {
+            "x": 1412,
+            "y": 0
+          },
+          "start": {
+            "x": 1600,
+            "y": 1600
+          }
+        }
+      ],
+      "slots": [
+        {
+          "hit_polygon": [
+            {
+              "x": 0,
+              "y": 0
+            },
+            {
+              "x": 1412,
+              "y": 0
+            },
+            {
+              "x": 1600,
+              "y": 1600
+            },
+            {
+              "x": 0,
+              "y": 2880
+            }
+          ],
+          "icon_center": {
+            "x": 688,
+            "y": 1178
+          },
+          "id": "home_time",
+          "position": "left"
+        },
+        {
+          "hit_polygon": [
+            {
+              "x": 1600,
+              "y": 1600
+            },
+            {
+              "x": 3200,
+              "y": 2663
+            },
+            {
+              "x": 3200,
+              "y": 3200
+            },
+            {
+              "x": 0,
+              "y": 3200
+            },
+            {
+              "x": 0,
+              "y": 2880
+            }
+          ],
+          "icon_center": {
+            "x": 1657,
+            "y": 2635
+          },
+          "id": "home_notes",
+          "position": "bottom"
+        },
+        {
+          "hit_polygon": [
+            {
+              "x": 1412,
+              "y": 0
+            },
+            {
+              "x": 3200,
+              "y": 0
+            },
+            {
+              "x": 3200,
+              "y": 2663
+            },
+            {
+              "x": 1600,
+              "y": 1600
+            }
+          ],
+          "icon_center": {
+            "x": 2427,
+            "y": 1064
+          },
+          "id": "home_settings",
+          "position": "right"
+        }
+      ],
+      "source": "assets/dxf/3_1.dxf",
+      "source_line_count": 7,
+      "source_sha256": "8cad0b1f0a32b8092a3bf3cc1d96d4cfc6319f438957a119e88b43885e389c97"
+    },
+    {
+      "discarded_outer_line_count": 4,
+      "id": "notes_3_1m",
+      "rules": [
+        {
+          "end": {
+            "x": 1412,
+            "y": 3200
+          },
+          "start": {
+            "x": 1600,
+            "y": 1600
+          }
+        },
+        {
+          "end": {
+            "x": 0,
+            "y": 320
+          },
+          "start": {
+            "x": 1600,
+            "y": 1600
+          }
+        },
+        {
+          "end": {
+            "x": 3200,
+            "y": 537
+          },
+          "start": {
+            "x": 1600,
+            "y": 1600
+          }
+        }
+      ],
+      "slots": [
+        {
+          "hit_polygon": [
+            {
+              "x": 0,
+              "y": 0
+            },
+            {
+              "x": 3200,
+              "y": 0
+            },
+            {
+              "x": 3200,
+              "y": 537
+            },
+            {
+              "x": 1600,
+              "y": 1600
+            },
+            {
+              "x": 0,
+              "y": 320
+            }
+          ],
+          "icon_center": {
+            "x": 1657,
+            "y": 565
+          },
+          "id": "notes_record",
+          "position": "top"
+        },
+        {
+          "hit_polygon": [
+            {
+              "x": 0,
+              "y": 320
+            },
+            {
+              "x": 1600,
+              "y": 1600
+            },
+            {
+              "x": 1412,
+              "y": 3200
+            },
+            {
+              "x": 0,
+              "y": 3200
+            }
+          ],
+          "icon_center": {
+            "x": 688,
+            "y": 2022
+          },
+          "id": "notes_listen",
+          "position": "left"
+        },
+        {
+          "hit_polygon": [
+            {
+              "x": 3200,
+              "y": 537
+            },
+            {
+              "x": 3200,
+              "y": 3200
+            },
+            {
+              "x": 1412,
+              "y": 3200
+            },
+            {
+              "x": 1600,
+              "y": 1600
+            }
+          ],
+          "icon_center": {
+            "x": 2427,
+            "y": 2136
+          },
+          "id": "notes_read",
+          "position": "right"
+        }
+      ],
+      "source": "assets/dxf/3_1m.dxf",
+      "source_line_count": 7,
+      "source_sha256": "e1fb400c92b56ae05cd67865a92c901f9392d6c36cc2dde3e5e46f64ea4540b5"
+    },
+    {
+      "discarded_outer_line_count": 4,
+      "id": "time_4_1",
+      "rules": [
+        {
+          "end": {
+            "x": 1688,
+            "y": 3200
+          },
+          "start": {
+            "x": 1515,
+            "y": 1685
+          }
+        },
+        {
+          "end": {
+            "x": 3200,
+            "y": 1688
+          },
+          "start": {
+            "x": 1685,
+            "y": 1515
+          }
+        },
+        {
+          "end": {
+            "x": 0,
+            "y": 1512
+          },
+          "start": {
+            "x": 1515,
+            "y": 1685
+          }
+        },
+        {
+          "end": {
+            "x": 1515,
+            "y": 1685
+          },
+          "start": {
+            "x": 1685,
+            "y": 1515
+          }
+        },
+        {
+          "end": {
+            "x": 1512,
+            "y": 0
+          },
+          "start": {
+            "x": 1685,
+            "y": 1515
+          }
+        }
+      ],
+      "slots": [
+        {
+          "hit_polygon": [
+            {
+              "x": 0,
+              "y": 0
+            },
+            {
+              "x": 1512,
+              "y": 0
+            },
+            {
+              "x": 1685,
+              "y": 1515
+            },
+            {
+              "x": 1515,
+              "y": 1685
+            },
+            {
+              "x": 0,
+              "y": 1512
+            }
+          ],
+          "icon_center": {
+            "x": 815,
+            "y": 815
+          },
+          "id": "time_alarm",
+          "position": "top_left"
+        },
+        {
+          "hit_polygon": [
+            {
+              "x": 1512,
+              "y": 0
+            },
+            {
+              "x": 3200,
+              "y": 0
+            },
+            {
+              "x": 3200,
+              "y": 1688
+            },
+            {
+              "x": 1685,
+              "y": 1515
+            }
+          ],
+          "icon_center": {
+            "x": 2414,
+            "y": 786
+          },
+          "id": "time_stopwatch",
+          "position": "top_right"
+        },
+        {
+          "hit_polygon": [
+            {
+              "x": 0,
+              "y": 1512
+            },
+            {
+              "x": 1515,
+              "y": 1685
+            },
+            {
+              "x": 1688,
+              "y": 3200
+            },
+            {
+              "x": 0,
+              "y": 3200
+            }
+          ],
+          "icon_center": {
+            "x": 786,
+            "y": 2414
+          },
+          "id": "time_timer",
+          "position": "bottom_left"
+        },
+        {
+          "hit_polygon": [
+            {
+              "x": 1685,
+              "y": 1515
+            },
+            {
+              "x": 3200,
+              "y": 1688
+            },
+            {
+              "x": 3200,
+              "y": 3200
+            },
+            {
+              "x": 1688,
+              "y": 3200
+            },
+            {
+              "x": 1515,
+              "y": 1685
+            }
+          ],
+          "icon_center": {
+            "x": 2385,
+            "y": 2385
+          },
+          "id": "time_interval",
+          "position": "bottom_right"
+        }
+      ],
+      "source": "assets/dxf/4_1.dxf",
+      "source_line_count": 9,
+      "source_sha256": "ba0cba4e59edfa718466eec60f5b69fd40f718d177986710c9590f1fc9001ea8"
+    },
+    {
+      "discarded_outer_line_count": 4,
+      "horizontal_mirror_of": "time_4_1",
+      "id": "settings_4_0m",
+      "rules": [
+        {
+          "end": {
+            "x": 1512,
+            "y": 3200
+          },
+          "start": {
+            "x": 1685,
+            "y": 1685
+          }
+        },
+        {
+          "end": {
+            "x": 0,
+            "y": 1688
+          },
+          "start": {
+            "x": 1515,
+            "y": 1515
+          }
+        },
+        {
+          "end": {
+            "x": 1685,
+            "y": 1685
+          },
+          "start": {
+            "x": 1515,
+            "y": 1515
+          }
+        },
+        {
+          "end": {
+            "x": 3200,
+            "y": 1512
+          },
+          "start": {
+            "x": 1685,
+            "y": 1685
+          }
+        },
+        {
+          "end": {
+            "x": 1688,
+            "y": 0
+          },
+          "start": {
+            "x": 1515,
+            "y": 1515
+          }
+        }
+      ],
+      "slots": [
+        {
+          "hit_polygon": [
+            {
+              "x": 0,
+              "y": 0
+            },
+            {
+              "x": 1688,
+              "y": 0
+            },
+            {
+              "x": 1515,
+              "y": 1515
+            },
+            {
+              "x": 0,
+              "y": 1688
+            }
+          ],
+          "icon_center": {
+            "x": 786,
+            "y": 786
+          },
+          "id": "settings_volume",
+          "position": "top_left"
+        },
+        {
+          "hit_polygon": [
+            {
+              "x": 1688,
+              "y": 0
+            },
+            {
+              "x": 3200,
+              "y": 0
+            },
+            {
+              "x": 3200,
+              "y": 1512
+            },
+            {
+              "x": 1685,
+              "y": 1685
+            },
+            {
+              "x": 1515,
+              "y": 1515
+            }
+          ],
+          "icon_center": {
+            "x": 2385,
+            "y": 815
+          },
+          "id": "settings_theme",
+          "position": "top_right"
+        },
+        {
+          "hit_polygon": [
+            {
+              "x": 1515,
+              "y": 1515
+            },
+            {
+              "x": 1685,
+              "y": 1685
+            },
+            {
+              "x": 1512,
+              "y": 3200
+            },
+            {
+              "x": 0,
+              "y": 3200
+            },
+            {
+              "x": 0,
+              "y": 1688
+            }
+          ],
+          "icon_center": {
+            "x": 815,
+            "y": 2385
+          },
+          "id": "settings_hour_format",
+          "position": "bottom_left"
+        },
+        {
+          "hit_polygon": [
+            {
+              "x": 3200,
+              "y": 1512
+            },
+            {
+              "x": 3200,
+              "y": 3200
+            },
+            {
+              "x": 1512,
+              "y": 3200
+            },
+            {
+              "x": 1685,
+              "y": 1685
+            }
+          ],
+          "icon_center": {
+            "x": 2414,
+            "y": 2414
+          },
+          "id": "settings_sync",
+          "position": "bottom_right"
+        }
+      ],
+      "source": "assets/dxf/4_0m.dxf",
+      "source_line_count": 9,
+      "source_sha256": "608863e99b81cc76da1599850615a9f81a8f6460de3389f87e7fcc5eb560d50b"
+    }
+  ],
+  "rule_width_px": 4,
+  "schema_version": 1
+}
