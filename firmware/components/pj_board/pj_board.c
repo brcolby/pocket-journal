@@ -182,6 +182,12 @@
 #define PJ_AUDIO_FRAME_BYTES 4
 #define PJ_AUDIO_MCLK_MULTIPLE I2S_MCLK_MULTIPLE_384
 #define PJ_AUDIO_MIC_GAIN_DB 42.0f
+/*
+ * esp_codec_dev subtracts the declared PA gain from its DAC target.  Zero
+ * compensation keeps full volume at 0 dB; the former 6 dB declaration
+ * attenuated every nonzero setting by about half in voltage amplitude.
+ */
+#define PJ_AUDIO_CODEC_PA_GAIN_COMPENSATION_DB 0.0f
 #define PJ_AUDIO_RECORD_TASK_STACK 6144
 #define PJ_AUDIO_PROCESS_TASK_STACK 6144
 #define PJ_AUDIO_PROCESS_QUEUE_LENGTH 4U
@@ -3342,7 +3348,7 @@ static esp_err_t epd_refresh_partial(const pj_framebuffer_t *framebuffer,
     }
     ESP_RETURN_ON_ERROR(epd_prepare_partial(), TAG,
                         "display partial mode preparation failed");
-    ESP_LOGI(TAG, "Display partial refresh x=%d y=%d w=%d h=%d bytes=%d ram=0x24",
+    ESP_LOGI(TAG, "Display partial refresh x=%d y=%d w=%d h=%d bytes=%d ram=0x24->0x26->0x24",
              x0, y0, x1 - x0 + 1, y1 - y0 + 1, byte_len);
     ESP_RETURN_ON_ERROR(epd_set_windows((uint16_t)x0, mem_y_start,
                                         (uint16_t)x1, mem_y_end),
@@ -3384,17 +3390,17 @@ static esp_err_t epd_refresh_full(const pj_framebuffer_t *framebuffer)
                                         PJ_DISPLAY_HEIGHT - 1, 0),
                         TAG, "display full window failed");
     ESP_RETURN_ON_ERROR(epd_set_cursor(0, PJ_DISPLAY_HEIGHT - 1), TAG,
-                        "display full cursor 0x24 failed");
-    ESP_RETURN_ON_ERROR(epd_send_command(0x24), TAG,
-                        "display full RAM 0x24 command failed");
-    ESP_RETURN_ON_ERROR(epd_write_bytes(g_epd_buffer, PJ_FRAMEBUFFER_BYTES), TAG,
-                        "display full RAM 0x24 transfer failed");
-    ESP_RETURN_ON_ERROR(epd_set_cursor(0, PJ_DISPLAY_HEIGHT - 1), TAG,
                         "display full cursor 0x26 failed");
     ESP_RETURN_ON_ERROR(epd_send_command(0x26), TAG,
                         "display full RAM 0x26 command failed");
     ESP_RETURN_ON_ERROR(epd_write_bytes(g_epd_buffer, PJ_FRAMEBUFFER_BYTES), TAG,
                         "display full RAM 0x26 transfer failed");
+    ESP_RETURN_ON_ERROR(epd_set_cursor(0, PJ_DISPLAY_HEIGHT - 1), TAG,
+                        "display full cursor 0x24 failed");
+    ESP_RETURN_ON_ERROR(epd_send_command(0x24), TAG,
+                        "display full RAM 0x24 command failed");
+    ESP_RETURN_ON_ERROR(epd_write_bytes(g_epd_buffer, PJ_FRAMEBUFFER_BYTES), TAG,
+                        "display full RAM 0x24 transfer failed");
     ESP_RETURN_ON_ERROR(epd_turn_on_display(), TAG, "display full activation failed");
     return ESP_OK;
 }
@@ -6309,7 +6315,7 @@ static esp_err_t audio_codec_init(void)
         .invert_mclk = false,
         .invert_sclk = false,
         .hw_gain = {
-            .pa_gain = 6.0f,
+            .pa_gain = PJ_AUDIO_CODEC_PA_GAIN_COMPENSATION_DB,
         },
         .mclk_div = PJ_AUDIO_MCLK_MULTIPLE,
     };

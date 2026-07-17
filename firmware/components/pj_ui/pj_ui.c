@@ -67,7 +67,7 @@ static const state_meta_t STATE_META[PJ_UI_STATE_COUNT] = {
 };
 
 static const tile_t HOME_TILES[] = {
-    {"Time", PJ_CARBON_ICON_TIME_FILLED, PJ_UI_STATE_TIME,
+    {"Time", PJ_CARBON_ICON_TIME, PJ_UI_STATE_TIME,
      PJ_LAYOUT_SLOT_HOME_TIME},
     {"Notes", PJ_CARBON_ICON_DATA_ENRICHMENT, PJ_UI_STATE_NOTES,
      PJ_LAYOUT_SLOT_HOME_NOTES},
@@ -625,7 +625,7 @@ void pj_ui_init(pj_ui_context_t *ctx)
     ctx->interaction_generation = 1;
     ctx->visual_revision = 1;
     ctx->full_refresh_revision = 1;
-    ctx->volume = 5;
+    ctx->volume = 10;
     ctx->battery_percent = 84;
     ctx->temperature_c = 22;
     ctx->humidity_percent = 45;
@@ -1784,7 +1784,7 @@ static void audio_note_display_label(char *out, size_t out_size, const char *lab
         day >= 1 && day <= 31 && hour >= 0 && hour <= 23 &&
         minute >= 0 && minute <= 59) {
         (void)sequence;
-        (void)snprintf(out, out_size, "%s %02d %02d:%02d",
+        (void)snprintf(out, out_size, "%s%02d%02d:%02d",
                        months[month - 1], day, hour, minute);
         return;
     }
@@ -1880,10 +1880,9 @@ static void draw_settings(const pj_ui_context_t *ctx, pj_framebuffer_t *fb)
 
 static void draw_volume(const pj_ui_context_t *ctx, pj_framebuffer_t *fb)
 {
-    int width = (ctx->volume * PJ_DISPLAY_WIDTH) / 10;
-    if (width > 0) {
-        fill_rect(fb, 0, 0, width, 100);
-    }
+    char value[4];
+    (void)snprintf(value, sizeof(value), "%d", ctx->volume);
+    draw_text_center_at(fb, PJ_DISPLAY_WIDTH / 2, 50, value, 4);
     draw_horizontal_rule(fb, 100);
     draw_vertical_rule(fb, 100, 100, 100);
     const pj_carbon_icon_id_t actions[] = {
@@ -1895,46 +1894,45 @@ static void draw_volume(const pj_ui_context_t *ctx, pj_framebuffer_t *fb)
 static void draw_sync(const pj_ui_context_t *ctx, pj_framebuffer_t *fb)
 {
     const char *status = ctx->sync_inventory_state == PJ_UI_SYNC_INVENTORY_PENDING ?
-        "CHECKING" : ctx->sync_inventory_state == PJ_UI_SYNC_INVENTORY_UNKNOWN ?
-        "UNKNOWN" : "IDLE";
+        "CHECK" : ctx->sync_inventory_state == PJ_UI_SYNC_INVENTORY_UNKNOWN ?
+        "WAIT" : "IDLE";
     if (strcmp(ctx->sync_phase, "succeeded") == 0) {
-        status = "COMPLETE";
+        status = "DONE";
     } else if (strcmp(ctx->sync_phase, "offline") == 0) {
         status = "OFFLINE";
     } else if (strcmp(ctx->sync_phase, "failed") == 0 ||
                strcmp(ctx->sync_phase, "auth_failed") == 0 ||
                strcmp(ctx->sync_phase, "protocol_failed") == 0) {
-        status = "FAILED";
+        status = "ERROR";
     } else if (strcmp(ctx->sync_phase, "discovering") == 0 ||
                strcmp(ctx->sync_phase, "requesting") == 0 ||
                strcmp(ctx->sync_phase, "running") == 0) {
-        status = "ACTIVE";
+        status = "SYNC";
     } else if (ctx->sync_request_pending ||
                strcmp(ctx->sync_phase, "pending") == 0) {
-        status = "PENDING";
+        status = "QUEUED";
     }
-    const char *detail = ctx->sync_online ? "CONNECTED" : "WAITING";
+    const char *detail = ctx->sync_online ? "ONLINE" : "WAIT";
     if (strcmp(ctx->sync_phase, "auth_failed") == 0) {
         detail = "AUTH";
     } else if (strcmp(ctx->sync_phase, "protocol_failed") == 0) {
-        detail = "PROTOCOL";
+        detail = "PROTO";
     } else if (strcmp(ctx->sync_phase, "failed") == 0) {
-        detail = "TERMINAL";
+        detail = "ERROR";
     } else if (strcmp(ctx->sync_phase, "offline") == 0) {
-        detail = "NETWORK";
+        detail = "NET";
     }
 
-    char pending[24];
-    char sent[24];
-    char failed[24];
+    char counts[32];
     if (ctx->sync_inventory_state == PJ_UI_SYNC_INVENTORY_READY) {
-        (void)snprintf(pending, sizeof(pending), "PENDING %d", ctx->sync_pending);
+        (void)snprintf(counts, sizeof(counts), "Q%d S%d E%d",
+                       ctx->sync_pending, ctx->sync_transferred,
+                       ctx->sync_failed);
     } else {
-        (void)snprintf(pending, sizeof(pending), "%s", "PENDING ?");
+        (void)snprintf(counts, sizeof(counts), "Q? S%d E%d",
+                       ctx->sync_transferred, ctx->sync_failed);
     }
-    (void)snprintf(sent, sizeof(sent), "SENT %d", ctx->sync_transferred);
-    (void)snprintf(failed, sizeof(failed), "FAIL %d", ctx->sync_failed);
-    const char *lines[] = {status, pending, sent, failed, detail};
+    const char *lines[] = {status, counts, detail};
     int scale = PJ_UI_FONT_SCALE_COUNT;
     int band_height = PJ_DISPLAY_HEIGHT / (int)(sizeof(lines) / sizeof(lines[0]));
     while (scale > 1) {

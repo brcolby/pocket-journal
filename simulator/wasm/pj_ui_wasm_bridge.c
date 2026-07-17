@@ -292,9 +292,9 @@ EMSCRIPTEN_KEEPALIVE
 void pj_sim_seed_timestamp_notes(void)
 {
     static const char *labels[] = {
-        "JAN 19 09:19",
-        "JUL 15 21:41",
-        "DEC 31 19:09",
+        "REC 20260119 0919 1",
+        "REC 20260715 2141 2",
+        "REC 20261231 1909 3",
     };
     memset(g_note_labels, 0, sizeof(g_note_labels));
     g_note_count = (int)(sizeof(labels) / sizeof(labels[0]));

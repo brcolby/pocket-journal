@@ -66,7 +66,7 @@ PUNCTUATION = " " + string.punctuation
 # duplicate VolumeUp size is intentional: it is a 64px Settings launcher and a
 # 40px Volume control.  These pairs total 30 compiled semantic records.
 SEMANTIC_ICONS: tuple[tuple[str, str, tuple[int, ...]], ...] = (
-    ("TIME_FILLED", "time--filled.svg", (64,)),
+    ("TIME", "time.svg", (64,)),
     ("DATA_ENRICHMENT", "data-enrichment.svg", (64,)),
     ("SERVICE_LEVELS", "service-levels.svg", (64,)),
     ("WAVEFORM", "waveform.svg", (64,)),
@@ -124,7 +124,7 @@ REFERENCE_FILES: tuple[str, ...] = (
     "settings.svg",
     "stop.svg",
     "subtract.svg",
-    "time.svg",
+    "time--filled.svg",
     "wifi.svg",
 )
 
@@ -419,12 +419,14 @@ def build_manifest() -> dict:
             "settings_composites": [
                 {
                     "allowed_sizes": [64],
-                    "components": ["PJ_CARBON_GLYPH_SMALL_DIGIT_1", "PJ_CARBON_GLYPH_SMALL_DIGIT_2", "PJ_CARBON_GLYPH_UPPER_H"],
+                    "components": ["PJ_CARBON_GLYPH_SMALL_DIGIT_1", "PJ_CARBON_GLYPH_SMALL_DIGIT_2", "PJ_CARBON_GLYPH_LOWER_H"],
+                    "component_sizes": [64, 64, 32],
                     "typed_id": "PJ_CARBON_GLYPH_SETTINGS_12H",
                 },
                 {
                     "allowed_sizes": [64],
-                    "components": ["PJ_CARBON_GLYPH_SMALL_DIGIT_2", "PJ_CARBON_GLYPH_SMALL_DIGIT_4", "PJ_CARBON_GLYPH_UPPER_H"],
+                    "components": ["PJ_CARBON_GLYPH_SMALL_DIGIT_2", "PJ_CARBON_GLYPH_SMALL_DIGIT_4", "PJ_CARBON_GLYPH_LOWER_H"],
+                    "component_sizes": [64, 64, 32],
                     "typed_id": "PJ_CARBON_GLYPH_SETTINGS_24H",
                 },
             ],
@@ -578,8 +580,22 @@ def compose_settings_bitmap(component_bitmaps: Sequence[Bitmap]) -> Bitmap:
 def generate_composites(glyph_records: list[dict]) -> list[dict]:
     by_key = {(record["id"], record["size"]): record["bitmap"] for record in glyph_records}
     definitions = (
-        ("PJ_CARBON_GLYPH_SETTINGS_12H", ("PJ_CARBON_GLYPH_SMALL_DIGIT_1", "PJ_CARBON_GLYPH_SMALL_DIGIT_2", "PJ_CARBON_GLYPH_UPPER_H")),
-        ("PJ_CARBON_GLYPH_SETTINGS_24H", ("PJ_CARBON_GLYPH_SMALL_DIGIT_2", "PJ_CARBON_GLYPH_SMALL_DIGIT_4", "PJ_CARBON_GLYPH_UPPER_H")),
+        (
+            "PJ_CARBON_GLYPH_SETTINGS_12H",
+            (
+                ("PJ_CARBON_GLYPH_SMALL_DIGIT_1", 64),
+                ("PJ_CARBON_GLYPH_SMALL_DIGIT_2", 64),
+                ("PJ_CARBON_GLYPH_LOWER_H", 32),
+            ),
+        ),
+        (
+            "PJ_CARBON_GLYPH_SETTINGS_24H",
+            (
+                ("PJ_CARBON_GLYPH_SMALL_DIGIT_2", 64),
+                ("PJ_CARBON_GLYPH_SMALL_DIGIT_4", 64),
+                ("PJ_CARBON_GLYPH_LOWER_H", 32),
+            ),
+        ),
     )
     return [
         {
@@ -587,8 +603,8 @@ def generate_composites(glyph_records: list[dict]) -> list[dict]:
             "id": typed_id,
             "kind": "settings_composite",
             "size": 64,
-            "source": "+".join(components),
-            "bitmap": compose_settings_bitmap([by_key[(component, 64)] for component in components]),
+            "source": "+".join(f"{component}@{size}" for component, size in components),
+            "bitmap": compose_settings_bitmap([by_key[(component, size)] for component, size in components]),
         }
         for typed_id, components in definitions
     ]

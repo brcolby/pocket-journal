@@ -10,7 +10,7 @@ The Home launcher uses `assets/dxf/3_1.dxf`, normalized to the complete 200 x
 
 | Position | Destination | Carbon graphic |
 | --- | --- | --- |
-| Left | Time | `TimeFilled` |
+| Left | Time | `Time` |
 | Bottom | Notes | `DataEnrichment` |
 | Right | Settings | `ServiceLevels` |
 
@@ -20,7 +20,7 @@ The same generated geometry contract covers the other top-level launchers:
 | --- | --- | --- |
 | Notes | `3_1m.dxf` | Record (top), Listen (left), Read (right) |
 | Time | `4_1.dxf` | Alarm (top-left), Stopwatch (top-right), Timer (bottom-left), Interval (bottom-right) |
-| Settings | `4_0m.dxf` | Volume (top-left), Theme (top-right), 12H/24H (bottom-left), Sync (bottom-right) |
+| Settings | `4_0m.dxf` | Volume (top-left), Theme (top-right), 12h/24h (bottom-left), Sync (bottom-right) |
 
 `4_1.dxf` is the canonical unmirrored four-sector source. `4_0m.dxf` is
 validated as its exact horizontal geometry mirror. Slot identities are assigned

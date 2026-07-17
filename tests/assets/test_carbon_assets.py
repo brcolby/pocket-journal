@@ -102,8 +102,12 @@ class CarbonAssetContractTest(unittest.TestCase):
             nine = next(record["bitmap"].rows for record in records if record["id"].endswith("_9"))
             self.assertNotEqual(one, nine)
 
-    def test_settings_composites_use_only_small_digits_and_uppercase_h(self) -> None:
+    def test_settings_composites_use_only_small_digits_and_lowercase_h(self) -> None:
         composites = [record for record in self.glyphs if record["kind"] == "settings_composite"]
+        base_by_key = {
+            (record["id"], record["size"]): record["bitmap"]
+            for record in self.base_glyphs
+        }
         self.assertEqual([record["id"] for record in composites], [
             "PJ_CARBON_GLYPH_SETTINGS_12H",
             "PJ_CARBON_GLYPH_SETTINGS_24H",
@@ -111,8 +115,16 @@ class CarbonAssetContractTest(unittest.TestCase):
         self.assertNotEqual(composites[0]["bitmap"].rows, composites[1]["bitmap"].rows)
         for record in composites:
             self.assertEqual((record["bitmap"].width, record["bitmap"].height), (64, 64))
-            self.assertIn("PJ_CARBON_GLYPH_UPPER_H", record["source"])
+            self.assertIn("PJ_CARBON_GLYPH_LOWER_H@32", record["source"])
+            self.assertNotIn("PJ_CARBON_GLYPH_UPPER_H", record["source"])
             self.assertNotIn("PJ_CARBON_GLYPH_DIGIT_", record["source"])
+        small_digit = base_by_key[("PJ_CARBON_GLYPH_SMALL_DIGIT_2", 64)]
+        lowercase_h = base_by_key[("PJ_CARBON_GLYPH_LOWER_H", 32)]
+        assert small_digit.ink_bbox is not None and lowercase_h.ink_bbox is not None
+        self.assertLess(
+            lowercase_h.ink_bbox[3] - lowercase_h.ink_bbox[1],
+            small_digit.ink_bbox[3] - small_digit.ink_bbox[1],
+        )
 
     def test_exact_semantic_record_contract(self) -> None:
         expected = {
@@ -175,8 +187,8 @@ class CarbonAssetContractTest(unittest.TestCase):
 int main(void) {
     assert(PJ_CARBON_ICON_BITMAP_COUNT == 30);
     assert(PJ_CARBON_DERIVED_GLYPH_COUNT == 72);
-    assert(pj_carbon_icon_lookup(PJ_CARBON_ICON_TIME_FILLED, 64) != 0);
-    assert(pj_carbon_icon_lookup(PJ_CARBON_ICON_TIME_FILLED, 40) == 0);
+    assert(pj_carbon_icon_lookup(PJ_CARBON_ICON_TIME, 64) != 0);
+    assert(pj_carbon_icon_lookup(PJ_CARBON_ICON_TIME, 40) == 0);
     assert(pj_carbon_icon_lookup(PJ_CARBON_ICON_PLAY_FILLED, 144) != 0);
     assert(pj_carbon_glyph_lookup_codepoint('A', 32) != 0);
     assert(pj_carbon_glyph_lookup_codepoint('a', 32) != 0);

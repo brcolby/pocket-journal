@@ -91,8 +91,11 @@ The inline bootstrap logger writes to the same endpoint before `src/main.js` loa
 - `notes`: record, listen, read.
 - `time`: alarm, stopwatch, timer, interval.
 - `settings`: four DXF sectors for Volume, Light/Dark (the invariant
-  `AsleepFilled` icon), 12H/24H, and Sync.
-- `volume`: the filled meter uses the full upper half; the lower minus and plus controls adjust it.
+  `AsleepFilled` icon), compact 12h/24h, and Sync.
+- `volume`: a 0–10 numeric counter uses the upper half; the lower minus and
+  plus controls adjust it through exact partial updates.
+- `sync`: three centered status/count/detail lines share one maximized font
+  size.
 - `record`: entry first presents a full `00:00` frame; capture then starts and
   elapsed playable PCM duration is reserved on a hard one-second cadence. AUX
   stops/saves and returns home while processing continues asynchronously.

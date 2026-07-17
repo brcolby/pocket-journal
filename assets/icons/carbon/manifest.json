@@ -6,10 +6,15 @@
         "allowed_sizes": [
           64
         ],
+        "component_sizes": [
+          64,
+          64,
+          32
+        ],
         "components": [
           "PJ_CARBON_GLYPH_SMALL_DIGIT_1",
           "PJ_CARBON_GLYPH_SMALL_DIGIT_2",
-          "PJ_CARBON_GLYPH_UPPER_H"
+          "PJ_CARBON_GLYPH_LOWER_H"
         ],
         "typed_id": "PJ_CARBON_GLYPH_SETTINGS_12H"
       },
@@ -17,10 +22,15 @@
         "allowed_sizes": [
           64
         ],
+        "component_sizes": [
+          64,
+          64,
+          32
+        ],
         "components": [
           "PJ_CARBON_GLYPH_SMALL_DIGIT_2",
           "PJ_CARBON_GLYPH_SMALL_DIGIT_4",
-          "PJ_CARBON_GLYPH_UPPER_H"
+          "PJ_CARBON_GLYPH_LOWER_H"
         ],
         "typed_id": "PJ_CARBON_GLYPH_SETTINGS_24H"
       }
@@ -1843,24 +1853,24 @@
       "typed_ids": []
     },
     {
+      "allowed_sizes": [],
+      "kind": "reference_icon",
+      "path": "svg/32/time--filled.svg",
+      "sha256": "dc6f51877e199ddd56dae4de11a4e720d98e35c0cb37b88464c26b7aacdae68a",
+      "status": "reference",
+      "typed_ids": []
+    },
+    {
       "allowed_sizes": [
         64
       ],
       "kind": "semantic_icon",
-      "path": "svg/32/time--filled.svg",
-      "sha256": "dc6f51877e199ddd56dae4de11a4e720d98e35c0cb37b88464c26b7aacdae68a",
-      "status": "active",
-      "typed_ids": [
-        "PJ_CARBON_ICON_TIME_FILLED"
-      ]
-    },
-    {
-      "allowed_sizes": [],
-      "kind": "reference_icon",
       "path": "svg/32/time.svg",
       "sha256": "bb29c2f0d3f68c550684da4840799eab35a26d01b116a317c082f87f45779317",
-      "status": "reference",
-      "typed_ids": []
+      "status": "active",
+      "typed_ids": [
+        "PJ_CARBON_ICON_TIME"
+      ]
     },
     {
       "allowed_sizes": [

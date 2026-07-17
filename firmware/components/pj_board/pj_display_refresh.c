@@ -171,7 +171,7 @@ pj_display_refresh_plan_t pj_display_refresh_plan(
         plan.kind = PJ_DISPLAY_REFRESH_PARTIAL;
         plan.deferred_cleanup = cleanup_due;
         plan.transfer_bytes = (uint32_t)(plan.region.width / 8) *
-            (uint32_t)plan.region.height;
+            (uint32_t)plan.region.height * PJ_DISPLAY_PARTIAL_WIRE_WRITES;
     }
     return plan;
 }
@@ -295,5 +295,25 @@ int pj_display_refresh_commit_partial_planes(
     if (result != 0) return result;
     result = io->write(io->context, current, length);
     if (result != 0) return result;
-    return io->activate(io->context);
+    result = io->activate(io->context);
+    if (result != 0) return result;
+
+    /*
+     * The fast LUT is differential.  Once the panel has accepted the new
+     * pixels, advance its previous-image RAM and then restore current RAM to
+     * the same bytes.  Rewriting both planes matches the SSD1681 reference
+     * sequence and prevents later unchanged digit strokes from being compared
+     * with a stale navigation/full-refresh base.
+     */
+    result = io->position(io->context);
+    if (result != 0) return result;
+    result = io->command(io->context, PJ_DISPLAY_PARTIAL_PREVIOUS_RAM_COMMAND);
+    if (result != 0) return result;
+    result = io->write(io->context, current, length);
+    if (result != 0) return result;
+    result = io->position(io->context);
+    if (result != 0) return result;
+    result = io->command(io->context, PJ_DISPLAY_PARTIAL_CURRENT_RAM_COMMAND);
+    if (result != 0) return result;
+    return io->write(io->context, current, length);
 }

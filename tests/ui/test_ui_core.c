@@ -65,6 +65,18 @@ static int framebuffer_differences(const pj_framebuffer_t *left,
     return count;
 }
 
+static void assert_framebuffer_region_equal(
+    const pj_framebuffer_t *left, const pj_framebuffer_t *right,
+    int x, int y, int width, int height)
+{
+    for (int row = y; row < y + height; row++) {
+        for (int column = x; column < x + width; column++) {
+            assert(pj_framebuffer_get(left, column, row) ==
+                   pj_framebuffer_get(right, column, row));
+        }
+    }
+}
+
 static pj_ui_dirty_region_t independent_changed_bounds(
     const pj_framebuffer_t *before, const pj_framebuffer_t *after)
 {
@@ -665,6 +677,42 @@ static void test_note_pages_selection_and_content_partials(void)
     presenter_accept_partial(&fixture, &context);
 }
 
+static void test_audio_note_timestamps_are_compact(void)
+{
+    const char raw[][PJ_UI_NOTE_LABEL_LEN] = {
+        "REC 20260717 0909 1",
+    };
+    const char compact[][PJ_UI_NOTE_LABEL_LEN] = {
+        "JUL1709:09",
+    };
+    const char spaced[][PJ_UI_NOTE_LABEL_LEN] = {
+        "JUL 17 09:09",
+    };
+    pj_ui_context_t context;
+    pj_ui_context_t expected;
+    pj_ui_context_t old_layout;
+    pj_framebuffer_t actual_frame;
+    pj_framebuffer_t expected_frame;
+    pj_framebuffer_t old_frame;
+
+    pj_ui_init(&context);
+    context.state = PJ_UI_STATE_LISTEN;
+    pj_ui_set_notes(&context, 1, raw);
+    pj_ui_compose_frame(&context, &actual_frame);
+
+    pj_ui_init(&expected);
+    expected.state = PJ_UI_STATE_LISTEN;
+    pj_ui_set_notes(&expected, 1, compact);
+    pj_ui_compose_frame(&expected, &expected_frame);
+    assert(memcmp(&actual_frame, &expected_frame, sizeof(actual_frame)) == 0);
+
+    pj_ui_init(&old_layout);
+    old_layout.state = PJ_UI_STATE_LISTEN;
+    pj_ui_set_notes(&old_layout, 1, spaced);
+    pj_ui_compose_frame(&old_layout, &old_frame);
+    assert(framebuffer_differences(&actual_frame, &old_frame) > 0);
+}
+
 static void test_typed_preferences_revisions_and_theme_inversion(void)
 {
     pj_ui_context_t context;
@@ -744,6 +792,7 @@ static void test_settings_mapping_and_volume_extrema(void)
     pj_ui_context_t context;
     navigate_home_to(&context, PJ_LAYOUT_SLOT_HOME_SETTINGS);
     assert(context.state == PJ_UI_STATE_SETTINGS);
+    assert(context.volume == 10);
     uint32_t full = context.full_refresh_revision;
     assert(tap_slot(&context, PJ_LAYOUT_SETTINGS_4_0M,
                     PJ_LAYOUT_SLOT_SETTINGS_HOUR_FORMAT));
@@ -767,19 +816,30 @@ static void test_settings_mapping_and_volume_extrema(void)
     pj_ui_apply_preferences(&context, &preferences);
     presenter_fixture_t fixture;
     presenter_start(&fixture, &context);
+    pj_framebuffer_t fixed_controls = fixture.accepted;
+    pj_framebuffer_t previous_frame = fixture.accepted;
+    assert(count_black_pixels_in_region(
+               &fixture.accepted, 0, 0, PJ_DISPLAY_WIDTH, 100) > 0);
     for (int volume = 0; volume <= 10; volume++) {
         preferences.volume = volume;
         int previous = context.volume;
         pj_ui_apply_preferences(&context, &preferences);
         if (volume != previous) {
-            presenter_accept_partial(&fixture, &context);
+            pj_ui_dirty_region_t dirty =
+                presenter_accept_partial(&fixture, &context);
+            assert(dirty.y >= 0);
+            assert(dirty.y + dirty.height <= 100);
         }
         pj_framebuffer_t frame;
         pj_ui_compose_frame(&context, &frame);
-        for (int x = 0; x < PJ_DISPLAY_WIDTH; x++) {
-            assert(pj_framebuffer_get(&frame, x, 50) ==
-                   (x < volume * PJ_DISPLAY_WIDTH / 10));
+        assert_framebuffer_region_equal(
+            &frame, &fixed_controls, 0, 100, PJ_DISPLAY_WIDTH, 100);
+        assert(count_black_pixels_in_region(
+                   &frame, 0, 0, PJ_DISPLAY_WIDTH, 100) < 5000);
+        if (volume > 0) {
+            assert(framebuffer_differences(&previous_frame, &frame) > 0);
         }
+        previous_frame = frame;
     }
     for (int volume = 9; volume >= 0; volume--) {
         preferences.volume = volume;
@@ -924,6 +984,39 @@ static void test_stopwatch_timer_interval_commands(void)
     assert(count_black_pixels_in_region(&frame, 99, 100, 3, 100) == 0);
 }
 
+static void test_timer_adjustment_sequence(void)
+{
+    static const int upward[] = {60, 90, 120};
+    static const int downward[] = {90, 60, 30};
+    pj_ui_context_t context;
+    pj_ui_init(&context);
+    context.state = PJ_UI_STATE_TIMER;
+    pj_ui_preferences_t preferences = current_preferences(&context);
+    preferences.timer_seconds = 30;
+    pj_ui_apply_preferences(&context, &preferences);
+    assert(context.timer_seconds == 30);
+    assert(context.timer_preset_seconds == 30);
+
+    presenter_fixture_t fixture;
+    presenter_start(&fixture, &context);
+    for (size_t index = 0; index < ARRAY_LEN(upward); index++) {
+        assert(pj_ui_handle_touch(&context, 50, 125, PJ_TOUCH_TAP));
+        assert(context.timer_seconds == upward[index]);
+        assert(context.timer_preset_seconds == upward[index]);
+        consume_expected_command(&context, PJ_UI_TIME_COMMAND_TIMER_SET,
+                                 (uint64_t)upward[index] * 1000u, 0);
+        presenter_accept_partial(&fixture, &context);
+    }
+    for (size_t index = 0; index < ARRAY_LEN(downward); index++) {
+        assert(pj_ui_handle_touch(&context, 50, 175, PJ_TOUCH_TAP));
+        assert(context.timer_seconds == downward[index]);
+        assert(context.timer_preset_seconds == downward[index]);
+        consume_expected_command(&context, PJ_UI_TIME_COMMAND_TIMER_SET,
+                                 (uint64_t)downward[index] * 1000u, 0);
+        presenter_accept_partial(&fixture, &context);
+    }
+}
+
 static void assert_stopwatch_transition(int from, int to)
 {
     pj_ui_context_t context;
@@ -983,7 +1076,8 @@ static void assert_interval_transition(int from, int to)
 static void test_all_digit_carries_in_both_directions(void)
 {
     static const int transitions[][2] = {
-        {9, 10}, {19, 20}, {39, 40}, {59, 60},
+        {8, 9}, {9, 10}, {10, 11}, {11, 12}, {12, 13},
+        {19, 20}, {39, 40}, {59, 60},
     };
     for (size_t index = 0; index < ARRAY_LEN(transitions); index++) {
         assert_stopwatch_transition(transitions[index][0], transitions[index][1]);
@@ -992,7 +1086,7 @@ static void test_all_digit_carries_in_both_directions(void)
     }
 }
 
-static void test_sync_five_line_phases_and_transactions(void)
+static void test_sync_compact_common_scale_phases_and_transactions(void)
 {
     pj_ui_context_t context;
     navigate_home_to(&context, PJ_LAYOUT_SLOT_HOME_SETTINGS);
@@ -1039,10 +1133,10 @@ static void test_sync_five_line_phases_and_transactions(void)
             phases[index].error, phases[index].request_pending);
         presenter_accept_partial(&fixture, &context);
         assert(count_black_pixels(&fixture.accepted) > 0);
-        for (int band = 0; band < 5; band++) {
+        for (int band = 0; band < 3; band++) {
             assert(count_black_pixels_in_region(
-                       &fixture.accepted, 0, band * PJ_DISPLAY_HEIGHT / 5,
-                       PJ_DISPLAY_WIDTH, PJ_DISPLAY_HEIGHT / 5) > 0);
+                       &fixture.accepted, 0, band * PJ_DISPLAY_HEIGHT / 3,
+                       PJ_DISPLAY_WIDTH, PJ_DISPLAY_HEIGHT / 3) > 0);
         }
     }
     presentation = pj_ui_sync_presentation_generation(&context);
@@ -1118,7 +1212,7 @@ static void test_exact_presenter_reconstruction_for_dynamic_screens(void)
     context.state = PJ_UI_STATE_VOLUME;
     presenter_start(&fixture, &context);
     preferences = current_preferences(&context);
-    preferences.volume = 10;
+    preferences.volume = 9;
     pj_ui_apply_preferences(&context, &preferences);
     presenter_accept_partial(&fixture, &context);
 
@@ -1186,13 +1280,15 @@ int main(void)
     test_playback_uses_only_full_screen_play_and_pause();
     test_case_punctuation_and_long_transcript();
     test_note_pages_selection_and_content_partials();
+    test_audio_note_timestamps_are_compact();
     test_typed_preferences_revisions_and_theme_inversion();
     test_settings_mapping_and_volume_extrema();
     test_battery_thresholds_and_clock_partials();
     test_alarm_caret_and_toggle_controls();
     test_stopwatch_timer_interval_commands();
+    test_timer_adjustment_sequence();
     test_all_digit_carries_in_both_directions();
-    test_sync_five_line_phases_and_transactions();
+    test_sync_compact_common_scale_phases_and_transactions();
     test_exact_presenter_reconstruction_for_dynamic_screens();
     test_presenter_idle_barrier_rejection_and_navigation_full();
     puts("ui core tests passed");

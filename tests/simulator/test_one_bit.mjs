@@ -37,8 +37,12 @@ for (const size of [16, 24, 32, 64]) {
   assert.notDeepEqual(glyph("PJ_CARBON_GLYPH_UPPER_A", size).rows, glyph("PJ_CARBON_GLYPH_LOWER_A", size).rows);
   assert.notDeepEqual(glyph("PJ_CARBON_GLYPH_DIGIT_1", size).rows, glyph("PJ_CARBON_GLYPH_DIGIT_9", size).rows);
 }
-assert.ok(glyph("PJ_CARBON_GLYPH_SETTINGS_12H", 64));
-assert.ok(glyph("PJ_CARBON_GLYPH_SETTINGS_24H", 64));
+for (const id of ["PJ_CARBON_GLYPH_SETTINGS_12H", "PJ_CARBON_GLYPH_SETTINGS_24H"]) {
+  const composite = glyph(id, 64);
+  assert.ok(composite?.rows.join("").includes("1"));
+  assert.match(composite.source, /PJ_CARBON_GLYPH_LOWER_H@32/);
+  assert.doesNotMatch(composite.source, /PJ_CARBON_GLYPH_UPPER_H/);
+}
 assert.equal(punctuationAsset.family, "IBM Plex Mono Bold");
 assert.equal(punctuationAsset.license, "SIL Open Font License 1.1");
 for (const size of [16, 24, 32, 64]) {
@@ -50,7 +54,7 @@ assert.equal(iconAsset.family, "Carbon Icons");
 assert.equal(iconAsset.record_count, 30);
 const icon = (id, size) => iconAsset.records.find((record) => record.id === id && record.size === size);
 for (const [id, size] of [
-  ["PJ_CARBON_ICON_TIME_FILLED", 64],
+  ["PJ_CARBON_ICON_TIME", 64],
   ["PJ_CARBON_ICON_WAVEFORM", 64],
   ["PJ_CARBON_ICON_PLAY_FILLED", 40],
   ["PJ_CARBON_ICON_PLAY_FILLED", 144],
@@ -65,6 +69,7 @@ const simulatorAuxJs = await readFile("simulator/src/aux_input.js", "utf8");
 const makefile = await readFile("Makefile", "utf8");
 const wasmBridge = await readFile("simulator/wasm/pj_ui_wasm_bridge.c", "utf8");
 const appMain = await readFile("firmware/main/app_main.c", "utf8");
+const boardSource = await readFile("firmware/components/pj_board/pj_board.c", "utf8");
 const galleryTool = await readFile("tools/generate_ui_gallery.mjs", "utf8");
 await assert.rejects(
   readFile("simulator/src/ui_model.js", "utf8"),
@@ -138,6 +143,38 @@ assert.match(appMain, /service_seconds_cadence\(&g_ui, now_ms\)/);
 assert.match(appMain, /pj_display_worker_cadence_start\(1, first_deadline\)/);
 assert.match(appMain, /pj_ui_set_recording_elapsed\(ui, status\.recording_elapsed_ms\)/);
 assert.match(appMain, /dynamic_changed \|= pj_board_update_time_state\(&g_ui\)/);
+
+assert.match(
+  boardSource,
+  /#define PJ_AUDIO_CODEC_PA_GAIN_COMPENSATION_DB 0\.0f/,
+  "the output route must retain the approved +6 dB gain over the legacy compensation",
+);
+const audioCodecConfigSource = boardSource.slice(
+  boardSource.indexOf("es8311_codec_cfg_t es8311_cfg"),
+  boardSource.indexOf("const audio_codec_if_t *codec_if"),
+);
+assert.match(
+  audioCodecConfigSource,
+  /\.pa_gain = PJ_AUDIO_CODEC_PA_GAIN_COMPENSATION_DB/,
+  "ES8311 setup must use the named zero-dB PA compensation",
+);
+assert.doesNotMatch(
+  audioCodecConfigSource,
+  /\.pa_gain = 6\.0f/,
+  "the retired 6 dB output attenuation must not return",
+);
+
+const displayFullStart = boardSource.indexOf("static esp_err_t epd_refresh_full");
+const displayFullSource = boardSource.slice(
+  displayFullStart,
+  boardSource.indexOf("static int storage_refresh_capacity", displayFullStart),
+);
+assert.ok(
+  displayFullSource.indexOf("epd_send_command(0x26)") <
+    displayFullSource.indexOf("epd_send_command(0x24)"),
+  "full refresh must seed previous RAM before current RAM and leave 0x24 last",
+);
+assert.match(boardSource, /ram=0x24->0x26->0x24/);
 
 const cadenceEndSource = appMain.slice(
   appMain.indexOf("static void end_seconds_cadence"),
