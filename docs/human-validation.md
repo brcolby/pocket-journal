@@ -5,34 +5,33 @@ low-frequency, large-batch hardware pass. Human notes may be mildly lossy:
 record what you actually observed, including blockers, and agents will map that
 evidence to the exact Bead acceptance criteria.
 
-Last synchronized with `bd human list`: 2026-07-16 (33 human-validation Beads).
+Last synchronized with `bd human list`: 2026-07-17 (34 human-validation Beads).
 Do not repeat a failed check on unchanged firmware.
 
 ## Nominated Build
 
-- Commit and firmware version: `4fe641c`.
-- Image: `/private/tmp/pj-final-4fe641c/pocket_journal.bin`.
-- Size: 1,642,496 bytes.
+- Source commit and reported firmware version: `574332a` / `574332a-dirty`.
+  The dirty suffix is caused by preserved unrelated local partner/documentation
+  changes; the firmware sources are committed through `574332a`.
+- Image: `firmware/build-carbon-final/pocket_journal.bin`.
+- Size: 1,511,424 bytes (`0x171000`).
 - SHA-256:
-  `07d0d69ddf917a0438c0b006aeeff39abfc3d345b86d65751a1d894383105dbd`.
+  `9ca0817d4b3e5bc2e6e5fc90da044cb09e52d9b0e05cfee928d0a59a83d2478f`.
 - ESP image validation hash:
-  `a772e867b562872158e19295d5d3b90f2e08c415ad74b3cb39270e8217f6a276`.
-- Built with ESP-IDF 6.0.1 and 22% free in each 2 MiB application partition.
-- Flashed successfully as a development image without starting a monitor.
-- Live evidence after flashing: exact firmware, SD/audio/Wi-Fi/DHCP ready at
-  `192.168.213.241`, storage healthy, fixed UTC offset synchronized, and boot ID
-  `764293020`. Ten independent USB status open/request/close cycles kept that
-  boot ID, returned without panic, and released the port every time. A bounded
-  no-reset check returned complete status with no low-stack warning.
-- Existing recordings were removed; the final device inventory is empty. The
-  first cleanup removed 4 WAVs, 4 note files, and 2 transcripts but reported a
-  retryable residue; after terminal-state inspection, a zero-item cleanup retry
-  succeeded.
-- The managed validation companion is running on port `8765`; generation 7 is
-  acknowledged, online, and succeeded with zero pending files.
-- Automated evidence: full `make test` passed with 327 partner tests and all
-  native/UI/simulator gates. `make test-simulator-runtime ui-gallery` passed;
-  all 25 gallery frames and the contact sheet were image-inspected.
+  `da2d3506c8da0f1ec6767d4eec76e7f9b7c1d2242a814979a22260fca1b0f8b1`.
+- Built with ESP-IDF 6.0.1 and 28% (`0x8f000`) free in each 2 MiB
+  application partition. A clean build contains no LVGL component or symbol.
+- Flashed and byte-verified as a development image on `pj-d45d34`, ESP32-S3
+  MAC `14:C1:9F:D4:5D:34`, at `/dev/cu.usbmodem1101`.
+- Live no-reset probe after flashing: exact firmware answered `PJ_STATUS` with
+  boot ID `4042065248`; SD storage, audio, Wi-Fi/DHCP, and fixed-offset time
+  synchronization were ready. USB recovery was neither needed nor attempted.
+- Automated evidence: deterministic Carbon generation verified 73 active and
+  26 reference sources, 72 glyph identities, and 30 semantic bitmaps; all 13
+  asset and 7 exhaustive DXF tests passed. Native UI/board/display tests,
+  combined ASan/UBSan UI/worker/pipeline runs, 328 partner tests, WASM runtime,
+  one-bit/AUX simulator tests, and image analysis passed. All 51 gallery frames
+  and the contact sheet were inspected.
 - This is development validation, not a release. No tag or release has been
   created.
 
@@ -55,30 +54,69 @@ process owns the USB serial port.
   and preferences persist (`pocket-journal-2f2`, `pocket-journal-aw7`,
   `pocket-journal-wsl`).
 
-### 2. Display, Touch, And AUX
+### 2. Carbon Display, DXF Touch, Cadence, And AUX
 
-- [ ] Inspect Clock, Home, note lists, note playback, Record, Alarm, Stopwatch,
-  Timer, Interval, Settings, Volume, and Sync. Confirm uppercase text,
-  contiguous edge-to-edge controls, thick boundaries, large unclipped type, no
-  top title or back button, full-screen playback/recording controls, and a
-  full-height Volume bar (`pocket-journal-nz5`, `pocket-journal-2ji`).
-- [ ] Exercise digit boundaries `09 -> 10`, `19 -> 20`, `39 -> 40`, and
-  `59 -> 60` across Stopwatch, Timer, Interval, and Record. Confirm digits
-  advance in order, `1` and `9` are upright and distinct, play/pause never
-  flips by itself, and no stale lines, reordered digits, or neighboring pixels
-  appear (`pocket-journal-cjx`, `pocket-journal-zi6`,
-  `pocket-journal-e43`).
-- [ ] Produce at least 30 partial updates, including Volume changes. During
-  several updates, rapidly press the current control and a control that changes
-  screens. The latest requested frame must win; stale taps must not affect the
-  later screen; elapsed time and input must remain responsive during both
-  partial and full refreshes (`pocket-journal-9by`, `pocket-journal-1vc`,
-  `pocket-journal-jjt`).
-- [ ] While Stopwatch runs, repeatedly toggle play/pause and confirm the icon
-  and digits remain authoritative. While Timer and Interval are paused,
-  repeatedly use plus/minus and confirm each displayed value is applied exactly
-  once, without reverting to an older preset (`pocket-journal-8q5`,
+For machine-readable evidence, capture the serial monitor while performing this
+section (stop with Ctrl-]):
+
+```bash
+cd firmware
+source "$HOME/.espressif/v6.0.1/esp-idf/export.sh"
+idf.py -B build-carbon-final -p /dev/cu.usbmodem1101 monitor \
+  --no-reset --timestamps --disable-auto-color 2>&1 | \
+  tee /private/tmp/pj-carbon-hardware.log
+```
+
+Afterward, preserve the output of:
+
+```bash
+rg 'Seconds cadence (start|end)|Display metrics|Display generations' \
+  /private/tmp/pj-carbon-hardware.log
+```
+
+- [ ] Exercise every sector of Home `3_1`, Notes `3_1m`, Time `4_1`, and
+  Settings `4_0m`, including screen edges, both sides of every visible divider,
+  the four-sector center diagonal, and all divider intersections. On Alarm,
+  Stopwatch, Timer, and Interval, exercise the active rectangular hitboxes even
+  though their separators are intentionally invisible. Each touch must have
+  stable single-slot ownership, with no dead strip or mirrored icon
+  (`pocket-journal-nz5`, `pocket-journal-nz5.5`).
+- [ ] Inspect Clock, Home, Notes, note lists/detail, Record, Alarm, Stopwatch,
+  Timer, Interval, Settings, Volume, and Sync in light and dark themes. Confirm
+  case-preserving Carbon letters/numbers, distinct upright `1` and `9`, bold
+  mapped icons at a consistent scale, 4 px interior rules with no redundant
+  outer box, legible note paging, and a maximized uniform five-line Sync stack.
+  Confirm Volume bars never enter reserved white space and no square Stop icon
+  appears anywhere (`pocket-journal-nz5`, `pocket-journal-nz5.6`,
+  `pocket-journal-2ji`).
+- [ ] Run Record, Stopwatch, Timer, and Interval for at least 120 consecutive
+  displayed seconds each. Record must first present a complete `00:00` screen,
+  then measure playable captured PCM duration. For every clock, observe each
+  second exactly once with no skip, duplicate, late stall, or superseded frame;
+  exercise `09 -> 10`, `19 -> 20`, `39 -> 40`, and `59 -> 60`, Play/Pause, and
+  Interval round boundaries. The log must contain one named cadence start/end
+  per run, at least 120 submitted sequences, `late_max_ms <= 75`, and zero
+  overruns and misses (`pocket-journal-cjx`, `pocket-journal-zi6`,
   `pocket-journal-9by`).
+- [ ] Keep one seconds clock active for at least 30 partial updates. Confirm no
+  cleanup full refresh interrupts the cadence; pause or leave afterward and
+  confirm exactly one safe deferred cleanup. The log must show cleanup deferred
+  while active and promoted on cadence end. Across this and Volume changes,
+  confirm no ghosting, reordered digits, displaced pixels, or stale neighboring
+  content (`pocket-journal-e43`, `pocket-journal-9by`).
+- [ ] In Settings, switch 12H/24H and confirm only the localized content changes
+  via partial refresh. Switch theme and confirm an immediate full inversion;
+  the top-right `AsleepFilled` icon must retain the same shape. Battery changes,
+  Clock/status ticks, Alarm Toggle, Volume, Play/Pause, and other same-layout
+  changes must remain exact partials (`pocket-journal-nz5`,
+  `pocket-journal-cjx`, `pocket-journal-e43`).
+- [ ] During several partials, rapidly press the current control and then one
+  that changes screens. The latest accepted frame must win, a rejected request
+  must retry losslessly, and stale taps must not affect the later screen. While
+  Stopwatch runs, repeatedly toggle Play/Pause; while Timer and Interval are
+  paused, use their carets and confirm each authoritative value is applied once
+  without reverting (`pocket-journal-9by`, `pocket-journal-1vc`,
+  `pocket-journal-8q5`, `pocket-journal-jjt`).
 - [ ] Confirm AUX short performs the current primary action, AUX double enters
   Record only from Clock or Home, and AUX hold goes Back once at 0.5 seconds.
   Playback must navigate Back from both playing and paused states; holding
@@ -94,9 +132,10 @@ diagnostic before asking for calibration evidence.
 
 ### 3. Notes, Recording, Playback, And Sync
 
-- [ ] Confirm note list rows show three notes per page with full-page navigation.
-  Dates must omit the year, use the available width, remain legible, and
-  truncate long note text cleanly without overlapping controls
+- [ ] Confirm note list rows show three notes per page with Carbon chevrons for
+  full-page navigation. Dates must omit the year, use the available width,
+  remain legible, and truncate long note text cleanly without overlapping
+  controls
   (`pocket-journal-nz5`, `pocket-journal-te0`).
 - [ ] Record continuously for at least two minutes. Stop/save with AUX and
   confirm immediate return with no Saving screen or blocking display load.
@@ -139,11 +178,12 @@ diagnostic before asking for calibration evidence.
 
 ### 5. Settings, Off, And Wake
 
-- [ ] Change Volume, Light/Dark, 12/24-hour, C/F, reading size, Alarm, Timer,
-  and Interval values. Reboot and confirm every setting persists. Check the
-  large day/date, temperature, humidity, battery percentage, Alarm HR/MIN
-  controls, and transcript text sizing (`pocket-journal-wsl`,
-  `pocket-journal-aw7`).
+- [ ] Change Volume, theme, and 12/24-hour mode through the fixed Settings
+  sectors; change C/F, reading size, Alarm, Timer, and Interval through their
+  supported control or companion path. Reboot and confirm every setting
+  persists. Check the large day/date, temperature, humidity, 28 px battery icon
+  plus percentage, Alarm caret controls, and transcript text sizing
+  (`pocket-journal-wsl`, `pocket-journal-aw7`).
 - [ ] On USB power, press PWR once and confirm only the splash art is rendered
   before sleep. Wake once and confirm direct return to Home, not Clock, with
   fresh time/sensor data. The first refresh and first edge/corner touch must
@@ -172,8 +212,8 @@ These checks do not block completion of the core regression pass.
 
 ## OTA Deferred
 
-Do not run OTA in this batch. The previous OTA candidate predates the fixes in
-`4fe641c` and is not nominated. A fresh signed candidate, manifest, digest, and
+Do not run OTA in this batch. Existing OTA candidates predate the Carbon build
+`574332a` and are not nominated. A fresh signed candidate, manifest, digest, and
 rollback plan must be prepared and identified before hardware OTA validation
 (`pocket-journal-i4s`, `pocket-journal-i4s.2`). Do not create or publish a
 release tag without explicit human approval.
