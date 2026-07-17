@@ -28,45 +28,45 @@ int main(void)
     pj_ui_set_notes(&ui, 4, labels);
 
     ui.state = PJ_UI_STATE_STATIC;
-    pj_ui_render(&ui, &fb);
+    pj_ui_compose_frame(&ui, &fb);
     write_pgm("/tmp/pj-ui-static.pgm", &fb);
 
     ui.state = PJ_UI_STATE_TIME_TEMP;
-    pj_ui_render(&ui, &fb);
+    pj_ui_compose_frame(&ui, &fb);
     write_pgm("/tmp/pj-ui-time-temp.pgm", &fb);
 
     ui.state = PJ_UI_STATE_HOME;
-    pj_ui_render(&ui, &fb);
+    pj_ui_compose_frame(&ui, &fb);
     write_pgm("/tmp/pj-ui-home.pgm", &fb);
 
     ui.state = PJ_UI_STATE_NOTES;
-    pj_ui_render(&ui, &fb);
+    pj_ui_compose_frame(&ui, &fb);
     write_pgm("/tmp/pj-ui-notes.pgm", &fb);
 
     ui.state = PJ_UI_STATE_TIME;
-    pj_ui_render(&ui, &fb);
+    pj_ui_compose_frame(&ui, &fb);
     write_pgm("/tmp/pj-ui-time-menu.pgm", &fb);
 
     ui.state = PJ_UI_STATE_RECORD;
     ui.record_state = PJ_RECORD_ACTIVE;
-    pj_ui_render(&ui, &fb);
+    pj_ui_compose_frame(&ui, &fb);
     write_pgm("/tmp/pj-ui-record.pgm", &fb);
 
     ui.state = PJ_UI_STATE_LISTEN;
-    pj_ui_render(&ui, &fb);
+    pj_ui_compose_frame(&ui, &fb);
     write_pgm("/tmp/pj-ui-listen.pgm", &fb);
 
     ui.state = PJ_UI_STATE_ALARM;
-    pj_ui_render(&ui, &fb);
+    pj_ui_compose_frame(&ui, &fb);
     write_pgm("/tmp/pj-ui-alarm.pgm", &fb);
 
     ui.state = PJ_UI_STATE_STOPWATCH;
     ui.stopwatch_seconds = 3723;
-    pj_ui_render(&ui, &fb);
+    pj_ui_compose_frame(&ui, &fb);
     write_pgm("/tmp/pj-ui-stopwatch.pgm", &fb);
 
     ui.state = PJ_UI_STATE_SETTINGS;
-    pj_ui_render(&ui, &fb);
+    pj_ui_compose_frame(&ui, &fb);
     write_pgm("/tmp/pj-ui-settings.pgm", &fb);
 
     return 0;

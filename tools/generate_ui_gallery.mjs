@@ -46,18 +46,18 @@ function png(pixels, width, height) {
   return Buffer.concat([Buffer.from("89504e470d0a1a0a", "hex"), chunk("IHDR", header), chunk("IDAT", deflateSync(raw)), chunk("IEND", Buffer.alloc(0))]);
 }
 function resetToHome() { api.pj_sim_reset(); api.pj_sim_wake(); }
-function resetToSettings() { resetToHome(); api.pj_sim_touch_tap(20, 170); }
-function resetToNoteList(rowY) {
+function resetToSettings() { resetToHome(); api.pj_sim_touch_tap(180, 80); }
+function resetToNoteList(transcript = false) {
   resetToHome();
   api.pj_sim_seed_review_notes();
-  api.pj_sim_touch_tap(100, 33);
-  api.pj_sim_touch_tap(100, rowY);
+  api.pj_sim_touch_tap(100, 180);
+  api.pj_sim_touch_tap(transcript ? 180 : 20, 120);
 }
 function resetToTimestampNoteList() {
   resetToHome();
   api.pj_sim_seed_timestamp_notes();
-  api.pj_sim_touch_tap(100, 33);
-  api.pj_sim_touch_tap(100, 100);
+  api.pj_sim_touch_tap(100, 180);
+  api.pj_sim_touch_tap(20, 120);
 }
 function advanceToSecondNotePage() {
   api.pj_sim_touch_tap(150, 175);
@@ -72,38 +72,85 @@ function frame() {
 }
 
 const fullBleed = (minEdgeSides = 3) => ({ maxEdgePixels: Infinity, maxComponentFraction: 1, minEdgeSides });
+const darkFullBleed = { ...fullBleed(4), maxDensity: 1, maxEdgeInset: 3 };
 const scenarios = [
   ["static", "static", () => api.pj_sim_reset(), { ...fullBleed(4), maxDensity: 0.75 }],
   ["time-temp", "time_temp", () => { api.pj_sim_reset(); api.pj_sim_set_status(84, 22, 45); api.pj_sim_set_time(9, 41, 2026, 6, 6); api.pj_sim_wake(); api.pj_sim_aux_long(); }],
   ["time-temp-12h-f", "time_temp", () => { api.pj_sim_reset(); api.pj_sim_set_status(84, 22, 45); api.pj_sim_set_time(21, 41, 2026, 6, 6); api.pj_sim_set_preferences(0, 1, 3); api.pj_sim_wake(); api.pj_sim_aux_long(); }],
+  ...[0, 10, 11, 39, 40, 79, 80, 100].map((battery) => [
+    `time-temp-battery-${battery}`,
+    "time_temp",
+    () => { api.pj_sim_reset(); api.pj_sim_set_status(battery, 22, 45); api.pj_sim_wake(); api.pj_sim_aux_long(); },
+  ]),
+  ["time-temp-dark", "time_temp", () => {
+    api.pj_sim_reset();
+    api.pj_sim_set_status(84, 22, 45);
+    api.pj_sim_set_full_preferences(7, 1, 1, 0, 2);
+    api.pj_sim_wake();
+    api.pj_sim_aux_long();
+  }, darkFullBleed],
   ["home", "home", resetToHome, fullBleed()],
-  ["notes", "notes", () => { resetToHome(); api.pj_sim_touch_tap(100, 33); }, fullBleed()],
-  ["record-active", "record", () => { resetToHome(); api.pj_sim_aux_double(); }],
-  ["listen-empty", "listen", () => { resetToHome(); api.pj_sim_touch_tap(100, 33); api.pj_sim_touch_tap(100, 100); }, fullBleed()],
-  ["listen-page-1", "listen", () => resetToNoteList(100), fullBleed()],
-  ["listen-page-2", "listen", () => { resetToNoteList(100); advanceToSecondNotePage(); }, fullBleed()],
-  ["listen-timestamps", "listen", resetToTimestampNoteList, fullBleed()],
-  ["read-page-1", "read", () => resetToNoteList(166), fullBleed()],
-  ["note-detail", "note_detail", () => { resetToHome(); api.pj_sim_set_note_count(1); api.pj_sim_touch_tap(100, 33); api.pj_sim_touch_tap(100, 100); api.pj_sim_touch_tap(100, 25); }],
-  ["transcript-detail", "note_detail", () => { resetToHome(); api.pj_sim_seed_review_notes(); api.pj_sim_touch_tap(100, 33); api.pj_sim_touch_tap(100, 166); api.pj_sim_touch_tap(100, 25); }],
-  ["time", "time", () => { resetToHome(); api.pj_sim_touch_tap(20, 125); }, fullBleed(4)],
-  ["alarm", "alarm", () => { resetToHome(); api.pj_sim_touch_tap(20, 125); api.pj_sim_touch_tap(40, 70); }, fullBleed()],
+  ["notes", "notes", () => { resetToHome(); api.pj_sim_touch_tap(100, 180); }, fullBleed()],
+  ["record-arming", "record", () => { resetToHome(); api.pj_sim_aux_double(); }],
+  ["record-active", "record", () => {
+    resetToHome(); api.pj_sim_aux_double(); api.pj_sim_set_audio_state(1, 0); api.pj_sim_set_recording_elapsed(61);
+  }],
+  ["listen-empty", "listen", () => { resetToHome(); api.pj_sim_touch_tap(100, 180); api.pj_sim_touch_tap(20, 120); }, fullBleed(2)],
+  ["listen-page-1", "listen", () => resetToNoteList(), fullBleed(2)],
+  ["listen-page-2", "listen", () => { resetToNoteList(); advanceToSecondNotePage(); }, fullBleed(2)],
+  ["listen-timestamps", "listen", resetToTimestampNoteList, fullBleed(2)],
+  ["read-page-1", "read", () => resetToNoteList(true), fullBleed(2)],
+  ["note-detail", "note_detail", () => { resetToHome(); api.pj_sim_set_note_count(1); api.pj_sim_touch_tap(100, 180); api.pj_sim_touch_tap(20, 120); api.pj_sim_touch_tap(100, 25); }],
+  ["note-detail-playing", "note_detail", () => {
+    resetToHome(); api.pj_sim_set_note_count(1); api.pj_sim_touch_tap(100, 180); api.pj_sim_touch_tap(20, 120); api.pj_sim_touch_tap(100, 25); api.pj_sim_set_audio_state(0, 1);
+  }],
+  ["transcript-detail", "note_detail", () => { resetToNoteList(true); api.pj_sim_touch_tap(100, 25); }],
+  ["transcript-punctuation", "note_detail", () => {
+    resetToHome(); api.pj_sim_seed_punctuation_note(); api.pj_sim_touch_tap(100, 180); api.pj_sim_touch_tap(180, 120); api.pj_sim_touch_tap(100, 25);
+  }, { maxImbalance: 1 }],
+  ["transcript-long", "note_detail", () => {
+    resetToHome(); api.pj_sim_seed_long_note(); api.pj_sim_touch_tap(100, 180); api.pj_sim_touch_tap(180, 120); api.pj_sim_touch_tap(100, 25);
+  }, { maxImbalance: 1 }],
+  ["time", "time", () => { resetToHome(); api.pj_sim_touch_tap(20, 80); }, fullBleed(4)],
+  ["alarm", "alarm", () => { resetToHome(); api.pj_sim_touch_tap(20, 80); api.pj_sim_touch_tap(40, 40); }],
   ["alarm-12h-pm", "alarm", () => {
     resetToHome();
     api.pj_sim_set_preferences(0, 0, 3);
-    api.pj_sim_touch_tap(20, 125);
-    api.pj_sim_touch_tap(40, 70);
-    for (let hour = 0; hour < 12; hour += 1) api.pj_sim_touch_tap(150, 140);
-  }, fullBleed()],
-  ["stopwatch", "stopwatch", () => { resetToHome(); api.pj_sim_touch_tap(20, 125); api.pj_sim_touch_tap(150, 70); }, fullBleed(2)],
-  ["timer", "timer", () => { resetToHome(); api.pj_sim_touch_tap(20, 125); api.pj_sim_touch_tap(40, 150); }, fullBleed()],
-  ["interval", "interval", () => { resetToHome(); api.pj_sim_touch_tap(20, 125); api.pj_sim_touch_tap(150, 150); }, fullBleed()],
+    api.pj_sim_touch_tap(20, 80);
+    api.pj_sim_touch_tap(40, 40);
+    for (let hour = 0; hour < 12; hour += 1) api.pj_sim_touch_tap(40, 140);
+  }],
+  ["stopwatch", "stopwatch", () => { resetToHome(); api.pj_sim_touch_tap(20, 80); api.pj_sim_touch_tap(160, 40); }],
+  ["stopwatch-running-09", "stopwatch", () => { resetToHome(); api.pj_sim_touch_tap(20, 80); api.pj_sim_touch_tap(160, 40); api.pj_sim_set_time_runtime(1, 9, 0, 0, 0, 0, 1); }],
+  ["stopwatch-running-10", "stopwatch", () => { resetToHome(); api.pj_sim_touch_tap(20, 80); api.pj_sim_touch_tap(160, 40); api.pj_sim_set_time_runtime(1, 10, 0, 0, 0, 0, 1); }],
+  ["timer", "timer", () => { resetToHome(); api.pj_sim_touch_tap(20, 80); api.pj_sim_touch_tap(40, 160); }],
+  ["timer-running", "timer", () => { resetToHome(); api.pj_sim_touch_tap(20, 80); api.pj_sim_touch_tap(40, 160); api.pj_sim_set_time_runtime(0, 0, 1, 59, 0, 0, 1); }],
+  ["timer-paused", "timer", () => { resetToHome(); api.pj_sim_touch_tap(20, 80); api.pj_sim_touch_tap(40, 160); api.pj_sim_set_time_runtime(0, 0, 0, 59, 0, 0, 1); }],
+  ["interval", "interval", () => { resetToHome(); api.pj_sim_touch_tap(20, 80); api.pj_sim_touch_tap(160, 160); }],
+  ["interval-running-round-2", "interval", () => { resetToHome(); api.pj_sim_touch_tap(20, 80); api.pj_sim_touch_tap(160, 160); api.pj_sim_set_time_runtime(0, 0, 0, 0, 1, 39, 2); }],
+  ["interval-paused-round-3", "interval", () => { resetToHome(); api.pj_sim_touch_tap(20, 80); api.pj_sim_touch_tap(160, 160); api.pj_sim_set_time_runtime(0, 0, 0, 0, 0, 39, 3); }],
   ["settings-light-24h", "settings", resetToSettings, fullBleed(3)],
-  ["volume-adjusted", "volume", () => { resetToSettings(); api.pj_sim_touch_tap(50, 50); api.pj_sim_touch_tap(150, 160); }, fullBleed()],
-  ["settings-dark-24h", "settings", () => { resetToSettings(); api.pj_sim_touch_tap(150, 50); },
+  ["volume-adjusted", "volume", () => { resetToSettings(); api.pj_sim_touch_tap(40, 40); api.pj_sim_touch_tap(150, 160); },
+    { maxEdgePixels: Infinity, maxComponentFraction: 1 }],
+  ["volume-minimum", "volume", () => { resetToHome(); api.pj_sim_set_full_preferences(0, 0, 1, 0, 2); api.pj_sim_touch_tap(180, 80); api.pj_sim_touch_tap(40, 40); },
+    { maxEdgePixels: Infinity, maxComponentFraction: 1 }],
+  ["volume-maximum", "volume", () => { resetToHome(); api.pj_sim_set_full_preferences(10, 0, 1, 0, 2); api.pj_sim_touch_tap(180, 80); api.pj_sim_touch_tap(40, 40); },
+    { maxEdgePixels: Infinity, maxComponentFraction: 1, maxDensity: 0.65 }],
+  ["settings-dark-24h", "settings", () => { resetToSettings(); api.pj_sim_touch_tap(160, 40); },
     { ...fullBleed(4), maxDensity: 1, maxEdgeInset: 3 }],
-  ["settings-light-12h", "settings", () => { resetToSettings(); api.pj_sim_touch_tap(50, 150); }, fullBleed(3)],
-  ["settings-sync", "sync", () => { resetToSettings(); api.pj_sim_touch_tap(150, 150); }],
+  ["settings-light-12h", "settings", () => { resetToSettings(); api.pj_sim_touch_tap(40, 160); }, fullBleed(3)],
+  ["settings-sync", "sync", () => { resetToSettings(); api.pj_sim_touch_tap(160, 160); }],
+  ...[
+    ["pending", 1, 4, 0, 0, 1],
+    ["running", 2, 3, 2, 0, 1],
+    ["succeeded", 3, 0, 7, 0, 1],
+    ["failed", 4, 2, 3, 1, 1],
+    ["offline", 5, 5, 0, 0, 0],
+  ].map(([phase, phaseId, pending, transferred, failed, online]) => [
+    `settings-sync-${phase}`,
+    "sync",
+    () => { resetToSettings(); api.pj_sim_touch_tap(160, 160); api.pj_sim_set_sync_preview(phaseId, pending, transferred, failed, online); },
+  ]),
   ["alert-alarm", "home", () => { resetToHome(); api.pj_sim_set_alert(1); }, fullBleed(2)],
 ];
 

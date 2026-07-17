@@ -10,6 +10,10 @@ const { instance } = await WebAssembly.instantiate(wasmBytes, {
 });
 const api = instance.exports;
 const decoder = new TextDecoder();
+const RECORD_IDLE = 0;
+const RECORD_ARMING = 1;
+const RECORD_ACTIVE = 2;
+const RECORD_STOPPING = 3;
 
 api.__wasm_call_ctors();
 
@@ -37,6 +41,30 @@ function framebufferSnapshot() {
   const start = api.pj_sim_framebuffer();
   const end = start + api.pj_sim_framebuffer_bytes();
   return new Uint8Array(api.memory.buffer.slice(start, end));
+}
+
+function framebufferBit(framebuffer, x, y) {
+  const index = y * 200 + x;
+  return (framebuffer[index >> 3] >> (index & 7)) & 1;
+}
+
+function exactChangedBounds(before, after) {
+  let minX = 200;
+  let minY = 200;
+  let maxX = -1;
+  let maxY = -1;
+  for (let y = 0; y < 200; y += 1) {
+    for (let x = 0; x < 200; x += 1) {
+      if (framebufferBit(before, x, y) === framebufferBit(after, x, y)) continue;
+      minX = Math.min(minX, x);
+      minY = Math.min(minY, y);
+      maxX = Math.max(maxX, x);
+      maxY = Math.max(maxY, y);
+    }
+  }
+  return maxX < minX
+    ? { x: 0, y: 0, width: 0, height: 0 }
+    : { x: minX, y: minY, width: maxX - minX + 1, height: maxY - minY + 1 };
 }
 
 function packedPbm(source) {
@@ -68,15 +96,16 @@ api.pj_sim_wake();
 assertRendered("home");
 assert.equal(api.pj_sim_aux_double(), 1);
 assertRendered("record");
-assert.equal(api.pj_sim_record_state(), 1);
+assert.equal(api.pj_sim_record_state(), RECORD_ARMING);
 api.pj_sim_set_audio_state(1, 0);
+assert.equal(api.pj_sim_record_state(), RECORD_ACTIVE);
 assert.equal(api.pj_sim_aux_long(), 1);
 assertRendered("home");
-assert.equal(api.pj_sim_record_state(), 2);
+assert.equal(api.pj_sim_record_state(), RECORD_STOPPING);
 api.pj_sim_set_audio_state(1, 0);
-assert.equal(api.pj_sim_record_state(), 2);
+assert.equal(api.pj_sim_record_state(), RECORD_STOPPING);
 api.pj_sim_set_audio_state(0, 0);
-assert.equal(api.pj_sim_record_state(), 0);
+assert.equal(api.pj_sim_record_state(), RECORD_IDLE);
 assertRendered("home");
 
 api.pj_sim_reset();
@@ -86,8 +115,8 @@ api.pj_sim_wake();
 assert.equal(api.pj_sim_aux_double(), 1);
 assertRendered("record");
 api.pj_sim_set_audio_state(0, 0);
-assert.equal(api.pj_sim_record_state(), 0);
-assertRendered("home");
+assert.equal(api.pj_sim_record_state(), RECORD_ARMING);
+assertRendered("record");
 
 api.pj_sim_reset();
 api.pj_sim_wake();
@@ -106,7 +135,7 @@ assert.equal(api.pj_sim_aux_double(), 1);
 assertRendered("record");
 api.pj_sim_set_audio_state(1, 0);
 assert.equal(api.pj_sim_aux_short(), 1);
-assert.equal(api.pj_sim_record_state(), 2);
+assert.equal(api.pj_sim_record_state(), RECORD_STOPPING);
 assertRendered("home");
 api.pj_sim_set_audio_state(0, 0);
 
@@ -119,9 +148,9 @@ assertRendered("record");
 api.pj_sim_reset();
 api.pj_sim_wake();
 api.pj_sim_set_note_count(1);
-assert.equal(api.pj_sim_touch_tap(100, 33), 1);
+assert.equal(api.pj_sim_touch_tap(100, 180), 1);
 assertRendered("notes");
-assert.equal(api.pj_sim_touch_tap(100, 100), 1);
+assert.equal(api.pj_sim_touch_tap(20, 120), 1);
 assertRendered("listen");
 
 assert.equal(api.pj_sim_touch_tap(100, 25), 1);
@@ -149,8 +178,8 @@ assertRendered("listen");
 api.pj_sim_reset();
 api.pj_sim_wake();
 api.pj_sim_set_note_count(1);
-api.pj_sim_touch_tap(100, 33);
-api.pj_sim_touch_tap(100, 100);
+api.pj_sim_touch_tap(100, 180);
+api.pj_sim_touch_tap(20, 120);
 api.pj_sim_touch_tap(100, 25);
 api.pj_sim_set_audio_state(0, 1);
 assert.equal(api.pj_sim_touch_tap(20, 30), 1);
@@ -164,8 +193,8 @@ assertRendered("listen");
 api.pj_sim_reset();
 api.pj_sim_wake();
 api.pj_sim_seed_review_notes();
-api.pj_sim_touch_tap(100, 33);
-api.pj_sim_touch_tap(100, 100);
+api.pj_sim_touch_tap(100, 180);
+api.pj_sim_touch_tap(20, 120);
 assertRendered("listen");
 assert.equal(api.pj_sim_touch_tap(50, 175), 0);
 assert.equal(api.pj_sim_touch_tap(150, 175), 1);
@@ -176,8 +205,8 @@ assert.equal(api.pj_sim_touch_tap(50, 175), 1);
 api.pj_sim_reset();
 api.pj_sim_wake();
 api.pj_sim_seed_timestamp_notes();
-api.pj_sim_touch_tap(100, 33);
-api.pj_sim_touch_tap(100, 100);
+api.pj_sim_touch_tap(100, 180);
+api.pj_sim_touch_tap(20, 120);
 assertRendered("listen");
 
 api.pj_sim_reset();
@@ -207,11 +236,34 @@ api.pj_sim_wake();
 assert.equal(api.pj_sim_aux_long(), 1);
 assertRendered("time_temp");
 
+const beforeStatusPartial = framebufferSnapshot();
+api.pj_sim_set_status(39, 23, 46);
+const afterStatusPartial = framebufferSnapshot();
+const exactStatusBounds = exactChangedBounds(beforeStatusPartial, afterStatusPartial);
+assert.equal(api.pj_sim_frame_result(), 2, "status change must be presented as an exact partial");
+assert.equal(api.pj_sim_dirty_partial(), 1);
+assert.deepEqual(
+  {
+    x: api.pj_sim_dirty_x(),
+    y: api.pj_sim_dirty_y(),
+    width: api.pj_sim_dirty_width(),
+    height: api.pj_sim_dirty_height(),
+  },
+  exactStatusBounds,
+);
+api.pj_sim_render();
+assert.equal(api.pj_sim_frame_result(), 0, "idle render must not expose stale partial metadata");
+assert.equal(api.pj_sim_dirty_x(), 0);
+assert.equal(api.pj_sim_dirty_y(), 0);
+assert.equal(api.pj_sim_dirty_width(), 0);
+assert.equal(api.pj_sim_dirty_height(), 0);
+assert.equal(api.pj_sim_dirty_partial(), 0);
+
 api.pj_sim_reset();
 api.pj_sim_wake();
-assert.equal(api.pj_sim_touch_tap(20, 125), 1);
+assert.equal(api.pj_sim_touch_tap(20, 80), 1);
 assertRendered("time");
-assert.equal(api.pj_sim_touch_tap(150, 70), 1);
+assert.equal(api.pj_sim_touch_tap(160, 40), 1);
 assertRendered("stopwatch");
 assert.equal(api.pj_sim_aux_short(), 1);
 assert.equal(api.pj_sim_aux_double(), 0);

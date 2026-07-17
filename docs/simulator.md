@@ -12,13 +12,18 @@ The display canvas is treated as a hardware framebuffer:
 - Partial refreshes use the dirty region reported by firmware.
 - Browser-side drawing is limited to expanding firmware framebuffer bits into canvas pixels.
 
-The firmware renderer uses generated 1-bit font and Carbon icon headers. The generation steps also write JSON copies for asset inspection and simulator contract tests.
+The firmware renderer uses generated case-preserving Carbon letters and numbers,
+typed Carbon icons, and IBM Plex Mono Bold only for punctuation, spaces, and
+unsupported characters. The manifest-driven generator writes byte-identical
+firmware headers and simulator JSON.
 
-Regenerate font assets after changing the source TTF or logical size map:
+Regenerate or verify the pinned asset set after changing a source, extraction
+rule, or authorized size:
 
 ```sh
-make generate-font-assets
-make generate-icon-assets
+python3 -m pip install --target /tmp/pj-carbon-python \
+  --require-hashes -r tools/carbon-assets-requirements.lock
+PYTHONPATH=/tmp/pj-carbon-python make test-assets
 ```
 
 Build the firmware-backed simulator runtime:
@@ -79,16 +84,23 @@ The inline bootstrap logger writes to the same endpoint before `src/main.js` loa
 
 ## Interaction Model
 
-- `static`: tap or short-press BOOT/AUX to `time_temp`.
-- `time_temp`: short-press BOOT/AUX or tap to `home`; long-press BOOT/AUX returns to `static`.
-- `home`: fixed firmware tiles for notes, time, and settings.
+- `static`: compiled splash art; the power control wakes directly to `home`.
+- `time_temp`: the minute-resolution Clock; tap or AUX short returns to `home`.
+- `home`: fixed DXF sectors for Time, Notes, and Settings. AUX long reaches the
+  Clock parent.
 - `notes`: record, listen, read.
 - `time`: alarm, stopwatch, timer, interval.
-- `settings`: three direct rows for volume, light/dark appearance, and 12/24-hour time.
+- `settings`: four DXF sectors for Volume, Light/Dark (the invariant
+  `AsleepFilled` icon), 12H/24H, and Sync.
 - `volume`: the filled meter uses the full upper half; the lower minus and plus controls adjust it.
-- `record`: entering starts recording; AUX stops/saves it and returns home while processing continues asynchronously.
+- `record`: entry first presents a full `00:00` frame; capture then starts and
+  elapsed playable PCM duration is reserved on a hard one-second cadence. AUX
+  stops/saves and returns home while processing continues asynchronously.
 - `listen` and `read`: show three dummy recordings per page ordered newest first; tap a note to enter detail or use the bottom arrows to move one full page.
-- AUX double-click jumps from any idle screen, including the resting screen, directly into recording. It is ignored while recording, playback, stopwatch, timer, or interval activity is in progress.
+- AUX double-click jumps directly into Record only from Home or Clock. It is
+  ignored elsewhere and during active media/time work.
 - AUX single-click actions wait 350 ms so a second click can be recognized. A long press fires once at the 500 ms threshold while AUX remains held; release is consumed and does not emit another action.
 - The AUX long press is the sole Back action and backs out through the firmware parent state graph; child screens have no rendered or touch Back target.
-- AUX short press follows the focused action on each screen; AUX double press cycles focus where a screen exposes multiple actions. Active media and time screens start, pause, or stop their current action without requiring touch.
+- AUX short invokes only the obvious primary action on a screen. There is no
+  hidden focus model; secondary controls are direct touch targets. Active
+  media and time screens start or pause without rendering a square Stop icon.

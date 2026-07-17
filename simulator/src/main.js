@@ -40,19 +40,19 @@ const REVIEW_ROUTES = {
   static: [],
   time_temp: ["wake", "back"],
   home: ["wake"],
-  notes: ["wake", [100, 33]],
-  record: ["wake", [100, 33], [100, 33]],
-  listen: ["wake", [100, 33], [100, 100]],
-  listen_page_2: ["wake", [100, 33], [100, 100], [150, 175]],
-  read: ["wake", [100, 33], [100, 166]],
-  time: ["wake", [20, 125]],
-  alarm: ["wake", [20, 125], [40, 70]],
-  stopwatch: ["wake", [20, 125], [150, 70]],
-  timer: ["wake", [20, 125], [40, 150]],
-  interval: ["wake", [20, 125], [150, 150]],
-  settings: ["wake", [20, 170]],
-  volume: ["wake", [20, 170], [50, 50]],
-  sync: ["wake", [20, 170], [150, 150]],
+  notes: ["wake", [100, 180]],
+  record: ["wake", [100, 180], [100, 20]],
+  listen: ["wake", [100, 180], [20, 120]],
+  listen_page_2: ["wake", [100, 180], [20, 120], [150, 175]],
+  read: ["wake", [100, 180], [180, 120]],
+  time: ["wake", [20, 80]],
+  alarm: ["wake", [20, 80], [40, 40]],
+  stopwatch: ["wake", [20, 80], [160, 40]],
+  timer: ["wake", [20, 80], [40, 160]],
+  interval: ["wake", [20, 80], [160, 160]],
+  settings: ["wake", [180, 80]],
+  volume: ["wake", [180, 80], [40, 40]],
+  sync: ["wake", [180, 80], [160, 160]],
 };
 
 window.__pocketJournalSimulatorModuleLoaded = true;
@@ -77,7 +77,7 @@ function stateLabel() {
 
 function dirtyRegion() {
   if (!api) {
-    return { x: 0, y: 0, width: DISPLAY_WIDTH, height: DISPLAY_HEIGHT, partial: 0 };
+    return { x: 0, y: 0, width: DISPLAY_WIDTH, height: DISPLAY_HEIGHT, partial: 0, result: 3 };
   }
   return {
     x: api.dirtyX(),
@@ -85,6 +85,7 @@ function dirtyRegion() {
     width: api.dirtyWidth(),
     height: api.dirtyHeight(),
     partial: api.dirtyPartial(),
+    result: api.frameResult(),
   };
 }
 
@@ -243,6 +244,7 @@ function bindApi(module) {
     dirtyWidth: module.cwrap("pj_sim_dirty_width", "number", []),
     dirtyHeight: module.cwrap("pj_sim_dirty_height", "number", []),
     dirtyPartial: module.cwrap("pj_sim_dirty_partial", "number", []),
+    frameResult: module.cwrap("pj_sim_frame_result", "number", []),
   };
 }
 
@@ -283,12 +285,16 @@ function paintFirmwareFramebuffer(action = "render") {
   api.render();
   const state = stateLabel();
   const dirty = dirtyRegion();
-  const region = dirty.partial && dirty.width > 0 && dirty.height > 0
+  const region = dirty.result === 2 && dirty.width > 0 && dirty.height > 0
     ? dirty
-    : { x: 0, y: 0, width: DISPLAY_WIDTH, height: DISPLAY_HEIGHT, partial: 0 };
+    : dirty.result === 3
+      ? { x: 0, y: 0, width: DISPLAY_WIDTH, height: DISPLAY_HEIGHT, partial: 0 }
+      : null;
 
-  copyFirmwareFramebuffer(region);
-  ctx.putImageData(framebufferImage, 0, 0, region.x, region.y, region.width, region.height);
+  if (region) {
+    copyFirmwareFramebuffer(region);
+    ctx.putImageData(framebufferImage, 0, 0, region.x, region.y, region.width, region.height);
+  }
   stateName.textContent = state;
   if (viewPicker && Object.hasOwn(REVIEW_ROUTES, state)) {
     viewPicker.value = state;

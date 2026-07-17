@@ -1,4 +1,4 @@
-.PHONY: test test-firmware-tools test-ui test-input test-display-worker test-sync-inventory-gate test-display-pipeline test-partner test-simulator test-simulator-runtime test-ui-images ui-gallery check-lvgl-managed check-static-art generate-static-art generate-font-assets generate-icon-assets generate-simulator-wasm simulator clean
+.PHONY: test test-assets test-dxf-geometry test-ui test-layout-geometry test-input test-display-worker test-sync-inventory-gate test-display-pipeline test-partner test-simulator test-simulator-runtime test-ui-images ui-gallery check-carbon-assets check-dxf-geometry check-static-art generate-dxf-geometry generate-static-art generate-font-assets generate-icon-assets generate-simulator-wasm simulator clean
 
 CC ?= cc
 CFLAGS ?= -std=c11 -Wall -Wextra -Werror -pedantic
@@ -15,7 +15,7 @@ RECORDING_TEST_BIN := build/test_recording
 NOTE_MODEL_TEST_BIN := build/test_note_model
 AUTH_TEST_BIN := build/test_auth
 SETTINGS_TEST_BIN := build/test_settings
-HOME_LAYOUT_TEST_BIN := build/test_home_layout
+LAYOUT_GEOMETRY_TEST_BIN := build/test_layout_geometry
 STORAGE_TEST_BIN := build/test_storage
 STORAGE_COORDINATOR_TEST_BIN := build/test_storage_coordinator
 RUNTIME_DIAGNOSTICS_TEST_BIN := build/test_runtime_diagnostics
@@ -36,43 +36,39 @@ WIFI_STATE_TEST_BIN := build/test_wifi_state
 TIME_SYNC_TEST_BIN := build/test_time_sync
 COMPANION_SYNC_TEST_BIN := build/test_companion_sync
 COMPANION_SYNC_RUNTIME_TEST_BIN := build/test_companion_sync_runtime
-LVGL_DIR := firmware/managed_components/lvgl__lvgl
-ifneq ($(wildcard $(LVGL_DIR)/src),)
-LVGL_SRCS := $(wildcard $(LVGL_DIR)/src/*.c)
-LVGL_SRCS += $(shell find $(LVGL_DIR)/src/core $(LVGL_DIR)/src/display $(LVGL_DIR)/src/font $(LVGL_DIR)/src/indev $(LVGL_DIR)/src/misc $(LVGL_DIR)/src/tick -name '*.c')
-LVGL_SRCS += $(wildcard $(LVGL_DIR)/src/draw/*.c)
-LVGL_SRCS += $(shell find $(LVGL_DIR)/src/draw/sw -name '*.c')
-LVGL_SRCS += $(wildcard $(LVGL_DIR)/src/libs/bin_decoder/lv_bin_decoder.c)
-LVGL_SRCS += $(wildcard $(LVGL_DIR)/src/layouts/*.c $(LVGL_DIR)/src/layouts/flex/*.c)
-LVGL_SRCS += $(wildcard $(LVGL_DIR)/src/osal/lv_os.c $(LVGL_DIR)/src/osal/lv_os_none.c)
-LVGL_SRCS += $(wildcard $(LVGL_DIR)/src/stdlib/*.c $(LVGL_DIR)/src/stdlib/clib/*.c)
-LVGL_SRCS += $(wildcard $(LVGL_DIR)/src/themes/lv_theme.c)
-LVGL_SRCS += $(shell find $(LVGL_DIR)/src/widgets/bar $(LVGL_DIR)/src/widgets/button $(LVGL_DIR)/src/widgets/canvas $(LVGL_DIR)/src/widgets/image $(LVGL_DIR)/src/widgets/label $(LVGL_DIR)/src/widgets/line -name '*.c')
-endif
-LVGL_CFLAGS := -DPJ_UI_USE_LVGL=1 -D_POSIX_C_SOURCE=200809L -DLV_CONF_INCLUDE_SIMPLE -DLV_CONF_SUPPRESS_DEFINE_CHECK -Wno-newline-eof -Wno-unused-parameter -I$(LVGL_DIR) -I$(LVGL_DIR)/src
+UI_RENDER_SRCS := firmware/components/pj_ui/pj_layout_geometry.c \
+	firmware/components/pj_ui/pj_default_static_art.c \
+	firmware/components/pj_ui/pj_ui.c
+UI_PRESENTER_SRCS := $(UI_RENDER_SRCS) firmware/components/pj_ui/pj_ui_presenter.c
 SIM_WASM_JS := simulator/generated/pj_ui_wasm.js
 SIM_WASM := simulator/generated/pj_ui_wasm.wasm
-SIM_WASM_EXPORTS := ['_pj_sim_init','_pj_sim_reset','_pj_sim_wake','_pj_sim_sleep','_pj_sim_aux_short','_pj_sim_aux_long','_pj_sim_aux_double','_pj_sim_touch_tap','_pj_sim_tick','_pj_sim_set_status','_pj_sim_set_preferences','_pj_sim_set_time','_pj_sim_set_audio_state','_pj_sim_set_alert','_pj_sim_set_alert_detail','_pj_sim_record_state','_pj_sim_playback_state','_pj_sim_set_note_count','_pj_sim_set_note_label','_pj_sim_seed_review_notes','_pj_sim_seed_timestamp_notes','_pj_sim_render','_pj_sim_framebuffer','_pj_sim_framebuffer_bytes','_pj_sim_display_width','_pj_sim_display_height','_pj_sim_state','_pj_sim_state_name','_pj_sim_dirty_x','_pj_sim_dirty_y','_pj_sim_dirty_width','_pj_sim_dirty_height','_pj_sim_dirty_partial']
+SIM_WASM_EXPORTS := ['_pj_sim_init','_pj_sim_reset','_pj_sim_wake','_pj_sim_sleep','_pj_sim_aux_short','_pj_sim_aux_long','_pj_sim_aux_double','_pj_sim_touch_tap','_pj_sim_tick','_pj_sim_set_status','_pj_sim_set_preferences','_pj_sim_set_full_preferences','_pj_sim_set_time','_pj_sim_set_time_runtime','_pj_sim_set_audio_state','_pj_sim_set_recording_elapsed','_pj_sim_set_sync_preview','_pj_sim_set_alert','_pj_sim_set_alert_detail','_pj_sim_record_state','_pj_sim_playback_state','_pj_sim_set_note_count','_pj_sim_set_note_label','_pj_sim_seed_review_notes','_pj_sim_seed_timestamp_notes','_pj_sim_seed_punctuation_note','_pj_sim_seed_long_note','_pj_sim_render','_pj_sim_framebuffer','_pj_sim_framebuffer_bytes','_pj_sim_display_width','_pj_sim_display_height','_pj_sim_state','_pj_sim_state_name','_pj_sim_dirty_x','_pj_sim_dirty_y','_pj_sim_dirty_width','_pj_sim_dirty_height','_pj_sim_dirty_partial','_pj_sim_frame_result']
 
 test: test-firmware-tools test-ui test-input test-partner test-simulator
 
-test-firmware-tools:
+test-firmware-tools: test-dxf-geometry
 	python3 tests/firmware/test_app_size.py
 
-check-lvgl-managed:
-	@if [ ! -d "$(LVGL_DIR)/src" ]; then \
-		echo "LVGL managed component is missing. Run: cd firmware && idf.py reconfigure"; \
-		exit 1; \
-	fi
+test-assets: check-carbon-assets
+	python3 -m unittest tests.assets.test_carbon_assets
 
-test-ui: check-lvgl-managed check-static-art
+check-carbon-assets:
+	python3 tools/generate_icon_assets.py --check
+
+generate-dxf-geometry:
+	python3 tools/generate_dxf_geometry.py
+
+check-dxf-geometry:
+	python3 tools/generate_dxf_geometry.py --check
+
+test-dxf-geometry: check-dxf-geometry
+	python3 tests/firmware/test_dxf_geometry.py
+
+test-ui: check-static-art test-layout-geometry
 	mkdir -p build
-	$(CC) $(CFLAGS) $(LVGL_CFLAGS) \
+	$(CC) $(CFLAGS) \
 		-Ifirmware/components/pj_ui/include \
-		$(LVGL_SRCS) \
-		firmware/components/pj_ui/pj_home_layout.c \
-		firmware/components/pj_ui/pj_default_static_art.c \
-		firmware/components/pj_ui/pj_ui.c \
+		$(UI_PRESENTER_SRCS) \
 		tests/ui/test_ui_core.c \
 		-o $(UI_TEST_BIN)
 	$(UI_TEST_BIN)
@@ -82,6 +78,15 @@ test-ui: check-lvgl-managed check-static-art
 		tests/ui/test_time_model.c \
 		-o $(TIME_MODEL_TEST_BIN)
 	$(TIME_MODEL_TEST_BIN)
+
+test-layout-geometry: check-dxf-geometry
+	mkdir -p build
+	$(CC) $(CFLAGS) \
+		-Ifirmware/components/pj_ui/include \
+		firmware/components/pj_ui/pj_layout_geometry.c \
+		tests/ui/test_layout_geometry.c \
+		-o $(LAYOUT_GEOMETRY_TEST_BIN)
+	$(LAYOUT_GEOMETRY_TEST_BIN)
 
 test-display-worker:
 	mkdir -p build
@@ -110,9 +115,7 @@ test-display-pipeline: check-static-art
 		-Ifirmware/main \
 		-Ifirmware/components/pj_ui/include \
 		-Ifirmware/components/pj_board/include \
-		firmware/components/pj_ui/pj_home_layout.c \
-		firmware/components/pj_ui/pj_default_static_art.c \
-		firmware/components/pj_ui/pj_ui.c \
+		$(UI_PRESENTER_SRCS) \
 		firmware/components/pj_board/pj_display_refresh.c \
 		firmware/main/pj_display_worker.c \
 		tests/board/test_display_pipeline.c \
@@ -179,12 +182,6 @@ test-input: test-display-worker test-sync-inventory-gate test-display-pipeline
 		tests/board/test_settings.c \
 		-o $(SETTINGS_TEST_BIN)
 	$(SETTINGS_TEST_BIN)
-	$(CC) $(CFLAGS) \
-		-Ifirmware/components/pj_ui/include \
-		firmware/components/pj_ui/pj_home_layout.c \
-		tests/board/test_home_layout.c \
-		-o $(HOME_LAYOUT_TEST_BIN)
-	$(HOME_LAYOUT_TEST_BIN)
 	$(CC) $(CFLAGS) \
 		-D_POSIX_C_SOURCE=200809L \
 		-Ifirmware/components/pj_board/include \
@@ -330,7 +327,7 @@ generate-static-art:
 check-static-art:
 	python3 tools/generate_static_art.py --check
 
-generate-simulator-wasm: check-lvgl-managed check-static-art
+generate-simulator-wasm: check-static-art check-dxf-geometry
 	@if ! command -v $(EMCC) >/dev/null 2>&1; then \
 		if [ -f "$(SIM_WASM_JS)" ] && [ -f "$(SIM_WASM)" ]; then \
 			echo "emcc not found; using existing $(SIM_WASM_JS)."; \
@@ -341,12 +338,9 @@ generate-simulator-wasm: check-lvgl-managed check-static-art
 		exit 1; \
 	fi
 	mkdir -p simulator/generated
-	$(EMCC) -std=c11 -O2 $(LVGL_CFLAGS) \
+	$(EMCC) -std=c11 -O2 -Wall -Wextra -Werror \
 		-Ifirmware/components/pj_ui/include \
-		$(LVGL_SRCS) \
-		firmware/components/pj_ui/pj_home_layout.c \
-		firmware/components/pj_ui/pj_default_static_art.c \
-		firmware/components/pj_ui/pj_ui.c \
+		$(UI_PRESENTER_SRCS) \
 		simulator/wasm/pj_ui_wasm_bridge.c \
 		-o $(SIM_WASM_JS) \
 		-s MODULARIZE=1 \
