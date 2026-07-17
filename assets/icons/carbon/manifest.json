@@ -1,0 +1,1959 @@
+{
+  "derived": {
+    "carbon_glyph_count": 72,
+    "settings_composites": [
+      {
+        "allowed_sizes": [
+          64
+        ],
+        "components": [
+          "PJ_CARBON_GLYPH_SMALL_DIGIT_1",
+          "PJ_CARBON_GLYPH_SMALL_DIGIT_2",
+          "PJ_CARBON_GLYPH_UPPER_H"
+        ],
+        "typed_id": "PJ_CARBON_GLYPH_SETTINGS_12H"
+      },
+      {
+        "allowed_sizes": [
+          64
+        ],
+        "components": [
+          "PJ_CARBON_GLYPH_SMALL_DIGIT_2",
+          "PJ_CARBON_GLYPH_SMALL_DIGIT_4",
+          "PJ_CARBON_GLYPH_UPPER_H"
+        ],
+        "typed_id": "PJ_CARBON_GLYPH_SETTINGS_24H"
+      }
+    ]
+  },
+  "font_fallback": {
+    "family": "IBM Plex Mono Bold",
+    "file": "assets/fonts/IBMPlexMono-Bold.ttf",
+    "file_sha256": "74e5eedcfa4596497d34e19023cabdabd3a8c852b903007a5654a59591a72ffb",
+    "license": "SIL Open Font License 1.1",
+    "license_file": "assets/fonts/IBMPlexMono-LICENSE.txt",
+    "license_sha256": "1d3d06b7bffbd3e5e86ffa32dc4a4baad52135afde9a5fa619a0f63145e97122",
+    "roles": [
+      "space",
+      "ASCII punctuation",
+      "unsupported-codepoint fallback"
+    ],
+    "sizes": [
+      16,
+      24,
+      32,
+      64
+    ],
+    "version": "2.005"
+  },
+  "package": {
+    "license": "Apache-2.0",
+    "license_file": "assets/icons/carbon/LICENSE",
+    "license_sha256": "037b3e9eaff51477b270e9082f54b99175e4dd893548654f00995045b68294b8",
+    "name": "@carbon/icons",
+    "source_url": "https://www.npmjs.com/package/@carbon/icons/v/11.82.0",
+    "tarball_sha1": "c5ae9cc66e2698db1f05a8110e051c7b94eed8df",
+    "version": "11.82.0"
+  },
+  "rasterization": {
+    "cairosvg": "2.9.0",
+    "complete_viewbox": [
+      0,
+      0,
+      32,
+      32
+    ],
+    "dither": false,
+    "downsample": "Pillow.Resampling.LANCZOS",
+    "pillow": "12.3.0",
+    "supersample": 8,
+    "threshold": 192
+  },
+  "schema_version": 1,
+  "source_counts": {
+    "active": 73,
+    "reference": 26,
+    "total": 99
+  },
+  "sources": [
+    {
+      "allowed_sizes": [],
+      "kind": "reference_icon",
+      "path": "svg/32/add.svg",
+      "sha256": "a01e6d04990c6c1c0b6f3a53e6ca07753547ff314219b640acaff8c6baa1c52d",
+      "status": "reference",
+      "typed_ids": []
+    },
+    {
+      "allowed_sizes": [
+        64
+      ],
+      "kind": "semantic_icon",
+      "path": "svg/32/alarm.svg",
+      "sha256": "022bc2be4a72d542b02cb93630473670cd34f82ae7cc461013bb80d4c410c30e",
+      "status": "active",
+      "typed_ids": [
+        "PJ_CARBON_ICON_ALARM"
+      ]
+    },
+    {
+      "allowed_sizes": [],
+      "kind": "reference_icon",
+      "path": "svg/32/arrow--down.svg",
+      "sha256": "0994e5f12d8f3fab033f39574069734b548106751cb8764bde4980dfb9972a6e",
+      "status": "reference",
+      "typed_ids": []
+    },
+    {
+      "allowed_sizes": [],
+      "kind": "reference_icon",
+      "path": "svg/32/arrow--left.svg",
+      "sha256": "838cba8acdf8c362b4caae2aa7da22dfb306b88c224c526477f65f94e1be91e1",
+      "status": "reference",
+      "typed_ids": []
+    },
+    {
+      "allowed_sizes": [],
+      "kind": "reference_icon",
+      "path": "svg/32/arrow--right.svg",
+      "sha256": "219cec5920739c27df65aa7af418522e71fcc29a67cd6c44e801b6449ac8b17a",
+      "status": "reference",
+      "typed_ids": []
+    },
+    {
+      "allowed_sizes": [],
+      "kind": "reference_icon",
+      "path": "svg/32/arrow--up.svg",
+      "sha256": "864411e03b475206a89cc8e48b01fd3450600ccf65d842fd0c91c9ffbfcf33f1",
+      "status": "reference",
+      "typed_ids": []
+    },
+    {
+      "allowed_sizes": [
+        64
+      ],
+      "kind": "semantic_icon",
+      "path": "svg/32/asleep--filled.svg",
+      "sha256": "d7856ea55630152e41c147465fd0eef8191179b378353ab5c0580b9f07baf3b8",
+      "status": "active",
+      "typed_ids": [
+        "PJ_CARBON_ICON_ASLEEP_FILLED"
+      ]
+    },
+    {
+      "allowed_sizes": [],
+      "kind": "reference_icon",
+      "path": "svg/32/battery--charging.svg",
+      "sha256": "f332325766568ce73cdc95dba3c873ed7e8702ef7a91fa4fe16c800184ca9d19",
+      "status": "reference",
+      "typed_ids": []
+    },
+    {
+      "allowed_sizes": [
+        28
+      ],
+      "kind": "semantic_icon",
+      "path": "svg/32/battery--empty.svg",
+      "sha256": "54bebc60078a0739b6f850cc5737391019bd93d7d2d378bd478a6c0d351cf446",
+      "status": "active",
+      "typed_ids": [
+        "PJ_CARBON_ICON_BATTERY_EMPTY"
+      ]
+    },
+    {
+      "allowed_sizes": [
+        28
+      ],
+      "kind": "semantic_icon",
+      "path": "svg/32/battery--full.svg",
+      "sha256": "cd094696f8f7d02e7d263bd3cc56dea4314e9b16f7825c992be2a22a7b8abd7c",
+      "status": "active",
+      "typed_ids": [
+        "PJ_CARBON_ICON_BATTERY_FULL"
+      ]
+    },
+    {
+      "allowed_sizes": [
+        28
+      ],
+      "kind": "semantic_icon",
+      "path": "svg/32/battery--half.svg",
+      "sha256": "193dd22313a7cc602d5d3799b5b2f2fe26ab53f7fa56f486e28a07e6c68cd272",
+      "status": "active",
+      "typed_ids": [
+        "PJ_CARBON_ICON_BATTERY_HALF"
+      ]
+    },
+    {
+      "allowed_sizes": [
+        28
+      ],
+      "kind": "semantic_icon",
+      "path": "svg/32/battery--low.svg",
+      "sha256": "6b127909ad694dd0ccf4108312fbed3ad046bc68af8ebd332d0e8997c2579fe1",
+      "status": "active",
+      "typed_ids": [
+        "PJ_CARBON_ICON_BATTERY_LOW"
+      ]
+    },
+    {
+      "allowed_sizes": [
+        40
+      ],
+      "kind": "semantic_icon",
+      "path": "svg/32/caret--down.svg",
+      "sha256": "094f6d692940ca118f905f25ce051270aa37d78d70954f2a31476d5aef25dbcc",
+      "status": "active",
+      "typed_ids": [
+        "PJ_CARBON_ICON_CARET_DOWN"
+      ]
+    },
+    {
+      "allowed_sizes": [
+        40
+      ],
+      "kind": "semantic_icon",
+      "path": "svg/32/caret--up.svg",
+      "sha256": "55672e13233ab4e12ecf4d41b1b717ab363d42976c8e17bdb70cedc68b420f67",
+      "status": "active",
+      "typed_ids": [
+        "PJ_CARBON_ICON_CARET_UP"
+      ]
+    },
+    {
+      "allowed_sizes": [],
+      "kind": "reference_icon",
+      "path": "svg/32/chevron--down.svg",
+      "sha256": "8dc9cb4b5a2ecc78e91f629e2571a4d9c472f1eba609506d5bbefabb68a0c01b",
+      "status": "reference",
+      "typed_ids": []
+    },
+    {
+      "allowed_sizes": [
+        40
+      ],
+      "kind": "semantic_icon",
+      "path": "svg/32/chevron--left.svg",
+      "sha256": "4778ef3456634371f8d2044902cfed7d3a726b3bb9d25903f90c6e77f8c6f3d4",
+      "status": "active",
+      "typed_ids": [
+        "PJ_CARBON_ICON_CHEVRON_LEFT"
+      ]
+    },
+    {
+      "allowed_sizes": [
+        40
+      ],
+      "kind": "semantic_icon",
+      "path": "svg/32/chevron--right.svg",
+      "sha256": "4a7b039f808594c7f0e567c73c31dfda762c9e590b9cf2079de50d6c088457ac",
+      "status": "active",
+      "typed_ids": [
+        "PJ_CARBON_ICON_CHEVRON_RIGHT"
+      ]
+    },
+    {
+      "allowed_sizes": [],
+      "kind": "reference_icon",
+      "path": "svg/32/chevron--up.svg",
+      "sha256": "0493e8a090f9e4f2aebc35ae18a55a0728b892a515ede162bf4d176696f9be52",
+      "status": "reference",
+      "typed_ids": []
+    },
+    {
+      "allowed_sizes": [
+        64
+      ],
+      "kind": "semantic_icon",
+      "path": "svg/32/data-enrichment.svg",
+      "sha256": "bd67f3711fe09831fdda075c192a20abd2ecb3ba62ff7fd69c7b508e194ed06b",
+      "status": "active",
+      "typed_ids": [
+        "PJ_CARBON_ICON_DATA_ENRICHMENT"
+      ]
+    },
+    {
+      "allowed_sizes": [],
+      "kind": "reference_icon",
+      "path": "svg/32/document--audio.svg",
+      "sha256": "ab57eb1457a902a8d5c0c38541988df71d7804df373421bb5b0bd75edb6223a1",
+      "status": "reference",
+      "typed_ids": []
+    },
+    {
+      "allowed_sizes": [],
+      "kind": "reference_icon",
+      "path": "svg/32/document.svg",
+      "sha256": "15339a06f6593c495042659b80b1d9ed2f49b9712ecdf3a35cdcd668a9a81e8d",
+      "status": "reference",
+      "typed_ids": []
+    },
+    {
+      "allowed_sizes": [
+        64
+      ],
+      "kind": "semantic_icon",
+      "path": "svg/32/fetch-upload.svg",
+      "sha256": "6acf2bac1588efa84cb18911932940d843c6cfb9dcb950e6639cf2a5b2c0c3ef",
+      "status": "active",
+      "typed_ids": [
+        "PJ_CARBON_ICON_FETCH_UPLOAD"
+      ]
+    },
+    {
+      "allowed_sizes": [
+        64
+      ],
+      "kind": "semantic_icon",
+      "path": "svg/32/hearing.svg",
+      "sha256": "5214f36897ccb097d626cefbf351f227cfb859a63ae61d5257cf04cf6c02cf95",
+      "status": "active",
+      "typed_ids": [
+        "PJ_CARBON_ICON_HEARING"
+      ]
+    },
+    {
+      "allowed_sizes": [],
+      "kind": "reference_icon",
+      "path": "svg/32/home.svg",
+      "sha256": "615a688f68355572c2e18935776c4abe6382e333c789cda9ca1df5c570b2ffa2",
+      "status": "reference",
+      "typed_ids": []
+    },
+    {
+      "allowed_sizes": [
+        64
+      ],
+      "kind": "semantic_icon",
+      "path": "svg/32/hourglass.svg",
+      "sha256": "b4ca8239717619fd6b8cd674d7c66fe3351d8d9f850e608e0112715451dcdc81",
+      "status": "active",
+      "typed_ids": [
+        "PJ_CARBON_ICON_HOURGLASS"
+      ]
+    },
+    {
+      "allowed_sizes": [
+        16,
+        24,
+        32,
+        64
+      ],
+      "glyph_extraction": {
+        "cell": "half_viewbox_centered",
+        "groups": [
+          {
+            "codepoint": 65,
+            "elements": [
+              1
+            ],
+            "typed_id": "PJ_CARBON_GLYPH_UPPER_A"
+          },
+          {
+            "codepoint": 97,
+            "elements": [
+              0
+            ],
+            "typed_id": "PJ_CARBON_GLYPH_LOWER_A"
+          }
+        ],
+        "method": "painted_element_horizontal_clustering",
+        "split_at_x_16": false
+      },
+      "kind": "letter_pair",
+      "path": "svg/32/letter--Aa.svg",
+      "sha256": "5cc5a202f3eddf141d8cfe36a111bdca3181d2156472b526b65718ceb4e0aebd",
+      "status": "active",
+      "typed_ids": [
+        "PJ_CARBON_GLYPH_UPPER_A",
+        "PJ_CARBON_GLYPH_LOWER_A"
+      ]
+    },
+    {
+      "allowed_sizes": [
+        16,
+        24,
+        32,
+        64
+      ],
+      "glyph_extraction": {
+        "cell": "half_viewbox_centered",
+        "groups": [
+          {
+            "codepoint": 66,
+            "elements": [
+              1
+            ],
+            "typed_id": "PJ_CARBON_GLYPH_UPPER_B"
+          },
+          {
+            "codepoint": 98,
+            "elements": [
+              0
+            ],
+            "typed_id": "PJ_CARBON_GLYPH_LOWER_B"
+          }
+        ],
+        "method": "painted_element_horizontal_clustering",
+        "split_at_x_16": false
+      },
+      "kind": "letter_pair",
+      "path": "svg/32/letter--Bb.svg",
+      "sha256": "307a4865d017e5afd6d7dac279afa63ff311b01f115501262ccce27434267795",
+      "status": "active",
+      "typed_ids": [
+        "PJ_CARBON_GLYPH_UPPER_B",
+        "PJ_CARBON_GLYPH_LOWER_B"
+      ]
+    },
+    {
+      "allowed_sizes": [
+        16,
+        24,
+        32,
+        64
+      ],
+      "glyph_extraction": {
+        "cell": "half_viewbox_centered",
+        "groups": [
+          {
+            "codepoint": 67,
+            "elements": [
+              1
+            ],
+            "typed_id": "PJ_CARBON_GLYPH_UPPER_C"
+          },
+          {
+            "codepoint": 99,
+            "elements": [
+              0
+            ],
+            "typed_id": "PJ_CARBON_GLYPH_LOWER_C"
+          }
+        ],
+        "method": "painted_element_horizontal_clustering",
+        "split_at_x_16": false
+      },
+      "kind": "letter_pair",
+      "path": "svg/32/letter--Cc.svg",
+      "sha256": "3978963b054c732b5992808d1804482a2c59920ade6fb9c99c61e0d329051b0d",
+      "status": "active",
+      "typed_ids": [
+        "PJ_CARBON_GLYPH_UPPER_C",
+        "PJ_CARBON_GLYPH_LOWER_C"
+      ]
+    },
+    {
+      "allowed_sizes": [
+        16,
+        24,
+        32,
+        64
+      ],
+      "glyph_extraction": {
+        "cell": "half_viewbox_centered",
+        "groups": [
+          {
+            "codepoint": 68,
+            "elements": [
+              1
+            ],
+            "typed_id": "PJ_CARBON_GLYPH_UPPER_D"
+          },
+          {
+            "codepoint": 100,
+            "elements": [
+              0
+            ],
+            "typed_id": "PJ_CARBON_GLYPH_LOWER_D"
+          }
+        ],
+        "method": "painted_element_horizontal_clustering",
+        "split_at_x_16": false
+      },
+      "kind": "letter_pair",
+      "path": "svg/32/letter--Dd.svg",
+      "sha256": "466d69f964d8ec1b679e099088271535b10b18bfeb1039580b7f7a0545a3dd4b",
+      "status": "active",
+      "typed_ids": [
+        "PJ_CARBON_GLYPH_UPPER_D",
+        "PJ_CARBON_GLYPH_LOWER_D"
+      ]
+    },
+    {
+      "allowed_sizes": [
+        16,
+        24,
+        32,
+        64
+      ],
+      "glyph_extraction": {
+        "cell": "half_viewbox_centered",
+        "groups": [
+          {
+            "codepoint": 69,
+            "elements": [
+              1
+            ],
+            "typed_id": "PJ_CARBON_GLYPH_UPPER_E"
+          },
+          {
+            "codepoint": 101,
+            "elements": [
+              0
+            ],
+            "typed_id": "PJ_CARBON_GLYPH_LOWER_E"
+          }
+        ],
+        "method": "painted_element_horizontal_clustering",
+        "split_at_x_16": false
+      },
+      "kind": "letter_pair",
+      "path": "svg/32/letter--Ee.svg",
+      "sha256": "622b6f865efb12ab9f1c6e68aa2187e8ca6aa62c1a37581d6d0ee2e1a728433b",
+      "status": "active",
+      "typed_ids": [
+        "PJ_CARBON_GLYPH_UPPER_E",
+        "PJ_CARBON_GLYPH_LOWER_E"
+      ]
+    },
+    {
+      "allowed_sizes": [
+        16,
+        24,
+        32,
+        64
+      ],
+      "glyph_extraction": {
+        "cell": "half_viewbox_centered",
+        "groups": [
+          {
+            "codepoint": 70,
+            "elements": [
+              0
+            ],
+            "typed_id": "PJ_CARBON_GLYPH_UPPER_F"
+          },
+          {
+            "codepoint": 102,
+            "elements": [
+              1
+            ],
+            "typed_id": "PJ_CARBON_GLYPH_LOWER_F"
+          }
+        ],
+        "method": "painted_element_horizontal_clustering",
+        "split_at_x_16": false
+      },
+      "kind": "letter_pair",
+      "path": "svg/32/letter--Ff.svg",
+      "sha256": "c456fc4898671be85009ef0435ec2442d0f74d381d287057602a49267aef0dd4",
+      "status": "active",
+      "typed_ids": [
+        "PJ_CARBON_GLYPH_UPPER_F",
+        "PJ_CARBON_GLYPH_LOWER_F"
+      ]
+    },
+    {
+      "allowed_sizes": [
+        16,
+        24,
+        32,
+        64
+      ],
+      "glyph_extraction": {
+        "cell": "half_viewbox_centered",
+        "groups": [
+          {
+            "codepoint": 71,
+            "elements": [
+              1
+            ],
+            "typed_id": "PJ_CARBON_GLYPH_UPPER_G"
+          },
+          {
+            "codepoint": 103,
+            "elements": [
+              0
+            ],
+            "typed_id": "PJ_CARBON_GLYPH_LOWER_G"
+          }
+        ],
+        "method": "painted_element_horizontal_clustering",
+        "split_at_x_16": false
+      },
+      "kind": "letter_pair",
+      "path": "svg/32/letter--Gg.svg",
+      "sha256": "7f9b4eaaafc7de85cd34c65f6ce5b2cb9ac99fdc5075b1816c1661cf85877d3a",
+      "status": "active",
+      "typed_ids": [
+        "PJ_CARBON_GLYPH_UPPER_G",
+        "PJ_CARBON_GLYPH_LOWER_G"
+      ]
+    },
+    {
+      "allowed_sizes": [
+        16,
+        24,
+        32,
+        64
+      ],
+      "glyph_extraction": {
+        "cell": "half_viewbox_centered",
+        "groups": [
+          {
+            "codepoint": 72,
+            "elements": [
+              0
+            ],
+            "typed_id": "PJ_CARBON_GLYPH_UPPER_H"
+          },
+          {
+            "codepoint": 104,
+            "elements": [
+              1
+            ],
+            "typed_id": "PJ_CARBON_GLYPH_LOWER_H"
+          }
+        ],
+        "method": "painted_element_horizontal_clustering",
+        "split_at_x_16": false
+      },
+      "kind": "letter_pair",
+      "path": "svg/32/letter--Hh.svg",
+      "sha256": "0fc3718fa1b2a5376197cee168a5b7a8903b2b7facf769684b93b7519204015d",
+      "status": "active",
+      "typed_ids": [
+        "PJ_CARBON_GLYPH_UPPER_H",
+        "PJ_CARBON_GLYPH_LOWER_H"
+      ]
+    },
+    {
+      "allowed_sizes": [
+        16,
+        24,
+        32,
+        64
+      ],
+      "glyph_extraction": {
+        "cell": "half_viewbox_centered",
+        "groups": [
+          {
+            "codepoint": 73,
+            "elements": [
+              0
+            ],
+            "typed_id": "PJ_CARBON_GLYPH_UPPER_I"
+          },
+          {
+            "codepoint": 105,
+            "elements": [
+              1,
+              2
+            ],
+            "typed_id": "PJ_CARBON_GLYPH_LOWER_I"
+          }
+        ],
+        "method": "painted_element_horizontal_clustering",
+        "split_at_x_16": false
+      },
+      "kind": "letter_pair",
+      "path": "svg/32/letter--Ii.svg",
+      "sha256": "0780d37b94d67bbe215922e52e0d2018519d229a494244fad473324559248530",
+      "status": "active",
+      "typed_ids": [
+        "PJ_CARBON_GLYPH_UPPER_I",
+        "PJ_CARBON_GLYPH_LOWER_I"
+      ]
+    },
+    {
+      "allowed_sizes": [
+        16,
+        24,
+        32,
+        64
+      ],
+      "glyph_extraction": {
+        "cell": "half_viewbox_centered",
+        "groups": [
+          {
+            "codepoint": 74,
+            "elements": [
+              2
+            ],
+            "typed_id": "PJ_CARBON_GLYPH_UPPER_J"
+          },
+          {
+            "codepoint": 106,
+            "elements": [
+              0,
+              1
+            ],
+            "typed_id": "PJ_CARBON_GLYPH_LOWER_J"
+          }
+        ],
+        "method": "painted_element_horizontal_clustering",
+        "split_at_x_16": false
+      },
+      "kind": "letter_pair",
+      "path": "svg/32/letter--Jj.svg",
+      "sha256": "b4fa6136a899bc25b7cc92f73b49663a48db169a63288773c759778b6b1c3022",
+      "status": "active",
+      "typed_ids": [
+        "PJ_CARBON_GLYPH_UPPER_J",
+        "PJ_CARBON_GLYPH_LOWER_J"
+      ]
+    },
+    {
+      "allowed_sizes": [
+        16,
+        24,
+        32,
+        64
+      ],
+      "glyph_extraction": {
+        "cell": "half_viewbox_centered",
+        "groups": [
+          {
+            "codepoint": 75,
+            "elements": [
+              0
+            ],
+            "typed_id": "PJ_CARBON_GLYPH_UPPER_K"
+          },
+          {
+            "codepoint": 107,
+            "elements": [
+              1
+            ],
+            "typed_id": "PJ_CARBON_GLYPH_LOWER_K"
+          }
+        ],
+        "method": "painted_element_horizontal_clustering",
+        "split_at_x_16": false
+      },
+      "kind": "letter_pair",
+      "path": "svg/32/letter--Kk.svg",
+      "sha256": "f36887f98928706c54bdaf662ad8519b24e6e17e7ee876fe66377c6b82bfaabf",
+      "status": "active",
+      "typed_ids": [
+        "PJ_CARBON_GLYPH_UPPER_K",
+        "PJ_CARBON_GLYPH_LOWER_K"
+      ]
+    },
+    {
+      "allowed_sizes": [
+        16,
+        24,
+        32,
+        64
+      ],
+      "glyph_extraction": {
+        "cell": "half_viewbox_centered",
+        "groups": [
+          {
+            "codepoint": 76,
+            "elements": [
+              0
+            ],
+            "typed_id": "PJ_CARBON_GLYPH_UPPER_L"
+          },
+          {
+            "codepoint": 108,
+            "elements": [
+              1
+            ],
+            "typed_id": "PJ_CARBON_GLYPH_LOWER_L"
+          }
+        ],
+        "method": "painted_element_horizontal_clustering",
+        "split_at_x_16": false
+      },
+      "kind": "letter_pair",
+      "path": "svg/32/letter--Ll.svg",
+      "sha256": "9a3fdb0599269d132c80fcd47ec7e300522066440f7f557b38ab334cc85b64ed",
+      "status": "active",
+      "typed_ids": [
+        "PJ_CARBON_GLYPH_UPPER_L",
+        "PJ_CARBON_GLYPH_LOWER_L"
+      ]
+    },
+    {
+      "allowed_sizes": [
+        16,
+        24,
+        32,
+        64
+      ],
+      "glyph_extraction": {
+        "cell": "half_viewbox_centered",
+        "groups": [
+          {
+            "codepoint": 77,
+            "elements": [
+              1
+            ],
+            "typed_id": "PJ_CARBON_GLYPH_UPPER_M"
+          },
+          {
+            "codepoint": 109,
+            "elements": [
+              0
+            ],
+            "typed_id": "PJ_CARBON_GLYPH_LOWER_M"
+          }
+        ],
+        "method": "painted_element_horizontal_clustering",
+        "split_at_x_16": false
+      },
+      "kind": "letter_pair",
+      "path": "svg/32/letter--Mm.svg",
+      "sha256": "7fcd79177da860182ce4315db6fc5fe20fd8d4441227cf6ab514c95e22ef698d",
+      "status": "active",
+      "typed_ids": [
+        "PJ_CARBON_GLYPH_UPPER_M",
+        "PJ_CARBON_GLYPH_LOWER_M"
+      ]
+    },
+    {
+      "allowed_sizes": [
+        16,
+        24,
+        32,
+        64
+      ],
+      "glyph_extraction": {
+        "cell": "half_viewbox_centered",
+        "groups": [
+          {
+            "codepoint": 78,
+            "elements": [
+              1
+            ],
+            "typed_id": "PJ_CARBON_GLYPH_UPPER_N"
+          },
+          {
+            "codepoint": 110,
+            "elements": [
+              0
+            ],
+            "typed_id": "PJ_CARBON_GLYPH_LOWER_N"
+          }
+        ],
+        "method": "painted_element_horizontal_clustering",
+        "split_at_x_16": false
+      },
+      "kind": "letter_pair",
+      "path": "svg/32/letter--Nn.svg",
+      "sha256": "b8ffa7d73b27e6b3e546960649dc3ec7f99da2bdcdda47114e124f1b6dcde0a4",
+      "status": "active",
+      "typed_ids": [
+        "PJ_CARBON_GLYPH_UPPER_N",
+        "PJ_CARBON_GLYPH_LOWER_N"
+      ]
+    },
+    {
+      "allowed_sizes": [
+        16,
+        24,
+        32,
+        64
+      ],
+      "glyph_extraction": {
+        "cell": "half_viewbox_centered",
+        "groups": [
+          {
+            "codepoint": 79,
+            "elements": [
+              1
+            ],
+            "typed_id": "PJ_CARBON_GLYPH_UPPER_O"
+          },
+          {
+            "codepoint": 111,
+            "elements": [
+              0
+            ],
+            "typed_id": "PJ_CARBON_GLYPH_LOWER_O"
+          }
+        ],
+        "method": "painted_element_horizontal_clustering",
+        "split_at_x_16": false
+      },
+      "kind": "letter_pair",
+      "path": "svg/32/letter--Oo.svg",
+      "sha256": "459241205a0d388e39484f0ea6888f7a7fd259a700e5f74bcce567c1d660e701",
+      "status": "active",
+      "typed_ids": [
+        "PJ_CARBON_GLYPH_UPPER_O",
+        "PJ_CARBON_GLYPH_LOWER_O"
+      ]
+    },
+    {
+      "allowed_sizes": [
+        16,
+        24,
+        32,
+        64
+      ],
+      "glyph_extraction": {
+        "cell": "half_viewbox_centered",
+        "groups": [
+          {
+            "codepoint": 80,
+            "elements": [
+              1
+            ],
+            "typed_id": "PJ_CARBON_GLYPH_UPPER_P"
+          },
+          {
+            "codepoint": 112,
+            "elements": [
+              0
+            ],
+            "typed_id": "PJ_CARBON_GLYPH_LOWER_P"
+          }
+        ],
+        "method": "painted_element_horizontal_clustering",
+        "split_at_x_16": false
+      },
+      "kind": "letter_pair",
+      "path": "svg/32/letter--Pp.svg",
+      "sha256": "2d5cb9e8102458c1e45d8336a09ed781e862cb85c3c8bfcb4a7954efacb44971",
+      "status": "active",
+      "typed_ids": [
+        "PJ_CARBON_GLYPH_UPPER_P",
+        "PJ_CARBON_GLYPH_LOWER_P"
+      ]
+    },
+    {
+      "allowed_sizes": [
+        16,
+        24,
+        32,
+        64
+      ],
+      "glyph_extraction": {
+        "cell": "half_viewbox_centered",
+        "groups": [
+          {
+            "codepoint": 81,
+            "elements": [
+              1
+            ],
+            "typed_id": "PJ_CARBON_GLYPH_UPPER_Q"
+          },
+          {
+            "codepoint": 113,
+            "elements": [
+              0
+            ],
+            "typed_id": "PJ_CARBON_GLYPH_LOWER_Q"
+          }
+        ],
+        "method": "painted_element_horizontal_clustering",
+        "split_at_x_16": false
+      },
+      "kind": "letter_pair",
+      "path": "svg/32/letter--Qq.svg",
+      "sha256": "b2e0aab429b2c472f572e3d1d55a6baeeb9a9e03a82cbe2884bf7aad91a5fc99",
+      "status": "active",
+      "typed_ids": [
+        "PJ_CARBON_GLYPH_UPPER_Q",
+        "PJ_CARBON_GLYPH_LOWER_Q"
+      ]
+    },
+    {
+      "allowed_sizes": [
+        16,
+        24,
+        32,
+        64
+      ],
+      "glyph_extraction": {
+        "cell": "half_viewbox_centered",
+        "groups": [
+          {
+            "codepoint": 82,
+            "elements": [
+              0
+            ],
+            "typed_id": "PJ_CARBON_GLYPH_UPPER_R"
+          },
+          {
+            "codepoint": 114,
+            "elements": [
+              1
+            ],
+            "typed_id": "PJ_CARBON_GLYPH_LOWER_R"
+          }
+        ],
+        "method": "painted_element_horizontal_clustering",
+        "split_at_x_16": false
+      },
+      "kind": "letter_pair",
+      "path": "svg/32/letter--Rr.svg",
+      "sha256": "6ebad19de045bab3b20fffb921aeea4f272fee0b4043229194ecf3d3635be4af",
+      "status": "active",
+      "typed_ids": [
+        "PJ_CARBON_GLYPH_UPPER_R",
+        "PJ_CARBON_GLYPH_LOWER_R"
+      ]
+    },
+    {
+      "allowed_sizes": [
+        16,
+        24,
+        32,
+        64
+      ],
+      "glyph_extraction": {
+        "cell": "half_viewbox_centered",
+        "groups": [
+          {
+            "codepoint": 83,
+            "elements": [
+              1
+            ],
+            "typed_id": "PJ_CARBON_GLYPH_UPPER_S"
+          },
+          {
+            "codepoint": 115,
+            "elements": [
+              0
+            ],
+            "typed_id": "PJ_CARBON_GLYPH_LOWER_S"
+          }
+        ],
+        "method": "painted_element_horizontal_clustering",
+        "split_at_x_16": false
+      },
+      "kind": "letter_pair",
+      "path": "svg/32/letter--Ss.svg",
+      "sha256": "063510a2316208569fade002bc6bd2b788c82fb3eab26b43232fba3a0a23bae2",
+      "status": "active",
+      "typed_ids": [
+        "PJ_CARBON_GLYPH_UPPER_S",
+        "PJ_CARBON_GLYPH_LOWER_S"
+      ]
+    },
+    {
+      "allowed_sizes": [
+        16,
+        24,
+        32,
+        64
+      ],
+      "glyph_extraction": {
+        "cell": "half_viewbox_centered",
+        "groups": [
+          {
+            "codepoint": 84,
+            "elements": [
+              0
+            ],
+            "typed_id": "PJ_CARBON_GLYPH_UPPER_T"
+          },
+          {
+            "codepoint": 116,
+            "elements": [
+              1
+            ],
+            "typed_id": "PJ_CARBON_GLYPH_LOWER_T"
+          }
+        ],
+        "method": "painted_element_horizontal_clustering",
+        "split_at_x_16": false
+      },
+      "kind": "letter_pair",
+      "path": "svg/32/letter--Tt.svg",
+      "sha256": "1beea0de79f16ddfc09b8bf7f324b661566b780dcaf6da4dbce3ee34a9de2de4",
+      "status": "active",
+      "typed_ids": [
+        "PJ_CARBON_GLYPH_UPPER_T",
+        "PJ_CARBON_GLYPH_LOWER_T"
+      ]
+    },
+    {
+      "allowed_sizes": [
+        16,
+        24,
+        32,
+        64
+      ],
+      "glyph_extraction": {
+        "cell": "half_viewbox_centered",
+        "groups": [
+          {
+            "codepoint": 85,
+            "elements": [
+              1
+            ],
+            "typed_id": "PJ_CARBON_GLYPH_UPPER_U"
+          },
+          {
+            "codepoint": 117,
+            "elements": [
+              0
+            ],
+            "typed_id": "PJ_CARBON_GLYPH_LOWER_U"
+          }
+        ],
+        "method": "painted_element_horizontal_clustering",
+        "split_at_x_16": false
+      },
+      "kind": "letter_pair",
+      "path": "svg/32/letter--Uu.svg",
+      "sha256": "3e573dd2fffb7e1398fb12281ee219c58d1392385e11ff38dc88095a6b1053a7",
+      "status": "active",
+      "typed_ids": [
+        "PJ_CARBON_GLYPH_UPPER_U",
+        "PJ_CARBON_GLYPH_LOWER_U"
+      ]
+    },
+    {
+      "allowed_sizes": [
+        16,
+        24,
+        32,
+        64
+      ],
+      "glyph_extraction": {
+        "cell": "half_viewbox_centered",
+        "groups": [
+          {
+            "codepoint": 86,
+            "elements": [
+              1
+            ],
+            "typed_id": "PJ_CARBON_GLYPH_UPPER_V"
+          },
+          {
+            "codepoint": 118,
+            "elements": [
+              0
+            ],
+            "typed_id": "PJ_CARBON_GLYPH_LOWER_V"
+          }
+        ],
+        "method": "painted_element_horizontal_clustering",
+        "split_at_x_16": false
+      },
+      "kind": "letter_pair",
+      "path": "svg/32/letter--Vv.svg",
+      "sha256": "8f1db2c352d6ac298cb554d18a883d976b937fa1031453945bffa45d6d2a8d81",
+      "status": "active",
+      "typed_ids": [
+        "PJ_CARBON_GLYPH_UPPER_V",
+        "PJ_CARBON_GLYPH_LOWER_V"
+      ]
+    },
+    {
+      "allowed_sizes": [
+        16,
+        24,
+        32,
+        64
+      ],
+      "glyph_extraction": {
+        "cell": "half_viewbox_centered",
+        "groups": [
+          {
+            "codepoint": 87,
+            "elements": [
+              1
+            ],
+            "typed_id": "PJ_CARBON_GLYPH_UPPER_W"
+          },
+          {
+            "codepoint": 119,
+            "elements": [
+              0
+            ],
+            "typed_id": "PJ_CARBON_GLYPH_LOWER_W"
+          }
+        ],
+        "method": "painted_element_horizontal_clustering",
+        "split_at_x_16": false
+      },
+      "kind": "letter_pair",
+      "path": "svg/32/letter--Ww.svg",
+      "sha256": "263433add4b8b4f6aa26707bc36a75358261b31c57834f3d7164bb2bc53186c5",
+      "status": "active",
+      "typed_ids": [
+        "PJ_CARBON_GLYPH_UPPER_W",
+        "PJ_CARBON_GLYPH_LOWER_W"
+      ]
+    },
+    {
+      "allowed_sizes": [
+        16,
+        24,
+        32,
+        64
+      ],
+      "glyph_extraction": {
+        "cell": "half_viewbox_centered",
+        "groups": [
+          {
+            "codepoint": 88,
+            "elements": [
+              0
+            ],
+            "typed_id": "PJ_CARBON_GLYPH_UPPER_X"
+          },
+          {
+            "codepoint": 120,
+            "elements": [
+              1
+            ],
+            "typed_id": "PJ_CARBON_GLYPH_LOWER_X"
+          }
+        ],
+        "method": "painted_element_horizontal_clustering",
+        "split_at_x_16": false
+      },
+      "kind": "letter_pair",
+      "path": "svg/32/letter--Xx.svg",
+      "sha256": "ce002d1834eec311425445af640b77dac7da8133af28069a097b6316f08aa21f",
+      "status": "active",
+      "typed_ids": [
+        "PJ_CARBON_GLYPH_UPPER_X",
+        "PJ_CARBON_GLYPH_LOWER_X"
+      ]
+    },
+    {
+      "allowed_sizes": [
+        16,
+        24,
+        32,
+        64
+      ],
+      "glyph_extraction": {
+        "cell": "half_viewbox_centered",
+        "groups": [
+          {
+            "codepoint": 89,
+            "elements": [
+              0
+            ],
+            "typed_id": "PJ_CARBON_GLYPH_UPPER_Y"
+          },
+          {
+            "codepoint": 121,
+            "elements": [
+              1
+            ],
+            "typed_id": "PJ_CARBON_GLYPH_LOWER_Y"
+          }
+        ],
+        "method": "painted_element_horizontal_clustering",
+        "split_at_x_16": false
+      },
+      "kind": "letter_pair",
+      "path": "svg/32/letter--Yy.svg",
+      "sha256": "46f1874d9051af5dfe09539c5e65d058b4aab1807bed7d8561b8d0a709fac1e3",
+      "status": "active",
+      "typed_ids": [
+        "PJ_CARBON_GLYPH_UPPER_Y",
+        "PJ_CARBON_GLYPH_LOWER_Y"
+      ]
+    },
+    {
+      "allowed_sizes": [
+        16,
+        24,
+        32,
+        64
+      ],
+      "glyph_extraction": {
+        "cell": "half_viewbox_centered",
+        "groups": [
+          {
+            "codepoint": 90,
+            "elements": [
+              1
+            ],
+            "typed_id": "PJ_CARBON_GLYPH_UPPER_Z"
+          },
+          {
+            "codepoint": 122,
+            "elements": [
+              0
+            ],
+            "typed_id": "PJ_CARBON_GLYPH_LOWER_Z"
+          }
+        ],
+        "method": "painted_element_horizontal_clustering",
+        "split_at_x_16": false
+      },
+      "kind": "letter_pair",
+      "path": "svg/32/letter--Zz.svg",
+      "sha256": "f049f4b58a6bb802b9eacd73d60380723b4cefc0e71aa17471c2bf61603b2f0a",
+      "status": "active",
+      "typed_ids": [
+        "PJ_CARBON_GLYPH_UPPER_Z",
+        "PJ_CARBON_GLYPH_LOWER_Z"
+      ]
+    },
+    {
+      "allowed_sizes": [],
+      "kind": "reference_icon",
+      "path": "svg/32/list.svg",
+      "sha256": "51b1f6339e379718815793004f307de52128ad703cab51316e38cebeea6c1354",
+      "status": "reference",
+      "typed_ids": []
+    },
+    {
+      "allowed_sizes": [],
+      "kind": "reference_icon",
+      "path": "svg/32/microphone.svg",
+      "sha256": "5981e050636d248225c7b636e2f0dd6f3fcb0d7e47f7924370947a71223357a2",
+      "status": "reference",
+      "typed_ids": []
+    },
+    {
+      "allowed_sizes": [],
+      "kind": "reference_icon",
+      "path": "svg/32/notebook.svg",
+      "sha256": "e49bd550eaab8eadca0d0536072cf1f56dbe67ba0e7be68ddaee187391743bb9",
+      "status": "reference",
+      "typed_ids": []
+    },
+    {
+      "allowed_sizes": [
+        16,
+        24,
+        32,
+        64
+      ],
+      "glyph_extraction": {
+        "codepoint": 48,
+        "method": "complete_viewbox_centered_fixed_cell"
+      },
+      "kind": "number",
+      "path": "svg/32/number--0.svg",
+      "sha256": "e2aed18b4531465634a4bcd81288bebc58d1cbe072eeadf126f2b28e8d41226a",
+      "status": "active",
+      "typed_ids": [
+        "PJ_CARBON_GLYPH_DIGIT_0"
+      ]
+    },
+    {
+      "allowed_sizes": [
+        16,
+        24,
+        32,
+        64
+      ],
+      "glyph_extraction": {
+        "codepoint": 49,
+        "method": "complete_viewbox_centered_fixed_cell"
+      },
+      "kind": "number",
+      "path": "svg/32/number--1.svg",
+      "sha256": "9d70125e6eae5f8ae7a8a412d1fd01d4fc3d265fb9f390da467398f07b767ee7",
+      "status": "active",
+      "typed_ids": [
+        "PJ_CARBON_GLYPH_DIGIT_1"
+      ]
+    },
+    {
+      "allowed_sizes": [
+        16,
+        24,
+        32,
+        64
+      ],
+      "glyph_extraction": {
+        "codepoint": 50,
+        "method": "complete_viewbox_centered_fixed_cell"
+      },
+      "kind": "number",
+      "path": "svg/32/number--2.svg",
+      "sha256": "deb99012dd8c820c126c335967a59ad3ad51434f617928eea31e57ce0a6f69dd",
+      "status": "active",
+      "typed_ids": [
+        "PJ_CARBON_GLYPH_DIGIT_2"
+      ]
+    },
+    {
+      "allowed_sizes": [
+        16,
+        24,
+        32,
+        64
+      ],
+      "glyph_extraction": {
+        "codepoint": 51,
+        "method": "complete_viewbox_centered_fixed_cell"
+      },
+      "kind": "number",
+      "path": "svg/32/number--3.svg",
+      "sha256": "8a1d7fe92b70ed26a07c91fef412c2b5cb1967d9162bd3b6cb5351e5a2e5047f",
+      "status": "active",
+      "typed_ids": [
+        "PJ_CARBON_GLYPH_DIGIT_3"
+      ]
+    },
+    {
+      "allowed_sizes": [
+        16,
+        24,
+        32,
+        64
+      ],
+      "glyph_extraction": {
+        "codepoint": 52,
+        "method": "complete_viewbox_centered_fixed_cell"
+      },
+      "kind": "number",
+      "path": "svg/32/number--4.svg",
+      "sha256": "fd32dba4303f99bee78c2f95e6ef6581645d05a16e08cbc061e1e729e7a8ebfd",
+      "status": "active",
+      "typed_ids": [
+        "PJ_CARBON_GLYPH_DIGIT_4"
+      ]
+    },
+    {
+      "allowed_sizes": [
+        16,
+        24,
+        32,
+        64
+      ],
+      "glyph_extraction": {
+        "codepoint": 53,
+        "method": "complete_viewbox_centered_fixed_cell"
+      },
+      "kind": "number",
+      "path": "svg/32/number--5.svg",
+      "sha256": "adbd09e913c301355223f8f5fc663c956cd07aae49dfeae2149ce8b76ac259d7",
+      "status": "active",
+      "typed_ids": [
+        "PJ_CARBON_GLYPH_DIGIT_5"
+      ]
+    },
+    {
+      "allowed_sizes": [
+        16,
+        24,
+        32,
+        64
+      ],
+      "glyph_extraction": {
+        "codepoint": 54,
+        "method": "complete_viewbox_centered_fixed_cell"
+      },
+      "kind": "number",
+      "path": "svg/32/number--6.svg",
+      "sha256": "e42e333d9ebea7b5d70a75cbbe56beb079a1fac1b54a44b796f982d8ccc4a9fa",
+      "status": "active",
+      "typed_ids": [
+        "PJ_CARBON_GLYPH_DIGIT_6"
+      ]
+    },
+    {
+      "allowed_sizes": [
+        16,
+        24,
+        32,
+        64
+      ],
+      "glyph_extraction": {
+        "codepoint": 55,
+        "method": "complete_viewbox_centered_fixed_cell"
+      },
+      "kind": "number",
+      "path": "svg/32/number--7.svg",
+      "sha256": "283779ebfec024da790ad3c939745ec2b8e7056f407b77189bc85a4878bc4c59",
+      "status": "active",
+      "typed_ids": [
+        "PJ_CARBON_GLYPH_DIGIT_7"
+      ]
+    },
+    {
+      "allowed_sizes": [
+        16,
+        24,
+        32,
+        64
+      ],
+      "glyph_extraction": {
+        "codepoint": 56,
+        "method": "complete_viewbox_centered_fixed_cell"
+      },
+      "kind": "number",
+      "path": "svg/32/number--8.svg",
+      "sha256": "45ae005a2ad6ea983b5d56866c22c4337b9576b0912d8f94113ae2eaa4b9edd5",
+      "status": "active",
+      "typed_ids": [
+        "PJ_CARBON_GLYPH_DIGIT_8"
+      ]
+    },
+    {
+      "allowed_sizes": [
+        16,
+        24,
+        32,
+        64
+      ],
+      "glyph_extraction": {
+        "codepoint": 57,
+        "method": "complete_viewbox_centered_fixed_cell"
+      },
+      "kind": "number",
+      "path": "svg/32/number--9.svg",
+      "sha256": "f7baebd6563ebbd2d987d02123b8bed17ec9f6370b4ead2264d9e4c46dee6125",
+      "status": "active",
+      "typed_ids": [
+        "PJ_CARBON_GLYPH_DIGIT_9"
+      ]
+    },
+    {
+      "allowed_sizes": [
+        16,
+        24,
+        32,
+        64
+      ],
+      "glyph_extraction": {
+        "composition_only": true,
+        "method": "complete_viewbox_centered_fixed_cell"
+      },
+      "kind": "number_small",
+      "path": "svg/32/number--small--0.svg",
+      "sha256": "876919b1ddb973a17206fc2f647f721c11a3f6f499edbc0a45d8b62c242b1a26",
+      "status": "active",
+      "typed_ids": [
+        "PJ_CARBON_GLYPH_SMALL_DIGIT_0"
+      ]
+    },
+    {
+      "allowed_sizes": [
+        16,
+        24,
+        32,
+        64
+      ],
+      "glyph_extraction": {
+        "composition_only": true,
+        "method": "complete_viewbox_centered_fixed_cell"
+      },
+      "kind": "number_small",
+      "path": "svg/32/number--small--1.svg",
+      "sha256": "6c3cdfe3d5767e0131377584f0826a8fba7af125270dc49a58323cdf6b34bafe",
+      "status": "active",
+      "typed_ids": [
+        "PJ_CARBON_GLYPH_SMALL_DIGIT_1"
+      ]
+    },
+    {
+      "allowed_sizes": [
+        16,
+        24,
+        32,
+        64
+      ],
+      "glyph_extraction": {
+        "composition_only": true,
+        "method": "complete_viewbox_centered_fixed_cell"
+      },
+      "kind": "number_small",
+      "path": "svg/32/number--small--2.svg",
+      "sha256": "03e6658a362245b1bd4aa5656337493e74b6a0de3905272c2689157e2486db95",
+      "status": "active",
+      "typed_ids": [
+        "PJ_CARBON_GLYPH_SMALL_DIGIT_2"
+      ]
+    },
+    {
+      "allowed_sizes": [
+        16,
+        24,
+        32,
+        64
+      ],
+      "glyph_extraction": {
+        "composition_only": true,
+        "method": "complete_viewbox_centered_fixed_cell"
+      },
+      "kind": "number_small",
+      "path": "svg/32/number--small--3.svg",
+      "sha256": "c37ae63f799c259b34d83ebac5131b55d653c1381489a0e7c66f641abfe25efc",
+      "status": "active",
+      "typed_ids": [
+        "PJ_CARBON_GLYPH_SMALL_DIGIT_3"
+      ]
+    },
+    {
+      "allowed_sizes": [
+        16,
+        24,
+        32,
+        64
+      ],
+      "glyph_extraction": {
+        "composition_only": true,
+        "method": "complete_viewbox_centered_fixed_cell"
+      },
+      "kind": "number_small",
+      "path": "svg/32/number--small--4.svg",
+      "sha256": "28b19c057e97cf5bf3ed1d58bc6e033db69b84ea45f79326484dd3fb048ad8fa",
+      "status": "active",
+      "typed_ids": [
+        "PJ_CARBON_GLYPH_SMALL_DIGIT_4"
+      ]
+    },
+    {
+      "allowed_sizes": [
+        16,
+        24,
+        32,
+        64
+      ],
+      "glyph_extraction": {
+        "composition_only": true,
+        "method": "complete_viewbox_centered_fixed_cell"
+      },
+      "kind": "number_small",
+      "path": "svg/32/number--small--5.svg",
+      "sha256": "9ba488ed354ad00d77294269013abf3a00030cb39a686fb695c5de1932b0678b",
+      "status": "active",
+      "typed_ids": [
+        "PJ_CARBON_GLYPH_SMALL_DIGIT_5"
+      ]
+    },
+    {
+      "allowed_sizes": [
+        16,
+        24,
+        32,
+        64
+      ],
+      "glyph_extraction": {
+        "composition_only": true,
+        "method": "complete_viewbox_centered_fixed_cell"
+      },
+      "kind": "number_small",
+      "path": "svg/32/number--small--6.svg",
+      "sha256": "e8916c561e3757afa6bce58704033d0eac0ff1d7edfa00654f49865939f1ce6f",
+      "status": "active",
+      "typed_ids": [
+        "PJ_CARBON_GLYPH_SMALL_DIGIT_6"
+      ]
+    },
+    {
+      "allowed_sizes": [
+        16,
+        24,
+        32,
+        64
+      ],
+      "glyph_extraction": {
+        "composition_only": true,
+        "method": "complete_viewbox_centered_fixed_cell"
+      },
+      "kind": "number_small",
+      "path": "svg/32/number--small--7.svg",
+      "sha256": "9107a44a4ff22169b7671867db238ee62b779790f90a7a50c584b990392ab679",
+      "status": "active",
+      "typed_ids": [
+        "PJ_CARBON_GLYPH_SMALL_DIGIT_7"
+      ]
+    },
+    {
+      "allowed_sizes": [
+        16,
+        24,
+        32,
+        64
+      ],
+      "glyph_extraction": {
+        "composition_only": true,
+        "method": "complete_viewbox_centered_fixed_cell"
+      },
+      "kind": "number_small",
+      "path": "svg/32/number--small--8.svg",
+      "sha256": "8cb6b82b9fc38a24c20b1dc2a91049f795c2210720b33d11059954c912debc07",
+      "status": "active",
+      "typed_ids": [
+        "PJ_CARBON_GLYPH_SMALL_DIGIT_8"
+      ]
+    },
+    {
+      "allowed_sizes": [
+        16,
+        24,
+        32,
+        64
+      ],
+      "glyph_extraction": {
+        "composition_only": true,
+        "method": "complete_viewbox_centered_fixed_cell"
+      },
+      "kind": "number_small",
+      "path": "svg/32/number--small--9.svg",
+      "sha256": "e69e281519ca8c06ba8aa583605efe30283346d4554b1d0018b54da95d6a7c20",
+      "status": "active",
+      "typed_ids": [
+        "PJ_CARBON_GLYPH_SMALL_DIGIT_9"
+      ]
+    },
+    {
+      "allowed_sizes": [
+        40,
+        144
+      ],
+      "kind": "semantic_icon",
+      "path": "svg/32/pause--filled.svg",
+      "sha256": "f0503bd1d4febaaa985a1633c738ca36622f8bf26dd1c942f27aa3776f809549",
+      "status": "active",
+      "typed_ids": [
+        "PJ_CARBON_ICON_PAUSE_FILLED"
+      ]
+    },
+    {
+      "allowed_sizes": [],
+      "kind": "reference_icon",
+      "path": "svg/32/pause.svg",
+      "sha256": "72de15849b67389f90984bc5341cef25aacb3ab32a81cde21a0b9302ce63379e",
+      "status": "reference",
+      "typed_ids": []
+    },
+    {
+      "allowed_sizes": [
+        40,
+        144
+      ],
+      "kind": "semantic_icon",
+      "path": "svg/32/play--filled.svg",
+      "sha256": "8d5a32b9294424369499923df283bbbf904362df341b3a4f48e0259e0253cb9b",
+      "status": "active",
+      "typed_ids": [
+        "PJ_CARBON_ICON_PLAY_FILLED"
+      ]
+    },
+    {
+      "allowed_sizes": [],
+      "kind": "reference_icon",
+      "path": "svg/32/play.svg",
+      "sha256": "24a61bb7999fffbaab2c767b18e2cc4d099b1258f5f9ecb48e27355b60b52f13",
+      "status": "reference",
+      "typed_ids": []
+    },
+    {
+      "allowed_sizes": [],
+      "kind": "reference_icon",
+      "path": "svg/32/power.svg",
+      "sha256": "c4d55c50fa7e959b904497cdc436fde82c5e39cc72bcffc49406f3170de224e2",
+      "status": "reference",
+      "typed_ids": []
+    },
+    {
+      "allowed_sizes": [],
+      "kind": "reference_icon",
+      "path": "svg/32/read-me.svg",
+      "sha256": "b3eeb11c00f076a3c6a966f60f4d9a18250a937378a5ddb95e65e34d895bc389",
+      "status": "reference",
+      "typed_ids": []
+    },
+    {
+      "allowed_sizes": [],
+      "kind": "reference_icon",
+      "path": "svg/32/recording.svg",
+      "sha256": "0ce6320c92c9a30bf234e4b5e93c4eac4faa457997bc086a3de2f01bdcb30b8f",
+      "status": "reference",
+      "typed_ids": []
+    },
+    {
+      "allowed_sizes": [
+        64
+      ],
+      "kind": "semantic_icon",
+      "path": "svg/32/repeat.svg",
+      "sha256": "9b8911c9d9e2f3d93b14cdcf0c0f86011987ba9146bca9927f3e52d37bfebd93",
+      "status": "active",
+      "typed_ids": [
+        "PJ_CARBON_ICON_REPEAT"
+      ]
+    },
+    {
+      "allowed_sizes": [
+        40
+      ],
+      "kind": "semantic_icon",
+      "path": "svg/32/reset--alt.svg",
+      "sha256": "b5fe78dcd20e4606cbedbd9d8581cccdfe6b7adfab59aa055fa219c90b91b183",
+      "status": "active",
+      "typed_ids": [
+        "PJ_CARBON_ICON_RESET_ALT"
+      ]
+    },
+    {
+      "allowed_sizes": [],
+      "kind": "reference_icon",
+      "path": "svg/32/reset.svg",
+      "sha256": "5b88cd0137cbe9df81f7948934eae0bc7a3e79a8008a22e6cbb5dcf5b2c01b38",
+      "status": "reference",
+      "typed_ids": []
+    },
+    {
+      "allowed_sizes": [
+        64
+      ],
+      "kind": "semantic_icon",
+      "path": "svg/32/service-levels.svg",
+      "sha256": "944e77d9f609bc91ccf6d640c25f686af133fab2ab080e6936efddc482b62124",
+      "status": "active",
+      "typed_ids": [
+        "PJ_CARBON_ICON_SERVICE_LEVELS"
+      ]
+    },
+    {
+      "allowed_sizes": [],
+      "kind": "reference_icon",
+      "path": "svg/32/settings--adjust.svg",
+      "sha256": "cd123aecde6b8b523a6571f1771557b3551ba137c7db780f9a477e450e3fab91",
+      "status": "reference",
+      "typed_ids": []
+    },
+    {
+      "allowed_sizes": [],
+      "kind": "reference_icon",
+      "path": "svg/32/settings.svg",
+      "sha256": "8d1c96e9027c61db3868de22015d2b676b116082a5386cfc34e840ecb1729eb5",
+      "status": "reference",
+      "typed_ids": []
+    },
+    {
+      "allowed_sizes": [],
+      "kind": "reference_icon",
+      "path": "svg/32/stop.svg",
+      "sha256": "f8a8e78d0e3c71792a444a405107ac8a57229f4b6fb815b755ed6ec962472721",
+      "status": "reference",
+      "typed_ids": []
+    },
+    {
+      "allowed_sizes": [],
+      "kind": "reference_icon",
+      "path": "svg/32/subtract.svg",
+      "sha256": "e357de93bb19043c7d20b04ea8abf14d9ead171cb6e65f4351171230835553f8",
+      "status": "reference",
+      "typed_ids": []
+    },
+    {
+      "allowed_sizes": [
+        64
+      ],
+      "kind": "semantic_icon",
+      "path": "svg/32/time--filled.svg",
+      "sha256": "dc6f51877e199ddd56dae4de11a4e720d98e35c0cb37b88464c26b7aacdae68a",
+      "status": "active",
+      "typed_ids": [
+        "PJ_CARBON_ICON_TIME_FILLED"
+      ]
+    },
+    {
+      "allowed_sizes": [],
+      "kind": "reference_icon",
+      "path": "svg/32/time.svg",
+      "sha256": "bb29c2f0d3f68c550684da4840799eab35a26d01b116a317c082f87f45779317",
+      "status": "reference",
+      "typed_ids": []
+    },
+    {
+      "allowed_sizes": [
+        64
+      ],
+      "kind": "semantic_icon",
+      "path": "svg/32/timer.svg",
+      "sha256": "a6f7cea9c5ac8ed4e8862a3bfc70dc99d0b4c44fc4ebf06ec8bdd6dff0a2be47",
+      "status": "active",
+      "typed_ids": [
+        "PJ_CARBON_ICON_TIMER"
+      ]
+    },
+    {
+      "allowed_sizes": [
+        40
+      ],
+      "kind": "semantic_icon",
+      "path": "svg/32/toggle-off.svg",
+      "sha256": "ec4adfaa68b27e41f61e349ca1cd1e5543a548d0708f6230308b08dee738f590",
+      "status": "active",
+      "typed_ids": [
+        "PJ_CARBON_ICON_TOGGLE_OFF"
+      ]
+    },
+    {
+      "allowed_sizes": [
+        40
+      ],
+      "kind": "semantic_icon",
+      "path": "svg/32/toggle-on.svg",
+      "sha256": "dd654c28f169b91d486ecf3c471829969b2e30ba9d1b3f7c522d2ab944372647",
+      "status": "active",
+      "typed_ids": [
+        "PJ_CARBON_ICON_TOGGLE_ON"
+      ]
+    },
+    {
+      "allowed_sizes": [
+        64
+      ],
+      "kind": "semantic_icon",
+      "path": "svg/32/view--filled.svg",
+      "sha256": "a3fbb9d188213748cb5bf43a660cc8c7d8d90ba6f2b2c8ee9d7867282b53e89e",
+      "status": "active",
+      "typed_ids": [
+        "PJ_CARBON_ICON_VIEW_FILLED"
+      ]
+    },
+    {
+      "allowed_sizes": [
+        40
+      ],
+      "kind": "semantic_icon",
+      "path": "svg/32/volume--down.svg",
+      "sha256": "eaf8d5e25a4a154920c3df5acd14a3f4f3ce9e76766eb50aba853e53d661e6f5",
+      "status": "active",
+      "typed_ids": [
+        "PJ_CARBON_ICON_VOLUME_DOWN"
+      ]
+    },
+    {
+      "allowed_sizes": [
+        40,
+        64
+      ],
+      "kind": "semantic_icon",
+      "path": "svg/32/volume--up.svg",
+      "sha256": "a24afa6fed2d7d2001ff9858ea222cffb78ef6bbd0cd3e3c84e47ccbe5b18451",
+      "status": "active",
+      "typed_ids": [
+        "PJ_CARBON_ICON_VOLUME_UP"
+      ]
+    },
+    {
+      "allowed_sizes": [
+        64
+      ],
+      "kind": "semantic_icon",
+      "path": "svg/32/waveform.svg",
+      "sha256": "455c9469fb454a12cf3c301b34a7a6d765cb360f2c3a5343d4a3d32ccd0bed77",
+      "status": "active",
+      "typed_ids": [
+        "PJ_CARBON_ICON_WAVEFORM"
+      ]
+    },
+    {
+      "allowed_sizes": [],
+      "kind": "reference_icon",
+      "path": "svg/32/wifi.svg",
+      "sha256": "8ed5b8bb067ebf6929cd722999ca71011e9da413a151b9d8fd01319fac7979e6",
+      "status": "reference",
+      "typed_ids": []
+    }
+  ]
+}

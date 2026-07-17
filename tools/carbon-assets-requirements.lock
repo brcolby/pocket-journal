@@ -1,0 +1,22 @@
+# Install with: python3 -m pip install --require-hashes -r tools/carbon-assets-requirements.lock
+# Wheels and hashes were resolved for CPython 3.14 on macOS arm64. Pure-Python
+# dependencies are platform-independent; Pillow and cffi are intentionally
+# pinned to the exact approved build inputs.
+cairosvg==2.9.0 \
+    --hash=sha256:4b82d07d145377dffdfc19d9791bd5fb65539bb4da0adecf0bdbd9cd4ffd7c68
+cairocffi==1.7.1 \
+    --hash=sha256:9803a0e11f6c962f3b0ae2ec8ba6ae45e957a146a004697a1ac1bbf16b073b3f
+cffi==2.1.0 \
+    --hash=sha256:c4165821e131d6d4ca444347c2b694e2311bcfa3fe5a861cc72968f28867beac
+cssselect2==0.9.0 \
+    --hash=sha256:6a99e5f91f9a016a304dd929b0966ca464bcfda15177b6fb4a118fc0fb5d9563
+defusedxml==0.7.1 \
+    --hash=sha256:a352e7e428770286cc899e2542b6cdaedb2b4953ff269a210103ec58f6198a61
+pillow==12.3.0 \
+    --hash=sha256:e158cb00350dc278f3b91551101aa7d12415a66ebf2c91d8d5ac14e56ddd3ad0
+pycparser==3.0 \
+    --hash=sha256:b727414169a36b7d524c1c3e31839a521725078d7b2ff038656844266160a992
+tinycss2==1.5.1 \
+    --hash=sha256:3415ba0f5839c062696996998176c4a3751d18b7edaaeeb658c9ce21ec150661
+webencodings==0.5.1 \
+    --hash=sha256:a0af1213f3c2226497a97e2b3aa01a7e4bee4f403f95be16fc9acd2947514a78
