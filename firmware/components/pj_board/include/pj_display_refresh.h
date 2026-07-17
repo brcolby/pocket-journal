@@ -41,6 +41,7 @@ typedef struct {
     uint32_t transfer_bytes;
     int requested_partial;
     int promoted_to_full;
+    int deferred_cleanup;
 } pj_display_refresh_plan_t;
 
 typedef struct {
@@ -51,6 +52,7 @@ typedef struct {
     uint64_t applied_partial;
     uint64_t noops;
     uint64_t errors;
+    uint64_t cleanup_deferrals;
     uint64_t requested_area;
     uint64_t changed_pixels;
     uint64_t transfer_bytes;
@@ -63,11 +65,17 @@ typedef struct {
 typedef struct {
     uint32_t partial_limit;
     uint32_t partial_since_full;
+    int cleanup_deferred;
+    int cleanup_pending;
     pj_display_refresh_metrics_t metrics;
 } pj_display_refresh_policy_t;
 
 void pj_display_refresh_policy_init(pj_display_refresh_policy_t *policy,
                                     uint32_t partial_limit);
+void pj_display_refresh_set_cleanup_deferred(
+    pj_display_refresh_policy_t *policy, int deferred);
+int pj_display_refresh_cleanup_pending(
+    const pj_display_refresh_policy_t *policy);
 int pj_display_refresh_region_normalize(const pj_ui_dirty_region_t *dirty,
                                         int align_x_to_byte,
                                         pj_ui_dirty_region_t *normalized);

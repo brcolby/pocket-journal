@@ -507,6 +507,40 @@ static void test_partial_bw_repeated_digit_transitions(void)
     }
 }
 
+static void test_cleanup_is_deferred_only_during_seconds_cadence(void)
+{
+    pj_display_refresh_policy_t policy;
+    pj_display_refresh_policy_init(&policy, 3);
+    policy.partial_since_full = 2;
+    pj_framebuffer_t shadow = {0};
+    pj_framebuffer_t frame = {0};
+    set_pixel(&frame, 17, 23);
+    const pj_ui_dirty_region_t dirty = {
+        .x = 17, .y = 23, .width = 1, .height = 1, .partial = 1,
+    };
+
+    pj_display_refresh_set_cleanup_deferred(&policy, 1);
+    pj_display_refresh_plan_t plan = pj_display_refresh_plan(
+        &policy, &frame, &shadow, 1, &dirty);
+    assert(plan.kind == PJ_DISPLAY_REFRESH_PARTIAL);
+    assert(plan.deferred_cleanup);
+    assert(!plan.promoted_to_full);
+    assert(pj_display_refresh_complete(&policy, &shadow, &(int){1},
+                                       &frame, &plan, 1, 600000, 590000));
+    assert(pj_display_refresh_cleanup_pending(&policy));
+    assert(policy.metrics.cleanup_deferrals == 1);
+
+    memset(&shadow, 0, sizeof(shadow));
+    pj_display_refresh_set_cleanup_deferred(&policy, 0);
+    plan = pj_display_refresh_plan(&policy, &frame, &shadow, 1, &dirty);
+    assert(plan.kind == PJ_DISPLAY_REFRESH_FULL);
+    assert(plan.promoted_to_full);
+    int shadow_valid = 1;
+    assert(pj_display_refresh_complete(&policy, &shadow, &shadow_valid,
+                                       &frame, &plan, 1, 1800000, 1790000));
+    assert(!pj_display_refresh_cleanup_pending(&policy));
+}
+
 int main(void)
 {
     test_region_clips_and_aligns();
@@ -523,6 +557,7 @@ int main(void)
     test_partial_bw_commit_writes_current_once_then_activates();
     test_partial_bw_commit_propagates_each_failure();
     test_partial_bw_repeated_digit_transitions();
+    test_cleanup_is_deferred_only_during_seconds_cadence();
     puts("display refresh tests passed");
     return 0;
 }

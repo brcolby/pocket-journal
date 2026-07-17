@@ -24,6 +24,18 @@ void pj_display_refresh_policy_init(pj_display_refresh_policy_t *policy,
     policy->partial_limit = partial_limit;
 }
 
+void pj_display_refresh_set_cleanup_deferred(
+    pj_display_refresh_policy_t *policy, int deferred)
+{
+    if (policy != NULL) policy->cleanup_deferred = deferred != 0;
+}
+
+int pj_display_refresh_cleanup_pending(
+    const pj_display_refresh_policy_t *policy)
+{
+    return policy != NULL && policy->cleanup_pending;
+}
+
 int pj_display_refresh_region_normalize(const pj_ui_dirty_region_t *dirty,
                                         int align_x_to_byte,
                                         pj_ui_dirty_region_t *normalized)
@@ -141,8 +153,10 @@ pj_display_refresh_plan_t pj_display_refresh_plan(
         .partial = 1,
     };
     (void)pj_display_refresh_region_normalize(&changed, 1, &plan.region);
-    if (policy != NULL && policy->partial_limit > 0 &&
-        policy->partial_since_full >= policy->partial_limit - 1u) {
+    int cleanup_due = policy != NULL && policy->partial_limit > 0 &&
+        (policy->cleanup_pending ||
+         policy->partial_since_full >= policy->partial_limit - 1u);
+    if (cleanup_due && !policy->cleanup_deferred) {
         plan.kind = PJ_DISPLAY_REFRESH_FULL;
         plan.region = (pj_ui_dirty_region_t) {
             .x = 0,
@@ -155,6 +169,7 @@ pj_display_refresh_plan_t pj_display_refresh_plan(
         plan.promoted_to_full = 1;
     } else {
         plan.kind = PJ_DISPLAY_REFRESH_PARTIAL;
+        plan.deferred_cleanup = cleanup_due;
         plan.transfer_bytes = (uint32_t)(plan.region.width / 8) *
             (uint32_t)plan.region.height;
     }
@@ -197,9 +212,14 @@ void pj_display_refresh_record(pj_display_refresh_policy_t *policy,
     if (plan->kind == PJ_DISPLAY_REFRESH_FULL) {
         metrics->applied_full++;
         policy->partial_since_full = 0;
+        policy->cleanup_pending = 0;
     } else {
         metrics->applied_partial++;
         if (policy->partial_since_full < UINT32_MAX) policy->partial_since_full++;
+        if (plan->deferred_cleanup) {
+            policy->cleanup_pending = 1;
+            metrics->cleanup_deferrals++;
+        }
     }
 }
 

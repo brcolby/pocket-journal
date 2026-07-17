@@ -7364,36 +7364,21 @@ static int settings_apply_to_ui(pj_ui_context_t *ui, const pj_settings_t *settin
     if (ui == NULL || settings == NULL) {
         return 0;
     }
-    int changed = ui->volume != settings->volume ||
-                  ui->dark_mode != settings->dark_mode ||
-                  ui->alarm_on != settings->alarm_enabled ||
-                  ui->alarm_hour != settings->alarm_hour ||
-                  ui->alarm_minute != settings->alarm_minute ||
-                  ui->timer_preset_seconds != settings->timer_seconds ||
-                  ui->interval_preset_seconds != settings->interval_seconds ||
-                  ui->clock_24h != settings->clock_24h ||
-                  ui->temperature_fahrenheit != settings->temperature_fahrenheit ||
-                  ui->transcript_font_size != settings->transcript_font_size;
-    ui->volume = settings->volume;
-    ui->dark_mode = settings->dark_mode;
-    ui->alarm_on = settings->alarm_enabled;
-    ui->alarm_hour = settings->alarm_hour;
-    ui->alarm_minute = settings->alarm_minute;
-    ui->timer_preset_seconds = settings->timer_seconds;
-    ui->interval_preset_seconds = settings->interval_seconds;
-    ui->clock_24h = settings->clock_24h;
-    ui->temperature_fahrenheit = settings->temperature_fahrenheit;
-    ui->transcript_font_size = settings->transcript_font_size;
-    if (!ui->timer_running) {
-        ui->timer_seconds = settings->timer_seconds;
-    }
-    if (!ui->interval_running) {
-        ui->interval_seconds = settings->interval_seconds;
-    }
-    if (changed) {
-        pj_ui_request_full_refresh(ui);
-    }
-    return changed;
+    uint32_t before = pj_ui_visual_revision(ui);
+    const pj_ui_preferences_t preferences = {
+        .volume = settings->volume,
+        .dark_mode = settings->dark_mode,
+        .alarm_enabled = settings->alarm_enabled,
+        .alarm_hour = settings->alarm_hour,
+        .alarm_minute = settings->alarm_minute,
+        .timer_seconds = settings->timer_seconds,
+        .interval_seconds = settings->interval_seconds,
+        .clock_24h = settings->clock_24h,
+        .temperature_fahrenheit = settings->temperature_fahrenheit,
+        .transcript_font_size = settings->transcript_font_size,
+    };
+    pj_ui_apply_preferences(ui, &preferences);
+    return pj_ui_visual_revision(ui) != before;
 }
 
 void pj_board_refresh_settings(pj_ui_context_t *ui)
@@ -7754,6 +7739,7 @@ int pj_board_update_time_state(pj_ui_context_t *ui)
     if (!pj_time_controller_ready(&g_time_controller) || ui == NULL) {
         return 0;
     }
+    uint32_t visual_before = pj_ui_visual_revision(ui);
     pj_time_controller_result_t result;
     uint32_t reset_generation = interval_reset_take_pending();
     if (reset_generation != 0U) {
@@ -7775,14 +7761,16 @@ int pj_board_update_time_state(pj_ui_context_t *ui)
         (void)time_state_apply_audio_ack();
         (void)time_state_project(ui);
     }
-    return pj_ui_is_dirty(ui);
+    return pj_ui_visual_revision(ui) != visual_before;
 #else
     (void)ui;
     return 0;
 #endif
 }
 
-int pj_board_display_framebuffer(const pj_framebuffer_t *fb, const pj_ui_dirty_region_t *dirty)
+int pj_board_display_framebuffer_ex(const pj_framebuffer_t *fb,
+                                    const pj_ui_dirty_region_t *dirty,
+                                    int defer_cleanup)
 {
 #ifdef ESP_PLATFORM
     if (fb == NULL || g_epd_spi == NULL) {
@@ -7811,6 +7799,8 @@ int pj_board_display_framebuffer(const pj_framebuffer_t *fb, const pj_ui_dirty_r
 
     int64_t refresh_started_us = esp_timer_get_time();
     g_epd_refresh_busy_us = 0;
+    pj_display_refresh_set_cleanup_deferred(&g_epd_refresh_policy,
+                                            defer_cleanup);
     pj_display_refresh_plan_t plan = pj_display_refresh_plan(
         &g_epd_refresh_policy, fb, &g_epd_shadow_fb, g_epd_shadow_valid, dirty);
     if (plan.kind == PJ_DISPLAY_REFRESH_NOOP) {
@@ -7873,16 +7863,37 @@ int pj_board_display_framebuffer(const pj_framebuffer_t *fb, const pj_ui_dirty_r
                                       1, latency_us, busy_time_us);
     ESP_LOGI(TAG, "Display metrics full=%" PRIu64 " partial=%" PRIu64
              " noop=%" PRIu64 " errors=%" PRIu64 " changed=%" PRIu32
-             " latency_us=%" PRIu32 " busy_us=%" PRIu32,
+             " latency_us=%" PRIu32 " busy_us=%" PRIu32
+             " cleanup_deferrals=%" PRIu64 " cleanup_pending=%d"
+             " partial_since_full=%" PRIu32,
              g_epd_refresh_policy.metrics.applied_full,
              g_epd_refresh_policy.metrics.applied_partial,
              g_epd_refresh_policy.metrics.noops,
              g_epd_refresh_policy.metrics.errors,
-             plan.changed_pixels, latency_us, busy_time_us);
+             plan.changed_pixels, latency_us, busy_time_us,
+             g_epd_refresh_policy.metrics.cleanup_deferrals,
+             g_epd_refresh_policy.cleanup_pending,
+             g_epd_refresh_policy.partial_since_full);
     return 1;
 #else
     (void)fb;
     (void)dirty;
+    (void)defer_cleanup;
+    return 0;
+#endif
+}
+
+int pj_board_display_framebuffer(const pj_framebuffer_t *fb,
+                                 const pj_ui_dirty_region_t *dirty)
+{
+    return pj_board_display_framebuffer_ex(fb, dirty, 0);
+}
+
+int pj_board_display_cleanup_pending(void)
+{
+#ifdef ESP_PLATFORM
+    return pj_display_refresh_cleanup_pending(&g_epd_refresh_policy);
+#else
     return 0;
 #endif
 }
