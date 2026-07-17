@@ -5,33 +5,34 @@ low-frequency, large-batch hardware pass. Human notes may be mildly lossy:
 record what you actually observed, including blockers, and agents will map that
 evidence to the exact Bead acceptance criteria.
 
-Last synchronized with `bd human list`: 2026-07-17 (34 human-validation Beads).
+Last synchronized with `bd human list`: 2026-07-17 (35 human-validation Beads).
 Do not repeat a failed check on unchanged firmware.
 
 ## Nominated Build
 
-- Source commit and reported firmware version: `574332a` / `574332a-dirty`.
+- Source commit and reported firmware version: `f57d49b` / `f57d49b-dirty`.
   The dirty suffix is caused by preserved unrelated local partner/documentation
-  changes; the firmware sources are committed through `574332a`.
-- Image: `firmware/build-carbon-final/pocket_journal.bin`.
+  changes; the firmware sources are committed through `f57d49b`.
+- Image: `firmware/build-carbon-fixes/pocket_journal.bin`.
 - Size: 1,511,424 bytes (`0x171000`).
 - SHA-256:
-  `9ca0817d4b3e5bc2e6e5fc90da044cb09e52d9b0e05cfee928d0a59a83d2478f`.
+  `581be34f098f43f671de9dc22b8ea31843aa08934519ad147af7661e692a9f28`.
 - ESP image validation hash:
-  `da2d3506c8da0f1ec6767d4eec76e7f9b7c1d2242a814979a22260fca1b0f8b1`.
+  `7657b851b3bae085f0d8e51a67caab07f393913bb0ebe90970a5d47cd63c34c4`.
 - Built with ESP-IDF 6.0.1 and 28% (`0x8f000`) free in each 2 MiB
   application partition. A clean build contains no LVGL component or symbol.
 - Flashed and byte-verified as a development image on `pj-d45d34`, ESP32-S3
   MAC `14:C1:9F:D4:5D:34`, at `/dev/cu.usbmodem1101`.
 - Live no-reset probe after flashing: exact firmware answered `PJ_STATUS` with
-  boot ID `4042065248`; SD storage, audio, Wi-Fi/DHCP, and fixed-offset time
+  boot ID `1779544349`; SD storage, audio, Wi-Fi/DHCP, and fixed-offset time
   synchronization were ready. USB recovery was neither needed nor attempted.
 - Automated evidence: deterministic Carbon generation verified 73 active and
   26 reference sources, 72 glyph identities, and 30 semantic bitmaps; all 13
-  asset and 7 exhaustive DXF tests passed. Native UI/board/display tests,
-  combined ASan/UBSan UI/worker/pipeline runs, 328 partner tests, WASM runtime,
-  one-bit/AUX simulator tests, and image analysis passed. All 51 gallery frames
-  and the contact sheet were inspected.
+  asset and 7 exhaustive DXF tests passed. All 32 native C executables and 344
+  Python cases passed, including 328 partner tests. Combined ASan/UBSan
+  UI/worker/pipeline/refresh runs, WASM runtime, one-bit/AUX simulator tests,
+  exact Timer partial reconstruction, and image analysis passed. All 51
+  gallery frames and the contact sheet were inspected.
 - This is development validation, not a release. No tag or release has been
   created.
 
@@ -62,7 +63,7 @@ section (stop with Ctrl-]):
 ```bash
 cd firmware
 source "$HOME/.espressif/v6.0.1/esp-idf/export.sh"
-idf.py -B build-carbon-final -p /dev/cu.usbmodem1101 monitor \
+idf.py -B build-carbon-fixes -p /dev/cu.usbmodem1101 monitor \
   --no-reset --timestamps --disable-auto-color 2>&1 | \
   tee /private/tmp/pj-carbon-hardware.log
 ```
@@ -85,26 +86,28 @@ rg 'Seconds cadence (start|end)|Display metrics|Display generations' \
   Timer, Interval, Settings, Volume, and Sync in light and dark themes. Confirm
   case-preserving Carbon letters/numbers, distinct upright `1` and `9`, bold
   mapped icons at a consistent scale, 4 px interior rules with no redundant
-  outer box, legible note paging, and a maximized uniform five-line Sync stack.
-  Confirm Volume bars never enter reserved white space and no square Stop icon
-  appears anywhere (`pocket-journal-nz5`, `pocket-journal-nz5.6`,
-  `pocket-journal-2ji`).
+  outer box, the unfilled Home Time icon, compact lowercase `12h`/`24h`,
+  legible note paging, and a centered three-line Sync stack using one font
+  size. Confirm Volume shows only a 0–10 number above its controls and no
+  square Stop icon appears anywhere (`pocket-journal-nz5`,
+  `pocket-journal-nz5.6`, `pocket-journal-nz5.8`, `pocket-journal-2ji`).
 - [ ] Run Record, Stopwatch, Timer, and Interval for at least 120 consecutive
   displayed seconds each. Record must first present a complete `00:00` screen,
   then measure playable captured PCM duration. For every clock, observe each
   second exactly once with no skip, duplicate, late stall, or superseded frame;
-  exercise `09 -> 10`, `19 -> 20`, `39 -> 40`, and `59 -> 60`, Play/Pause, and
-  Interval round boundaries. The log must contain one named cadence start/end
-  per run, at least 120 submitted sequences, `late_max_ms <= 75`, and zero
-  overruns and misses (`pocket-journal-cjx`, `pocket-journal-zi6`,
-  `pocket-journal-9by`).
+  exercise `08 -> 09 -> 10`, `11 -> 12 -> 13`, `19 -> 20`, `39 -> 40`, and
+  `59 -> 60`, Play/Pause, and Interval round boundaries. Digits must remain
+  complete, with no old/new segments interleaved. The log must contain one
+  named cadence start/end per run, at least 120 submitted sequences,
+  `late_max_ms <= 75`, and zero overruns and misses (`pocket-journal-cjx`,
+  `pocket-journal-zi6`, `pocket-journal-9by`, `pocket-journal-nz5.8`).
 - [ ] Keep one seconds clock active for at least 30 partial updates. Confirm no
   cleanup full refresh interrupts the cadence; pause or leave afterward and
   confirm exactly one safe deferred cleanup. The log must show cleanup deferred
-  while active and promoted on cadence end. Across this and Volume changes,
-  confirm no ghosting, reordered digits, displaced pixels, or stale neighboring
-  content (`pocket-journal-e43`, `pocket-journal-9by`).
-- [ ] In Settings, switch 12H/24H and confirm only the localized content changes
+  while active and promoted on cadence end. Across this and Volume number
+  changes, confirm no ghosting, reordered digits, displaced pixels, or stale
+  neighboring content (`pocket-journal-e43`, `pocket-journal-9by`).
+- [ ] In Settings, switch 12h/24h and confirm only the localized content changes
   via partial refresh. Switch theme and confirm an immediate full inversion;
   the top-right `AsleepFilled` icon must retain the same shape. Battery changes,
   Clock/status ticks, Alarm Toggle, Volume, Play/Pause, and other same-layout
@@ -134,9 +137,9 @@ diagnostic before asking for calibration evidence.
 
 - [ ] Confirm note list rows show three notes per page with Carbon chevrons for
   full-page navigation. Dates must omit the year, use the available width,
-  remain legible, and truncate long note text cleanly without overlapping
-  controls
-  (`pocket-journal-nz5`, `pocket-journal-te0`).
+  contain no spaces (for example `JUL1709:09`), remain legible, and truncate
+  long note text cleanly without overlapping controls (`pocket-journal-nz5`,
+  `pocket-journal-nz5.8`, `pocket-journal-te0`).
 - [ ] Record continuously for at least two minutes. Stop/save with AUX and
   confirm immediate return with no Saving screen or blocking display load.
   As soon as the durable raw note appears, enter Record again and create a
@@ -166,12 +169,16 @@ diagnostic before asking for calibration evidence.
   spontaneous or repeated beeping; reset before leaving the device
   (`pocket-journal-8q5`, `pocket-journal-xl8`).
 - [ ] Start, pause, adjust, resume, leave, and revisit Stopwatch and Timer.
-  Confirm large stable time, exact paused adjustments, and documented
-  pause/reset/back behavior (`pocket-journal-8q5`).
+  From `00:30`, press Timer Up three times and confirm the exact visible series
+  `01:00`, `01:30`, `02:00`; press Down three times and confirm the reverse.
+  Confirm large stable time and documented pause/reset/back behavior
+  (`pocket-journal-8q5`, `pocket-journal-nz5.8`).
 - [ ] At nonzero volume, trigger one Timer or Alarm alert. Confirm one short
   nonmodal sound, responsive navigation, exact alert clearing, and audio idle
-  afterward. Repeat at volume zero and confirm silence
-  (`pocket-journal-oi9`, `pocket-journal-xl8`).
+  afterward. Repeat at volume zero and confirm silence. At volume 10, confirm
+  the requested approximately 2x output is useful without clipping, crackle,
+  or speaker distress (`pocket-journal-oi9`, `pocket-journal-xl8`,
+  `pocket-journal-nz5.8`).
 - [ ] Arm a short alert, enter sleep, and confirm one RTC wake without a wake
   loop. Manual wake must still work, including an early wake followed by
   re-entering sleep (`pocket-journal-54s`).
