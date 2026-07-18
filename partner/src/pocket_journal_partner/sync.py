@@ -37,6 +37,9 @@ def _new_job(device_id: str, audio_id: str, filename: str) -> dict[str, Any]:
         "transcription_fingerprint": None,
         "cache_key": None,
         "device_payload_sha256": None,
+        "device_payload_intent_sha256": None,
+        "pending_device_payload_sha256": None,
+        "pending_device_payload_intent_sha256": None,
         "last_error": None,
         "updated_at": _now(),
     }
@@ -141,21 +144,58 @@ def _device_payload(
     return payload, hashlib.sha256(_json_bytes(payload)).hexdigest()
 
 
+def _device_payload_intent_sha256(
+    transcript: dict[str, Any],
+    source: dict[str, Any],
+    fingerprint: dict[str, Any],
+    title: str,
+) -> str:
+    """Identify every input that can change the desired device document."""
+    intent = {
+        "transcript": transcript,
+        "source": source,
+        "transcription_fingerprint": fingerprint,
+        "title": title,
+    }
+    return hashlib.sha256(_json_bytes(intent)).hexdigest()
+
+
+def _transcript_matches_source(
+    transcript: dict[str, Any] | None,
+    source: dict[str, Any],
+) -> bool:
+    if not isinstance(transcript, dict):
+        return False
+    text = transcript.get("text")
+    sync_metadata = transcript.get("sync")
+    return (
+        isinstance(text, str)
+        and bool(text.strip())
+        and isinstance(sync_metadata, dict)
+        and sync_metadata.get("schema_version") == TRANSCRIPT_SCHEMA_VERSION
+        and sync_metadata.get("source") == source
+    )
+
+
 def _skipped_result(
     device_id: str,
     audio_id: str,
     job: dict[str, Any],
     transcript: dict[str, Any],
     source: dict[str, Any],
+    *,
+    reason: str = "device_and_local_state_current",
 ) -> dict[str, Any]:
     return {
         "device_id": device_id,
         "audio_id": audio_id,
         "status": "skipped",
         "stage": str(job.get("stage") or "uploaded"),
-        "reason": "device_and_local_state_current",
+        "reason": reason,
         "source_sha256": source["sha256"],
         "model": transcript.get("model", ""),
+        "downloaded": False,
+        "transcribed": False,
         "uploaded": False,
     }
 
@@ -187,9 +227,10 @@ def _download_and_inspect(
     item: Any,
     *,
     force_download: bool = False,
-) -> tuple[Path, dict[str, Any]]:
+) -> tuple[Path, dict[str, Any], bool]:
     audio_path = store.audio_path(device_id, item.audio_id, item.filename)
     metadata: dict[str, Any] | None = None
+    downloaded_audio = False
     if audio_path.exists() and not force_download:
         try:
             metadata = inspect_wav(audio_path)
@@ -231,6 +272,7 @@ def _download_and_inspect(
                     f"expected {expected_sha256}, got {metadata['sha256']}"
                 )
             downloaded.replace(audio_path)
+            downloaded_audio = True
 
     if item.size is not None and metadata["bytes"] != item.size:
         raise ValueError(
@@ -241,7 +283,7 @@ def _download_and_inspect(
             "downloaded WAV data length mismatch: "
             f"expected {item.data_bytes} bytes, got {metadata['data_bytes']}"
         )
-    return audio_path, metadata
+    return audio_path, metadata, downloaded_audio
 
 
 def _failure_result(
@@ -251,6 +293,10 @@ def _failure_result(
     job: dict[str, Any],
     operation: str,
     error: Exception,
+    *,
+    downloaded: bool = False,
+    transcribed: bool = False,
+    uploaded: bool = False,
 ) -> dict[str, Any]:
     message = str(error).strip() or error.__class__.__name__
     retryable = operation != "prepare_upload"
@@ -260,13 +306,20 @@ def _failure_result(
         retryable = error.retryable
     if operation == "transcribe" and isinstance(error, ValueError):
         retryable = False
-    job["last_error"] = {
+    last_error = {
         "operation": operation,
         "type": error.__class__.__name__,
         "message": message,
         "retryable": retryable,
         "at": _now(),
     }
+    pending_intent = job.get("pending_device_payload_intent_sha256")
+    pending_payload = job.get("pending_device_payload_sha256")
+    if isinstance(pending_intent, str):
+        last_error["device_payload_intent_sha256"] = pending_intent
+    if isinstance(pending_payload, str):
+        last_error["device_payload_sha256"] = pending_payload
+    job["last_error"] = last_error
     try:
         _save_job(store, device_id, audio_id, job)
     except Exception as save_error:
@@ -279,6 +332,9 @@ def _failure_result(
         "operation": operation,
         "retryable": retryable,
         "error": message,
+        "downloaded": downloaded,
+        "transcribed": transcribed,
+        "uploaded": uploaded,
     }
 
 
@@ -292,15 +348,29 @@ def _item_identity(item: Any) -> dict[str, Any]:
 
 
 def _cached_permanent_failure(
-    job: dict[str, Any], item: Any, fingerprint: dict[str, Any]
+    job: dict[str, Any],
+    item: Any,
+    fingerprint: dict[str, Any],
+    *,
+    device_payload_intent_sha256: str | None = None,
 ) -> dict[str, Any] | None:
     error = job.get("last_error")
     if not isinstance(error, dict) or error.get("retryable") is not False:
         return None
     if job.get("item_identity") != _item_identity(item):
         return None
-    if error.get("operation") == "transcribe" and job.get("transcription_fingerprint") != fingerprint:
+    if (
+        error.get("operation") == "transcribe"
+        and job.get("transcription_fingerprint") != fingerprint
+    ):
         return None
+    if error.get("operation") in {"prepare_upload", "upload_transcript"}:
+        if (
+            not isinstance(device_payload_intent_sha256, str)
+            or error.get("device_payload_intent_sha256")
+            != device_payload_intent_sha256
+        ):
+            return None
     return {
         "device_id": job.get("device_id"),
         "audio_id": job.get("audio_id"),
@@ -310,7 +380,12 @@ def _cached_permanent_failure(
         "retryable": False,
         "error": error.get("message", "permanent failure"),
         "cached": True,
+        "downloaded": False,
+        "transcribed": False,
+        "uploaded": False,
     }
+
+
 def _sync_audio_item(
     device_id: str,
     client: DeviceClient | SerialDeviceClient,
@@ -324,6 +399,9 @@ def _sync_audio_item(
 ) -> dict[str, Any]:
     job = _new_job(device_id, item.audio_id, item.filename)
     operation = "index_note"
+    downloaded_action = False
+    transcribed_action = False
+    uploaded_action = False
     try:
         note = library.upsert_discovered(
             device_id,
@@ -337,82 +415,205 @@ def _sync_audio_item(
         )
         operation = "load_state"
         completed_job = store.load_job(device_id, item.audio_id)
-        if item.synced or item.transcript_uploaded:
-            completed_transcript = store.load_transcript(device_id, item.audio_id)
-            completed_source = (
-                completed_job.get("source") if isinstance(completed_job, dict) else None
-            )
-            cached_source = _verified_cached_source(store, device_id, item)
-            if not reprocess_synced and (
-                isinstance(completed_job, dict)
-                and completed_job.get("audio_id") == item.audio_id
-                and completed_job.get("stage") == "uploaded"
-                and isinstance(completed_source, dict)
-                and cached_source == completed_source
-                and _transcript_matches(completed_transcript, cached_source, fingerprint)
-            ):
-                job = completed_job
-                completed_job["last_error"] = None
-                _save_job(store, device_id, item.audio_id, completed_job)
-                cached_path = store.audio_path(device_id, item.audio_id, item.filename)
-                if cached_path.is_file():
-                    library.attach_audio(
-                        note.note_id,
-                        cached_path,
-                        source_sha256=cached_source.get("sha256"),
-                    )
-                assert completed_transcript is not None
-                library.attach_transcript(note.note_id, completed_transcript)
-                operation = "prepare_upload"
-                device_payload, device_payload_sha256 = _device_payload(
-                    completed_transcript, cached_source, fingerprint, note.title
-                )
-                if (
-                    not upload_transcripts
-                    or completed_job.get("device_payload_sha256")
-                    == device_payload_sha256
-                ):
-                    return _skipped_result(
-                        device_id,
-                        item.audio_id,
-                        completed_job,
-                        completed_transcript,
-                        cached_source,
-                    )
+        completed_transcript = store.load_transcript(device_id, item.audio_id)
+        completed_source = (
+            completed_job.get("source") if isinstance(completed_job, dict) else None
+        )
+        cached_source = _verified_cached_source(store, device_id, item)
+        completed_state_is_current = (
+            isinstance(completed_job, dict)
+            and completed_job.get("schema_version") == JOB_SCHEMA_VERSION
+            and completed_job.get("device_id") == device_id
+            and completed_job.get("audio_id") == item.audio_id
+            and completed_job.get("stage") in {"transcribed", "uploaded"}
+            and isinstance(completed_source, dict)
+            and cached_source == completed_source
+            and _transcript_matches_source(completed_transcript, completed_source)
+        )
 
-                operation = "upload_transcript"
-                client.upload_transcript(item.audio_id, device_payload)
-                completed_job["device_payload_sha256"] = device_payload_sha256
-                completed_job["last_error"] = None
-                _save_job(store, device_id, item.audio_id, completed_job)
-                library.upsert_discovered(
+        # Fake mode is local-only diagnostics. It may fill an empty library, but
+        # it must never replace a real transcript already tied to this source.
+        if (
+            isinstance(backend, FakeTranscriptionBackend)
+            and completed_state_is_current
+            and not _transcript_matches(
+                completed_transcript, completed_source, fingerprint
+            )
+        ):
+            job = completed_job
+            cached_path = store.audio_path(device_id, item.audio_id, item.filename)
+            library.attach_audio(
+                note.note_id,
+                cached_path,
+                source_sha256=completed_source["sha256"],
+            )
+            assert completed_transcript is not None
+            library.attach_transcript(note.note_id, completed_transcript)
+            return _skipped_result(
+                device_id,
+                item.audio_id,
+                completed_job,
+                completed_transcript,
+                completed_source,
+                reason="fake_backend_preserved_existing_transcript",
+            )
+
+        completed_state_matches_backend = (
+            completed_state_is_current
+            and _transcript_matches(
+                completed_transcript, completed_source, fingerprint
+            )
+        )
+        if not reprocess_synced and completed_state_matches_backend:
+            job = completed_job
+            cached_path = store.audio_path(device_id, item.audio_id, item.filename)
+            library.attach_audio(
+                note.note_id,
+                cached_path,
+                source_sha256=completed_source["sha256"],
+            )
+            assert completed_transcript is not None
+            library.attach_transcript(note.note_id, completed_transcript)
+
+            if not upload_transcripts:
+                return _skipped_result(
                     device_id,
                     item.audio_id,
-                    item.filename,
-                    label=getattr(item, "label", None),
-                    source_sha256=cached_source["sha256"],
-                    created_at=getattr(item, "created_at", None),
-                    duration_ms=getattr(item, "duration_ms", None),
-                    device_synced=True,
+                    completed_job,
+                    completed_transcript,
+                    completed_source,
+                    reason="local_transcript_current",
                 )
-                entry = {
-                    "device_id": device_id,
-                    "audio_id": item.audio_id,
-                    "audio_file": str(cached_path),
-                    "status": "uploaded",
-                    "stage": "uploaded",
-                    "reason": "device_payload_changed",
-                    "source_sha256": cached_source["sha256"],
-                    "synced_at": _now(),
-                    "model": completed_transcript.get("model", ""),
-                    "uploaded": True,
-                }
-                store.append_sync_log(entry)
-                return entry
+
+            payload_intent_sha256 = _device_payload_intent_sha256(
+                completed_transcript,
+                completed_source,
+                fingerprint,
+                note.title,
+            )
+            if (
+                bool(item.synced or item.transcript_uploaded)
+                and completed_job.get("device_payload_intent_sha256")
+                == payload_intent_sha256
+                and isinstance(completed_job.get("device_payload_sha256"), str)
+            ):
+                completed_job["pending_device_payload_intent_sha256"] = None
+                completed_job["pending_device_payload_sha256"] = None
+                completed_job["last_error"] = None
+                _save_job(store, device_id, item.audio_id, completed_job)
+                return _skipped_result(
+                    device_id,
+                    item.audio_id,
+                    completed_job,
+                    completed_transcript,
+                    completed_source,
+                )
+
+            cached_failure = _cached_permanent_failure(
+                completed_job,
+                item,
+                fingerprint,
+                device_payload_intent_sha256=payload_intent_sha256,
+            )
+            if cached_failure is not None:
+                return cached_failure
+
+            completed_job["attempt_count"] = int(
+                completed_job.get("attempt_count", 0)
+            ) + 1
+            completed_job["item_identity"] = _item_identity(item)
+            completed_job["pending_device_payload_intent_sha256"] = (
+                payload_intent_sha256
+            )
+            completed_job["pending_device_payload_sha256"] = None
+            operation = "prepare_upload"
+            device_payload, device_payload_sha256 = _device_payload(
+                completed_transcript, completed_source, fingerprint, note.title
+            )
+            completed_job["pending_device_payload_sha256"] = (
+                device_payload_sha256
+            )
+            if (
+                bool(item.synced or item.transcript_uploaded)
+                and completed_job.get("device_payload_sha256")
+                == device_payload_sha256
+            ):
+                completed_job["device_payload_intent_sha256"] = (
+                    payload_intent_sha256
+                )
+                completed_job["pending_device_payload_intent_sha256"] = None
+                completed_job["pending_device_payload_sha256"] = None
+                completed_job["last_error"] = None
+                _save_job(store, device_id, item.audio_id, completed_job)
+                return _skipped_result(
+                    device_id,
+                    item.audio_id,
+                    completed_job,
+                    completed_transcript,
+                    completed_source,
+                )
+
+            operation = "upload_transcript"
+            client.upload_transcript(item.audio_id, device_payload)
+            uploaded_action = True
+            completed_job["stage"] = "uploaded"
+            completed_job["device_payload_sha256"] = device_payload_sha256
+            completed_job["device_payload_intent_sha256"] = payload_intent_sha256
+            completed_job["pending_device_payload_intent_sha256"] = None
+            completed_job["pending_device_payload_sha256"] = None
+            completed_job["last_error"] = None
+            _save_job(store, device_id, item.audio_id, completed_job)
+            library.upsert_discovered(
+                device_id,
+                item.audio_id,
+                item.filename,
+                label=getattr(item, "label", None),
+                source_sha256=completed_source["sha256"],
+                created_at=getattr(item, "created_at", None),
+                duration_ms=getattr(item, "duration_ms", None),
+                device_synced=True,
+            )
+            entry = {
+                "device_id": device_id,
+                "audio_id": item.audio_id,
+                "audio_file": str(cached_path),
+                "status": "uploaded",
+                "stage": "uploaded",
+                "reason": "device_payload_changed",
+                "source_sha256": completed_source["sha256"],
+                "synced_at": _now(),
+                "model": completed_transcript.get("model", ""),
+                "downloaded": False,
+                "transcribed": False,
+                "uploaded": True,
+            }
+            store.append_sync_log(entry)
+            return entry
 
         job = _load_job(store, device_id, item.audio_id, item.filename)
         if not reprocess_synced:
-            cached_failure = _cached_permanent_failure(job, item, fingerprint)
+            cached_payload_intent: str | None = None
+            cached_job_source = job.get("source")
+            cached_job_transcript = store.load_transcript(device_id, item.audio_id)
+            if (
+                isinstance(cached_job_source, dict)
+                and _transcript_matches(
+                    cached_job_transcript, cached_job_source, fingerprint
+                )
+            ):
+                assert cached_job_transcript is not None
+                cached_payload_intent = _device_payload_intent_sha256(
+                    cached_job_transcript,
+                    cached_job_source,
+                    fingerprint,
+                    note.title,
+                )
+            cached_failure = _cached_permanent_failure(
+                job,
+                item,
+                fingerprint,
+                device_payload_intent_sha256=cached_payload_intent,
+            )
             if cached_failure is not None:
                 return cached_failure
         job["attempt_count"] = int(job.get("attempt_count", 0)) + 1
@@ -422,12 +623,15 @@ def _sync_audio_item(
         job["transcription_fingerprint"] = None
         job["cache_key"] = None
         job["device_payload_sha256"] = None
+        job["device_payload_intent_sha256"] = None
+        job["pending_device_payload_sha256"] = None
+        job["pending_device_payload_intent_sha256"] = None
         job["last_error"] = None
         operation = "save_job"
         _save_job(store, device_id, item.audio_id, job)
 
         operation = "download_audio"
-        audio_path, audio_metadata = _download_and_inspect(
+        audio_path, audio_metadata, downloaded_action = _download_and_inspect(
             client,
             store,
             device_id,
@@ -447,6 +651,7 @@ def _sync_audio_item(
         transcript = store.load_transcript(device_id, item.audio_id)
         if not _transcript_matches(transcript, source, fingerprint):
             transcript = _prepare_transcript(backend.transcribe(audio_path), source, fingerprint)
+            transcribed_action = True
             store.save_transcript(device_id, item.audio_id, transcript)
         job["stage"] = "transcribed"
         _save_job(store, device_id, item.audio_id, job)
@@ -454,14 +659,24 @@ def _sync_audio_item(
         library.attach_transcript(note.note_id, transcript)
 
         if upload_transcripts:
+            payload_intent_sha256 = _device_payload_intent_sha256(
+                transcript, source, fingerprint, note.title
+            )
+            job["pending_device_payload_intent_sha256"] = payload_intent_sha256
+            job["pending_device_payload_sha256"] = None
             operation = "prepare_upload"
             device_payload, device_payload_sha256 = _device_payload(
                 transcript, source, fingerprint, note.title
             )
+            job["pending_device_payload_sha256"] = device_payload_sha256
             operation = "upload_transcript"
             client.upload_transcript(item.audio_id, device_payload)
+            uploaded_action = True
             job["stage"] = "uploaded"
             job["device_payload_sha256"] = device_payload_sha256
+            job["device_payload_intent_sha256"] = payload_intent_sha256
+            job["pending_device_payload_intent_sha256"] = None
+            job["pending_device_payload_sha256"] = None
         else:
             job["stage"] = "transcribed"
         job["last_error"] = None
@@ -487,7 +702,9 @@ def _sync_audio_item(
             "source_sha256": source["sha256"],
             "synced_at": _now(),
             "model": transcript.get("model", ""),
-            "uploaded": upload_transcripts,
+            "downloaded": downloaded_action,
+            "transcribed": transcribed_action,
+            "uploaded": uploaded_action,
         }
         operation = "append_sync_log"
         store.append_sync_log(entry)
@@ -495,7 +712,17 @@ def _sync_audio_item(
     except Exception as error:
         if operation == "download_audio" and isinstance(error, ValueError):
             operation = "verify_audio"
-        return _failure_result(store, device_id, item.audio_id, job, operation, error)
+        return _failure_result(
+            store,
+            device_id,
+            item.audio_id,
+            job,
+            operation,
+            error,
+            downloaded=downloaded_action,
+            transcribed=transcribed_action,
+            uploaded=uploaded_action,
+        )
 
 
 def sync_device_audio(

@@ -133,6 +133,9 @@ class SyncTests(unittest.TestCase):
         self.assertEqual(client.uploaded, ["new.wav"])
         self.assertEqual(backend.calls, 1)
         self.assertEqual(results[0]["status"], "uploaded")
+        self.assertTrue(results[0]["downloaded"])
+        self.assertTrue(results[0]["transcribed"])
+        self.assertTrue(results[0]["uploaded"])
         self.assertEqual(job["stage"], "uploaded")  # type: ignore[index]
         self.assertEqual(job["attempt_count"], 1)  # type: ignore[index]
         self.assertEqual(job["source"]["sha256"], results[0]["source_sha256"])  # type: ignore[index]
@@ -400,6 +403,135 @@ class SyncTests(unittest.TestCase):
         self.assertEqual(client.upload_payloads[-1]["title"], "Field note")
         self.assertEqual(len(job["device_payload_sha256"]), 64)  # type: ignore[index]
 
+    def test_permanent_title_upload_failure_is_cached_by_exact_payload_intent(self) -> None:
+        class ConditionalUploadClient(FakeClient):
+            def __init__(self, items: list[AudioItem]) -> None:
+                super().__init__(items)
+                self.reject = False
+
+            def upload_transcript(self, audio_id: str, transcript: dict[str, object]) -> None:
+                self.uploaded.append(audio_id)
+                if self.reject:
+                    raise DeviceHTTPError("authentication failed", 401, False)
+                self.upload_payloads.append(transcript)
+
+        payload = wav_bytes()
+        item = AudioItem("note.wav", "note.wav", size=len(payload), data_bytes=4)
+        with TemporaryDirectory() as tmp:
+            client = ConditionalUploadClient([item])
+            store = PartnerStore(Path(tmp))
+            backend = FakeBackend()
+            library = NoteLibrary(Path(tmp))
+            note_id = stable_note_id("pj-test", "note.wav")
+
+            sync_device_audio("pj-test", client, store, backend)  # type: ignore[arg-type]
+            item.synced = True
+            library.update_title(note_id, "Blocked title")
+            client.reject = True
+            failed = sync_device_audio("pj-test", client, store, backend)  # type: ignore[arg-type]
+            cached = sync_device_audio("pj-test", client, store, backend)  # type: ignore[arg-type]
+
+            library.update_title(note_id, "Allowed title")
+            client.reject = False
+            changed = sync_device_audio("pj-test", client, store, backend)  # type: ignore[arg-type]
+
+            library.update_title(note_id, "Forced title")
+            client.reject = True
+            sync_device_audio("pj-test", client, store, backend)  # type: ignore[arg-type]
+            client.reject = False
+            forced = sync_device_audio(  # type: ignore[arg-type]
+                "pj-test", client, store, backend, reprocess_synced=True
+            )
+            job = store.load_job("pj-test", "note.wav")
+
+        self.assertEqual(failed[0]["status"], "failed")
+        self.assertFalse(failed[0]["retryable"])
+        self.assertFalse(failed[0]["downloaded"])
+        self.assertFalse(failed[0]["transcribed"])
+        self.assertFalse(failed[0]["uploaded"])
+        self.assertTrue(cached[0]["cached"])
+        self.assertEqual(client.uploaded[:2], ["note.wav", "note.wav"])
+        self.assertEqual(changed[0]["status"], "uploaded")
+        self.assertEqual(changed[0]["reason"], "device_payload_changed")
+        self.assertEqual(client.upload_payloads[-2]["title"], "Allowed title")
+        self.assertEqual(forced[0]["status"], "uploaded")
+        self.assertTrue(forced[0]["downloaded"])
+        self.assertFalse(forced[0]["transcribed"])
+        self.assertTrue(forced[0]["uploaded"])
+        self.assertEqual(client.upload_payloads[-1]["title"], "Forced title")
+        self.assertEqual(client.uploaded, ["note.wav"] * 5)
+        self.assertEqual(backend.calls, 1)
+        self.assertIsNone(job["last_error"])  # type: ignore[index]
+
+    def test_first_run_round_trips_mixed_notes_with_exact_source_identity(self) -> None:
+        first_payload = wav_bytes(b"\x01\x00\x02\x00")
+        second_payload = wav_bytes(b"\x03\x00\x04\x00")
+        first_digest = hashlib.sha256(first_payload).hexdigest()
+        second_digest = hashlib.sha256(second_payload).hexdigest()
+        items = [
+            AudioItem(
+                "new.wav",
+                "new.wav",
+                size=len(first_payload),
+                data_bytes=4,
+                source_sha256=first_digest,
+            ),
+            AudioItem(
+                "remote-synced.wav",
+                "remote-synced.wav",
+                size=len(second_payload),
+                data_bytes=4,
+                source_sha256=second_digest,
+                synced=True,
+            ),
+        ]
+
+        class IdentityBackend(FakeBackend):
+            def __init__(self) -> None:
+                super().__init__("identity-v1")
+                self.sources: list[str] = []
+
+            def transcribe(self, audio_path: Path) -> dict[str, object]:
+                self.calls += 1
+                source = hashlib.sha256(audio_path.read_bytes()).hexdigest()
+                self.sources.append(source)
+                return {"text": f"transcript:{source}", "model": self.model}
+
+        with TemporaryDirectory() as tmp:
+            client = FakeClient(items)
+            client.payloads = {
+                "new.wav": first_payload,
+                "remote-synced.wav": second_payload,
+            }
+            backend = IdentityBackend()
+            results = sync_device_audio(  # type: ignore[arg-type]
+                "pj-test", client, PartnerStore(Path(tmp)), backend
+            )
+            library = NoteLibrary(Path(tmp))
+            notes = [
+                library.get(stable_note_id("pj-test", item.audio_id))
+                for item in items
+            ]
+
+        self.assertEqual([result["status"] for result in results], ["uploaded", "uploaded"])
+        self.assertEqual(
+            [(result["downloaded"], result["transcribed"], result["uploaded"])
+             for result in results],
+            [(True, True, True), (True, True, True)],
+        )
+        self.assertEqual(client.downloaded, ["new.wav", "remote-synced.wav"])
+        self.assertEqual(client.uploaded, ["new.wav", "remote-synced.wav"])
+        self.assertEqual(backend.sources, [first_digest, second_digest])
+        self.assertEqual(
+            [payload["source"]["sha256"] for payload in client.upload_payloads],  # type: ignore[index]
+            [first_digest, second_digest],
+        )
+        self.assertEqual(
+            [note.transcript_text for note in notes if note is not None],
+            [f"transcript:{first_digest}", f"transcript:{second_digest}"],
+        )
+        self.assertTrue(all(note is not None and note.device_synced for note in notes))
+
     def test_complete_long_text_is_uploaded_without_truncation(self) -> None:
         with TemporaryDirectory() as tmp:
             client = FakeClient()
@@ -494,24 +626,62 @@ class SyncTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             client = FakeClient()
             store = PartnerStore(Path(tmp))
-            results = sync_device_audio(  # type: ignore[arg-type]
+            first = sync_device_audio(  # type: ignore[arg-type]
+                "pj-test", client, store, FakeBackend(), upload_transcripts=False
+            )
+            repeated = sync_device_audio(  # type: ignore[arg-type]
                 "pj-test", client, store, FakeBackend(), upload_transcripts=False
             )
             job = store.load_job("pj-test", "new.wav")
 
-        self.assertEqual(results[0]["status"], "transcribed")
+        self.assertEqual(first[0]["status"], "transcribed")
+        self.assertEqual(repeated[0]["status"], "skipped")
+        self.assertEqual(repeated[0]["reason"], "local_transcript_current")
+        self.assertFalse(repeated[0]["downloaded"])
+        self.assertFalse(repeated[0]["transcribed"])
+        self.assertFalse(repeated[0]["uploaded"])
         self.assertEqual(job["stage"], "transcribed")  # type: ignore[index]
         self.assertEqual(client.uploaded, [])
 
     def test_real_fake_backend_is_always_local_only(self) -> None:
         with TemporaryDirectory() as tmp:
             client = FakeClient()
-            results = sync_device_audio(  # type: ignore[arg-type]
-                "pj-test", client, PartnerStore(Path(tmp)), FakeTranscriptionBackend()
+            store = PartnerStore(Path(tmp))
+            first = sync_device_audio(  # type: ignore[arg-type]
+                "pj-test", client, store, FakeTranscriptionBackend()
+            )
+            repeated = sync_device_audio(  # type: ignore[arg-type]
+                "pj-test", client, store, FakeTranscriptionBackend()
             )
 
-        self.assertEqual(results[0]["status"], "transcribed")
+        self.assertEqual(first[0]["status"], "transcribed")
+        self.assertEqual(repeated[0]["status"], "skipped")
         self.assertEqual(client.uploaded, [])
+
+    def test_fake_backend_preserves_existing_real_transcript(self) -> None:
+        payload = wav_bytes()
+        item = AudioItem("note.wav", "note.wav", size=len(payload), data_bytes=4)
+        with TemporaryDirectory() as tmp:
+            client = FakeClient([item])
+            store = PartnerStore(Path(tmp))
+            real_backend = FakeBackend("real-model", text="real transcript")
+            sync_device_audio("pj-test", client, store, real_backend)  # type: ignore[arg-type]
+            item.synced = True
+            preserved = sync_device_audio(  # type: ignore[arg-type]
+                "pj-test", client, store, FakeTranscriptionBackend()
+            )
+            transcript = store.load_transcript("pj-test", "note.wav")
+            note = NoteLibrary(Path(tmp)).get(stable_note_id("pj-test", "note.wav"))
+
+        self.assertEqual(preserved[0]["status"], "skipped")
+        self.assertEqual(
+            preserved[0]["reason"], "fake_backend_preserved_existing_transcript"
+        )
+        self.assertEqual(transcript["model"], "real-model")  # type: ignore[index]
+        self.assertEqual(transcript["text"], "real transcript")  # type: ignore[index]
+        self.assertEqual(note.transcript_text, "real transcript")  # type: ignore[union-attr]
+        self.assertEqual(client.downloaded, ["note.wav"])
+        self.assertEqual(client.uploaded, ["note.wav"])
 
     def test_changed_same_size_audio_invalidates_cached_transcript(self) -> None:
         with TemporaryDirectory() as tmp:
