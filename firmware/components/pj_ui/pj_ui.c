@@ -820,6 +820,11 @@ void pj_ui_wake(pj_ui_context_t *ctx)
     set_state(ctx, PJ_UI_STATE_HOME);
 }
 
+void pj_ui_power_wake(pj_ui_context_t *ctx)
+{
+    set_state(ctx, PJ_UI_STATE_TIME_TEMP);
+}
+
 void pj_ui_sleep(pj_ui_context_t *ctx)
 {
     /* Leaving Record only requests an asynchronous worker stop.  Keep the

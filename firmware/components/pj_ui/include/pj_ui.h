@@ -211,6 +211,7 @@ int pj_ui_handle_aux_short(pj_ui_context_t *ctx);
 int pj_ui_handle_aux_long(pj_ui_context_t *ctx);
 int pj_ui_handle_aux_double(pj_ui_context_t *ctx);
 void pj_ui_wake(pj_ui_context_t *ctx);
+void pj_ui_power_wake(pj_ui_context_t *ctx);
 void pj_ui_sleep(pj_ui_context_t *ctx);
 void pj_ui_set_status(pj_ui_context_t *ctx, int battery_percent, int temperature_c,
                       int humidity_percent);

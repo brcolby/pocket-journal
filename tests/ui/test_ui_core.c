@@ -259,6 +259,22 @@ static void navigate_home_to(pj_ui_context_t *context,
     assert(tap_slot(context, PJ_LAYOUT_HOME_3_1, slot));
 }
 
+static void test_power_wake_targets_clock(void)
+{
+    pj_ui_context_t context;
+    pj_ui_init(&context);
+    pj_ui_power_wake(&context);
+    assert(context.state == PJ_UI_STATE_TIME_TEMP);
+
+    pj_ui_sleep(&context);
+    assert(context.state == PJ_UI_STATE_STATIC);
+    pj_ui_power_wake(&context);
+    assert(context.state == PJ_UI_STATE_TIME_TEMP);
+
+    pj_ui_wake(&context);
+    assert(context.state == PJ_UI_STATE_HOME);
+}
+
 static int asset_pixel(const pj_asset_bitmap_t *asset, int x, int y)
 {
     uint8_t byte = asset->data[(size_t)y * asset->stride + (size_t)x / 8u];
@@ -1512,6 +1528,7 @@ static void test_presenter_idle_barrier_rejection_and_navigation_full(void)
 
 int main(void)
 {
+    test_power_wake_targets_clock();
     test_geometry_is_exhaustive_and_navigation_is_fixed();
     test_state_metadata_and_deterministic_composition();
     test_record_arming_and_back_contract();

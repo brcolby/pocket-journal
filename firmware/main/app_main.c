@@ -542,7 +542,7 @@ static void handle_board_event(pj_ui_context_t *ui, const pj_board_event_t *even
     int handled = 0;
     switch (event->type) {
     case PJ_BOARD_EVENT_WAKE:
-        pj_ui_wake(ui);
+        pj_ui_power_wake(ui);
         handled = 1;
         break;
     case PJ_BOARD_EVENT_SLEEP:
@@ -564,7 +564,7 @@ static void handle_board_event(pj_ui_context_t *ui, const pj_board_event_t *even
         break;
     case PJ_BOARD_EVENT_POWER:
         if (pj_ui_current_state(ui) == PJ_UI_STATE_STATIC) {
-            pj_ui_wake(ui);
+            pj_ui_power_wake(ui);
         } else {
             pj_ui_sleep(ui);
         }
@@ -599,7 +599,7 @@ void app_main(void)
     pj_ui_presenter_init(&g_presenter);
     pj_ui_init(&g_ui);
     pj_board_refresh_settings(&g_ui);
-    pj_ui_wake(&g_ui);
+    pj_ui_power_wake(&g_ui);
     pj_board_refresh_status(&g_ui);
     pj_board_refresh_time_state(&g_ui);
     (void)pj_board_companion_sync_resume();
@@ -636,14 +636,14 @@ void app_main(void)
             sleep_pending = 0;
             int sleep_result = pj_board_enter_sleep();
             if (sleep_result > 0) {
-                pj_ui_wake(&g_ui);
+                pj_ui_power_wake(&g_ui);
                 pj_board_refresh_status(&g_ui);
                 (void)pj_board_update_time_state(&g_ui);
                 render_and_submit_if_changed(&g_ui);
             } else if (sleep_result == 0) {
                 sleep_pending = 1;
             } else {
-                pj_ui_wake(&g_ui);
+                pj_ui_power_wake(&g_ui);
                 render_and_submit_if_changed(&g_ui);
             }
         }
