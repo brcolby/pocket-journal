@@ -5,28 +5,28 @@ low-frequency, large-batch hardware pass. Human notes may be mildly lossy:
 record what you actually observed, including blockers, and agents will map that
 evidence to the exact Bead acceptance criteria.
 
-Last synchronized with `bd human list`: 2026-07-17 (37 human-validation Beads).
+Last synchronized with `bd human list`: 2026-07-18 (37 human-validation Beads).
 Do not repeat a failed check on unchanged firmware.
 
 ## Nominated Build
 
-- Source commit and reported firmware version: `8622c24` / `8622c24`.
-- Image: `firmware/build-v1-8622c24/pocket_journal.bin`.
+- Source commit and reported firmware version: `029f6df` / `029f6df`.
+- Image: `firmware/build-v1-029f6df/pocket_journal.bin`.
 - Size: 1,511,424 bytes (`0x171000`).
 - SHA-256:
-  `108a197282981e8f9c28cee64c6bc7828d246d1e8d219d6a3daf862f5437d40b`.
+  `82f2221ab019288a1c514003b3de2f08452081d7ab198fc668110fceeb7d96c2`.
 - ESP image validation hash:
-  `4be1eec0510af7295e116d4755b6c898ab1526361ca5536df46ca78173bda124`.
+  `82dd3d33ee03c7e10843993974c62dc2a73512d299a2badbbdd01c0ac1777a68`.
 - ELF SHA-256:
-  `17346a10c9feb29991352c83ed23d9e309bd5a25fa33577f347637c5f278d813`.
+  `c4d737b603f9280e0f0b86c5de247f43e4f9d8dc4e40b4e84f76409c214de682`.
 - Built with ESP-IDF 6.0.1 and 28% (`0x8f000`) free in each 2 MiB
   application partition. A clean build contains no LVGL component or symbol.
 - Flashed and byte-verified as a development image on `pj-d45d34`, ESP32-S3
   MAC `14:C1:9F:D4:5D:34`, at `/dev/cu.usbmodem1101`.
 - Live USB probe after boot verification: exact firmware answered `PJ_STATUS`
-  without another reset, with boot ID `2811516533`; SD storage, audio,
-  Wi-Fi/DHCP, and fixed-offset time
-  synchronization were ready. USB recovery was neither needed nor attempted.
+  without another reset, with boot ID `3071218195`; SD storage, audio, Wi-Fi,
+  and fixed-offset time were ready. Companion sync was offline/pending at the
+  probe; USB recovery was neither needed nor attempted.
 - Automated evidence: deterministic Carbon generation verified 73 active and
   26 reference sources, 72 glyph identities, and 30 semantic bitmaps; all 13
   asset and 7 exhaustive DXF tests passed. All 32 native C executables and 362
@@ -34,12 +34,15 @@ Do not repeat a failed check on unchanged firmware.
   passed for all 32 native C executables (the vendored cJSON build suppresses
   only macOS SDK deprecation diagnostics). WASM runtime, one-bit/AUX simulator
   tests, exact Timer/Stopwatch partial reconstruction, and image analysis
-  passed. All 51 gallery frames and the contact sheet were inspected.
+  passed. All 52 gallery frames, including Alarm Off/On/12-hour states, and the
+  contact sheet were inspected.
 - Owner validation on the preceding `f57d49b` image confirmed the digit/time
   rendering corruption and Timer adjustment regressions are fixed. Because
   `8622c24` changes cadence cancellation and task priority, repeat only the
-  targeted cadence, Record exit, and UI-refinement checks below rather than
-  the already-passed broad digit diagnosis.
+  targeted cadence and UI-refinement checks below rather than the already-passed
+  broad digit diagnosis. Owner validation on `8622c24` also reports that Notes
+  Record behavior seems good; `029f6df` changes only the Alarm assets/compositor
+  and therefore preserves that evidence while adding the labeled larger toggle.
 - This is development validation, not a release. No tag or release has been
   created.
 
@@ -70,16 +73,16 @@ section (stop with Ctrl-]):
 ```bash
 cd firmware
 source "$HOME/.espressif/v6.0.1/esp-idf/export.sh"
-idf.py -B build-v1-8622c24 -p /dev/cu.usbmodem1101 monitor \
+idf.py -B build-v1-029f6df -p /dev/cu.usbmodem1101 monitor \
   --no-reset --timestamps --disable-auto-color 2>&1 | \
-  tee /private/tmp/pj-8622c24-hardware.log
+  tee /private/tmp/pj-029f6df-hardware.log
 ```
 
 Afterward, preserve the output of:
 
 ```bash
 rg 'Seconds cadence (start|end)|Display metrics|Display generations' \
-  /private/tmp/pj-8622c24-hardware.log
+  /private/tmp/pj-029f6df-hardware.log
 ```
 
 - [ ] Exercise every sector of Home `3_1`, Notes `3_1m`, Time `4_1`, and
@@ -94,9 +97,10 @@ rg 'Seconds cadence (start|end)|Display metrics|Display generations' \
   case-preserving Carbon letters/numbers, distinct upright `1` and `9`, bold
   mapped icons at a consistent scale, 4 px interior rules with no redundant
   outer box, the unfilled Home Time icon, compact lowercase `12h`/`24h`,
-  legible note paging, and a centered three-line Sync stack using one font
-  size. Confirm Volume shows only a 0–10 number above its controls and no
-  square Stop icon appears anywhere (`pocket-journal-nz5`,
+  legible note paging, a 56 px Alarm toggle flanked by explicit `OFF`/`ON`
+  labels, and a centered three-line Sync stack using one font size. Confirm
+  Volume shows only a 0–10 number above its controls and no square Stop icon
+  appears anywhere (`pocket-journal-nz5`,
   `pocket-journal-nz5.6`, `pocket-journal-nz5.8`,
   `pocket-journal-nz5.10`, `pocket-journal-2ji`).
 - [ ] Run Record, Stopwatch, Timer, and Interval for at least 120 consecutive
@@ -120,7 +124,9 @@ rg 'Seconds cadence (start|end)|Display metrics|Display generations' \
   via partial refresh. Switch theme and confirm an immediate full inversion;
   the top-right `AsleepFilled` icon must retain the same shape. Battery changes,
   Clock/status ticks, Alarm Toggle, Volume, Play/Pause, and other same-layout
-  changes must remain exact partials (`pocket-journal-nz5`,
+  changes must remain exact partials. Alarm Off/On must move only the labeled
+  toggle knob without a full flash or displaced neighboring controls
+  (`pocket-journal-nz5`,
   `pocket-journal-cjx`, `pocket-journal-e43`).
 - [ ] During several partials, rapidly press the current control and then one
   that changes screens. The latest accepted frame must win, a rejected request
