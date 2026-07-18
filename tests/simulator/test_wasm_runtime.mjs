@@ -97,6 +97,12 @@ assertRendered("home");
 assert.equal(api.pj_sim_aux_double(), 1);
 assertRendered("record");
 assert.equal(api.pj_sim_record_state(), RECORD_ARMING);
+const recordArmingZero = framebufferSnapshot();
+api.pj_sim_set_recording_elapsed(5);
+assert.deepEqual(
+  framebufferSnapshot(), recordArmingZero,
+  "Record arming must ignore stale nonzero board elapsed time",
+);
 api.pj_sim_set_audio_state(1, 0);
 assert.equal(api.pj_sim_record_state(), RECORD_ACTIVE);
 assert.equal(api.pj_sim_aux_long(), 1);

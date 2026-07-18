@@ -127,7 +127,7 @@ static int normalize_request(const pj_display_worker_request_t *input,
         input->cadence_class < PJ_DISPLAY_CADENCE_NONE ||
         input->cadence_class > PJ_DISPLAY_CADENCE_SECONDS ||
         input->cleanup_state < PJ_DISPLAY_CLEANUP_NONE ||
-        input->cleanup_state > PJ_DISPLAY_CLEANUP_PENDING) {
+        input->cleanup_state > PJ_DISPLAY_CLEANUP_SATISFY) {
         return 0;
     }
     *output = *input;
@@ -181,6 +181,28 @@ static void clear_slot(pj_display_worker_slot_t *slot)
     memset(slot, 0, sizeof(*slot));
 }
 
+static void retain_cadence_handoff(
+    pj_display_worker_model_t *model,
+    const pj_display_worker_slot_t *slot)
+{
+    if (slot->barrier || slot->dirty.width <= 0 ||
+        slot->dirty.height <= 0) {
+        return;
+    }
+    if (!model->cadence_handoff_pending) {
+        model->cadence_handoff_dirty = slot->dirty;
+        model->cadence_handoff_layout_epoch = slot->layout_epoch;
+        model->cadence_handoff_pending = 1;
+        return;
+    }
+    if (model->cadence_handoff_layout_epoch != slot->layout_epoch) {
+        model->cadence_handoff_dirty = full_region();
+        return;
+    }
+    model->cadence_handoff_dirty = merge_regions(
+        &model->cadence_handoff_dirty, &slot->dirty);
+}
+
 static int latest_ready_ordinary_slot(
     const pj_display_worker_model_t *model)
 {
@@ -204,6 +226,21 @@ static int ready_cadence_slot(const pj_display_worker_model_t *model)
     for (int i = 0; i < PJ_DISPLAY_WORKER_SLOT_COUNT; i++) {
         if (model->slots[i].state == PJ_DISPLAY_WORKER_SLOT_READY &&
             model->slots[i].cadence_class == PJ_DISPLAY_CADENCE_SECONDS) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static int cadence_slot_matches(const pj_display_worker_model_t *model,
+                                uint32_t sequence,
+                                uint64_t deadline_ms)
+{
+    for (int i = 0; i < PJ_DISPLAY_WORKER_SLOT_COUNT; i++) {
+        if (model->slots[i].state != PJ_DISPLAY_WORKER_SLOT_FREE &&
+            model->slots[i].cadence_class == PJ_DISPLAY_CADENCE_SECONDS &&
+            model->slots[i].cadence_sequence == sequence &&
+            model->slots[i].cadence_deadline_ms == deadline_ms) {
             return i;
         }
     }
@@ -291,12 +328,30 @@ int pj_display_worker_model_begin_submit_request(
 
     int slot = -1;
     if (normalized.cadence_class == PJ_DISPLAY_CADENCE_SECONDS) {
-        if (!model->cadence_active ||
-            normalized.cadence_sequence !=
+        if (!model->cadence_active) {
+            increment_saturated(&model->cadence_misses);
+            return 0;
+        }
+        /*
+         * A retry of an already reserved/accepted cadence snapshot, or a
+         * retry while the preceding READY snapshot awaits the display task,
+         * is backpressure rather than another cadence fault.  Any real late
+         * start/overrun is recorded once when that physical frame runs.
+         */
+        if (cadence_slot_matches(
+                model, normalized.cadence_sequence,
+                normalized.cadence_deadline_ms) >= 0 ||
+            (normalized.cadence_sequence ==
+                 model->cadence_expected_submit_sequence &&
+             normalized.cadence_deadline_ms ==
+                 model->cadence_expected_deadline_ms &&
+             ready_cadence_slot(model) >= 0)) {
+            return 0;
+        }
+        if (normalized.cadence_sequence !=
                 model->cadence_expected_submit_sequence ||
             normalized.cadence_deadline_ms !=
-                model->cadence_expected_deadline_ms ||
-            ready_cadence_slot(model) >= 0) {
+                model->cadence_expected_deadline_ms) {
             increment_saturated(&model->cadence_misses);
             return 0;
         }
@@ -319,6 +374,19 @@ int pj_display_worker_model_begin_submit_request(
     if (slot < 0) {
         return 0;
     }
+    if (normalized.cadence_class == PJ_DISPLAY_CADENCE_SECONDS) {
+        /*
+         * Mark the copy reservation as cadence-owned.  cadence_end() may run
+         * while the framebuffer memcpy is outside the model lock; the slot
+         * must remain reserved until that writer returns, but its commit is
+         * then rejected as an intentional cancellation rather than a miss.
+         */
+        model->slots[slot].cadence_class = PJ_DISPLAY_CADENCE_SECONDS;
+        model->slots[slot].cadence_sequence =
+            normalized.cadence_sequence;
+        model->slots[slot].cadence_deadline_ms =
+            normalized.cadence_deadline_ms;
+    }
     model->slots[slot].state = PJ_DISPLAY_WORKER_SLOT_WRITING;
     *slot_index = slot;
     return 1;
@@ -328,14 +396,19 @@ int pj_display_worker_model_commit_submit_request(
     pj_display_worker_model_t *model, int slot_index,
     const pj_display_worker_request_t *request, uint32_t *generation)
 {
-    pj_display_worker_request_t normalized;
     if (model == NULL || slot_index < 0 ||
         slot_index >= PJ_DISPLAY_WORKER_SLOT_COUNT ||
         model->slots[slot_index].state != PJ_DISPLAY_WORKER_SLOT_WRITING) {
         return 0;
     }
+    pj_display_worker_slot_t *slot = &model->slots[slot_index];
+    if (slot->cancel_on_commit) {
+        clear_slot(slot);
+        return 0;
+    }
+    pj_display_worker_request_t normalized;
     if (!model->accepting || !normalize_request(request, &normalized)) {
-        clear_slot(&model->slots[slot_index]);
+        clear_slot(slot);
         return 0;
     }
 
@@ -346,11 +419,10 @@ int pj_display_worker_model_commit_submit_request(
          normalized.cadence_deadline_ms !=
              model->cadence_expected_deadline_ms)) {
         increment_saturated(&model->cadence_misses);
-        clear_slot(&model->slots[slot_index]);
+        clear_slot(slot);
         return 0;
     }
 
-    pj_display_worker_slot_t *slot = &model->slots[slot_index];
     uint32_t replaced_generation = slot->generation;
     uint32_t replaced_layout_epoch = slot->layout_epoch;
     uint32_t baseline_layout_epoch = replaced_generation != 0 ?
@@ -375,6 +447,22 @@ int pj_display_worker_model_commit_submit_request(
                 &replaced_dirty, &normalized.dirty);
         }
         normalized.barrier = 0;
+    }
+    if (normalized.cadence_class == PJ_DISPLAY_CADENCE_NONE &&
+        model->cadence_handoff_pending) {
+        if (normalized.layout_epoch !=
+            model->cadence_handoff_layout_epoch) {
+            normalized.dirty = full_region();
+        } else if (normalized.barrier) {
+            normalized.dirty = model->cadence_handoff_dirty;
+        } else {
+            normalized.dirty = merge_regions(
+                &model->cadence_handoff_dirty, &normalized.dirty);
+        }
+        normalized.barrier = 0;
+        model->cadence_handoff_dirty = empty_region();
+        model->cadence_handoff_layout_epoch = 0;
+        model->cadence_handoff_pending = 0;
     }
 
     request_to_slot(slot, &normalized);
@@ -450,6 +538,14 @@ int pj_display_worker_model_take_request_at(
     if (model->slots[slot].cadence_class == PJ_DISPLAY_CADENCE_SECONDS &&
         started_at_ms < model->slots[slot].cadence_deadline_ms) {
         return 0;
+    }
+    if (model->slots[slot].cadence_class == PJ_DISPLAY_CADENCE_SECONDS) {
+        model->slots[slot].cleanup_state = PJ_DISPLAY_CLEANUP_DEFERRED;
+    } else if (model->cleanup_pending &&
+               !model->slots[slot].barrier) {
+        model->slots[slot].cleanup_state =
+            model->slots[slot].dirty.partial ?
+            PJ_DISPLAY_CLEANUP_DEFERRED : PJ_DISPLAY_CLEANUP_SATISFY;
     }
     model->slots[slot].state = PJ_DISPLAY_WORKER_SLOT_DISPLAYING;
     *slot_index = slot;
@@ -555,6 +651,9 @@ void pj_display_worker_model_complete_at(pj_display_worker_model_t *model,
         if (model->slots[slot_index].cleanup_state ==
             PJ_DISPLAY_CLEANUP_PENDING) {
             model->cleanup_pending = 1;
+        } else if (model->slots[slot_index].cleanup_state ==
+                   PJ_DISPLAY_CLEANUP_SATISFY) {
+            model->cleanup_pending = 0;
         }
         clear_slot(&model->slots[slot_index]);
         return;
@@ -613,6 +712,9 @@ void pj_display_worker_model_shutdown(pj_display_worker_model_t *model)
     }
     model->accepting = 0;
     model->force_full_on_commit = 0;
+    model->cadence_handoff_dirty = empty_region();
+    model->cadence_handoff_layout_epoch = 0;
+    model->cadence_handoff_pending = 0;
     for (int i = 0; i < PJ_DISPLAY_WORKER_SLOT_COUNT; i++) {
         if (model->slots[i].state != PJ_DISPLAY_WORKER_SLOT_DISPLAYING) {
             clear_slot(&model->slots[i]);
@@ -690,6 +792,7 @@ int pj_display_worker_model_cadence_start(
 {
     if (model == NULL || !model->accepting || model->cadence_active ||
         first_sequence == 0 || first_deadline_ms == 0 ||
+        model->cadence_handoff_pending ||
         !pj_display_worker_model_is_idle(model)) {
         return 0;
     }
@@ -699,6 +802,7 @@ int pj_display_worker_model_cadence_start(
     model->cadence_expected_deadline_ms = first_deadline_ms;
     model->cadence_last_started_sequence = 0;
     model->cadence_last_committed_sequence = 0;
+    model->cadence_last_semantic_fault_sequence = 0;
     return 1;
 }
 
@@ -711,10 +815,13 @@ void pj_display_worker_model_cadence_end(pj_display_worker_model_t *model)
     for (int i = 0; i < PJ_DISPLAY_WORKER_SLOT_COUNT; i++) {
         if (model->slots[i].state == PJ_DISPLAY_WORKER_SLOT_READY &&
             model->slots[i].cadence_class == PJ_DISPLAY_CADENCE_SECONDS) {
-            if (!model->slots[i].cadence_fault_recorded) {
-                increment_saturated(&model->cadence_misses);
-            }
+            retain_cadence_handoff(model, &model->slots[i]);
             clear_slot(&model->slots[i]);
+        } else if (model->slots[i].state ==
+                       PJ_DISPLAY_WORKER_SLOT_WRITING &&
+                   model->slots[i].cadence_class ==
+                       PJ_DISPLAY_CADENCE_SECONDS) {
+            model->slots[i].cancel_on_commit = 1;
         }
     }
 }
@@ -758,10 +865,12 @@ void pj_display_worker_model_note_input_deferred(
 }
 
 void pj_display_worker_model_note_cadence_fault(
-    pj_display_worker_model_t *model)
+    pj_display_worker_model_t *model, uint32_t sequence)
 {
-    if (model != NULL) {
+    if (model != NULL && sequence != 0U &&
+        model->cadence_last_semantic_fault_sequence != sequence) {
         increment_saturated(&model->cadence_misses);
+        model->cadence_last_semantic_fault_sequence = sequence;
     }
 }
 
@@ -828,9 +937,16 @@ int pj_display_worker_rate_record_start(
 #include "pj_board.h"
 
 #define PJ_DISPLAY_WORKER_STACK_WORDS 4096
-#define PJ_DISPLAY_WORKER_PRIORITY 3
+/* Record/Playback run at priority 5.  Cadence take/start must preempt a
+ * buffered capture loop, while AUX input remains the highest UI task at 7. */
+#define PJ_DISPLAY_WORKER_PRIORITY 6
 #define PJ_DISPLAY_WORKER_RETRY_MIN_MS 250U
 #define PJ_DISPLAY_WORKER_RETRY_MAX_MS 2000U
+
+_Static_assert(PJ_DISPLAY_WORKER_PRIORITY > 5,
+               "display cadence must preempt audio capture");
+_Static_assert(PJ_DISPLAY_WORKER_PRIORITY < configMAX_PRIORITIES,
+               "display worker priority must fit FreeRTOS");
 
 static const char *TAG = "pj-display-worker";
 static pj_display_worker_model_t g_model;
@@ -933,7 +1049,7 @@ static void display_worker_task(void *argument)
 
         int success = request.barrier || pj_board_display_framebuffer_ex(
             &g_slots[slot], &request.dirty,
-            request.cadence_class == PJ_DISPLAY_CADENCE_SECONDS);
+            request.cleanup_state == PJ_DISPLAY_CLEANUP_DEFERRED);
         int cleanup_pending = !request.barrier &&
             pj_board_display_cleanup_pending();
         uint64_t committed_at_ms = monotonic_ms();
@@ -1125,10 +1241,10 @@ void pj_display_worker_note_input_deferred(void)
     portEXIT_CRITICAL(&g_lock);
 }
 
-void pj_display_worker_note_cadence_fault(void)
+void pj_display_worker_note_cadence_fault(uint32_t sequence)
 {
     portENTER_CRITICAL(&g_lock);
-    pj_display_worker_model_note_cadence_fault(&g_model);
+    pj_display_worker_model_note_cadence_fault(&g_model, sequence);
     portEXIT_CRITICAL(&g_lock);
 }
 
@@ -1195,8 +1311,9 @@ void pj_display_worker_note_input_deferred(void)
 {
 }
 
-void pj_display_worker_note_cadence_fault(void)
+void pj_display_worker_note_cadence_fault(uint32_t sequence)
 {
+    (void)sequence;
 }
 
 #endif

@@ -786,7 +786,15 @@ void pj_ui_wake(pj_ui_context_t *ctx)
 
 void pj_ui_sleep(pj_ui_context_t *ctx)
 {
-    ctx->record_state = PJ_RECORD_IDLE;
+    /* Leaving Record only requests an asynchronous worker stop.  Keep the
+     * semantic gate closed until the board publishes its AUDIO completion;
+     * otherwise a quick sleep/wake can re-arm against the old capture and
+     * inherit its elapsed duration.  ARMING has not started capture yet and
+     * can still be cancelled immediately. */
+    ctx->record_state =
+        ctx->record_state == PJ_RECORD_ACTIVE ||
+        ctx->record_state == PJ_RECORD_STOPPING ?
+        PJ_RECORD_STOPPING : PJ_RECORD_IDLE;
     ctx->playback_state = PJ_PLAYBACK_IDLE;
     set_state(ctx, PJ_UI_STATE_STATIC);
 }
@@ -1076,6 +1084,17 @@ void pj_ui_set_audio_state(pj_ui_context_t *ctx, int recording, int playback_act
 
     ctx->record_state = next_record;
     ctx->playback_state = next_playback;
+    if (next_record == PJ_RECORD_IDLE) {
+        ctx->recording_seconds = 0;
+    }
+    if (previous_record == PJ_RECORD_STOPPING &&
+        next_record == PJ_RECORD_IDLE &&
+        ctx->state != PJ_UI_STATE_RECORD) {
+        /* Record controls become enabled without changing pixels.  Advance
+         * the semantic generation so an input captured while the old worker
+         * was still stopping cannot be replayed after its AUDIO ack. */
+        interaction_changed(ctx);
+    }
     if (previous_record != PJ_RECORD_IDLE && next_record == PJ_RECORD_IDLE &&
         ctx->state == PJ_UI_STATE_RECORD) {
         set_state(ctx, PJ_UI_STATE_HOME);
@@ -1114,7 +1133,10 @@ void pj_ui_set_recording_elapsed(pj_ui_context_t *ctx, uint64_t elapsed_ms)
     }
     uint64_t elapsed_seconds = elapsed_ms / 1000u;
     int seconds = elapsed_seconds > INT_MAX ? INT_MAX : (int)elapsed_seconds;
-    if (ctx->record_state != PJ_RECORD_IDLE && seconds < ctx->recording_seconds) {
+    if (ctx->record_state == PJ_RECORD_IDLE ||
+        ctx->record_state == PJ_RECORD_ARMING) {
+        seconds = 0;
+    } else if (seconds < ctx->recording_seconds) {
         return;
     }
     if (ctx->recording_seconds == seconds) {

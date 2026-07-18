@@ -29,6 +29,7 @@ typedef enum {
     PJ_DISPLAY_CLEANUP_NONE = 0,
     PJ_DISPLAY_CLEANUP_DEFERRED,
     PJ_DISPLAY_CLEANUP_PENDING,
+    PJ_DISPLAY_CLEANUP_SATISFY,
 } pj_display_cleanup_state_t;
 
 typedef struct {
@@ -58,6 +59,7 @@ typedef struct {
     pj_display_cleanup_state_t cleanup_state;
     int barrier;
     int cadence_fault_recorded;
+    int cancel_on_commit;
 } pj_display_worker_slot_t;
 
 typedef struct {
@@ -86,8 +88,12 @@ typedef struct {
     uint32_t cadence_expected_commit_sequence;
     uint32_t cadence_last_started_sequence;
     uint32_t cadence_last_committed_sequence;
+    uint32_t cadence_last_semantic_fault_sequence;
     uint64_t cadence_expected_deadline_ms;
     uint32_t cleanup_deferred_frames;
+    pj_ui_dirty_region_t cadence_handoff_dirty;
+    uint32_t cadence_handoff_layout_epoch;
+    int cadence_handoff_pending;
     int cadence_active;
     int cleanup_pending;
     int accepting;
@@ -158,7 +164,7 @@ void pj_display_worker_model_note_rate_deferred(
 void pj_display_worker_model_note_input_deferred(
     pj_display_worker_model_t *model);
 void pj_display_worker_model_note_cadence_fault(
-    pj_display_worker_model_t *model);
+    pj_display_worker_model_t *model, uint32_t sequence);
 int pj_display_worker_model_cadence_start(
     pj_display_worker_model_t *model, uint32_t first_sequence,
     uint64_t first_deadline_ms);
@@ -195,7 +201,7 @@ int pj_display_worker_is_idle(void);
 uint32_t pj_display_worker_committed_frames(void);
 pj_display_worker_status_t pj_display_worker_status(void);
 void pj_display_worker_note_input_deferred(void);
-void pj_display_worker_note_cadence_fault(void);
+void pj_display_worker_note_cadence_fault(uint32_t sequence);
 
 #ifdef __cplusplus
 }

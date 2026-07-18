@@ -527,12 +527,35 @@ static void test_deferred_metrics_are_explicit(void)
     pj_display_worker_model_init(&model);
     pj_display_worker_model_note_rate_deferred(&model);
     pj_display_worker_model_note_input_deferred(&model);
-    pj_display_worker_model_note_cadence_fault(&model);
+    pj_display_worker_model_note_cadence_fault(&model, 1U);
     pj_display_worker_status_t status =
         pj_display_worker_model_status(&model);
     assert(status.rate_deferred_frames == 1);
     assert(status.input_deferred_events == 1);
     assert(status.cadence_misses == 1);
+}
+
+static void test_semantic_cadence_fault_is_latched_per_sequence(void)
+{
+    pj_display_worker_model_t model;
+    pj_display_worker_model_init(&model);
+    assert(pj_display_worker_model_cadence_start(&model, 1U, 1000U));
+
+    for (int retry = 0; retry < 20; retry++) {
+        pj_display_worker_model_note_cadence_fault(&model, 1U);
+    }
+    pj_display_worker_model_note_cadence_fault(&model, 0U);
+    assert(pj_display_worker_model_status(&model).cadence_misses == 1U);
+
+    for (int retry = 0; retry < 20; retry++) {
+        pj_display_worker_model_note_cadence_fault(&model, 2U);
+    }
+    assert(pj_display_worker_model_status(&model).cadence_misses == 2U);
+
+    pj_display_worker_model_cadence_end(&model);
+    assert(pj_display_worker_model_cadence_start(&model, 1U, 3000U));
+    pj_display_worker_model_note_cadence_fault(&model, 1U);
+    assert(pj_display_worker_model_status(&model).cadence_misses == 3U);
 }
 
 static void test_generation_order_survives_wrap(void)
@@ -682,6 +705,217 @@ static void test_pending_pixels_survive_newer_barrier(void)
     assert(!taken.barrier);
     assert(taken.dirty.partial && taken.dirty.x == 20);
     assert(taken.interaction_generation == 9);
+}
+
+static pj_display_worker_request_t cadence_request_for(
+    const pj_ui_dirty_region_t *dirty, uint32_t sequence,
+    uint64_t deadline_ms)
+{
+    pj_display_worker_request_t request = request_for(dirty, 9, 30);
+    request.cadence_class = PJ_DISPLAY_CADENCE_SECONDS;
+    request.cadence_sequence = sequence;
+    request.cadence_deadline_ms = deadline_ms;
+    return request;
+}
+
+static void test_cadence_backpressure_does_not_inflate_misses(void)
+{
+    pj_display_worker_model_t model;
+    pj_display_worker_model_init(&model);
+    pj_ui_dirty_region_t dirty = partial_region(10, 10, 20, 20);
+    assert(pj_display_worker_model_cadence_start(&model, 1, 1000));
+    pj_display_worker_request_t first = cadence_request_for(
+        &dirty, 1, 1000);
+    int first_slot;
+    (void)submit_request(&model, &first, &first_slot);
+
+    int rejected_slot = -1;
+    for (int retry = 0; retry < 10; retry++) {
+        assert(!pj_display_worker_model_begin_submit_request(
+            &model, &first, &rejected_slot));
+    }
+    pj_display_worker_request_t second = cadence_request_for(
+        &dirty, 2, 2000);
+    for (int retry = 0; retry < 10; retry++) {
+        assert(!pj_display_worker_model_begin_submit_request(
+            &model, &second, &rejected_slot));
+    }
+    assert(pj_display_worker_model_status(&model).cadence_misses == 0);
+
+    pj_display_worker_request_t taken;
+    assert(pj_display_worker_model_take_request_at(
+        &model, &first_slot, &taken, NULL, 1000));
+    int second_slot;
+    (void)submit_request(&model, &second, &second_slot);
+    for (int retry = 0; retry < 10; retry++) {
+        assert(!pj_display_worker_model_begin_submit_request(
+            &model, &second, &rejected_slot));
+    }
+    assert(pj_display_worker_model_status(&model).cadence_misses == 0);
+
+    pj_display_worker_model_complete_at(&model, first_slot, 1, 1600);
+    assert(pj_display_worker_model_take_request_at(
+        &model, &second_slot, &taken, NULL, 2000));
+    pj_display_worker_model_complete_at(&model, second_slot, 1, 2600);
+    assert(pj_display_worker_model_status(&model).cadence_misses == 0);
+}
+
+static void test_cadence_cancel_handoffs_ready_pixels_without_a_miss(void)
+{
+    pj_display_worker_model_t model;
+    pj_display_worker_model_init(&model);
+    pj_ui_dirty_region_t cadence_dirty = partial_region(10, 20, 30, 40);
+    pj_ui_dirty_region_t pause_dirty = partial_region(100, 120, 20, 30);
+    assert(pj_display_worker_model_cadence_start(&model, 1, 1000));
+
+    pj_display_worker_request_t cadence = cadence_request_for(
+        &cadence_dirty, 1, 1000);
+    int cadence_slot;
+    (void)submit_request(&model, &cadence, &cadence_slot);
+    assert(model.slots[cadence_slot].state ==
+           PJ_DISPLAY_WORKER_SLOT_READY);
+
+    pj_display_worker_model_cadence_end(&model);
+    pj_display_worker_status_t status =
+        pj_display_worker_model_status(&model);
+    assert(!status.cadence_active);
+    assert(status.cadence_misses == 0);
+    assert(model.cadence_handoff_pending);
+    assert(!pj_display_worker_model_cadence_start(&model, 1, 2000));
+
+    pj_display_worker_request_t pause = request_for(
+        &pause_dirty, 9, 31);
+    int pause_slot;
+    (void)submit_request(&model, &pause, &pause_slot);
+    assert(!model.cadence_handoff_pending);
+    pj_display_worker_request_t taken;
+    assert(pj_display_worker_model_take_request_at(
+        &model, &pause_slot, &taken, NULL, 1000));
+    assert(taken.cadence_class == PJ_DISPLAY_CADENCE_NONE);
+    assert(taken.dirty.partial);
+    assert(taken.dirty.x == 10 && taken.dirty.y == 20);
+    assert(taken.dirty.width == 110 && taken.dirty.height == 130);
+    pj_display_worker_model_complete_at(&model, pause_slot, 1, 1600);
+    assert(pj_display_worker_model_cadence_start(&model, 1, 2000));
+}
+
+static void test_cadence_cancel_queues_ordinary_behind_physical_frame(void)
+{
+    pj_display_worker_model_t model;
+    pj_display_worker_model_init(&model);
+    pj_ui_dirty_region_t first_dirty = partial_region(10, 10, 20, 20);
+    pj_ui_dirty_region_t canceled_dirty = partial_region(40, 40, 20, 20);
+    pj_ui_dirty_region_t navigation_dirty = partial_region(80, 80, 20, 20);
+    assert(pj_display_worker_model_cadence_start(&model, 1, 1000));
+
+    pj_display_worker_request_t first = cadence_request_for(
+        &first_dirty, 1, 1000);
+    int active_slot;
+    (void)submit_request(&model, &first, &active_slot);
+    pj_display_worker_request_t taken;
+    assert(pj_display_worker_model_take_request_at(
+        &model, &active_slot, &taken, NULL, 1000));
+
+    pj_display_worker_request_t canceled = cadence_request_for(
+        &canceled_dirty, 2, 2000);
+    int canceled_slot;
+    (void)submit_request(&model, &canceled, &canceled_slot);
+    assert(canceled_slot != active_slot);
+
+    pj_display_worker_model_cadence_end(&model);
+    assert(model.slots[active_slot].state ==
+           PJ_DISPLAY_WORKER_SLOT_DISPLAYING);
+    assert(model.slots[canceled_slot].state ==
+           PJ_DISPLAY_WORKER_SLOT_FREE);
+    assert(pj_display_worker_model_status(&model).cadence_misses == 0);
+
+    pj_display_worker_request_t navigation = request_for(
+        &navigation_dirty, 9, 31);
+    int navigation_slot;
+    (void)submit_request(&model, &navigation, &navigation_slot);
+    assert(navigation_slot == canceled_slot);
+    assert(!pj_display_worker_model_take_request_at(
+        &model, &navigation_slot, &taken, NULL, 1100));
+
+    pj_display_worker_model_complete_at(&model, active_slot, 1, 1600);
+    assert(pj_display_worker_model_take_request_at(
+        &model, &navigation_slot, &taken, NULL, 1600));
+    assert(taken.cadence_class == PJ_DISPLAY_CADENCE_NONE);
+    assert(taken.dirty.partial);
+    assert(taken.dirty.x == 40 && taken.dirty.y == 40);
+    assert(taken.dirty.width == 60 && taken.dirty.height == 60);
+    pj_display_worker_model_complete_at(
+        &model, navigation_slot, 1, 2200);
+
+    pj_display_worker_status_t status =
+        pj_display_worker_model_status(&model);
+    assert(status.cadence_starts == 1);
+    assert(status.cadence_commits == 1);
+    assert(status.cadence_last_committed_sequence == 1);
+    assert(status.cadence_misses == 0);
+    assert(status.ordering_errors == 0);
+    assert(status.committed_interaction_generation == 31);
+}
+
+static void test_cadence_cancel_during_copy_is_intentional(void)
+{
+    pj_display_worker_model_t model;
+    pj_display_worker_model_init(&model);
+    pj_ui_dirty_region_t dirty = partial_region(10, 10, 20, 20);
+    assert(pj_display_worker_model_cadence_start(&model, 1, 1000));
+    pj_display_worker_request_t cadence = cadence_request_for(
+        &dirty, 1, 1000);
+
+    int slot;
+    assert(pj_display_worker_model_begin_submit_request(
+        &model, &cadence, &slot));
+    assert(model.slots[slot].state == PJ_DISPLAY_WORKER_SLOT_WRITING);
+    pj_display_worker_model_cadence_end(&model);
+    assert(model.slots[slot].state == PJ_DISPLAY_WORKER_SLOT_WRITING);
+    assert(model.slots[slot].cancel_on_commit);
+    assert(!pj_display_worker_model_commit_submit_request(
+        &model, slot, &cadence, NULL));
+    assert(pj_display_worker_model_is_idle(&model));
+    assert(pj_display_worker_model_status(&model).cadence_misses == 0);
+}
+
+static void test_cleanup_waits_for_successful_full_handoff(void)
+{
+    pj_display_worker_model_t model;
+    pj_display_worker_model_init(&model);
+    pj_ui_dirty_region_t partial = partial_region(40, 40, 80, 80);
+    pj_ui_dirty_region_t full = full_region();
+    assert(pj_display_worker_model_cadence_start(&model, 1, 1000));
+    pj_display_worker_model_cleanup_due(&model);
+    pj_display_worker_model_cadence_end(&model);
+    assert(pj_display_worker_model_status(&model).cleanup_pending);
+
+    pj_display_worker_request_t pause = request_for(&partial, 9, 31);
+    int slot;
+    (void)submit_request(&model, &pause, &slot);
+    pj_display_worker_request_t taken;
+    assert(pj_display_worker_model_take_request_at(
+        &model, &slot, &taken, NULL, 1000));
+    assert(taken.dirty.partial);
+    assert(taken.cleanup_state == PJ_DISPLAY_CLEANUP_DEFERRED);
+    pj_display_worker_model_complete_at(&model, slot, 1, 1600);
+    assert(pj_display_worker_model_status(&model).cleanup_pending);
+
+    pj_display_worker_request_t navigation = request_for(&full, 10, 32);
+    (void)submit_request(&model, &navigation, &slot);
+    assert(pj_display_worker_model_take_request_at(
+        &model, &slot, &taken, NULL, 1700));
+    assert(!taken.dirty.partial);
+    assert(taken.cleanup_state == PJ_DISPLAY_CLEANUP_SATISFY);
+    pj_display_worker_model_complete_at(&model, slot, 0, 1800);
+    assert(pj_display_worker_model_status(&model).cleanup_pending);
+
+    assert(pj_display_worker_model_take_request_at(
+        &model, &slot, &taken, NULL, 2000));
+    assert(!taken.dirty.partial);
+    assert(taken.cleanup_state == PJ_DISPLAY_CLEANUP_SATISFY);
+    pj_display_worker_model_complete_at(&model, slot, 1, 3800);
+    assert(!pj_display_worker_model_status(&model).cleanup_pending);
 }
 
 static void test_hard_cadence_commits_120_consecutive_seconds(void)
@@ -852,12 +1086,18 @@ int main(void)
     test_touch_contact_before_commit_is_rejected_after_stabilizing();
     test_partial_rate_limit_is_global_and_size_independent();
     test_deferred_metrics_are_explicit();
+    test_semantic_cadence_fault_is_latched_per_sequence();
     test_generation_order_survives_wrap();
     test_same_layout_semantics_remain_partial();
     test_cross_layout_coalescing_promotes_full();
     test_cross_layout_after_commit_promotes_full();
     test_barrier_commits_interaction_without_pixels();
     test_pending_pixels_survive_newer_barrier();
+    test_cadence_backpressure_does_not_inflate_misses();
+    test_cadence_cancel_handoffs_ready_pixels_without_a_miss();
+    test_cadence_cancel_queues_ordinary_behind_physical_frame();
+    test_cadence_cancel_during_copy_is_intentional();
+    test_cleanup_waits_for_successful_full_handoff();
     test_hard_cadence_commits_120_consecutive_seconds();
     test_deferred_cleanup_metadata_is_informational();
     test_cadence_lateness_and_overrun_are_faults();

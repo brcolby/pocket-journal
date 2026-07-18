@@ -141,7 +141,10 @@ assert.match(appMain, /pj_loop_schedule_poll\(\s*&schedule, monotonic_ms\(\)\s*\
 assert.match(appMain, /if \(due\.second_due && !g_seconds_cadence\.active\)/);
 assert.match(appMain, /service_seconds_cadence\(&g_ui, now_ms\)/);
 assert.match(appMain, /pj_display_worker_cadence_start\(1, first_deadline\)/);
-assert.match(appMain, /pj_ui_set_recording_elapsed\(ui, status\.recording_elapsed_ms\)/);
+assert.match(
+  appMain,
+  /pj_ui_set_recording_elapsed\(\s*ui, status\.recording \? status\.recording_elapsed_ms : 0\)/,
+);
 assert.match(appMain, /dynamic_changed \|= pj_board_update_time_state\(&g_ui\)/);
 
 assert.match(
@@ -181,12 +184,13 @@ const cadenceEndSource = appMain.slice(
   appMain.indexOf("static void reconcile_seconds_cadence"),
 );
 assert.match(cadenceEndSource, /pj_display_worker_cadence_end\(\)/);
-assert.match(cadenceEndSource, /if \(cleanup_promoted\)[\s\S]*pj_ui_request_full_presentation\(ui\)/);
+assert.doesNotMatch(cadenceEndSource, /pj_display_worker_take_cleanup_pending/);
+assert.doesNotMatch(cadenceEndSource, /pj_ui_request_full_presentation\(ui\)/);
 assert.match(cadenceEndSource, /\(void\)render_and_submit_if_changed\(ui\)/);
 assert.ok(
   cadenceEndSource.indexOf("render_and_submit_if_changed(ui)") >
-    cadenceEndSource.indexOf("if (cleanup_promoted)"),
-  "cadence exit must always drain pause/reset/navigation after optional cleanup promotion",
+    cadenceEndSource.indexOf("pj_display_worker_cadence_end()"),
+  "cadence exit must immediately hand pause/reset/navigation to the ordinary path",
 );
 
 const recordArmingSource = appMain.slice(

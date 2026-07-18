@@ -511,6 +511,8 @@ static void test_record_arming_and_back_contract(void)
     assert(context.state == PJ_UI_STATE_RECORD);
     assert(context.record_state == PJ_RECORD_ARMING);
     assert(context.recording_seconds == 0);
+    pj_ui_set_recording_elapsed(&context, 5000);
+    assert(context.recording_seconds == 0);
 
     pj_framebuffer_t arming;
     pj_ui_compose_frame(&context, &arming);
@@ -538,9 +540,48 @@ static void test_record_arming_and_back_contract(void)
     assert(context.record_state == PJ_RECORD_STOPPING);
     pj_ui_set_audio_state(&context, 0, 0);
     assert(context.record_state == PJ_RECORD_IDLE);
+    assert(context.recording_seconds == 0);
+    pj_ui_set_recording_elapsed(&context, 60000);
+    assert(context.recording_seconds == 0);
 }
 
-static void test_playback_uses_only_full_screen_play_and_pause(void)
+static void test_record_sleep_waits_for_audio_ack_before_reentry(void)
+{
+    pj_ui_context_t context;
+    navigate_home_to(&context, PJ_LAYOUT_SLOT_HOME_NOTES);
+    assert(tap_slot(&context, PJ_LAYOUT_NOTES_3_1M,
+                    PJ_LAYOUT_SLOT_NOTES_RECORD));
+    pj_ui_set_audio_state(&context, 1, 0);
+    pj_ui_set_recording_elapsed(&context, 6000);
+    assert(context.record_state == PJ_RECORD_ACTIVE);
+    assert(context.recording_seconds == 6);
+
+    pj_ui_sleep(&context);
+    assert(context.state == PJ_UI_STATE_STATIC);
+    assert(context.record_state == PJ_RECORD_STOPPING);
+    pj_ui_wake(&context);
+    assert(context.state == PJ_UI_STATE_HOME);
+    assert(context.record_state == PJ_RECORD_STOPPING);
+    assert(!pj_ui_handle_aux_double(&context));
+
+    assert(tap_slot(&context, PJ_LAYOUT_HOME_3_1,
+                    PJ_LAYOUT_SLOT_HOME_NOTES));
+    assert(!tap_slot(&context, PJ_LAYOUT_NOTES_3_1M,
+                     PJ_LAYOUT_SLOT_NOTES_RECORD));
+    assert(context.state == PJ_UI_STATE_NOTES);
+
+    uint32_t stopping_interaction = context.interaction_generation;
+    pj_ui_set_audio_state(&context, 0, 0);
+    assert(context.record_state == PJ_RECORD_IDLE);
+    assert(context.recording_seconds == 0);
+    assert(context.interaction_generation != stopping_interaction);
+    assert(tap_slot(&context, PJ_LAYOUT_NOTES_3_1M,
+                    PJ_LAYOUT_SLOT_NOTES_RECORD));
+    assert(context.record_state == PJ_RECORD_ARMING);
+    assert(context.recording_seconds == 0);
+}
+
+static void test_playback_uses_only_compact_play_and_pause(void)
 {
     pj_ui_context_t context;
     navigate_home_to(&context, PJ_LAYOUT_SLOT_HOME_NOTES);
@@ -1368,7 +1409,8 @@ int main(void)
     test_geometry_is_exhaustive_and_navigation_is_fixed();
     test_state_metadata_and_deterministic_composition();
     test_record_arming_and_back_contract();
-    test_playback_uses_only_full_screen_play_and_pause();
+    test_record_sleep_waits_for_audio_ack_before_reentry();
+    test_playback_uses_only_compact_play_and_pause();
     test_case_punctuation_and_long_transcript();
     test_note_pages_selection_and_content_partials();
     test_audio_note_timestamps_are_compact();

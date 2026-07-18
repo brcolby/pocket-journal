@@ -934,13 +934,21 @@ static void recording_state_finish_capture(int succeeded)
     portEXIT_CRITICAL(&g_recording_lock);
 }
 
-static void recording_publish_completion(void)
+static int recording_take_completion(int *succeeded)
 {
-    int succeeded = 0;
     int completed;
+    if (succeeded == NULL) {
+        return 0;
+    }
+    *succeeded = 0;
     portENTER_CRITICAL(&g_recording_lock);
-    completed = pj_recording_take_completion(&g_recording, &succeeded);
+    completed = pj_recording_take_completion(&g_recording, succeeded);
     portEXIT_CRITICAL(&g_recording_lock);
+    return completed;
+}
+
+static void recording_publish_completion_result(int completed, int succeeded)
+{
     if (!completed) {
         return;
     }
@@ -950,6 +958,13 @@ static void recording_publish_completion(void)
         board_status_set_error_if_empty(
             "recording failed before a valid note was published");
     }
+}
+
+static void recording_publish_completion(void)
+{
+    int succeeded = 0;
+    int completed = recording_take_completion(&succeeded);
+    recording_publish_completion_result(completed, succeeded);
 }
 
 static pj_time_activity_t board_time_activity(void)
@@ -4109,10 +4124,14 @@ static void refresh_ui_sync_state(pj_ui_context_t *ui)
     if (ui == NULL || pj_ui_current_state(ui) == PJ_UI_STATE_SYNC) {
         return;
     }
+    pj_board_status_t status = board_status_snapshot_base();
     int pending = 0;
     int transferred = 0;
-    collect_sync_counts(&pending, &transferred);
-    pj_board_status_t status = board_status_snapshot_base();
+    /* Present the coherent cache immediately and let the inventory worker
+     * refresh it.  UI/status work must never synchronously walk the SD card. */
+    collect_sync_counts_nonblocking(
+        &pending, &transferred,
+        status.storage == PJ_BOARD_SERVICE_READY);
     pj_ui_set_sync_state(ui, pending, transferred,
                          status.wifi == PJ_BOARD_SERVICE_READY);
 }
@@ -4515,6 +4534,13 @@ static void refresh_ui_notes_from_sd(pj_ui_context_t *ui)
     ESP_LOGI(TAG, "%s note list refreshed: visible=%d playable=%d",
              transcript_view ? "Transcript" : "Audio", displayed, count);
     pj_ui_set_notes(ui, displayed, labels);
+}
+
+static int ui_state_uses_note_inventory(pj_ui_state_t state)
+{
+    return state == PJ_UI_STATE_LISTEN ||
+           state == PJ_UI_STATE_READ ||
+           state == PJ_UI_STATE_NOTE_DETAIL;
 }
 
 static int i2c_take(TickType_t timeout)
@@ -6402,18 +6428,26 @@ static void record_task_exit(int sync_resume_needed)
         xSemaphoreGive(g_audio_lock);
     }
     record_storage_release();
-    if (sync_resume_needed && !pj_board_companion_sync_resume()) {
-        ESP_LOGW(TAG,
-                 "Unable to resume queued Sync after recording publication");
-    }
-    recording_publish_completion();
-    board_audio_state_set(0, -1);
-    alert_audio_set_recording(0);
-    board_update_publish(BOARD_UPDATE_AUDIO);
+    /* Take the durable completion before releasing the lifecycle for another
+     * capture, but publish the cheap AUDIO transition before NOTES.  The UI
+     * can leave Record immediately; inventory projection remains background
+     * work and cannot hold up cadence cancellation or navigation. */
+    int recording_succeeded = 0;
+    int recording_completed =
+        recording_take_completion(&recording_succeeded);
     if (audio_lifecycle_take()) {
         g_record_task = NULL;
         pj_audio_lifecycle_finish_record(&g_audio_lifecycle);
         audio_lifecycle_give();
+    }
+    board_audio_state_set(0, -1);
+    alert_audio_set_recording(0);
+    board_update_publish(BOARD_UPDATE_AUDIO);
+    recording_publish_completion_result(
+        recording_completed, recording_succeeded);
+    if (sync_resume_needed && !pj_board_companion_sync_resume()) {
+        ESP_LOGW(TAG,
+                 "Unable to resume queued Sync after recording publication");
     }
     vTaskDelete(NULL);
 }
@@ -7559,7 +7593,15 @@ void pj_board_refresh_status(pj_ui_context_t *ui)
                      status.humidity_percent);
 #ifdef ESP_PLATFORM
     if (status.storage == PJ_BOARD_SERVICE_READY) {
-        refresh_ui_notes_from_sd(ui);
+        /*
+         * Directory probing is intentionally demand-driven.  In particular,
+         * publishing a recording must not make the main UI task rescan every
+         * note while it is trying to leave Record.  Entering Listen/Read calls
+         * pj_board_refresh_notes(), and visible note screens stay current here.
+         */
+        if (ui_state_uses_note_inventory(pj_ui_current_state(ui))) {
+            refresh_ui_notes_from_sd(ui);
+        }
         refresh_ui_sync_state(ui);
     }
 #endif
@@ -7605,6 +7647,11 @@ int pj_board_consume_notes_update(pj_ui_context_t *ui)
     pj_board_status_t status = pj_board_status();
     if (status.storage != PJ_BOARD_SERVICE_READY) {
         board_update_publish(BOARD_UPDATE_NOTES);
+        return 0;
+    }
+    if (!ui_state_uses_note_inventory(pj_ui_current_state(ui))) {
+        /* The durable update has already landed.  Defer the comparatively
+         * expensive directory projection until a note-list screen needs it. */
         return 0;
     }
     refresh_ui_notes_from_sd(ui);

@@ -39,9 +39,9 @@ typedef struct {
     seconds_clock_t clock;
     uint32_t sequence;
     uint32_t last_submitted_sequence;
+    uint32_t last_fault_logged_sequence;
     uint64_t deadline_ms;
     int active;
-    int ending;
 } seconds_cadence_t;
 
 static seconds_cadence_t g_seconds_cadence;
@@ -100,7 +100,7 @@ static int compose_and_submit(pj_ui_context_t *ui,
         &g_presenter, ui, &revision, &frame);
     if (result == PJ_UI_FRAME_IDLE) {
         if (cadence_class == PJ_DISPLAY_CADENCE_SECONDS) {
-            pj_display_worker_note_cadence_fault();
+            pj_display_worker_note_cadence_fault(cadence_sequence);
             return 0;
         }
         return 1;
@@ -111,7 +111,7 @@ static int compose_and_submit(pj_ui_context_t *ui,
     }
     if (result == PJ_UI_FRAME_NOOP &&
         cadence_class == PJ_DISPLAY_CADENCE_SECONDS) {
-        pj_display_worker_note_cadence_fault();
+        pj_display_worker_note_cadence_fault(cadence_sequence);
     }
     uint32_t sync_ui_generation = current == PJ_UI_STATE_SYNC ?
         pj_ui_sync_presentation_generation(ui) : 0;
@@ -181,12 +181,22 @@ static void sync_ui_audio_from_board(pj_ui_context_t *ui)
 {
     pj_board_status_t status = pj_board_status();
     pj_ui_set_audio_state(ui, status.recording, status.playback_active);
-    pj_ui_set_recording_elapsed(ui, status.recording_elapsed_ms);
+    /*
+     * The recording model intentionally retains the completed capture length
+     * until the next capture starts.  That retained value is useful to the
+     * storage/audio layer, but it is not the elapsed projection for a newly
+     * arming Record screen.  Project zero whenever capture is inactive so a
+     * fresh 00:00 frame cannot inherit the previous note's duration.
+     */
+    pj_ui_set_recording_elapsed(
+        ui, status.recording ? status.recording_elapsed_ms : 0);
 }
 
 static void apply_board_state_effects(pj_ui_state_t previous, pj_ui_state_t current, const pj_board_event_t *event)
 {
-    if (previous == PJ_UI_STATE_RECORD && current != PJ_UI_STATE_RECORD) {
+    int record_exit = previous == PJ_UI_STATE_RECORD &&
+        current != PJ_UI_STATE_RECORD;
+    if (record_exit) {
         set_recording_active(0);
     } else if (current == PJ_UI_STATE_RECORD && g_ui.record_state == PJ_RECORD_STOPPING &&
                (event->type == PJ_BOARD_EVENT_AUX_SHORT || event->type == PJ_BOARD_EVENT_AUX_LONG)) {
@@ -203,7 +213,12 @@ static void apply_board_state_effects(pj_ui_state_t previous, pj_ui_state_t curr
     } else if (state_is_playback(current)) {
         set_playback_active(g_ui.playback_state == PJ_PLAYBACK_ACTIVE, g_ui.selected_note);
     }
-    sync_ui_audio_from_board(&g_ui);
+    /* Record exit is a logical/UI transition, not a save-completion wait.
+     * The recording worker publishes AUDIO when durable raw publication has
+     * finished; polling its status here can only delay cadence cancellation. */
+    if (!record_exit) {
+        sync_ui_audio_from_board(&g_ui);
+    }
 }
 
 static seconds_clock_t desired_seconds_clock(const pj_ui_context_t *ui)
@@ -233,16 +248,12 @@ static void end_seconds_cadence(pj_ui_context_t *ui)
     pj_display_worker_status_t before = pj_display_worker_status();
     pj_display_worker_cadence_end();
     g_seconds_cadence = (seconds_cadence_t) {0};
-    int cleanup_promoted = pj_display_worker_take_cleanup_pending();
-    if (cleanup_promoted) {
-        pj_ui_request_full_presentation(ui);
-    }
     /*
-     * A pause, reset, or navigation mutation can arrive while the final
-     * cadence frame is still physical.  Ordinary presentation is suppressed
-     * until that frame commits, so always drain the current UI snapshot when
-     * releasing the reservation.  A deferred cleanup merely promotes this
-     * same handoff to full.
+     * An intentional pause, reset, or navigation cancels any queued cadence
+     * snapshot immediately.  The worker retains its exact pixel delta and
+     * merges it into this ordinary handoff while an in-flight physical frame
+     * is allowed to finish.  Cleanup stays deferred across a same-layout
+     * pause and is satisfied by the next successful navigation/full frame.
      */
     (void)render_and_submit_if_changed(ui);
     ESP_LOGI(TAG,
@@ -250,13 +261,13 @@ static void end_seconds_cadence(pj_ui_context_t *ui)
              " last_committed=%" PRIu32 " starts=%" PRIu32
              " commits=%" PRIu32 " late_max_ms=%" PRIu32
              " overruns=%" PRIu32 " misses=%" PRIu32
-             " cleanup_deferred=%" PRIu32 " cleanup_promoted=%d",
+             " cleanup_deferred=%" PRIu32 " cleanup_pending=%d",
              seconds_clock_name(ended.clock), ended.last_submitted_sequence,
              before.cadence_last_committed_sequence,
              before.cadence_starts, before.cadence_commits,
              before.cadence_max_start_lateness_ms,
              before.cadence_overruns, before.cadence_misses,
-             before.cleanup_deferred_frames, cleanup_promoted);
+             before.cleanup_deferred_frames, before.cleanup_pending);
 }
 
 static void reconcile_seconds_cadence(pj_ui_context_t *ui, uint64_t now_ms)
@@ -264,13 +275,7 @@ static void reconcile_seconds_cadence(pj_ui_context_t *ui, uint64_t now_ms)
     seconds_clock_t desired = desired_seconds_clock(ui);
     if (g_seconds_cadence.active &&
         g_seconds_cadence.clock != desired) {
-        g_seconds_cadence.ending = 1;
-        pj_display_worker_status_t status = pj_display_worker_status();
-        if (g_seconds_cadence.last_submitted_sequence == 0 ||
-            status.cadence_last_committed_sequence ==
-                g_seconds_cadence.last_submitted_sequence) {
-            end_seconds_cadence(ui);
-        }
+        end_seconds_cadence(ui);
         return;
     }
     if (desired == PJ_SECONDS_CLOCK_NONE || g_seconds_cadence.active) return;
@@ -308,6 +313,14 @@ static int service_record_arming(pj_ui_context_t *ui)
         status.committed_layout_epoch != pj_ui_layout_epoch(ui)) {
         return 0;
     }
+    /* A prior capture can still be finalizing after an asynchronous exit.
+     * Do not interpret pj_board_record_set_active()'s idempotent success for
+     * that worker as a successful new arm.  record_task_exit clears the
+     * lifecycle before it clears this status bit, so false is the safe point
+     * at which a new recording can be started. */
+    if (pj_board_status().recording) {
+        return 0;
+    }
     g_record_arm_display_generation = 0;
     set_recording_active(1);
     sync_ui_audio_from_board(ui);
@@ -324,7 +337,7 @@ static int service_record_arming(pj_ui_context_t *ui)
 
 static int service_seconds_cadence(pj_ui_context_t *ui, uint64_t now_ms)
 {
-    if (!g_seconds_cadence.active || g_seconds_cadence.ending ||
+    if (!g_seconds_cadence.active ||
         now_ms < g_seconds_cadence.deadline_ms) {
         return 0;
     }
@@ -333,13 +346,30 @@ static int service_seconds_cadence(pj_ui_context_t *ui, uint64_t now_ms)
     (void)pj_board_update_time_state(ui);
     (void)pj_board_tick_time(ui);
 
+    /*
+     * Board projection can end Record asynchronously (capture failure or
+     * completion) or resolve a time command while servicing this deadline.
+     * Release the old reservation and compose the resulting ordinary scene;
+     * never mislabel that navigation/state transition as a cadence frame.
+     */
+    if (desired_seconds_clock(ui) != g_seconds_cadence.clock) {
+        reconcile_seconds_cadence(ui, monotonic_ms());
+        return 1;
+    }
+
     uint32_t sequence = g_seconds_cadence.sequence;
     uint64_t deadline = g_seconds_cadence.deadline_ms;
     if (!compose_and_submit(ui, PJ_DISPLAY_CADENCE_SECONDS,
                             sequence, deadline)) {
-        ESP_LOGE(TAG, "Seconds cadence submission fault clock=%d sequence=%" PRIu32
-                 " deadline_ms=%" PRIu64 " now_ms=%" PRIu64,
-                 (int)g_seconds_cadence.clock, sequence, deadline, now_ms);
+        if (g_seconds_cadence.last_fault_logged_sequence != sequence) {
+            g_seconds_cadence.last_fault_logged_sequence = sequence;
+            ESP_LOGE(TAG,
+                     "Seconds cadence submission delayed clock=%d"
+                     " sequence=%" PRIu32 " deadline_ms=%" PRIu64
+                     " now_ms=%" PRIu64,
+                     (int)g_seconds_cadence.clock, sequence,
+                     deadline, now_ms);
+        }
         return 0;
     }
     g_seconds_cadence.last_submitted_sequence = sequence;
@@ -549,6 +579,10 @@ static void handle_board_event(pj_ui_context_t *ui, const pj_board_event_t *even
                  pj_ui_state_name(previous), event->x, event->y);
     }
     apply_board_state_effects(previous, pj_ui_current_state(ui), event);
+    /* Navigation out of Record changes the desired cadence immediately and
+     * must not queue behind unrelated settings/time transactions.  Time-page
+     * controls are reconciled again after their authoritative command below. */
+    reconcile_seconds_cadence(ui, monotonic_ms());
     (void)pj_board_store_settings_from_ui(ui);
     (void)pj_board_apply_time_actions(ui);
     reconcile_seconds_cadence(ui, monotonic_ms());

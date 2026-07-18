@@ -300,9 +300,9 @@ static void hard_cadence_advance_ui(hard_cadence_screen_t screen,
             pj_ui_time_command_t command;
             assert(pj_ui_consume_time_command(ui, &command));
             assert(command.type == PJ_UI_TIME_COMMAND_INTERVAL_SET);
-            assert(command.duration_ms == UINT64_C(61000));
-            assert(command.secondary_duration_ms == UINT64_C(61000));
-            assert(ui->interval_seconds == remaining);
+            assert(command.duration_ms == UINT64_C(31000));
+            assert(command.secondary_duration_ms == UINT64_C(31000));
+            assert(ui->interval_seconds == 31);
         }
         pj_ui_time_projection_t projection = {
             .interval_running = 1,
@@ -539,6 +539,303 @@ static void test_every_stopwatch_second_has_complete_dirty_coverage(void)
     }
     assert(pipeline.worker.committed_generation == 121);
     assert(pipeline.worker.ordering_errors == 0);
+}
+
+static void test_cadence_cancel_preserves_pixels_and_defers_cleanup(void)
+{
+    const uint64_t first_deadline_ms = 2800U;
+    pj_display_worker_model_t worker;
+    pj_display_worker_model_init(&worker);
+    pj_ui_presenter_t presenter;
+    pj_ui_presenter_init(&presenter);
+    pj_display_refresh_policy_t refresh;
+    pj_display_refresh_policy_init(
+        &refresh, PJ_DISPLAY_REFRESH_DEFAULT_PARTIAL_LIMIT);
+    pj_ui_context_t ui;
+    pj_ui_init(&ui);
+    ui.state = PJ_UI_STATE_STOPWATCH;
+    pj_ui_time_projection_t projection = stopwatch_projection(0);
+    pj_ui_set_time_projection(&ui, &projection);
+    pj_ui_request_full_presentation(&ui);
+
+    pj_ui_presenter_revision_t revision =
+        pj_ui_presenter_revision(&ui);
+    pj_ui_presenter_frame_t frame;
+    assert(pj_ui_presenter_prepare(
+        &presenter, &ui, &revision, &frame) == PJ_UI_FRAME_FULL);
+    pj_framebuffer_t panel = {0};
+    int panel_valid = 0;
+    pj_framebuffer_t initial = *frame.framebuffer;
+    pj_display_worker_request_t request =
+        request_from_presenter_frame(&frame);
+    int slot;
+    assert(pj_display_worker_model_begin_submit_request(
+        &worker, &request, &slot));
+    assert(pj_display_worker_model_commit_submit_request(
+        &worker, slot, &request, NULL));
+    assert(pj_ui_presenter_accept(&presenter, frame.token));
+    pj_display_worker_request_t taken;
+    assert(pj_display_worker_model_take_request_at(
+        &worker, &slot, &taken, NULL, 0U));
+    pj_display_refresh_plan_t plan = pj_display_refresh_plan(
+        &refresh, &initial, &panel, panel_valid, &taken.dirty);
+    assert(plan.kind == PJ_DISPLAY_REFRESH_FULL);
+    assert(pj_display_refresh_complete(
+        &refresh, &panel, &panel_valid, &initial, &plan, 1,
+        1800000U, 1780000U));
+    pj_display_worker_model_complete_at(&worker, slot, 1, 1800U);
+    assert(memcmp(&panel, &initial, sizeof(panel)) == 0);
+    assert(pj_display_worker_model_cadence_start(
+        &worker, 1U, first_deadline_ms));
+
+    projection = stopwatch_projection(1);
+    pj_ui_set_time_projection(&ui, &projection);
+    revision = pj_ui_presenter_revision(&ui);
+    assert(pj_ui_presenter_prepare(
+        &presenter, &ui, &revision, &frame) == PJ_UI_FRAME_PARTIAL);
+    pj_framebuffer_t first = *frame.framebuffer;
+    request = request_from_presenter_frame(&frame);
+    request.cadence_class = PJ_DISPLAY_CADENCE_SECONDS;
+    request.cadence_sequence = 1U;
+    request.cadence_deadline_ms = first_deadline_ms;
+    assert(pj_display_worker_model_begin_submit_request(
+        &worker, &request, &slot));
+    int first_slot = slot;
+    assert(pj_display_worker_model_commit_submit_request(
+        &worker, first_slot, &request, NULL));
+    assert(pj_ui_presenter_accept(&presenter, frame.token));
+    assert(pj_display_worker_model_take_request_at(
+        &worker, &first_slot, &taken, NULL, first_deadline_ms));
+    assert(taken.cleanup_state == PJ_DISPLAY_CLEANUP_DEFERRED);
+
+    projection = stopwatch_projection(2);
+    pj_ui_set_time_projection(&ui, &projection);
+    revision = pj_ui_presenter_revision(&ui);
+    assert(pj_ui_presenter_prepare(
+        &presenter, &ui, &revision, &frame) == PJ_UI_FRAME_PARTIAL);
+    request = request_from_presenter_frame(&frame);
+    request.cadence_class = PJ_DISPLAY_CADENCE_SECONDS;
+    request.cadence_sequence = 2U;
+    request.cadence_deadline_ms = first_deadline_ms +
+        PJ_DISPLAY_WORKER_CADENCE_PERIOD_MS;
+    int canceled_slot;
+    assert(pj_display_worker_model_begin_submit_request(
+        &worker, &request, &canceled_slot));
+    assert(canceled_slot != first_slot);
+    assert(pj_display_worker_model_commit_submit_request(
+        &worker, canceled_slot, &request, NULL));
+    assert(pj_ui_presenter_accept(&presenter, frame.token));
+
+    /* Model the 30-partial cleanup becoming due during the active clock. */
+    refresh.cleanup_pending = 1;
+    pj_display_worker_model_cleanup_due(&worker);
+    pj_display_worker_model_cadence_end(&worker);
+    assert(worker.slots[first_slot].state ==
+           PJ_DISPLAY_WORKER_SLOT_DISPLAYING);
+    assert(worker.slots[canceled_slot].state ==
+           PJ_DISPLAY_WORKER_SLOT_FREE);
+    assert(pj_display_worker_model_status(&worker).cadence_misses == 0U);
+
+    projection.stopwatch_running = 0;
+    projection.stopwatch_elapsed_ms = UINT64_C(2000);
+    pj_ui_set_time_projection(&ui, &projection);
+    revision = pj_ui_presenter_revision(&ui);
+    assert(pj_ui_presenter_prepare(
+        &presenter, &ui, &revision, &frame) == PJ_UI_FRAME_PARTIAL);
+    pj_framebuffer_t paused = *frame.framebuffer;
+    request = request_from_presenter_frame(&frame);
+    int pause_slot;
+    assert(pj_display_worker_model_begin_submit_request(
+        &worker, &request, &pause_slot));
+    assert(pause_slot == canceled_slot);
+    assert(pj_display_worker_model_commit_submit_request(
+        &worker, pause_slot, &request, NULL));
+    assert(pj_ui_presenter_accept(&presenter, frame.token));
+
+    pj_display_refresh_set_cleanup_deferred(&refresh, 1);
+    plan = pj_display_refresh_plan(
+        &refresh, &first, &panel, panel_valid, &taken.dirty);
+    assert(plan.kind == PJ_DISPLAY_REFRESH_PARTIAL);
+    assert(pj_display_refresh_complete(
+        &refresh, &panel, &panel_valid, &first, &plan, 1,
+        600000U, 580000U));
+    pj_display_worker_model_complete_at(
+        &worker, first_slot, 1, first_deadline_ms + 600U);
+    assert(memcmp(&panel, &first, sizeof(panel)) == 0);
+
+    assert(pj_display_worker_model_take_request_at(
+        &worker, &pause_slot, &taken, NULL,
+        first_deadline_ms + 600U));
+    assert(taken.dirty.partial);
+    assert(taken.cleanup_state == PJ_DISPLAY_CLEANUP_DEFERRED);
+    pj_framebuffer_t reconstructed = panel;
+    copy_region(&reconstructed, &paused, &taken.dirty);
+    assert(memcmp(&reconstructed, &paused, sizeof(paused)) == 0);
+    pj_display_refresh_set_cleanup_deferred(&refresh, 1);
+    plan = pj_display_refresh_plan(
+        &refresh, &paused, &panel, panel_valid, &taken.dirty);
+    assert(plan.kind == PJ_DISPLAY_REFRESH_PARTIAL);
+    assert(plan.deferred_cleanup);
+    assert(pj_display_refresh_complete(
+        &refresh, &panel, &panel_valid, &paused, &plan, 1,
+        600000U, 580000U));
+    pj_display_worker_model_complete_at(
+        &worker, pause_slot, 1, first_deadline_ms + 1200U);
+    assert(memcmp(&panel, &paused, sizeof(panel)) == 0);
+    assert(refresh.cleanup_pending);
+    assert(pj_display_worker_model_status(&worker).cleanup_pending);
+
+    ui.state = PJ_UI_STATE_HOME;
+    pj_ui_request_full_presentation(&ui);
+    revision = pj_ui_presenter_revision(&ui);
+    assert(pj_ui_presenter_prepare(
+        &presenter, &ui, &revision, &frame) == PJ_UI_FRAME_FULL);
+    pj_framebuffer_t home = *frame.framebuffer;
+    request = request_from_presenter_frame(&frame);
+    int home_slot;
+    assert(pj_display_worker_model_begin_submit_request(
+        &worker, &request, &home_slot));
+    assert(pj_display_worker_model_commit_submit_request(
+        &worker, home_slot, &request, NULL));
+    assert(pj_ui_presenter_accept(&presenter, frame.token));
+    assert(pj_display_worker_model_take_request_at(
+        &worker, &home_slot, &taken, NULL,
+        first_deadline_ms + 1200U));
+    assert(!taken.dirty.partial);
+    assert(taken.cleanup_state == PJ_DISPLAY_CLEANUP_SATISFY);
+    pj_display_refresh_set_cleanup_deferred(&refresh, 0);
+    plan = pj_display_refresh_plan(
+        &refresh, &home, &panel, panel_valid, &taken.dirty);
+    assert(plan.kind == PJ_DISPLAY_REFRESH_FULL);
+    assert(pj_display_refresh_complete(
+        &refresh, &panel, &panel_valid, &home, &plan, 1,
+        1800000U, 1780000U));
+    pj_display_worker_model_complete_at(
+        &worker, home_slot, 1, first_deadline_ms + 3000U);
+    assert(memcmp(&panel, &home, sizeof(panel)) == 0);
+    assert(!refresh.cleanup_pending);
+    assert(!pj_display_worker_model_status(&worker).cleanup_pending);
+}
+
+static void test_record_exit_cancels_ready_cadence_and_commits_home(void)
+{
+    pipeline_t pipeline;
+    pipeline_init(&pipeline);
+    pj_ui_context_t ui;
+    pj_ui_init(&ui);
+    ui.state = PJ_UI_STATE_RECORD;
+    pj_ui_set_audio_state(&ui, 1, 0);
+    pj_ui_set_recording_elapsed(&ui, 0U);
+    pj_ui_request_full_presentation(&ui);
+    (void)pipeline_submit(
+        &pipeline, &ui, pj_ui_interaction_generation(&ui), NULL);
+    (void)pipeline_commit_next(&pipeline, NULL);
+    assert(ui.record_state == PJ_RECORD_ACTIVE);
+    assert(pj_display_worker_model_cadence_start(
+        &pipeline.worker, 1U, 1000U));
+
+    pj_ui_set_recording_elapsed(&ui, 1000U);
+    pj_ui_presenter_revision_t revision =
+        pj_ui_presenter_revision(&ui);
+    pj_ui_presenter_frame_t frame;
+    assert(pj_ui_presenter_prepare(
+        &pipeline.presenter, &ui, &revision, &frame) ==
+           PJ_UI_FRAME_PARTIAL);
+    pj_display_worker_request_t request =
+        request_from_presenter_frame(&frame);
+    request.cadence_class = PJ_DISPLAY_CADENCE_SECONDS;
+    request.cadence_sequence = 1U;
+    request.cadence_deadline_ms = 1000U;
+    int cadence_slot;
+    assert(pj_display_worker_model_begin_submit_request(
+        &pipeline.worker, &request, &cadence_slot));
+    pipeline.frames[cadence_slot] = *frame.framebuffer;
+    assert(pj_display_worker_model_commit_submit_request(
+        &pipeline.worker, cadence_slot, &request, NULL));
+    assert(pj_ui_presenter_accept(&pipeline.presenter, frame.token));
+    assert(pipeline.worker.slots[cadence_slot].state ==
+           PJ_DISPLAY_WORKER_SLOT_READY);
+
+    assert(pj_ui_handle_aux_short(&ui));
+    assert(ui.state == PJ_UI_STATE_HOME);
+    assert(ui.record_state == PJ_RECORD_STOPPING);
+    pj_display_worker_model_cadence_end(&pipeline.worker);
+    assert(pipeline.worker.slots[cadence_slot].state ==
+           PJ_DISPLAY_WORKER_SLOT_FREE);
+    assert(pipeline.worker.cadence_handoff_pending);
+    assert(pj_display_worker_model_status(&pipeline.worker)
+               .cadence_misses == 0U);
+
+    revision = pj_ui_presenter_revision(&ui);
+    assert(pj_ui_presenter_prepare(
+        &pipeline.presenter, &ui, &revision, &frame) ==
+           PJ_UI_FRAME_FULL);
+    pj_framebuffer_t home = *frame.framebuffer;
+    request = request_from_presenter_frame(&frame);
+    int home_slot;
+    assert(pj_display_worker_model_begin_submit_request(
+        &pipeline.worker, &request, &home_slot));
+    pipeline.frames[home_slot] = home;
+    assert(pj_display_worker_model_commit_submit_request(
+        &pipeline.worker, home_slot, &request, NULL));
+    assert(pj_ui_presenter_accept(&pipeline.presenter, frame.token));
+    assert(!pipeline.worker.cadence_handoff_pending);
+    assert(!pipeline.worker.slots[home_slot].dirty.partial);
+    (void)pipeline_commit_next(&pipeline, NULL);
+    assert(memcmp(&pipeline.panel, &home, sizeof(home)) == 0);
+    pj_display_worker_status_t status =
+        pj_display_worker_model_status(&pipeline.worker);
+    assert(status.cadence_misses == 0U);
+    assert(status.committed_interaction_generation ==
+           revision.interaction_generation);
+    assert(status.ordering_errors == 0U);
+}
+
+static void test_async_record_end_releases_cadence_before_home_submit(void)
+{
+    pipeline_t pipeline;
+    pipeline_init(&pipeline);
+    pj_ui_context_t ui;
+    pj_ui_init(&ui);
+    ui.state = PJ_UI_STATE_RECORD;
+    pj_ui_set_audio_state(&ui, 1, 0);
+    pj_ui_request_full_presentation(&ui);
+    (void)pipeline_submit(
+        &pipeline, &ui, pj_ui_interaction_generation(&ui), NULL);
+    (void)pipeline_commit_next(&pipeline, NULL);
+    assert(pj_display_worker_model_cadence_start(
+        &pipeline.worker, 1U, 1000U));
+
+    /* Mirrors service_seconds_cadence's board projection before compose. */
+    pj_ui_set_audio_state(&ui, 0, 0);
+    assert(ui.state == PJ_UI_STATE_HOME);
+    assert(ui.record_state == PJ_RECORD_IDLE);
+    pj_display_worker_model_cadence_end(&pipeline.worker);
+
+    pj_ui_presenter_revision_t revision =
+        pj_ui_presenter_revision(&ui);
+    pj_ui_presenter_frame_t frame;
+    assert(pj_ui_presenter_prepare(
+        &pipeline.presenter, &ui, &revision, &frame) == PJ_UI_FRAME_FULL);
+    pj_framebuffer_t home = *frame.framebuffer;
+    pj_display_worker_request_t request =
+        request_from_presenter_frame(&frame);
+    assert(request.cadence_class == PJ_DISPLAY_CADENCE_NONE);
+    int home_slot;
+    assert(pj_display_worker_model_begin_submit_request(
+        &pipeline.worker, &request, &home_slot));
+    pipeline.frames[home_slot] = home;
+    assert(pj_display_worker_model_commit_submit_request(
+        &pipeline.worker, home_slot, &request, NULL));
+    assert(pj_ui_presenter_accept(&pipeline.presenter, frame.token));
+    (void)pipeline_commit_next(&pipeline, NULL);
+    assert(memcmp(&pipeline.panel, &home, sizeof(home)) == 0);
+    pj_display_worker_status_t status =
+        pj_display_worker_model_status(&pipeline.worker);
+    assert(!status.cadence_active);
+    assert(status.cadence_starts == 0U);
+    assert(status.cadence_commits == 0U);
+    assert(status.cadence_misses == 0U);
 }
 
 static void run_hard_cadence_screen(hard_cadence_screen_t screen)
@@ -801,7 +1098,7 @@ static void test_same_layout_semantics_wait_for_commit(void)
     pj_ui_time_command_t command;
     assert(pj_ui_consume_time_command(&ui, &command));
     assert(command.type == PJ_UI_TIME_COMMAND_TIMER_SET);
-    assert(command.duration_ms == 330000U);
+    assert(command.duration_ms == 90000U);
     uint32_t adjusted_epoch = pj_ui_interaction_generation(&ui);
     assert(adjusted_epoch != original_epoch);
     (void)pipeline_submit(&pipeline, &ui, adjusted_epoch, NULL);
@@ -812,7 +1109,7 @@ static void test_same_layout_semantics_wait_for_commit(void)
     assert(guarded_touch(&pipeline, &ui, adjusted_epoch, 201, 150, 120));
     assert(pj_ui_consume_time_command(&ui, &command));
     assert(command.type == PJ_UI_TIME_COMMAND_TIMER_START);
-    assert(command.duration_ms == 330000U);
+    assert(command.duration_ms == 90000U);
 }
 
 static void test_passive_ticks_keep_controls_live(void)
@@ -850,6 +1147,9 @@ int main(void)
     test_hidden_new_layout_controls_are_inert_until_commit();
     test_rapid_digit_updates_coalesce_to_exact_latest_frame();
     test_every_stopwatch_second_has_complete_dirty_coverage();
+    test_cadence_cancel_preserves_pixels_and_defers_cleanup();
+    test_record_exit_cancels_ready_cadence_and_commits_home();
+    test_async_record_end_releases_cadence_before_home_submit();
     test_hard_cadence_all_seconds_screens();
     test_layout_churn_commits_latest_full_frame_in_order();
     test_note_page_identity_waits_for_page_commit();

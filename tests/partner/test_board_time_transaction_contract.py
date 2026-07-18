@@ -110,7 +110,9 @@ class BoardTimeTransactionContractTests(unittest.TestCase):
         self.assertNotIn("g_ble_provision_task", self.source)
 
     def test_subsystems_only_clear_owned_status_errors(self) -> None:
-        completion = function_body(self.source, "recording_publish_completion")
+        completion = function_body(
+            self.source, "recording_publish_completion_result"
+        )
         self.assertIn("board_status_set_error_if_empty", completion)
         wipe = function_body(self.source, "recording_wipe_worker")
         self.assertIn("board_status_clear_error_if_equal", wipe)
