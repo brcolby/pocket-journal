@@ -43,8 +43,6 @@ class FakeClient:
     def __init__(self, items: list[AudioItem] | None = None) -> None:
         payload = wav_bytes()
         self.items = items or [
-            AudioItem("done.wav", "done.wav", synced=True),
-            AudioItem("legacy-done.wav", "legacy-done.wav", transcript_uploaded=True),
             AudioItem("new.wav", "new.wav", size=len(payload), data_bytes=4, duration_ms=1),
         ]
         self.payloads = {item.audio_id: payload for item in self.items}
@@ -90,26 +88,36 @@ class FakeBackend:
 class SyncTests(unittest.TestCase):
     def test_sync_reports_deterministic_item_progress(self) -> None:
         with TemporaryDirectory() as tmp:
-            events: list[dict[str, object]] = []
+            payload = wav_bytes()
+            item = AudioItem(
+                "note.wav", "note.wav", size=len(payload), data_bytes=4
+            )
+            client = FakeClient([item])
+            store = PartnerStore(Path(tmp))
+            backend = FakeBackend()
             sync_device_audio(
+                "pj-test", client, store, backend  # type: ignore[arg-type]
+            )
+            item.synced = True
+            events: list[dict[str, object]] = []
+            results = sync_device_audio(
                 "pj-test",
-                FakeClient(),
-                PartnerStore(Path(tmp)),
-                FakeBackend(),  # type: ignore[arg-type]
+                client,
+                store,
+                backend,  # type: ignore[arg-type]
                 progress=events.append,
             )
 
-        self.assertEqual(events[0], {"event": "listed", "total": 3})
-        self.assertEqual(events[-1], {"event": "complete", "total": 3})
+        self.assertEqual(events[0], {"event": "listed", "total": 1})
+        self.assertEqual(events[-1], {"event": "complete", "total": 1})
         self.assertEqual(
             [(event["audio_id"], event["status"])
              for event in events if event["event"] == "item_complete"],
-            [
-                ("done.wav", "skipped"),
-                ("legacy-done.wav", "skipped"),
-                ("new.wav", "uploaded"),
-            ],
+            [("note.wav", "skipped")],
         )
+        self.assertEqual(results[0]["status"], "skipped")
+        self.assertEqual(results[0]["stage"], "uploaded")
+        self.assertEqual(results[0]["reason"], "device_and_local_state_current")
 
     def test_sync_persists_verified_identity_and_uploaded_stage(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -190,6 +198,36 @@ class SyncTests(unittest.TestCase):
         self.assertTrue(second[0]["cached"])
         self.assertEqual(client.uploaded, ["new.wav"])
 
+    def test_reprocess_bypasses_cached_permanent_upload_failure(self) -> None:
+        class RecoveringClient(FakeClient):
+            def __init__(self) -> None:
+                super().__init__()
+                self.authorized = False
+
+            def upload_transcript(self, audio_id: str, transcript: dict[str, object]) -> None:
+                self.uploaded.append(audio_id)
+                if not self.authorized:
+                    raise DeviceHTTPError("authentication failed", 401, False)
+                self.upload_payloads.append(transcript)
+
+        with TemporaryDirectory() as tmp:
+            client = RecoveringClient()
+            store = PartnerStore(Path(tmp))
+            backend = FakeBackend()
+            first = sync_device_audio("pj-test", client, store, backend)  # type: ignore[arg-type]
+            cached = sync_device_audio("pj-test", client, store, backend)  # type: ignore[arg-type]
+            client.authorized = True
+            recovered = sync_device_audio(  # type: ignore[arg-type]
+                "pj-test", client, store, backend, reprocess_synced=True
+            )
+
+        self.assertFalse(first[0]["retryable"])
+        self.assertTrue(cached[0]["cached"])
+        self.assertEqual(recovered[0]["status"], "uploaded")
+        self.assertNotIn("cached", recovered[0])
+        self.assertEqual(client.uploaded, ["new.wav", "new.wav"])
+        self.assertEqual(backend.calls, 1)
+
     def test_retryable_upload_http_error_is_retried(self) -> None:
         class BusyClient(FakeClient):
             def upload_transcript(self, audio_id: str, transcript: dict[str, object]) -> None:
@@ -239,22 +277,29 @@ class SyncTests(unittest.TestCase):
             {"beam_size": 5},
         )
 
-    def test_explicit_reprocess_includes_device_synced_note(self) -> None:
+    def test_fresh_host_hydrates_device_synced_note_and_reprocesses_explicitly(self) -> None:
         payload = wav_bytes()
         item = AudioItem("done.wav", "done.wav", size=len(payload), data_bytes=4, synced=True)
         with TemporaryDirectory() as tmp:
             client = FakeClient([item])
             store = PartnerStore(Path(tmp))
             backend = FakeBackend("model-a")
-            skipped = sync_device_audio("pj-test", client, store, backend)  # type: ignore[arg-type]
-            processed = sync_device_audio(  # type: ignore[arg-type]
+            hydrated = sync_device_audio("pj-test", client, store, backend)  # type: ignore[arg-type]
+            reprocessed = sync_device_audio(  # type: ignore[arg-type]
                 "pj-test", client, store, backend, reprocess_synced=True
             )
+            note = NoteLibrary(Path(tmp)).get(stable_note_id("pj-test", "done.wav"))
+            job = store.load_job("pj-test", "done.wav")
 
-        self.assertEqual(skipped, [])
-        self.assertEqual(processed[0]["status"], "uploaded")
-        self.assertEqual(client.downloaded, ["done.wav"])
-        self.assertEqual(client.uploaded, ["done.wav"])
+        self.assertEqual(hydrated[0]["status"], "uploaded")
+        self.assertEqual(reprocessed[0]["status"], "uploaded")
+        self.assertEqual(client.downloaded, ["done.wav", "done.wav"])
+        self.assertEqual(client.uploaded, ["done.wav", "done.wav"])
+        self.assertEqual(backend.calls, 1)
+        self.assertIsNotNone(note)
+        self.assertIsNotNone(note.audio_path)  # type: ignore[union-attr]
+        self.assertEqual(note.transcript_text, "transcript")  # type: ignore[union-attr]
+        self.assertEqual(job["stage"], "uploaded")  # type: ignore[index]
 
     def test_synced_fingerprint_change_reprocesses_known_prior_upload(self) -> None:
         payload = wav_bytes()
@@ -321,10 +366,39 @@ class SyncTests(unittest.TestCase):
             item.synced = True
             repeated = sync_device_audio("pj-test", client, store, backend)  # type: ignore[arg-type]
 
-        self.assertEqual(repeated, [])
+        self.assertEqual(len(repeated), 1)
+        self.assertEqual(repeated[0]["status"], "skipped")
+        self.assertEqual(repeated[0]["stage"], "uploaded")
         self.assertEqual(backend.calls, 1)
         self.assertEqual(client.downloaded, ["note.wav"])
         self.assertEqual(client.uploaded, ["note.wav"])
+
+    def test_local_title_change_uploads_payload_only(self) -> None:
+        payload = wav_bytes()
+        item = AudioItem("note.wav", "note.wav", size=len(payload), data_bytes=4)
+        with TemporaryDirectory() as tmp:
+            client = FakeClient([item])
+            store = PartnerStore(Path(tmp))
+            backend = FakeBackend()
+            first = sync_device_audio("pj-test", client, store, backend)  # type: ignore[arg-type]
+            item.synced = True
+            library = NoteLibrary(Path(tmp))
+            note_id = stable_note_id("pj-test", "note.wav")
+            library.update_title(note_id, "Field note")
+            title_only = sync_device_audio("pj-test", client, store, backend)  # type: ignore[arg-type]
+            unchanged = sync_device_audio("pj-test", client, store, backend)  # type: ignore[arg-type]
+            job = store.load_job("pj-test", "note.wav")
+
+        self.assertEqual(first[0]["status"], "uploaded")
+        self.assertEqual(title_only[0]["status"], "uploaded")
+        self.assertEqual(title_only[0]["stage"], "uploaded")
+        self.assertEqual(title_only[0]["reason"], "device_payload_changed")
+        self.assertEqual(unchanged[0]["status"], "skipped")
+        self.assertEqual(client.downloaded, ["note.wav"])
+        self.assertEqual(client.uploaded, ["note.wav", "note.wav"])
+        self.assertEqual(backend.calls, 1)
+        self.assertEqual(client.upload_payloads[-1]["title"], "Field note")
+        self.assertEqual(len(job["device_payload_sha256"]), 64)  # type: ignore[index]
 
     def test_complete_long_text_is_uploaded_without_truncation(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -410,7 +484,11 @@ class SyncTests(unittest.TestCase):
 
         self.assertEqual(client.uploaded, ["note.wav"])
         self.assertEqual(backend.calls, 1)
-        self.assertEqual(sorted(len(result) for result in results), [0, 1])
+        self.assertEqual(sorted(len(result) for result in results), [1, 1])
+        self.assertEqual(
+            sorted(result[0]["status"] for result in results),
+            ["skipped", "uploaded"],
+        )
 
     def test_local_only_transcription_does_not_upload_placeholder(self) -> None:
         with TemporaryDirectory() as tmp:
