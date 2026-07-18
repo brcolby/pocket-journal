@@ -5,44 +5,52 @@ low-frequency, large-batch hardware pass. Human notes may be mildly lossy:
 record what you actually observed, including blockers, and agents will map that
 evidence to the exact Bead acceptance criteria.
 
-Last synchronized with `bd human list`: 2026-07-18 (37 human-validation Beads).
+Last synchronized with `bd human list`: 2026-07-18 (40 human-validation Beads).
 Do not repeat a failed check on unchanged firmware.
 
 ## Nominated Build
 
-- Source commit and reported firmware version: `029f6df` / `029f6df`.
-- Image: `firmware/build-v1-029f6df/pocket_journal.bin`.
+- Source commit and reported firmware version: `f3492f8` / `f3492f8`.
+- Image: `firmware/build-v1-f3492f8-exact/pocket_journal.bin`.
 - Size: 1,511,424 bytes (`0x171000`).
 - SHA-256:
-  `82f2221ab019288a1c514003b3de2f08452081d7ab198fc668110fceeb7d96c2`.
+  `546c674d3735cd3911c93de1562f9601179160b4874deecfd0dc31c4159d16b6`.
 - ESP image validation hash:
-  `82dd3d33ee03c7e10843993974c62dc2a73512d299a2badbbdd01c0ac1777a68`.
+  `a5fd4f41def16b40e250443a062c8d924da46f04aaff46ec7b07f9993c2a3da6`.
 - ELF SHA-256:
-  `c4d737b603f9280e0f0b86c5de247f43e4f9d8dc4e40b4e84f76409c214de682`.
+  `70e8737bb2ed8c38cd02fae1b1c057c0add189e63047c1ef863a43c45fa8f61d`.
 - Built with ESP-IDF 6.0.1 and 28% (`0x8f000`) free in each 2 MiB
   application partition. A clean build contains no LVGL component or symbol.
 - Flashed and byte-verified as a development image on `pj-d45d34`, ESP32-S3
   MAC `14:C1:9F:D4:5D:34`, at `/dev/cu.usbmodem1101`.
-- Live USB probe after boot verification: exact firmware answered `PJ_STATUS`
-  without another reset, with boot ID `3071218195`; SD storage, audio, Wi-Fi,
-  and fixed-offset time were ready. Companion sync was offline/pending at the
-  probe; USB recovery was neither needed nor attempted.
+- Two live USB probes after flashing answered `PJ_STATUS` with exact firmware,
+  stable boot ID `1210810430`, and monotonic uptime from 17,197 to 49,908 ms;
+  SD storage, audio, Wi-Fi, and fixed-offset time were ready. The current boot
+  retained a `panic` reset reason from the flash/reset sequence but did not
+  reset between probes; confirm a normal reason after the deliberate boot in
+  section 1. Companion sync was offline/pending at the probes; USB recovery was
+  neither needed nor attempted.
 - Automated evidence: deterministic Carbon generation verified 73 active and
   26 reference sources, 72 glyph identities, and 30 semantic bitmaps; all 13
-  asset and 7 exhaustive DXF tests passed. All 32 native C executables and 362
-  Python cases passed, including 333 partner tests. Combined ASan/UBSan runs
+  asset and 7 exhaustive DXF tests passed. All 32 native C executables and all
+  353 partner cases passed. Combined ASan/UBSan runs
   passed for all 32 native C executables (the vendored cJSON build suppresses
   only macOS SDK deprecation diagnostics). WASM runtime, one-bit/AUX simulator
   tests, exact Timer/Stopwatch partial reconstruction, and image analysis
-  passed. All 52 gallery frames, including Alarm Off/On/12-hour states, and the
-  contact sheet were inspected.
+  passed. The partner suite passed all 353 cases, including the searchable
+  browser/curses library, durable deletion, action-level sync summaries, and
+  one-call retry/identity fixtures. All 52 gallery frames, including Alarm
+  Off/On/12-hour and populated Read states, and the contact sheet were
+  inspected.
 - Owner validation on the preceding `f57d49b` image confirmed the digit/time
   rendering corruption and Timer adjustment regressions are fixed. Because
   `8622c24` changes cadence cancellation and task priority, repeat only the
   targeted cadence and UI-refinement checks below rather than the already-passed
   broad digit diagnosis. Owner validation on `8622c24` also reports that Notes
-  Record behavior seems good; `029f6df` changes only the Alarm assets/compositor
-  and therefore preserves that evidence while adding the labeled larger toggle.
+  Record behavior seems good; `029f6df` added only the labeled larger Alarm
+  toggle, while the later firmware change separates transcript bodies from note
+  identity for Read. Timer, cadence, and Record behavior are otherwise
+  preserved in `f3492f8`.
 - This is development validation, not a release. No tag or release has been
   created.
 
@@ -73,16 +81,16 @@ section (stop with Ctrl-]):
 ```bash
 cd firmware
 source "$HOME/.espressif/v6.0.1/esp-idf/export.sh"
-idf.py -B build-v1-029f6df -p /dev/cu.usbmodem1101 monitor \
+idf.py -B build-v1-f3492f8-exact -p /dev/cu.usbmodem1101 monitor \
   --no-reset --timestamps --disable-auto-color 2>&1 | \
-  tee /private/tmp/pj-029f6df-hardware.log
+  tee /private/tmp/pj-f3492f8-hardware.log
 ```
 
 Afterward, preserve the output of:
 
 ```bash
 rg 'Seconds cadence (start|end)|Display metrics|Display generations' \
-  /private/tmp/pj-029f6df-hardware.log
+  /private/tmp/pj-f3492f8-hardware.log
 ```
 
 - [ ] Exercise every sector of Home `3_1`, Notes `3_1m`, Time `4_1`, and
@@ -170,6 +178,20 @@ diagnostic before asking for calibration evidence.
   ghost, no square Stop or Recovered overlay appears, and there is no stuck
   audio state or corrupt note after a reboot during or shortly after
   background processing (`pocket-journal-61u`, `pocket-journal-te0`).
+- [ ] After a real transcript sync, locate the same recording in Listen and
+  Read. Both rows must use the same compact title/date label and stable note
+  identity. Opening Read must show wrapped transcript prose only—never a path,
+  metadata JSON, sync status, or internal identifier. Audio-only notes must not
+  appear as readable transcripts, and Back must return to the Read list without
+  affecting Listen playback (`pocket-journal-zon.2`).
+- [ ] Create one fresh recording and run exactly one foreground
+  `pj sync --transport usb`. Its terminal summary must attribute the note's
+  download, real model transcription, durable host-library write, and matching
+  device upload in that invocation. Confirm the note is immediately searchable
+  in `pj library tui` and `pj library serve`, then confirm its text in device
+  Read. A second unchanged sync must skip it without another model call or
+  duplicate row. Do not use `--backend fake` for this check because fake mode is
+  intentionally local-only (`pocket-journal-zon`, `pocket-journal-zon.3`).
 - [ ] With at least two visible notes, request Sync while the companion is
   offline, then bring it online. Confirm the screen shows the note inventory
   before ACTIVE, communicates offline/active/complete truthfully, remains
