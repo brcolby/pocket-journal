@@ -4,17 +4,20 @@ from contextlib import contextmanager, redirect_stdout
 from io import StringIO
 import json
 from pathlib import Path
+import signal
 import sqlite3
+import subprocess
 from tempfile import TemporaryDirectory
 import threading
 import unittest
 from unittest import mock
+import wave
 
 from pocket_journal_partner import cli
 from pocket_journal_partner.library import LIBRARY_SCHEMA_VERSION, NoteLibrary, stable_note_id
 from pocket_journal_partner.storage import PartnerStore
 import pocket_journal_partner.tui as tui_module
-from pocket_journal_partner.tui import run_tui
+from pocket_journal_partner.tui import NativeAudioPlayer, run_tui
 
 
 class FakeCursesError(Exception):
@@ -33,6 +36,7 @@ class FakeScreen:
         self.size_index = 0
         self.frames: list[dict[tuple[int, int], str]] = []
         self.current: dict[tuple[int, int], str] = {}
+        self.timeouts: list[int] = []
 
     def keypad(self, enabled: bool) -> None:
         del enabled
@@ -55,6 +59,9 @@ class FakeScreen:
     def refresh(self) -> None:
         pass
 
+    def timeout(self, milliseconds: int) -> None:
+        self.timeouts.append(milliseconds)
+
     def move(self, y: int, x: int) -> None:
         del y, x
 
@@ -64,7 +71,10 @@ class FakeScreen:
     def get_wch(self) -> object:
         if not self.keys:
             raise AssertionError("fake terminal ran out of keys")
-        return self.keys.pop(0)
+        key = self.keys.pop(0)
+        if isinstance(key, BaseException):
+            raise key
+        return key
 
     def rendered_text(self) -> str:
         frames = self.frames + ([self.current] if self.current else [])
@@ -98,6 +108,78 @@ class FakeCurses:
     def wrapper(self, callback):  # type: ignore[no-untyped-def]
         self.wrapper_called = True
         return callback(self.screen)
+
+
+class FakeAudioPlayer:
+    def __init__(self, *, statuses: list[str] | None = None) -> None:
+        self.events: list[object] = []
+        self.active_note: str | None = None
+        self.paused = False
+        self.closed = False
+        self.statuses = list(statuses or [])
+
+    def play(self, note_id: str, path: Path, *, duration_ms: int | None = None) -> None:
+        self.events.append(("play", note_id, path, duration_ms))
+        self.active_note = note_id
+        self.paused = False
+
+    def pause_resume(self) -> None:
+        if self.active_note is None:
+            self.events.append("pause-empty")
+            return
+        self.paused = not self.paused
+        self.events.append("pause" if self.paused else "resume")
+
+    def stop(self) -> None:
+        self.events.append("stop")
+        self.active_note = None
+        self.paused = False
+
+    def stop_note(self, note_id: str) -> None:
+        self.events.append(("stop-note", note_id))
+        if self.active_note == note_id:
+            self.active_note = None
+            self.paused = False
+
+    def status_text(self) -> str:
+        if self.statuses:
+            return self.statuses.pop(0)
+        if self.active_note is None:
+            return ""
+        return f"{'Paused' if self.paused else 'Playing'} 00:01 / 00:04"
+
+    def close(self) -> None:
+        self.events.append("close")
+        self.active_note = None
+        self.closed = True
+
+
+class FakeAudioProcess:
+    def __init__(self, pid: int = 4242, *, ignore_terminate: bool = False) -> None:
+        self.pid = pid
+        self.ignore_terminate = ignore_terminate
+        self.returncode: int | None = None
+        self.terminate_calls = 0
+        self.kill_calls = 0
+        self.wait_calls: list[float | None] = []
+
+    def poll(self) -> int | None:
+        return self.returncode
+
+    def terminate(self) -> None:
+        self.terminate_calls += 1
+        if not self.ignore_terminate:
+            self.returncode = -signal.SIGTERM
+
+    def kill(self) -> None:
+        self.kill_calls += 1
+        self.returncode = -signal.SIGKILL
+
+    def wait(self, timeout: float | None = None) -> int:
+        self.wait_calls.append(timeout)
+        if self.returncode is None:
+            raise subprocess.TimeoutExpired("audio-player", timeout)
+        return self.returncode
 
 
 class NoteLibraryTests(unittest.TestCase):
@@ -625,12 +707,16 @@ class LibraryCliAndTuiTests(unittest.TestCase):
             audio.parent.mkdir(parents=True, exist_ok=True)
             audio.write_bytes(b"RIFF")
             library.attach_audio(note.note_id, audio)
-            opened: list[Path] = []
+            player = FakeAudioPlayer()
             keys: list[object] = [
                 "/",
                 *"sample",
                 "\n",
                 "\n",
+                "p",
+                " ",
+                " ",
+                "s",
                 "p",
                 "e",
                 *("\b" * len("sample")),
@@ -646,7 +732,7 @@ class LibraryCliAndTuiTests(unittest.TestCase):
 
             result = run_tui(
                 library,
-                open_audio=lambda path: opened.append(path) or True,
+                audio_player=player,
                 screen=screen,
                 curses_module=curses,
             )
@@ -656,9 +742,300 @@ class LibraryCliAndTuiTests(unittest.TestCase):
             self.assertIn("Transcript?[2J remains readable", rendered)
             self.assertNotIn("\x1b", rendered)
             self.assertIn("Renamed note", rendered)
-            self.assertEqual(opened, [audio.resolve()])
+            self.assertIn("Playing 00:01 / 00:04", rendered)
+            self.assertEqual(
+                player.events,
+                [
+                    ("play", note.note_id, audio.resolve(), None),
+                    "pause",
+                    "resume",
+                    "stop",
+                    ("play", note.note_id, audio.resolve(), None),
+                    ("stop-note", note.note_id),
+                    "close",
+                ],
+            )
+            self.assertIn(200, screen.timeouts)
+            self.assertIn(-1, screen.timeouts)
+            self.assertTrue(player.closed)
             self.assertIsNone(library.get(note.note_id))
             self.assertFalse(audio.exists())
+
+    def test_native_player_uses_fixed_argv_tracks_time_and_reaps_paused_audio(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            audio = root / "audio" / "note name.wav"
+            audio.parent.mkdir()
+            with wave.open(str(audio), "wb") as stream:
+                stream.setnchannels(1)
+                stream.setsampwidth(2)
+                stream.setframerate(8_000)
+                stream.writeframes(b"\0\0" * 16_000)
+            now = [10.0]
+            processes: list[FakeAudioProcess] = []
+            launches: list[tuple[list[str], dict[str, object]]] = []
+            signals: list[tuple[int, int]] = []
+
+            def launch(arguments: list[str], **options: object) -> FakeAudioProcess:
+                launches.append((arguments, options))
+                process = FakeAudioProcess(pid=5000 + len(processes))
+                processes.append(process)
+                return process
+
+            player = NativeAudioPlayer(
+                root,
+                command=("/usr/bin/afplay",),
+                clock=lambda: now[0],
+                popen=launch,  # type: ignore[arg-type]
+                signal_process=lambda pid, action: signals.append((pid, action)),
+            )
+            player.play("note-a", audio)
+            self.assertEqual(launches[0][0], ["/usr/bin/afplay", str(audio.resolve())])
+            self.assertIs(launches[0][1]["stdin"], subprocess.DEVNULL)
+            self.assertIs(launches[0][1]["stdout"], subprocess.DEVNULL)
+            self.assertIs(launches[0][1]["stderr"], subprocess.DEVNULL)
+            self.assertTrue(launches[0][1]["close_fds"])
+            self.assertFalse(launches[0][1]["shell"])
+            self.assertTrue(launches[0][1]["start_new_session"])
+            self.assertEqual(player.status_text(), "Playing 00:00 / 00:02")
+
+            now[0] = 11.25
+            player.pause_resume()
+            self.assertEqual(player.status_text(), "Paused 00:01 / 00:02")
+            now[0] = 30.0
+            self.assertEqual(player.status_text(), "Paused 00:01 / 00:02")
+            player.close()
+
+            self.assertEqual(
+                signals,
+                [(processes[0].pid, signal.SIGSTOP), (processes[0].pid, signal.SIGCONT)],
+            )
+            self.assertEqual(processes[0].terminate_calls, 1)
+            self.assertEqual(processes[0].kill_calls, 0)
+            self.assertIsNotNone(processes[0].returncode)
+
+    def test_native_player_restarts_reports_failure_and_rejects_outside_paths(self) -> None:
+        with TemporaryDirectory() as tmp, TemporaryDirectory() as outside_tmp:
+            root = Path(tmp)
+            first_audio = root / "first.wav"
+            second_audio = root / "second.wav"
+            outside_audio = Path(outside_tmp) / "outside.wav"
+            for path in (first_audio, second_audio, outside_audio):
+                path.write_bytes(b"not-a-wave")
+            processes: list[FakeAudioProcess] = []
+            launches: list[list[str]] = []
+
+            def launch(arguments: list[str], **_options: object) -> FakeAudioProcess:
+                launches.append(arguments)
+                process = FakeAudioProcess(pid=6000 + len(processes))
+                processes.append(process)
+                return process
+
+            player = NativeAudioPlayer(
+                root,
+                command=("/usr/bin/afplay",),
+                popen=launch,  # type: ignore[arg-type]
+            )
+            player.play("first", first_audio, duration_ms=4_000)
+            player.play("second", second_audio, duration_ms=4_000)
+            self.assertEqual(processes[0].terminate_calls, 1)
+            self.assertEqual(len(launches), 2)
+
+            processes[1].returncode = 7
+            self.assertEqual(player.status_text(), "Playback failed (player exited 7)")
+            player.play("outside", outside_audio)
+            self.assertEqual(len(launches), 2)
+            self.assertIn("inside the library", player.status_text())
+            player.close()
+
+            unavailable = NativeAudioPlayer(root, command=None, popen=launch)  # type: ignore[arg-type]
+            unavailable.play("first", first_audio)
+            self.assertIn("unavailable", unavailable.status_text().lower())
+            self.assertEqual(len(launches), 2)
+
+    def test_native_player_owns_child_before_deferred_signal_unwinds(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            audio = root / "signal-race.wav"
+            audio.write_bytes(b"not-a-wave")
+            process = FakeAudioProcess()
+
+            def launch(_arguments: list[str], **_options: object) -> FakeAudioProcess:
+                handler = signal.getsignal(signal.SIGTERM)
+                if not callable(handler):
+                    raise AssertionError("launch signal was not deferred")
+                handler(signal.SIGTERM, None)
+                return process
+
+            player = NativeAudioPlayer(
+                root,
+                command=("/usr/bin/afplay",),
+                popen=launch,  # type: ignore[arg-type]
+            )
+            with tui_module._unwind_on_termination_signal():
+                with self.assertRaises(tui_module._TuiSignal) as termination:
+                    player.play("note", audio)
+
+            self.assertEqual(termination.exception.signum, signal.SIGTERM)
+            self.assertEqual(process.terminate_calls, 1)
+            self.assertIsNotNone(process.returncode)
+            player.close()
+
+    def test_native_player_restores_signals_after_partial_install_interrupt(self) -> None:
+        with TemporaryDirectory() as tmp:
+            player = NativeAudioPlayer(Path(tmp), command=None)
+
+            def previous_int(_signum: int, _frame: object) -> None:
+                pass
+
+            def previous_term(_signum: int, _frame: object) -> None:
+                pass
+
+            handlers: dict[int, object] = {
+                signal.SIGINT: previous_int,
+                signal.SIGTERM: previous_term,
+            }
+
+            def install(signum: int, handler: object) -> object:
+                if signum == signal.SIGTERM and handler is not previous_term:
+                    raise KeyboardInterrupt
+                previous = handlers[signum]
+                handlers[signum] = handler
+                return previous
+
+            with mock.patch.object(
+                signal,
+                "getsignal",
+                side_effect=lambda signum: handlers.get(signum, signal.SIG_IGN),
+            ):
+                with mock.patch.object(signal, "signal", side_effect=install):
+                    with self.assertRaises(KeyboardInterrupt):
+                        with player._defer_launch_signals():
+                            self.fail("partial installation should not enter the body")
+
+            self.assertIs(handlers[signal.SIGINT], previous_int)
+            self.assertIs(handlers[signal.SIGTERM], previous_term)
+
+    def test_native_player_restores_all_signals_when_restore_is_interrupted(self) -> None:
+        with TemporaryDirectory() as tmp:
+            player = NativeAudioPlayer(Path(tmp), command=None)
+
+            def previous_int(_signum: int, _frame: object) -> None:
+                pass
+
+            def previous_term(_signum: int, _frame: object) -> None:
+                pass
+
+            handlers: dict[int, object] = {
+                signal.SIGINT: previous_int,
+                signal.SIGTERM: previous_term,
+            }
+
+            def install(signum: int, handler: object) -> object:
+                previous = handlers[signum]
+                handlers[signum] = handler
+                if signum == signal.SIGTERM and handler is previous_term:
+                    raise KeyboardInterrupt
+                return previous
+
+            with mock.patch.object(
+                signal,
+                "getsignal",
+                side_effect=lambda signum: handlers.get(signum, signal.SIG_IGN),
+            ):
+                with mock.patch.object(signal, "signal", side_effect=install):
+                    with self.assertRaises(KeyboardInterrupt):
+                        with player._defer_launch_signals():
+                            pass
+
+            self.assertIs(handlers[signal.SIGINT], previous_int)
+            self.assertIs(handlers[signal.SIGTERM], previous_term)
+
+    def test_native_player_force_reaps_child_that_inherits_ignored_sigterm(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            audio = root / "ignored-term.wav"
+            audio.write_bytes(b"not-a-wave")
+            process = FakeAudioProcess(ignore_terminate=True)
+            player = NativeAudioPlayer(
+                root,
+                command=("/usr/bin/afplay",),
+                popen=lambda *_args, **_options: process,  # type: ignore[arg-type]
+            )
+
+            player.play("note", audio)
+            player.stop()
+
+            self.assertEqual(process.terminate_calls, 1)
+            self.assertEqual(process.kill_calls, 1)
+            self.assertEqual(
+                process.wait_calls,
+                [tui_module.PLAYER_TERMINATE_GRACE_SECONDS, tui_module.PLAYER_KILL_WAIT_SECONDS],
+            )
+            self.assertLessEqual(tui_module.PLAYER_TERMINATE_GRACE_SECONDS, 0.05)
+            self.assertIn("Playback stopped", player.status_text())
+
+    def test_tui_refreshes_without_input_and_closes_on_errors_and_signals(self) -> None:
+        with TemporaryDirectory() as tmp:
+            library = NoteLibrary(Path(tmp))
+            timed_player = FakeAudioPlayer(statuses=["Playing 00:00 / 00:04", "Playing 00:01 / 00:04"])
+            timed_screen = FakeScreen([FakeCursesError(), "q"])
+            self.assertEqual(
+                run_tui(
+                    library,
+                    audio_player=timed_player,
+                    screen=timed_screen,
+                    curses_module=FakeCurses(timed_screen),
+                ),
+                0,
+            )
+            rendered = timed_screen.rendered_text()
+            self.assertIn("Playing 00:00 / 00:04", rendered)
+            self.assertIn("Playing 00:01 / 00:04", rendered)
+            self.assertTrue(timed_player.closed)
+
+            failing_player = FakeAudioPlayer()
+            failing_screen = FakeScreen([RuntimeError("terminal failed")])
+            with self.assertRaisesRegex(RuntimeError, "terminal failed"):
+                run_tui(
+                    library,
+                    audio_player=failing_player,
+                    screen=failing_screen,
+                    curses_module=FakeCurses(failing_screen),
+                )
+            self.assertTrue(failing_player.closed)
+
+            termination_player = FakeAudioPlayer()
+
+            class TerminationScreen(FakeScreen):
+                def get_wch(self) -> object:
+                    handler = signal.getsignal(signal.SIGTERM)
+                    if not callable(handler):
+                        raise AssertionError("SIGTERM unwind handler was not installed")
+                    handler(signal.SIGTERM, None)
+                    raise AssertionError("SIGTERM unwind handler returned")
+
+            termination_screen = TerminationScreen([])
+            previous = signal.getsignal(signal.SIGTERM)
+            self.assertEqual(
+                run_tui(
+                    library,
+                    audio_player=termination_player,
+                    screen=termination_screen,
+                    curses_module=FakeCurses(termination_screen),
+                ),
+                128 + signal.SIGTERM,
+            )
+            self.assertTrue(termination_player.closed)
+            self.assertIs(signal.getsignal(signal.SIGTERM), previous)
+
+    def test_tui_preserves_ignored_termination_signals(self) -> None:
+        with mock.patch.object(signal, "getsignal", return_value=signal.SIG_IGN):
+            with mock.patch.object(signal, "signal") as install_handler:
+                with tui_module._unwind_on_termination_signal():
+                    pass
+
+        install_handler.assert_not_called()
 
     def test_tui_wrapper_resize_and_unavailable_curses_are_graceful(self) -> None:
         with TemporaryDirectory() as tmp:
