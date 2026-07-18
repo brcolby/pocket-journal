@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import signal
 import subprocess
 import sys
 from tempfile import TemporaryDirectory
@@ -13,6 +14,7 @@ import time
 import tty
 import unittest
 
+from pocket_journal_partner import cli
 from pocket_journal_partner.device import (
     AudioItem,
     DeviceError,
@@ -350,6 +352,14 @@ class FakeProcess:
 
     def kill(self) -> None:
         self.events.append(("kill",))
+
+
+class SigtermProcess(FakeProcess):
+    def communicate(self, timeout: float | None = None) -> tuple[str, str]:
+        self.events.append(("communicate", timeout))
+        if len(self.events) == 1:
+            signal.raise_signal(signal.SIGTERM)
+        return "", ""
 
 
 class SerialLifecycleTests(unittest.TestCase):
@@ -1113,6 +1123,7 @@ class SerialLifecycleTests(unittest.TestCase):
         self.assertIn("--no-stub", command)
         self.assertEqual(command[-1], "read-mac")
         self.assertNotIn("write-flash", command)
+        self.assertTrue(popen.call_args.kwargs["close_fds"])
         self.assertEqual(process.events, [("communicate", 1.5)])
 
     def test_watchdog_timeout_terminates_and_waits_for_child(self) -> None:
@@ -1161,6 +1172,36 @@ class SerialLifecycleTests(unittest.TestCase):
 
         self.assertIn(("terminate",), process.events)
         self.assertEqual(process.events[-1], ("communicate", 0.5))
+
+    def test_cli_sigterm_reaps_usb_recovery_child_and_restores_handler(self) -> None:
+        process = SigtermProcess(returncode=None)
+        client = SerialDeviceClient("/dev/cu.test", timeout=2)
+        previous_handler = signal.getsignal(signal.SIGTERM)
+
+        def run_recovery(_args):  # type: ignore[no-untyped-def]
+            client._watchdog_reset_usb_serial_jtag(
+                connect_mode="usb-reset", timeout=1
+            )
+            return 0
+
+        parsed = type("Args", (), {})()
+        parsed.func = run_recovery
+        parser = type("Parser", (), {"parse_args": lambda self, argv: parsed})()
+        with patch.object(cli, "build_parser", return_value=parser):
+            with patch(
+                "pocket_journal_partner.device.subprocess.Popen",
+                return_value=process,
+            ):
+                exit_code = cli.main([])
+
+        self.assertEqual(exit_code, 128 + signal.SIGTERM)
+        self.assertEqual(signal.getsignal(signal.SIGTERM), previous_handler)
+        self.assertEqual(process.events, [
+            ("communicate", 1),
+            ("poll",),
+            ("terminate",),
+            ("communicate", 0.5),
+        ])
 
     def test_child_cleanup_reaps_a_real_process(self) -> None:
         process = subprocess.Popen([

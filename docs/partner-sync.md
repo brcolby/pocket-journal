@@ -1,6 +1,9 @@
 # Partner Sync
 
 The partner CLI is the source of truth for laptop-side sync state.
+For installation and first provisioning, see [Install and Flashing](install.md).
+For the complete syntax, defaults, and options for every command below, see the
+[Partner CLI Reference](cli-reference.md).
 
 ## Commands
 
@@ -23,6 +26,7 @@ pj settings set alarm_enabled=true alarm_hour=7 alarm_minute=30
 pj settings set clock_24h=false temperature_unit=f transcript_font_size=3
 pj device status
 pj device wifi-diagnostics
+pj device stop-interval
 pj device usb-recover
 pj device sync-time
 pj device tone
@@ -32,6 +36,9 @@ pj device tone --audio-power-level 0
 pj device tone --codec-gp45 0xff
 pj device mic-check --duration-ms 2000
 pj device mic-check --duration-ms 2000 --gain-db 30
+pj firmware status
+pj recordings list
+pj recordings download --audio-id <audio-id> --output-dir ./recordings
 pj recordings wipe --yes
 ```
 
@@ -76,6 +83,8 @@ Only one process can own the USB serial port. Start `idf.py monitor` only for an
 explicit log session, then quit it with `Ctrl+]` before running the partner utility
 over USB-C. Partner commands request exclusive ownership, preset DTR/RTS before
 opening, and release the descriptor on success, timeout, error, or interruption.
+`SIGTERM` and terminal hangup are handled as cleanup requests: active serial
+contexts unwind before exit, and USB recovery terminates and reaps its esptool child.
 
 After closing the monitor, `pj device usb-recover` probes the application protocol
 and recognizable ROM output. When reset is needed, it first runs a bounded esptool

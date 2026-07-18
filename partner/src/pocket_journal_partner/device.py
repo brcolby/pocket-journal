@@ -1834,6 +1834,7 @@ class SerialDeviceClient:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
+                close_fds=True,
             )
             process.communicate(timeout=max(0.1, timeout))
         except subprocess.TimeoutExpired:

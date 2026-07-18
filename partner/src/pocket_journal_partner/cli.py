@@ -2,14 +2,17 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 import argparse
 import asyncio
+from contextlib import contextmanager
 import json
 import os
 import secrets
+import signal
 import sqlite3
 import sys
+import threading
 import webbrowser
 
 from .ble import provision_wifi
@@ -59,6 +62,40 @@ USB_PROVISIONING_TOKEN_BYTES = 16
 TIME_SYNC_PRECISION_SECONDS = 1
 TIME_SYNC_RETRY_COMMAND = "pj device sync-time"
 TIME_REPAIR_REASON = "legacy_missing_utc_offset"
+
+
+class _TerminationRequested(BaseException):
+    def __init__(self, signum: int) -> None:
+        self.signum = signum
+
+
+@contextmanager
+def _unwind_on_termination() -> Iterator[None]:
+    """Turn terminal shutdown signals into stack unwinding on the main thread."""
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+
+    watched = [signal.SIGTERM]
+    sighup = getattr(signal, "SIGHUP", None)
+    if isinstance(sighup, signal.Signals):
+        watched.append(sighup)
+    previous = {
+        signum: signal.getsignal(signum)
+        for signum in watched
+    }
+
+    def request_termination(signum: int, _frame: Any) -> None:
+        raise _TerminationRequested(signum)
+
+    for signum, handler in previous.items():
+        if handler is not signal.SIG_IGN:
+            signal.signal(signum, request_termination)
+    try:
+        yield
+    finally:
+        for signum, handler in previous.items():
+            signal.signal(signum, handler)
 
 
 def _print_json(payload) -> None:
@@ -1379,7 +1416,10 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
-        return args.func(args)
+        with _unwind_on_termination():
+            return args.func(args)
+    except _TerminationRequested as exc:
+        return 128 + exc.signum
     except DeviceError as exc:
         print(f"pj: error: {exc}", file=sys.stderr)
         return 1
