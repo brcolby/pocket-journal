@@ -8,10 +8,17 @@ import json
 from pathlib import Path
 import secrets
 import socket
+import sqlite3
 from typing import Any
 from urllib.parse import parse_qs, quote, urlsplit
 
-from .library import LibraryNote, NoteLibrary
+from .library import (
+    LIBRARY_AVAILABILITY_FILTERS,
+    MAX_SEARCH_LENGTH,
+    LibraryDeleteResult,
+    LibraryNote,
+    NoteLibrary,
+)
 
 
 DEFAULT_HOST = "127.0.0.1"
@@ -22,21 +29,55 @@ _AUDIO_PATH_PREFIX = "/audio/"
 
 
 _CSS = """
-:root { color-scheme: light dark; font-family: ui-sans-serif, system-ui, sans-serif; }
-body { margin: 0; background: Canvas; color: CanvasText; }
-header, main { max-width: 960px; margin: auto; padding: 24px; }
-header { border-bottom: 2px solid CanvasText; }
-h1 { margin: 0; font-size: 28px; }
-.note { display: grid; grid-template-columns: minmax(12rem, 1fr) auto; gap: 16px;
-        padding: 16px 0; border-bottom: 2px solid color-mix(in srgb, CanvasText 25%, Canvas); }
-.note a { color: LinkText; font-size: 20px; font-weight: 700; }
-.meta { font-variant-numeric: tabular-nums; opacity: .75; }
-.transcript { white-space: pre-wrap; font: 18px/1.55 ui-serif, Georgia, serif; }
-audio { width: 100%; margin: 16px 0; }
-form { display: flex; gap: 8px; margin: 20px 0; }
-input[type=text] { flex: 1; min-width: 0; padding: 10px; font: inherit; border: 2px solid CanvasText; }
-button { padding: 10px 18px; border: 2px solid CanvasText; background: CanvasText; color: Canvas; font: inherit; font-weight: 700; }
-@media (max-width: 560px) { .note { grid-template-columns: 1fr; } header, main { padding: 16px; } }
+:root { color-scheme: light dark; font-family: Inter, ui-sans-serif, system-ui, sans-serif;
+        --paper: #f4f1e8; --panel: #fffdf7; --ink: #20201e; --muted: #67645d;
+        --line: #cbc5b8; --accent: #155f5a; --danger: #a2382d; }
+@media (prefers-color-scheme: dark) { :root { --paper: #171816; --panel: #21221f;
+        --ink: #f1eee4; --muted: #aaa69c; --line: #45463f; --accent: #73c7be;
+        --danger: #f28f83; } }
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--paper); color: var(--ink); line-height: 1.45; }
+header, main { width: min(100% - 32px, 920px); margin: auto; }
+header { padding: 34px 0 22px; border-bottom: 1px solid var(--line); }
+.eyebrow { margin: 0 0 4px; color: var(--accent); font-size: 12px; font-weight: 800;
+           letter-spacing: .16em; text-transform: uppercase; }
+h1 { margin: 0; font: 700 clamp(28px, 5vw, 42px)/1.05 ui-serif, Georgia, serif; }
+h2 { font: 700 clamp(26px, 5vw, 38px)/1.15 ui-serif, Georgia, serif; }
+main { padding: 28px 0 64px; }
+.toolbar { display: grid; grid-template-columns: minmax(12rem, 1fr) minmax(9rem, auto) auto;
+           gap: 10px; margin: 0 0 14px; }
+input, select, button { min-height: 44px; padding: 9px 12px; border: 1px solid var(--line);
+                        border-radius: 7px; background: var(--panel); color: var(--ink); font: inherit; }
+input:focus, select:focus, button:focus, a:focus { outline: 3px solid var(--accent); outline-offset: 2px; }
+button { border-color: var(--accent); background: var(--accent); color: var(--paper); font-weight: 750;
+         cursor: pointer; }
+.summary { display: flex; justify-content: space-between; gap: 16px; margin: 0 0 8px;
+           color: var(--muted); font-size: 14px; }
+.notes { overflow: hidden; border: 1px solid var(--line); border-radius: 10px; background: var(--panel); }
+.note { display: grid; grid-template-columns: minmax(12rem, 1fr) auto; gap: 18px;
+        align-items: center; padding: 17px 18px; border-bottom: 1px solid var(--line); }
+.note:last-child { border-bottom: 0; }
+.note-title { color: var(--ink); font: 700 19px/1.25 ui-serif, Georgia, serif; text-decoration-thickness: 1px; }
+.note-sub { margin-top: 5px; color: var(--muted); font-size: 13px; font-variant-numeric: tabular-nums; }
+.badges { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 6px; }
+.badge { padding: 4px 8px; border: 1px solid var(--line); border-radius: 999px; color: var(--muted);
+         font-size: 11px; font-weight: 800; letter-spacing: .06em; text-transform: uppercase; }
+.badge.yes { border-color: var(--accent); color: var(--accent); }
+.empty, .notice { padding: 30px; border: 1px solid var(--line); border-radius: 10px; background: var(--panel); }
+.meta { color: var(--muted); font-variant-numeric: tabular-nums; }
+.transcript { padding: 22px; border: 1px solid var(--line); border-radius: 10px; background: var(--panel);
+              white-space: pre-wrap; font: 18px/1.6 ui-serif, Georgia, serif; }
+audio { width: 100%; margin: 8px 0 18px; }
+.edit-form { display: grid; grid-template-columns: 1fr auto; gap: 8px; margin: 24px 0; }
+.back { display: inline-block; margin-bottom: 10px; color: var(--accent); font-weight: 700; }
+.danger-link { color: var(--danger); font-weight: 750; }
+.danger { border-color: var(--danger); background: var(--danger); }
+.danger-box { margin-top: 32px; padding-top: 18px; border-top: 1px solid var(--line); }
+code { font-family: ui-monospace, SFMono-Regular, monospace; }
+@media (max-width: 620px) { header, main { width: min(100% - 24px, 920px); }
+  header { padding-top: 24px; } main { padding-top: 20px; }
+  .toolbar { grid-template-columns: 1fr; } .note { grid-template-columns: 1fr; gap: 10px; }
+  .badges { justify-content: flex-start; } .edit-form { grid-template-columns: 1fr; } }
 """
 
 
@@ -55,7 +96,9 @@ def _document(title: str, body: str) -> bytes:
         "<!doctype html><html lang='en'><head><meta charset='utf-8'>"
         "<meta name='viewport' content='width=device-width,initial-scale=1'>"
         f"<title>{escaped_title}</title><style>{_CSS}</style></head>"
-        f"<body><header><h1>POCKET JOURNAL</h1></header><main>{body}</main></body></html>"
+        "<body><header><p class='eyebrow'>Pocket Journal</p>"
+        "<h1>Local note library</h1></header>"
+        f"<main>{body}</main></body></html>"
     ).encode("utf-8")
 
 
@@ -63,41 +106,130 @@ def _note_url(note: LibraryNote) -> str:
     return _NOTE_PATH_PREFIX + note.note_id
 
 
-def _index_html(notes: list[LibraryNote]) -> bytes:
+def _availability_options(selected: str) -> str:
+    labels = {
+        "all": "All notes",
+        "audio": "Has audio",
+        "text": "Has text",
+        "missing_text": "Needs text",
+        "missing_audio": "Missing audio",
+    }
+    return "".join(
+        f"<option value='{value}'{' selected' if value == selected else ''}>"
+        f"{html.escape(labels[value])}</option>"
+        for value in LIBRARY_AVAILABILITY_FILTERS
+    )
+
+
+def _note_subtitle(note: LibraryNote) -> str:
+    parts = [note.filename]
+    if note.duration_ms is not None:
+        seconds = max(0, note.duration_ms // 1000)
+        parts.append(f"{seconds // 60}:{seconds % 60:02d}")
+    if note.created_at:
+        parts.append(note.created_at[:10])
+    return " · ".join(parts)
+
+
+def _index_html(
+    notes: list[LibraryNote],
+    *,
+    total: int,
+    query: str = "",
+    availability: str = "all",
+) -> bytes:
+    search = (
+        "<form class='toolbar' method='get' action='/'>"
+        f"<input type='search' name='q' maxlength='{MAX_SEARCH_LENGTH}' "
+        f"value='{html.escape(query)}' placeholder='Search titles and text' aria-label='Search notes'>"
+        f"<select name='availability' aria-label='Filter availability'>{_availability_options(availability)}</select>"
+        "<button type='submit'>Search</button></form>"
+    )
+    active = bool(query or availability != "all")
+    clear = "<a href='/'>Clear filters</a>" if active else ""
+    summary = (
+        "<div class='summary'>"
+        f"<span>{total} {'note' if total == 1 else 'notes'}</span>{clear}</div>"
+    )
     if not notes:
-        content = "<p>No local notes. Run <code>pj sync</code> after recording a note.</p>"
+        if active:
+            content = (
+                "<div class='empty'><strong>No matching notes.</strong> "
+                "Try a broader search or clear the availability filter.</div>"
+            )
+        else:
+            content = (
+                "<div class='empty'><strong>No local notes yet.</strong> "
+                "Run <code>pj sync</code> after recording a note.</div>"
+            )
     else:
         rows = []
         for note in notes:
-            media = "AUDIO" if note.audio_path else "NO AUDIO"
-            text = "TEXT" if note.transcript_text else "NO TEXT"
+            audio_class = "yes" if note.audio_path else ""
+            text_class = "yes" if note.transcript_text else ""
+            audio_label = "Audio" if note.audio_path else "No audio"
+            text_label = "Text" if note.transcript_text else "No text"
             rows.append(
-                "<article class='note'>"
-                f"<a href='{_note_url(note)}'>{html.escape(note.title)}</a>"
-                f"<span class='meta'>{media} / {text}</span></article>"
+                "<article class='note'><div>"
+                f"<a class='note-title' href='{_note_url(note)}'>{html.escape(note.title)}</a>"
+                f"<div class='note-sub'>{html.escape(_note_subtitle(note))}</div></div>"
+                "<div class='badges' aria-label='Note availability'>"
+                f"<span class='badge {audio_class}'>{audio_label}</span>"
+                f"<span class='badge {text_class}'>{text_label}</span></div></article>"
             )
-        content = "".join(rows)
-    return _document("Pocket Journal", content)
+        content = "<section class='notes'>" + "".join(rows) + "</section>"
+    return _document("Pocket Journal", search + summary + content)
 
 
-def _note_html(note: LibraryNote, csrf_token: str) -> bytes:
+def _note_html(note: LibraryNote, csrf_token: str, *, audio_available: bool) -> bytes:
     audio = (
         f"<audio controls preload='metadata' src='{_AUDIO_PATH_PREFIX}{note.note_id}'></audio>"
-        if note.audio_path
+        if audio_available
         else "<p class='meta'>No local audio.</p>"
     )
     transcript = html.escape(note.transcript_text or "No transcript yet.")
     action = _note_url(note) + "/title"
     body = (
-        "<p><a href='/'>ALL NOTES</a></p>"
+        "<a class='back' href='/'>← All notes</a>"
         f"<h2>{html.escape(note.title)}</h2>{audio}"
-        f"<form method='post' action='{action}'>"
+        f"<form class='edit-form' method='post' action='{action}'>"
         f"<input type='hidden' name='csrf' value='{html.escape(csrf_token)}'>"
         f"<input type='text' name='title' maxlength='200' required value='{html.escape(note.title)}' "
         "aria-label='Note title'><button type='submit'>SAVE TITLE</button></form>"
         f"<div class='transcript'>{transcript}</div>"
+        "<div class='danger-box'><a class='danger-link' "
+        f"href='{_note_url(note)}/delete'>Delete local note…</a></div>"
     )
     return _document(note.title, body)
+
+
+def _delete_confirmation_html(note: LibraryNote, csrf_token: str) -> bytes:
+    action = _note_url(note) + "/delete"
+    body = (
+        "<a class='back' href='" + _note_url(note) + "'>← Keep note</a>"
+        "<h2>Delete local note?</h2>"
+        f"<div class='notice'><strong>{html.escape(note.title)}</strong><p>"
+        "This removes the local library entry, transcript and sync caches, and its unshared "
+        "managed audio file. It does not delete the recording from the Pocket Journal device. "
+        "A future <code>pj sync</code> can restore the device recording locally.</p></div>"
+        f"<form class='edit-form' method='post' action='{action}'>"
+        f"<input type='hidden' name='csrf' value='{html.escape(csrf_token)}'>"
+        "<input type='text' name='confirm' required autocomplete='off' "
+        "placeholder='Type DELETE' aria-label='Type DELETE to confirm'>"
+        "<button class='danger' type='submit'>Delete local note</button></form>"
+    )
+    return _document("Delete local note", body)
+
+
+def _delete_result_html(result: LibraryDeleteResult) -> bytes:
+    details = " ".join(html.escape(error) for error in result.cleanup_errors)
+    body = (
+        "<h2>Library entry deleted</h2>"
+        f"<div class='notice'><strong>{html.escape(result.title)}</strong> was removed from the library. "
+        f"The database change is complete, but audio cleanup needs attention: {details}</div>"
+        "<p><a class='back' href='/'>← Return to all notes</a></p>"
+    )
+    return _document("Note deleted with warning", body)
 
 
 def _parse_range(value: str | None, size: int) -> tuple[int, int, bool] | None:
@@ -189,6 +321,18 @@ def create_server(
                 return None
             return library.get(note_id)
 
+        def _filters(self) -> tuple[str, str]:
+            query = parse_qs(
+                urlsplit(self.path).query,
+                keep_blank_values=True,
+                max_num_fields=8,
+            )
+            search = query.get("q", [""])[0]
+            availability = query.get("availability", ["all"])[0] or "all"
+            if availability not in LIBRARY_AVAILABILITY_FILTERS:
+                raise ValueError("Unknown availability filter.")
+            return search, availability
+
         def do_HEAD(self) -> None:
             self.do_GET()
 
@@ -198,11 +342,53 @@ def create_server(
                 return
             path = urlsplit(self.path).path
             if path == "/":
-                self._send(HTTPStatus.OK, _index_html(library.list_notes(limit=1000)), "text/html; charset=utf-8")
+                try:
+                    search, availability = self._filters()
+                    notes = library.list_notes(
+                        limit=1000,
+                        search=search,
+                        availability=availability,
+                    )
+                    total = library.count(
+                        search=search,
+                        availability=availability,
+                    )
+                except ValueError as error:
+                    self._error(HTTPStatus.BAD_REQUEST, str(error))
+                    return
+                self._send(
+                    HTTPStatus.OK,
+                    _index_html(
+                        notes,
+                        total=total,
+                        query=search,
+                        availability=availability,
+                    ),
+                    "text/html; charset=utf-8",
+                )
                 return
             if path == "/api/notes":
+                try:
+                    search, availability = self._filters()
+                    notes = library.list_notes(
+                        limit=1000,
+                        search=search,
+                        availability=availability,
+                    )
+                    total = library.count(
+                        search=search,
+                        availability=availability,
+                    )
+                except ValueError as error:
+                    self._error(HTTPStatus.BAD_REQUEST, str(error))
+                    return
                 payload = json.dumps(
-                    {"notes": [note.as_dict() for note in library.list_notes(limit=1000)]},
+                    {
+                        "notes": [note.as_dict() for note in notes],
+                        "total": total,
+                        "query": search,
+                        "availability": availability,
+                    },
                     ensure_ascii=False,
                     separators=(",", ":"),
                 ).encode("utf-8")
@@ -219,9 +405,27 @@ def create_server(
                     return
                 self._serve_audio(audio_path)
                 return
+            delete_note = self._note_from_path(
+                _NOTE_PATH_PREFIX, suffix="/delete"
+            )
+            if delete_note is not None:
+                self._send(
+                    HTTPStatus.OK,
+                    _delete_confirmation_html(delete_note, csrf_token),
+                    "text/html; charset=utf-8",
+                )
+                return
             note = self._note_from_path(_NOTE_PATH_PREFIX)
             if note is not None:
-                self._send(HTTPStatus.OK, _note_html(note, csrf_token), "text/html; charset=utf-8")
+                self._send(
+                    HTTPStatus.OK,
+                    _note_html(
+                        note,
+                        csrf_token,
+                        audio_available=library.resolve_audio_path(note) is not None,
+                    ),
+                    "text/html; charset=utf-8",
+                )
                 return
             self._error(HTTPStatus.NOT_FOUND, "Page not found.")
 
@@ -261,7 +465,11 @@ def create_server(
             if not self._trusted_host():
                 self._error(HTTPStatus.MISDIRECTED_REQUEST, "Untrusted host header.")
                 return
-            note = self._note_from_path(_NOTE_PATH_PREFIX, suffix="/title")
+            path = urlsplit(self.path).path
+            title_action = path.endswith("/title")
+            delete_action = path.endswith("/delete")
+            suffix = "/title" if title_action else "/delete" if delete_action else ""
+            note = self._note_from_path(_NOTE_PATH_PREFIX, suffix=suffix) if suffix else None
             if note is None:
                 self._error(HTTPStatus.NOT_FOUND, "Page not found.")
                 return
@@ -288,14 +496,48 @@ def create_server(
             if not secrets.compare_digest(submitted_csrf, csrf_token):
                 self._error(HTTPStatus.FORBIDDEN, "Invalid form token.")
                 return
-            try:
-                library.update_title(note.note_id, form.get("title", [""])[0])
-            except ValueError as error:
-                self._error(HTTPStatus.BAD_REQUEST, str(error))
-                return
+            if title_action:
+                try:
+                    library.update_title(note.note_id, form.get("title", [""])[0])
+                except ValueError as error:
+                    self._error(HTTPStatus.BAD_REQUEST, str(error))
+                    return
+                except (OSError, sqlite3.Error):
+                    self._error(
+                        HTTPStatus.INTERNAL_SERVER_ERROR,
+                        "The local note title could not be updated.",
+                    )
+                    return
+                location = quote(_note_url(note), safe="/")
+            else:
+                if form.get("confirm", [""])[0] != "DELETE":
+                    self._error(
+                        HTTPStatus.BAD_REQUEST,
+                        "Type DELETE exactly to confirm local deletion.",
+                    )
+                    return
+                try:
+                    result = library.delete_note(note.note_id)
+                except KeyError:
+                    self._error(HTTPStatus.NOT_FOUND, "Note not found.")
+                    return
+                except (OSError, TypeError, ValueError, sqlite3.Error):
+                    self._error(
+                        HTTPStatus.INTERNAL_SERVER_ERROR,
+                        "The local note could not be deleted.",
+                    )
+                    return
+                if result.cleanup_errors:
+                    self._send(
+                        HTTPStatus.OK,
+                        _delete_result_html(result),
+                        "text/html; charset=utf-8",
+                    )
+                    return
+                location = "/"
             self.send_response(HTTPStatus.SEE_OTHER)
             self._security_headers()
-            self.send_header("Location", quote(_note_url(note), safe="/"))
+            self.send_header("Location", location)
             self.send_header("Content-Length", "0")
             self.end_headers()
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import http.client
+import json
 from pathlib import Path
 import re
 from tempfile import TemporaryDirectory
@@ -47,11 +48,44 @@ class LibraryWebTests(unittest.TestCase):
         self.assertEqual(response.status, 200)
         self.assertEqual(response.getheader("X-Content-Type-Options"), "nosniff")
         self.assertIn("frame-ancestors 'none'", response.getheader("Content-Security-Policy"))
+        self.assertIn(b">Audio</span>", index)
+        self.assertIn(b">Text</span>", index)
 
         response, note = self.request("GET", f"/note/{self.note.note_id}")
         self.assertEqual(response.status, 200)
         self.assertIn(b"A &lt;private&gt; transcript", note)
         self.assertNotIn(b"A <private> transcript", note)
+
+    def test_search_and_availability_filter_browser_and_api_results(self) -> None:
+        quiet = self.library.upsert_discovered(
+            "device", "quiet", "quiet.wav", label="Quiet <idea>"
+        )
+        path = "/?" + urlencode({"q": "Quiet", "availability": "missing_text"})
+        response, index = self.request("GET", path)
+
+        self.assertEqual(response.status, 200)
+        self.assertIn(b"Quiet &lt;idea&gt;", index)
+        self.assertNotIn(b">sample</a>", index)
+        self.assertIn(b">No audio</span>", index)
+        self.assertIn(b">No text</span>", index)
+
+        api_path = "/api/notes?" + urlencode(
+            {"q": "Quiet", "availability": "missing_audio"}
+        )
+        response, payload = self.request("GET", api_path)
+        parsed = json.loads(payload)
+        self.assertEqual(response.status, 200)
+        self.assertEqual(parsed["total"], 1)
+        self.assertEqual(parsed["availability"], "missing_audio")
+        self.assertEqual(parsed["notes"][0]["note_id"], quiet.note_id)
+
+        response, no_results = self.request("GET", "/?q=does-not-exist")
+        self.assertEqual(response.status, 200)
+        self.assertIn(b"No matching notes", no_results)
+
+        response, invalid = self.request("GET", "/?availability=anything")
+        self.assertEqual(response.status, 400)
+        self.assertIn(b"Unknown availability filter", invalid)
 
     def test_audio_supports_bounded_ranges_and_rejects_invalid_ranges(self) -> None:
         response, payload = self.request(
@@ -101,6 +135,51 @@ class LibraryWebTests(unittest.TestCase):
         self.assertEqual(response.status, 303)
         self.assertEqual(response.getheader("Location"), f"/note/{self.note.note_id}")
         self.assertEqual(self.library.get(self.note.note_id).title, "Web title")  # type: ignore[union-attr]
+
+    def test_delete_requires_confirmation_and_csrf_then_removes_local_note(self) -> None:
+        response, confirmation = self.request(
+            "GET", f"/note/{self.note.note_id}/delete"
+        )
+        self.assertEqual(response.status, 200)
+        self.assertIn(b"does not delete the recording from the Pocket Journal device", confirmation)
+        match = re.search(rb"name='csrf' value='([^']+)'", confirmation)
+        self.assertIsNotNone(match)
+        assert match is not None
+
+        for form, expected in (
+            ({"csrf": "wrong", "confirm": "DELETE"}, 403),
+            ({"csrf": match.group(1).decode(), "confirm": "delete"}, 400),
+        ):
+            body = urlencode(form).encode()
+            response, _ = self.request(
+                "POST",
+                f"/note/{self.note.note_id}/delete",
+                body,
+                {
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "Content-Length": str(len(body)),
+                },
+            )
+            self.assertEqual(response.status, expected)
+            self.assertIsNotNone(self.library.get(self.note.note_id))
+            self.assertTrue(self.audio.exists())
+
+        body = urlencode(
+            {"csrf": match.group(1).decode(), "confirm": "DELETE"}
+        ).encode()
+        response, _ = self.request(
+            "POST",
+            f"/note/{self.note.note_id}/delete",
+            body,
+            {
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Content-Length": str(len(body)),
+            },
+        )
+        self.assertEqual(response.status, 303)
+        self.assertEqual(response.getheader("Location"), "/")
+        self.assertIsNone(self.library.get(self.note.note_id))
+        self.assertFalse(self.audio.exists())
 
     def test_unknown_and_traversal_shaped_paths_do_not_read_files(self) -> None:
         for path in ("/audio/../../sample.wav", "/audio/%2e%2e%2fsample.wav", "/note/not-an-id"):

@@ -6,14 +6,24 @@ from datetime import datetime, timezone
 import hashlib
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import sqlite3
 from typing import Any, Iterator
 import unicodedata
 
+from .storage import PartnerStore
 
-LIBRARY_SCHEMA_VERSION = 2
+
+LIBRARY_SCHEMA_VERSION = 3
 MAX_TITLE_LENGTH = 200
+MAX_SEARCH_LENGTH = 200
+LIBRARY_AVAILABILITY_FILTERS = (
+    "all",
+    "audio",
+    "text",
+    "missing_text",
+    "missing_audio",
+)
 
 
 def stable_note_id(device_id: str, audio_id: str) -> str:
@@ -40,6 +50,30 @@ def _validated_title(title: str) -> str:
     return normalized
 
 
+def _validated_search(search: str | None) -> str | None:
+    if search is None:
+        return None
+    if not isinstance(search, str):
+        raise ValueError("note search must be text")
+    if any(unicodedata.category(character) == "Cc" for character in search):
+        raise ValueError("note search must not contain control characters")
+    normalized = " ".join(search.split())
+    if not normalized:
+        return None
+    if len(normalized) > MAX_SEARCH_LENGTH:
+        raise ValueError(f"note search must be at most {MAX_SEARCH_LENGTH} characters")
+    return normalized
+
+
+def _validated_availability(availability: str) -> str:
+    if availability not in LIBRARY_AVAILABILITY_FILTERS:
+        raise ValueError(
+            "note availability must be one of "
+            + ", ".join(LIBRARY_AVAILABILITY_FILTERS)
+        )
+    return availability
+
+
 @dataclass(frozen=True)
 class LibraryNote:
     note_id: str
@@ -58,6 +92,20 @@ class LibraryNote:
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+@dataclass(frozen=True)
+class LibraryDeleteResult:
+    note_id: str
+    title: str
+    audio_path: str | None
+    audio_removed: bool
+    audio_retained_reason: str | None
+    cleanup_errors: tuple[str, ...]
+
+    @property
+    def cleanup_complete(self) -> bool:
+        return not self.cleanup_errors
 
 
 _MIGRATIONS = (
@@ -91,6 +139,19 @@ _MIGRATIONS = (
         """
         CREATE INDEX notes_updated_at_idx ON notes(updated_at DESC, note_id);
         CREATE INDEX notes_device_idx ON notes(device_id, created_at DESC, note_id);
+        """,
+    ),
+    (
+        3,
+        """
+        CREATE TABLE note_tombstones (
+            note_id TEXT PRIMARY KEY,
+            device_id TEXT NOT NULL,
+            audio_id TEXT NOT NULL,
+            deleted_at TEXT NOT NULL,
+            UNIQUE (device_id, audio_id),
+            CHECK (length(note_id) = 64)
+        );
         """,
     ),
 )
@@ -222,6 +283,7 @@ class NoteLibrary:
         created_at: str | None = None,
         duration_ms: int | None = None,
         device_synced: bool = False,
+        restore_deleted: bool = True,
     ) -> LibraryNote:
         if not device_id or not audio_id or not filename:
             raise ValueError("device id, audio id, and filename are required")
@@ -231,6 +293,17 @@ class NoteLibrary:
         now = _now()
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            if restore_deleted:
+                connection.execute(
+                    "DELETE FROM note_tombstones WHERE note_id = ?",
+                    (note_id,),
+                )
+            elif connection.execute(
+                "SELECT 1 FROM note_tombstones WHERE note_id = ?",
+                (note_id,),
+            ).fetchone() is not None:
+                connection.rollback()
+                raise KeyError(f"locally deleted note: {note_id}")
             connection.execute(
                 """
                 INSERT INTO notes(
@@ -324,6 +397,162 @@ class NoteLibrary:
         assert note is not None
         return note
 
+    def _managed_audio_candidate(self, relative_path: str) -> tuple[Path | None, str | None]:
+        if not isinstance(relative_path, str):
+            return None, "audio path is not a safe library-relative path"
+        pure = PurePosixPath(relative_path)
+        if (
+            not relative_path
+            or pure.is_absolute()
+            or any(part in {"", ".", ".."} for part in pure.parts)
+        ):
+            return None, "audio path is not a safe library-relative path"
+        candidate = self.root.joinpath(*pure.parts)
+        current = self.root
+        for part in pure.parts:
+            current /= part
+            try:
+                if current.is_symlink():
+                    return None, "audio path contains a symbolic link and was not removed"
+            except OSError as error:
+                return None, f"audio path could not be inspected: {error}"
+        try:
+            resolved = candidate.resolve(strict=False)
+            resolved.relative_to(self.root)
+        except (OSError, RuntimeError, ValueError):
+            return None, "audio path resolves outside the partner data directory"
+        return candidate, None
+
+    def _remove_managed_artifact(
+        self,
+        path: Path,
+        label: str,
+        errors: list[str],
+    ) -> bool:
+        """Remove one exact generated artifact without following directory links."""
+        try:
+            path.relative_to(self.root)
+            resolved_parent = path.parent.resolve(strict=False)
+            resolved_parent.relative_to(self.root)
+        except (OSError, RuntimeError, ValueError):
+            errors.append(f"{label} path is outside the partner data directory")
+            return False
+        try:
+            if path.is_symlink():
+                path.unlink()
+                return True
+            if not path.exists():
+                return False
+            if not path.is_file():
+                errors.append(f"{label} is not a regular file")
+                return False
+            path.unlink()
+            return True
+        except FileNotFoundError:
+            return False
+        except OSError as error:
+            errors.append(f"{label} could not be removed: {error}")
+            return False
+
+    def delete_note(self, note_id: str) -> LibraryDeleteResult:
+        """Delete one local index row and its unshared, verified managed audio.
+
+        The note workflow lock serializes this operation against device sync.
+        The database commit is authoritative; cleanup happens afterward so an
+        unlink failure cannot roll back into a row pointing at a partially
+        removed artifact. Cleanup never expands beyond exact managed paths.
+        """
+        with self._connect() as connection:
+            identity = connection.execute(
+                "SELECT device_id, audio_id FROM notes WHERE note_id = ?",
+                (note_id,),
+            ).fetchone()
+        if identity is None:
+            raise KeyError(f"unknown note: {note_id}")
+        device_id = identity["device_id"]
+        audio_id = identity["audio_id"]
+        if not isinstance(device_id, str) or not isinstance(audio_id, str):
+            raise ValueError("note identity is not valid text")
+        store = PartnerStore(self.root)
+        with store.workflow_lock(device_id, audio_id):
+            return self._delete_note_locked(note_id, store)
+
+    def _delete_note_locked(
+        self,
+        note_id: str,
+        store: PartnerStore,
+    ) -> LibraryDeleteResult:
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT note_id, device_id, audio_id, title, audio_path "
+                "FROM notes WHERE note_id = ?",
+                (note_id,),
+            ).fetchone()
+            if row is None:
+                connection.rollback()
+                raise KeyError(f"unknown note: {note_id}")
+            audio_path = row["audio_path"]
+            shared_audio = False
+            if audio_path:
+                shared_audio = (
+                    connection.execute(
+                        "SELECT 1 FROM notes WHERE note_id != ? AND audio_path = ? LIMIT 1",
+                        (note_id, audio_path),
+                    ).fetchone()
+                    is not None
+                )
+            connection.execute(
+                "INSERT OR REPLACE INTO note_tombstones("
+                "note_id, device_id, audio_id, deleted_at) VALUES (?, ?, ?, ?)",
+                (row["note_id"], row["device_id"], row["audio_id"], _now()),
+            )
+            connection.execute("DELETE FROM notes WHERE note_id = ?", (note_id,))
+            connection.commit()
+
+        removed = False
+        retained_reason: str | None = None
+        errors: list[str] = []
+        if audio_path and shared_audio:
+            retained_reason = "audio is shared by another library note"
+        elif audio_path:
+            candidate, unsafe_reason = self._managed_audio_candidate(audio_path)
+            if candidate is None:
+                errors.append(unsafe_reason or "audio path was not safe to remove")
+            else:
+                try:
+                    if candidate.exists():
+                        if not candidate.is_file():
+                            errors.append("audio attachment is not a regular file")
+                        else:
+                            candidate.unlink()
+                            removed = True
+                except FileNotFoundError:
+                    pass
+                except OSError as error:
+                    errors.append(f"audio file could not be removed: {error}")
+
+        # Legacy sync sidecars can otherwise recreate a deleted index row when
+        # the library next opens. Remove only the deterministic current/legacy
+        # paths for this identity; the tombstone also protects against failed
+        # cleanup until a real device sync explicitly rediscovers the note.
+        try:
+            sidecars = store.note_sidecar_paths(row["device_id"], row["audio_id"])
+        except (OSError, TypeError, ValueError) as error:
+            errors.append(f"note cache paths could not be derived: {error}")
+        else:
+            for index, path in enumerate(sidecars):
+                label = "transcript cache" if index < 2 else "sync job cache"
+                self._remove_managed_artifact(path, label, errors)
+        return LibraryDeleteResult(
+            note_id=row["note_id"],
+            title=row["title"],
+            audio_path=audio_path,
+            audio_removed=removed,
+            audio_retained_reason=retained_reason,
+            cleanup_errors=tuple(errors),
+        )
+
     def get(self, note_id: str) -> LibraryNote | None:
         if len(note_id) != 64 or any(character not in "0123456789abcdef" for character in note_id):
             return None
@@ -339,21 +568,13 @@ class NoteLibrary:
         limit: int = 100,
         offset: int = 0,
         search: str | None = None,
+        availability: str = "all",
     ) -> list[LibraryNote]:
         if not 1 <= limit <= 1000:
             raise ValueError("note list limit must be between 1 and 1000")
         if offset < 0:
             raise ValueError("note list offset must not be negative")
-        params: list[Any] = []
-        where = ""
-        if search:
-            escaped = search.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-            where = (
-                "WHERE title LIKE ? ESCAPE '\\' OR transcript_text LIKE ? ESCAPE '\\' "
-                "OR filename LIKE ? ESCAPE '\\'"
-            )
-            pattern = f"%{escaped}%"
-            params.extend((pattern, pattern, pattern))
+        where, params = self._filter_query(search, availability)
         params.extend((limit, offset))
         with self._connect() as connection:
             rows = connection.execute(
@@ -363,20 +584,49 @@ class NoteLibrary:
             ).fetchall()
         return [self._row_to_note(row) for row in rows]
 
-    def count(self, *, search: str | None = None) -> int:
-        if not search:
-            query = "SELECT COUNT(*) FROM notes"
-            params: tuple[Any, ...] = ()
-        else:
-            escaped = search.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-            pattern = f"%{escaped}%"
-            query = (
-                "SELECT COUNT(*) FROM notes WHERE title LIKE ? ESCAPE '\\' "
-                "OR transcript_text LIKE ? ESCAPE '\\' OR filename LIKE ? ESCAPE '\\'"
+    @staticmethod
+    def _filter_query(
+        search: str | None, availability: str
+    ) -> tuple[str, list[Any]]:
+        normalized_search = _validated_search(search)
+        normalized_availability = _validated_availability(availability)
+        clauses: list[str] = []
+        params: list[Any] = []
+        if normalized_search:
+            escaped = (
+                normalized_search.replace("\\", "\\\\")
+                .replace("%", "\\%")
+                .replace("_", "\\_")
             )
-            params = (pattern, pattern, pattern)
+            pattern = f"%{escaped}%"
+            clauses.append(
+                "(title LIKE ? ESCAPE '\\' OR transcript_text LIKE ? ESCAPE '\\' "
+                "OR filename LIKE ? ESCAPE '\\')"
+            )
+            params.extend((pattern, pattern, pattern))
+        availability_clauses = {
+            "all": None,
+            "audio": "audio_path IS NOT NULL",
+            "text": "transcript_text IS NOT NULL",
+            "missing_text": "transcript_text IS NULL",
+            "missing_audio": "audio_path IS NULL",
+        }
+        availability_clause = availability_clauses[normalized_availability]
+        if availability_clause:
+            clauses.append(availability_clause)
+        return ("WHERE " + " AND ".join(clauses) if clauses else ""), params
+
+    def count(
+        self,
+        *,
+        search: str | None = None,
+        availability: str = "all",
+    ) -> int:
+        where, params = self._filter_query(search, availability)
         with self._connect() as connection:
-            row = connection.execute(query, params).fetchone()
+            row = connection.execute(
+                f"SELECT COUNT(*) FROM notes {where}", params
+            ).fetchone()
         return int(row[0])
 
     def import_partner_store(self, store: Any) -> int:
@@ -408,6 +658,7 @@ class NoteLibrary:
                         else None
                     ),
                     device_synced=job.get("stage") == "uploaded",
+                    restore_deleted=False,
                 )
                 audio_path = store.audio_path(device_id, audio_id, filename)
                 if audio_path.is_file():

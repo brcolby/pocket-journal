@@ -148,7 +148,7 @@ class PartnerStore:
     def transcript_dir(self, device_id: str) -> Path:
         return self.root / "transcripts" / _path_component(device_id)
 
-    def transcript_path(self, device_id: str, audio_id: str) -> Path:
+    def _transcript_paths(self, device_id: str, audio_id: str) -> tuple[Path, Path]:
         component = _path_component(audio_id)
         path = self.transcript_dir(device_id) / f"{component[:_MAX_COMPONENT_LENGTH - 5]}.json"
         legacy_path = (
@@ -157,13 +157,17 @@ class PartnerStore:
             / _legacy_path_component(device_id)
             / f"{_legacy_path_component(audio_id)}.json"
         )
+        return path, legacy_path
+
+    def transcript_path(self, device_id: str, audio_id: str) -> Path:
+        path, legacy_path = self._transcript_paths(device_id, audio_id)
         _migrate_legacy_file(legacy_path, path)
         return path
 
     def job_dir(self, device_id: str) -> Path:
         return self.root / "jobs" / _path_component(device_id)
 
-    def job_path(self, device_id: str, audio_id: str) -> Path:
+    def _job_paths(self, device_id: str, audio_id: str) -> tuple[Path, Path]:
         component = _path_component(audio_id)
         path = self.job_dir(device_id) / f"{component[:_MAX_COMPONENT_LENGTH - 5]}.json"
         legacy_path = (
@@ -172,8 +176,18 @@ class PartnerStore:
             / _legacy_path_component(device_id)
             / f"{_legacy_path_component(audio_id)}.json"
         )
+        return path, legacy_path
+
+    def job_path(self, device_id: str, audio_id: str) -> Path:
+        path, legacy_path = self._job_paths(device_id, audio_id)
         _migrate_legacy_file(legacy_path, path)
         return path
+
+    def note_sidecar_paths(self, device_id: str, audio_id: str) -> tuple[Path, ...]:
+        """Return exact current and legacy cache paths without migrating them."""
+        transcript, legacy_transcript = self._transcript_paths(device_id, audio_id)
+        job, legacy_job = self._job_paths(device_id, audio_id)
+        return transcript, legacy_transcript, job, legacy_job
 
     def companion_state_path(self, device_id: str) -> Path:
         return self.root / "companion" / f"{_path_component(device_id)}.json"
