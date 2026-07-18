@@ -107,6 +107,16 @@ pj transcription status --digest
 pj sync
 ```
 
+One invocation is a complete round trip for every recording in its device
+snapshot: validated device WAV -> durable host audio -> local model -> durable
+host transcript/library row -> matching device transcript/title. The model is
+started only after the complete WAV passes size, data-length, and source-digest
+validation, and only when the audio or model fingerprint is new. Identical
+completed notes are reported as `skipped`; a note marked synced on the device is
+still downloaded and transcribed when its host artifacts are missing. The JSON
+summary reports how many items actually downloaded, invoked transcription,
+uploaded, skipped, or failed. Any item failure makes the command exit nonzero.
+
 `pj transcription setup` accepts an existing Q5_0 model only when its size and
 SHA-256 match the production baseline. It recognizes the benchmarked Apple
 Silicon Homebrew 1.9.1 runtime; other local builds require an explicit expected
@@ -181,16 +191,22 @@ the same structured library:
 pj library list [--search TEXT]
 pj library show NOTE_ID
 pj library title NOTE_ID 'New title'
-pj library tui
-pj library serve                 # http://127.0.0.1:8766
+pj library tui                   # curses keyboard browser
+pj library serve                 # searchable UI at http://127.0.0.1:8766
 ```
 
 The web UI binds only to a loopback address, rejects non-loopback `Host` headers
 to prevent DNS rebinding, sets restrictive browser security headers, requires an
-unguessable per-process form token for title changes, and
+unguessable per-process form token for title changes and deletion, and
 serves audio only by validated library identity. It supports byte ranges for
-normal browser seeking. The terminal UI uses numbered page commands and opens
-audio through the operating system without constructing a shell command.
+normal browser seeking. Its home supports title/transcript search, audio/text
+filters, responsive availability badges (including **No text**), useful empty
+states, title editing, and an explicit local-delete confirmation. Local deletion
+removes the library row and only exact managed audio/job/transcript artifacts; a
+durable tombstone prevents stale sidecars from restoring it on restart. It does
+not delete the recording on the device, so a later deliberate `pj sync` may
+restore it. The curses UI provides the same search, filters, reading, playback,
+rename, and typed-delete flow with arrow-key navigation and terminal cleanup.
 
 ## Data Stored Locally
 
@@ -214,7 +230,11 @@ idempotently. User-edited titles are retained on later syncs. Audio remains in
 the existing file tree; the database stores only paths constrained beneath the
 partner data directory.
 
-Device note metadata is durable under `/sdcard/pj/notes`. Partner sync skips notes already reported as `synced`, so repeated sync runs only transcribe new recordings.
+Device note metadata is durable under `/sdcard/pj/notes`. Repeated syncs skip
+only notes whose device state and validated local audio, transcript, model
+fingerprint, and uploaded payload are all current. Device-synced notes with
+missing host state are rehydrated in one call, while a local title-only change is
+uploaded without downloading audio or rerunning the model.
 
 For sandboxed or test runs, pass `--data-dir <path>` to commands that need the paired-device config.
 
