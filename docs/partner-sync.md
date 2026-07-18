@@ -207,8 +207,10 @@ durable tombstone prevents stale sidecars from restoring it on restart. It does
 not delete the recording on the device, so a later deliberate `pj sync` may
 restore it. The curses UI provides the same search, filters, reading, playback,
 rename, and typed-delete flow with arrow-key navigation and terminal cleanup.
-Playback stays inside the TUI: `P` plays or restarts the selected WAV, Space
-pauses or resumes, and `S` stops. The status line shows elapsed and total time.
+Playback stays inside the TUI: Space starts the selected WAV or toggles that
+note between playing and paused. Right Arrow opens note text, Left Arrow returns
+to the main note menu, `T` edits the title, `D` deletes, and `F` cycles the list
+filter. The status line shows elapsed and total time.
 macOS uses `/usr/bin/afplay` without opening another application; supported
 Linux hosts use an available native `paplay`, `aplay`, or headless `ffplay`.
 The player uses fixed argument vectors without a shell and is stopped and

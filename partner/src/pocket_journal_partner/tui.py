@@ -37,6 +37,18 @@ _FILTER_LABELS = {
     "missing_text": "needs text",
     "missing_audio": "missing audio",
 }
+_HOME_CONTROLS = (
+    "↑↓ move  → text  Space play/pause  / search  F filter  T title  D delete  Q quit"
+)
+_HOME_CONTROLS_COMPACT = (
+    "↑↓ move  → text  Space play/pause",
+    "/ search F filter T title D delete Q quit",
+)
+_DETAIL_CONTROLS = "↑↓ scroll  ← menu  Space play/pause  T title  D delete"
+_DETAIL_CONTROLS_COMPACT = (
+    "↑↓ scroll  ← menu  Space play/pause",
+    "T title  D delete",
+)
 
 
 @contextmanager
@@ -60,11 +72,13 @@ def _blocked_signal_table(signums: tuple[int, ...]) -> Iterator[None]:
 
 
 class AudioPlayer(Protocol):
-    def play(self, note_id: str, path: Path, *, duration_ms: int | None = None) -> None: ...
-
-    def pause_resume(self) -> None: ...
-
-    def stop(self) -> None: ...
+    def toggle(
+        self,
+        note_id: str,
+        path: Path | None,
+        *,
+        duration_ms: int | None = None,
+    ) -> bool: ...
 
     def stop_note(self, note_id: str) -> None: ...
 
@@ -319,6 +333,22 @@ class NativeAudioPlayer:
             self._last_message = f"Could not start audio player: {error}"
             return
 
+    def toggle(
+        self,
+        note_id: str,
+        path: Path | None,
+        *,
+        duration_ms: int | None = None,
+    ) -> bool:
+        self._refresh()
+        if self._process is not None and self._note_id == note_id:
+            self.pause_resume()
+            return True
+        if path is None:
+            return False
+        self.play(note_id, path, duration_ms=duration_ms)
+        return True
+
     def pause_resume(self) -> None:
         self._refresh()
         process = self._process
@@ -458,6 +488,22 @@ def _add(screen: Any, y: int, x: int, value: str, width: int, attribute: int = 0
             raise
 
 
+def _control_lines(width: int, full: str, compact: tuple[str, ...]) -> tuple[str, ...]:
+    return (full,) if len(full) <= max(1, width - 1) else compact
+
+
+def _draw_controls(
+    screen: Any,
+    module: Any,
+    height: int,
+    width: int,
+    lines: tuple[str, ...],
+) -> None:
+    start = height - len(lines)
+    for offset, line in enumerate(lines):
+        _add(screen, start + offset, 0, line, width - 1, _attr(module, "A_DIM"))
+
+
 def _set_input_timeout(screen: Any, milliseconds: int) -> bool:
     timeout = getattr(screen, "timeout", None)
     if not callable(timeout):
@@ -548,6 +594,13 @@ def _status_line(status: str, player: AudioPlayer) -> str:
     return status or playback
 
 
+def _toggle_note_audio(library: NoteLibrary, note: LibraryNote, player: AudioPlayer) -> str:
+    audio_path = library.resolve_audio_path(note)
+    if not player.toggle(note.note_id, audio_path, duration_ms=note.duration_ms):
+        return "No local audio is available for this note"
+    return ""
+
+
 def _draw_home(
     screen: Any,
     module: Any,
@@ -613,16 +666,17 @@ def _draw_home(
         line = line.ljust(available_title) + " " + badges
         attribute = _attr(module, "A_REVERSE") if absolute == selected else 0
         _add(screen, 3 + index, 0, line, width - 1, attribute)
+    controls = _control_lines(width, _HOME_CONTROLS, _HOME_CONTROLS_COMPACT)
     if status:
-        _add(screen, height - 2, 0, status, width - 1, _attr(module, "A_BOLD"))
-    _add(
-        screen,
-        height - 1,
-        0,
-        "↑↓ move  Enter read  / search  F filter  P play/restart  Space pause  S stop  E title  D delete  Q quit",
-        width - 1,
-        _attr(module, "A_DIM"),
-    )
+        _add(
+            screen,
+            height - len(controls) - 1,
+            0,
+            status,
+            width - 1,
+            _attr(module, "A_BOLD"),
+        )
+    _draw_controls(screen, module, height, width, controls)
     screen.refresh()
     return notes, offset, total, page_size
 
@@ -643,9 +697,10 @@ def _show_note(
         screen.erase()
         height, width = screen.getmaxyx()
         if height < MIN_HEIGHT or width < MIN_WIDTH:
-            _add(screen, 0, 0, "Resize terminal. B returns.", max(1, width - 1))
+            _add(screen, 0, 0, "Resize terminal. ← returns to menu.", max(1, width - 1))
             screen.refresh()
         else:
+            controls = _control_lines(width, _DETAIL_CONTROLS, _DETAIL_CONTROLS_COMPACT)
             _add(screen, 0, 0, note.title, width - 1, _attr(module, "A_BOLD"))
             _add(screen, 1, 0, _availability(note), width - 1, _attr(module, "A_DIM"))
             _add(screen, 2, 0, "─" * max(1, width - 1), width - 1, _attr(module, "A_DIM"))
@@ -653,27 +708,27 @@ def _show_note(
             wrapped: list[str] = []
             for paragraph in transcript.splitlines() or [""]:
                 wrapped.extend(textwrap.wrap(paragraph, max(1, width - 2)) or [""])
-            visible = max(1, height - 5)
+            visible = max(1, height - 4 - len(controls))
             scroll = min(max(0, scroll), max(0, len(wrapped) - visible))
             for row, line in enumerate(wrapped[scroll : scroll + visible], 3):
                 _add(screen, row, 1, line, max(1, width - 2))
             shown_status = _status_line(status, player)
             if shown_status:
-                _add(screen, height - 2, 0, shown_status, width - 1, _attr(module, "A_BOLD"))
-            _add(
-                screen,
-                height - 1,
-                0,
-                "↑↓ scroll  P play/restart  Space pause  S stop  E title  D delete  B back",
-                width - 1,
-                _attr(module, "A_DIM"),
-            )
+                _add(
+                    screen,
+                    height - len(controls) - 1,
+                    0,
+                    shown_status,
+                    width - 1,
+                    _attr(module, "A_BOLD"),
+                )
+            _draw_controls(screen, module, height, width, controls)
             screen.refresh()
         key = _read_key(screen, module)
         if key is None:
             continue
         status = ""
-        if key in ("b", "B", "q", "Q", "\x1b", getattr(module, "KEY_LEFT", -1)):
+        if key == getattr(module, "KEY_LEFT", -1):
             return status
         if key in (getattr(module, "KEY_UP", -1), "k", "K"):
             scroll = max(0, scroll - 1)
@@ -681,20 +736,10 @@ def _show_note(
         if key in (getattr(module, "KEY_DOWN", -1), "j", "J"):
             scroll += 1
             continue
-        if key in ("p", "P"):
-            audio_path = library.resolve_audio_path(note)
-            if audio_path is None:
-                status = "No local audio is available for this note"
-            else:
-                player.play(note.note_id, audio_path, duration_ms=note.duration_ms)
-            continue
         if key == " ":
-            player.pause_resume()
+            status = _toggle_note_audio(library, note, player)
             continue
-        if key in ("s", "S"):
-            player.stop()
-            continue
-        if key in ("e", "E"):
+        if key in ("t", "T"):
             value = _prompt(screen, module, "Title: ", initial=note.title)
             if value is not None:
                 try:
@@ -807,23 +852,13 @@ def _run_curses(
         if note is None:
             status = "No note is selected"
             continue
-        if key in ("\n", "\r", getattr(module, "KEY_ENTER", -1), "o", "O"):
+        if key == getattr(module, "KEY_RIGHT", -1):
             status = _show_note(screen, module, library, note.note_id, player)
             continue
-        if key in ("p", "P"):
-            audio_path = library.resolve_audio_path(note)
-            if audio_path is None:
-                status = "No local audio is available for this note"
-            else:
-                player.play(note.note_id, audio_path, duration_ms=note.duration_ms)
-            continue
         if key == " ":
-            player.pause_resume()
+            status = _toggle_note_audio(library, note, player)
             continue
-        if key in ("s", "S"):
-            player.stop()
-            continue
-        if key in ("e", "E"):
+        if key in ("t", "T"):
             value = _prompt(screen, module, "Title: ", initial=note.title)
             if value is not None:
                 try:

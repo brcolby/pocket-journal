@@ -91,6 +91,7 @@ class FakeCurses:
     KEY_UP = 259
     KEY_DOWN = 258
     KEY_LEFT = 260
+    KEY_RIGHT = 261
     KEY_PPAGE = 339
     KEY_NPAGE = 338
     KEY_HOME = 262
@@ -118,17 +119,24 @@ class FakeAudioPlayer:
         self.closed = False
         self.statuses = list(statuses or [])
 
-    def play(self, note_id: str, path: Path, *, duration_ms: int | None = None) -> None:
-        self.events.append(("play", note_id, path, duration_ms))
-        self.active_note = note_id
-        self.paused = False
-
-    def pause_resume(self) -> None:
-        if self.active_note is None:
-            self.events.append("pause-empty")
-            return
-        self.paused = not self.paused
-        self.events.append("pause" if self.paused else "resume")
+    def toggle(
+        self,
+        note_id: str,
+        path: Path | None,
+        *,
+        duration_ms: int | None = None,
+    ) -> bool:
+        if self.active_note == note_id:
+            self.paused = not self.paused
+            self.events.append("pause" if self.paused else "resume")
+            return True
+        if path is None:
+            return False
+        if self.active_note != note_id:
+            self.events.append(("play", note_id, path, duration_ms))
+            self.active_note = note_id
+            self.paused = False
+        return True
 
     def stop(self) -> None:
         self.events.append("stop")
@@ -712,22 +720,23 @@ class LibraryCliAndTuiTests(unittest.TestCase):
                 "/",
                 *"sample",
                 "\n",
-                "\n",
-                "p",
                 " ",
                 " ",
-                "s",
-                "p",
-                "e",
+                FakeCurses.KEY_RIGHT,
+                " ",
+                FakeCurses.KEY_LEFT,
+                "f",
+                "t",
                 *("\b" * len("sample")),
                 *"Renamed note",
                 "\n",
+                FakeCurses.KEY_RIGHT,
                 "d",
                 *"DELETE",
                 "\n",
                 "q",
             ]
-            screen = FakeScreen(keys)
+            screen = FakeScreen(keys, sizes=[(14, 44)])
             curses = FakeCurses(screen)
 
             result = run_tui(
@@ -743,14 +752,23 @@ class LibraryCliAndTuiTests(unittest.TestCase):
             self.assertNotIn("\x1b", rendered)
             self.assertIn("Renamed note", rendered)
             self.assertIn("Playing 00:01 / 00:04", rendered)
+            self.assertIn("filter: has audio", rendered)
+            self.assertIn("→ text", rendered)
+            self.assertIn("← menu", rendered)
+            self.assertIn("Space play/pause", rendered)
+            self.assertIn("T title", rendered)
+            self.assertIn("D delete", rendered)
+            self.assertNotIn("Enter read", rendered)
+            self.assertNotIn("P play/restart", rendered)
+            self.assertNotIn("E title", rendered)
+            self.assertNotIn("S stop", rendered)
+            self.assertNotIn("B back", rendered)
             self.assertEqual(
                 player.events,
                 [
                     ("play", note.note_id, audio.resolve(), None),
                     "pause",
                     "resume",
-                    "stop",
-                    ("play", note.note_id, audio.resolve(), None),
                     ("stop-note", note.note_id),
                     "close",
                 ],
@@ -760,6 +778,26 @@ class LibraryCliAndTuiTests(unittest.TestCase):
             self.assertTrue(player.closed)
             self.assertIsNone(library.get(note.note_id))
             self.assertFalse(audio.exists())
+
+    def test_tui_space_reports_when_selected_note_has_no_audio(self) -> None:
+        with TemporaryDirectory() as tmp:
+            library = NoteLibrary(Path(tmp))
+            library.upsert_discovered("device", "missing", "missing.wav")
+            player = FakeAudioPlayer()
+            screen = FakeScreen([" ", "q"])
+
+            self.assertEqual(
+                run_tui(
+                    library,
+                    audio_player=player,
+                    screen=screen,
+                    curses_module=FakeCurses(screen),
+                ),
+                0,
+            )
+
+            self.assertIn("No local audio is available", screen.rendered_text())
+            self.assertEqual(player.events, ["close"])
 
     def test_native_player_uses_fixed_argv_tracks_time_and_reaps_paused_audio(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -814,7 +852,7 @@ class LibraryCliAndTuiTests(unittest.TestCase):
             self.assertEqual(processes[0].kill_calls, 0)
             self.assertIsNotNone(processes[0].returncode)
 
-    def test_native_player_restarts_reports_failure_and_rejects_outside_paths(self) -> None:
+    def test_native_player_toggle_switches_notes_reports_failure_and_rejects_paths(self) -> None:
         with TemporaryDirectory() as tmp, TemporaryDirectory() as outside_tmp:
             root = Path(tmp)
             first_audio = root / "first.wav"
@@ -824,6 +862,7 @@ class LibraryCliAndTuiTests(unittest.TestCase):
                 path.write_bytes(b"not-a-wave")
             processes: list[FakeAudioProcess] = []
             launches: list[list[str]] = []
+            signals: list[tuple[int, int]] = []
 
             def launch(arguments: list[str], **_options: object) -> FakeAudioProcess:
                 launches.append(arguments)
@@ -835,23 +874,47 @@ class LibraryCliAndTuiTests(unittest.TestCase):
                 root,
                 command=("/usr/bin/afplay",),
                 popen=launch,  # type: ignore[arg-type]
+                signal_process=lambda pid, action: signals.append((pid, action)),
             )
-            player.play("first", first_audio, duration_ms=4_000)
-            player.play("second", second_audio, duration_ms=4_000)
+            player.toggle("first", first_audio, duration_ms=4_000)
+            player.toggle("first", first_audio, duration_ms=4_000)
+            self.assertIn("Paused", player.status_text())
+            first_audio.unlink()
+            self.assertTrue(player.toggle("first", None, duration_ms=4_000))
+            self.assertIn("Playing", player.status_text())
+            self.assertTrue(player.toggle("first", None, duration_ms=4_000))
+            self.assertIn("Paused", player.status_text())
+            player.toggle("second", second_audio, duration_ms=4_000)
             self.assertEqual(processes[0].terminate_calls, 1)
             self.assertEqual(len(launches), 2)
+            self.assertEqual(
+                signals,
+                [
+                    (processes[0].pid, signal.SIGSTOP),
+                    (processes[0].pid, signal.SIGCONT),
+                    (processes[0].pid, signal.SIGSTOP),
+                    (processes[0].pid, signal.SIGCONT),
+                ],
+            )
 
-            processes[1].returncode = 7
+            processes[1].returncode = 0
+            self.assertEqual(player.status_text(), "Playback finished at 00:04")
+            self.assertTrue(player.toggle("second", second_audio, duration_ms=4_000))
+            self.assertEqual(len(launches), 3)
+            processes[2].returncode = 7
             self.assertEqual(player.status_text(), "Playback failed (player exited 7)")
-            player.play("outside", outside_audio)
-            self.assertEqual(len(launches), 2)
+            self.assertTrue(player.toggle("outside", outside_audio))
+            self.assertEqual(len(launches), 3)
             self.assertIn("inside the library", player.status_text())
+            self.assertFalse(player.toggle("missing", None))
             player.close()
 
             unavailable = NativeAudioPlayer(root, command=None, popen=launch)  # type: ignore[arg-type]
-            unavailable.play("first", first_audio)
+            replacement = root / "replacement.wav"
+            replacement.write_bytes(b"not-a-wave")
+            self.assertTrue(unavailable.toggle("first", replacement))
             self.assertIn("unavailable", unavailable.status_text().lower())
-            self.assertEqual(len(launches), 2)
+            self.assertEqual(len(launches), 3)
 
     def test_native_player_owns_child_before_deferred_signal_unwinds(self) -> None:
         with TemporaryDirectory() as tmp:
