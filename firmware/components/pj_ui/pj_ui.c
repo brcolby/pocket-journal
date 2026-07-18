@@ -10,6 +10,8 @@
 #include <string.h>
 
 #define PJ_UI_MAX_DURATION_SECONDS 86400
+#define PJ_UI_MIN_TIMER_SECONDS 30
+#define PJ_UI_MIN_INTERVAL_SECONDS 30
 #define PJ_UI_NOTES_PER_PAGE 3
 #define PJ_UI_NOTE_PAGER_TOP 150
 #define PJ_UI_NOTE_MIN_TEXT_SCALE 3
@@ -640,10 +642,10 @@ void pj_ui_init(pj_ui_context_t *ctx)
     ctx->weekday = weekday_from_date(ctx->year, ctx->month, ctx->day);
     ctx->alarm_hour = 7;
     ctx->alarm_minute = 30;
-    ctx->timer_seconds = 300;
-    ctx->timer_preset_seconds = 300;
-    ctx->interval_seconds = 90;
-    ctx->interval_preset_seconds = 90;
+    ctx->timer_seconds = 60;
+    ctx->timer_preset_seconds = 60;
+    ctx->interval_seconds = 60;
+    ctx->interval_preset_seconds = 60;
     ctx->record_state = PJ_RECORD_IDLE;
     ctx->playback_state = PJ_PLAYBACK_IDLE;
     ctx->note_count = 0;
@@ -821,10 +823,12 @@ void pj_ui_apply_preferences(pj_ui_context_t *ctx,
     next.alarm_enabled = next.alarm_enabled != 0;
     next.alarm_hour = max_int(0, min_int(23, next.alarm_hour));
     next.alarm_minute = max_int(0, min_int(59, next.alarm_minute));
-    next.timer_seconds = max_int(30, min_int(PJ_UI_MAX_DURATION_SECONDS,
-                                             next.timer_seconds));
-    next.interval_seconds = max_int(60, min_int(PJ_UI_MAX_DURATION_SECONDS,
-                                                next.interval_seconds));
+    next.timer_seconds = max_int(PJ_UI_MIN_TIMER_SECONDS,
+                                 min_int(PJ_UI_MAX_DURATION_SECONDS,
+                                         next.timer_seconds));
+    next.interval_seconds = max_int(PJ_UI_MIN_INTERVAL_SECONDS,
+                                    min_int(PJ_UI_MAX_DURATION_SECONDS,
+                                            next.interval_seconds));
     next.clock_24h = next.clock_24h != 0;
     next.temperature_fahrenheit = next.temperature_fahrenheit != 0;
     next.transcript_font_size = max_int(2, min_int(3,
@@ -1422,10 +1426,12 @@ static int activate_control(pj_ui_context_t *ctx, int control)
         } else if (control == 3) {
             queue_time_command(ctx, PJ_UI_TIME_COMMAND_INTERVAL_RESET, 0, 0);
         } else {
-            int delta = control == 0 ? 60 : -60;
+            int delta = control == 0 ? 30 : -30;
             int base = ctx->interval_seconds > 0 ?
                 ctx->interval_seconds : ctx->interval_preset_seconds;
-            int preset = max_int(60, min_int(PJ_UI_MAX_DURATION_SECONDS, base + delta));
+            int preset = max_int(PJ_UI_MIN_INTERVAL_SECONDS,
+                                 min_int(PJ_UI_MAX_DURATION_SECONDS,
+                                         base + delta));
             queue_time_command(ctx, PJ_UI_TIME_COMMAND_INTERVAL_SET,
                                (uint64_t)preset * 1000u,
                                (uint64_t)preset * 1000u);
@@ -2053,7 +2059,7 @@ static void render_scene(const pj_ui_context_t *ctx, pj_framebuffer_t *fb)
     case PJ_UI_STATE_INTERVAL:
         (void)snprintf(text, sizeof(text), "%d", ctx->interval_round);
         {
-            int round_scale = 3;
+            int round_scale = PJ_UI_FONT_SCALE_COUNT;
             while (round_scale > 1 &&
                    text_width(text, round_scale) > PJ_DISPLAY_WIDTH - 10) {
                 round_scale--;
@@ -2077,7 +2083,7 @@ static void render_scene(const pj_ui_context_t *ctx, pj_framebuffer_t *fb)
         } else {
             draw_icon(fb, ctx->playback_state == PJ_PLAYBACK_IDLE ?
                            PJ_CARBON_ICON_PLAY_FILLED :
-                           PJ_CARBON_ICON_PAUSE_FILLED, 100, 100, 144);
+                           PJ_CARBON_ICON_PAUSE_FILLED, 100, 100, 96);
         }
         break;
     case PJ_UI_STATE_SYNC:

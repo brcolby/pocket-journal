@@ -147,8 +147,9 @@ diagnostic before asking for calibration evidence.
   valid playable note must result from each capture (`pocket-journal-sm1`,
   `pocket-journal-sm1.1`, `pocket-journal-5eo`).
 - [ ] Play/pause both notes, navigate Back from active and paused playback, and
-  play one through EOF. Confirm no square Stop or Recovered overlay, no stuck
-  audio state, and no corrupt note after a reboot during or shortly after
+  play one through EOF. Confirm the compact Play/Pause control leaves no heavy
+  ghost, no square Stop or Recovered overlay appears, and there is no stuck
+  audio state or corrupt note after a reboot during or shortly after
   background processing (`pocket-journal-61u`, `pocket-journal-te0`).
 - [ ] With at least two visible notes, request Sync while the companion is
   offline, then bring it online. Confirm the screen shows the note inventory
@@ -163,10 +164,13 @@ diagnostic before asking for calibration evidence.
 
 ### 4. Time Apps And Alerts
 
-- [ ] Start Interval at round 0 with the default 90-second duration. Observe at
-  least two boundaries. Rounds must increment once, timing must not drift, and
-  no large square Stop/INTERVAL/Recovered screen may appear. There must be no
-  spontaneous or repeated beeping; reset before leaving the device
+- [ ] Start Interval at round 0 with the default 60-second duration. Adjust Down
+  once to the 30-second minimum, then Up once to 60 seconds; each step must be
+  exactly 30 seconds. Observe at least two boundaries. The round counter must
+  use the same type size as the duration when it fits, rounds must increment
+  once, timing must not drift, and no large square Stop/INTERVAL/Recovered
+  screen may appear. There must be no spontaneous or repeated beeping; reset
+  before leaving the device
   (`pocket-journal-8q5`, `pocket-journal-xl8`).
 - [ ] Start, pause, adjust, resume, leave, and revisit Stopwatch and Timer.
   From `00:30`, press Timer Up three times and confirm the exact visible series

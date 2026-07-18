@@ -45,10 +45,12 @@ class SettingsCliTests(unittest.TestCase):
         self.assertEqual(
             _parse_settings_assignments(
                 ["volume=8", "theme=dark", "alarm_enabled=true", "timer_seconds=600",
-                 "clock_24h=false", "temperature_unit=f", "transcript_font_size=3"]
+                 "interval_seconds=30", "clock_24h=false", "temperature_unit=f",
+                 "transcript_font_size=3"]
             ),
             {"volume": 8, "theme": "dark", "alarm_enabled": True, "timer_seconds": 600,
-             "clock_24h": False, "temperature_unit": "f", "transcript_font_size": 3},
+             "interval_seconds": 30, "clock_24h": False,
+             "temperature_unit": "f", "transcript_font_size": 3},
         )
 
     def test_rejects_unsupported_and_malformed_assignments(self) -> None:
@@ -60,6 +62,7 @@ class SettingsCliTests(unittest.TestCase):
             ["alarm_hour=24"],
             ["alarm_minute=-1"],
             ["timer_seconds=29"],
+            ["interval_seconds=29"],
             ["interval_seconds=86401"],
             ["theme=blue"],
             ["alarm_enabled=yes"],
@@ -83,6 +86,13 @@ class SettingsCliTests(unittest.TestCase):
         self.assertEqual(calls[0][0], "PJ_SETTINGS_GET")
         self.assertEqual(calls[0][1]["max_attempts"], 2)
         self.assertTrue(calls[0][1]["request_id"])
+
+    def test_device_response_accepts_thirty_second_interval(self) -> None:
+        client = SerialDeviceClient("/dev/cu.test")
+        client._request = lambda *args, **kwargs: settings_payload(  # type: ignore[method-assign]
+            interval_seconds=30
+        )
+        self.assertEqual(client.get_settings()["interval_seconds"], 30)
 
     def test_usb_set_pins_generation_and_hex_encodes_canonical_json(self) -> None:
         client = SerialDeviceClient("/dev/cu.test")

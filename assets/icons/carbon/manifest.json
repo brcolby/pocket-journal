@@ -1713,7 +1713,7 @@
     {
       "allowed_sizes": [
         40,
-        144
+        96
       ],
       "kind": "semantic_icon",
       "path": "svg/32/pause--filled.svg",
@@ -1734,7 +1734,7 @@
     {
       "allowed_sizes": [
         40,
-        144
+        96
       ],
       "kind": "semantic_icon",
       "path": "svg/32/play--filled.svg",

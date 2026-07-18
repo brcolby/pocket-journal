@@ -89,8 +89,8 @@ Reads or atomically updates the persisted settings surface. A PUT may contain an
   "alarm_enabled": true,
   "alarm_hour": 7,
   "alarm_minute": 30,
-  "timer_seconds": 300,
-  "interval_seconds": 90,
+  "timer_seconds": 60,
+  "interval_seconds": 60,
   "clock_24h": true,
   "temperature_unit": "c",
   "transcript_font_size": 3,
@@ -98,7 +98,7 @@ Reads or atomically updates the persisted settings surface. A PUT may contain an
 }
 ```
 
-`theme` is `light` or `dark`; `volume` is `0` through `10`; alarm time uses a 24-hour stored value; `timer_seconds` is `30` through `86400`; `interval_seconds` is `60` through `86400`; `clock_24h` is boolean; `temperature_unit` is `c` or `f`; and `transcript_font_size` is `2` or `3`. GET also returns the derived `sync_pending` and `sync_transferred` counters plus a monotonic `generation`. The partner includes that value as `expected_generation`; a stale value returns `409 Conflict` without partial mutation. Legacy callers may omit it, but generation pinning is required for conflict-safe writes. When NVS has no valid stored value, defaults preserve full codec volume (`10`), light mode, a disabled `07:30` alarm, a five-minute timer, a 90-second interval, 24-hour time, Celsius, and the larger transcript font. Firmware settings schema 2 also migrates the former stored 1500-second interval default to 90 seconds.
+`theme` is `light` or `dark`; `volume` is `0` through `10`; alarm time uses a 24-hour stored value; `timer_seconds` and `interval_seconds` are `30` through `86400`; `clock_24h` is boolean; `temperature_unit` is `c` or `f`; and `transcript_font_size` is `2` or `3`. GET also returns the derived `sync_pending` and `sync_transferred` counters plus a monotonic `generation`. The partner includes that value as `expected_generation`; a stale value returns `409 Conflict` without partial mutation. Legacy callers may omit it, but generation pinning is required for conflict-safe writes. When NVS has no valid stored value, defaults preserve full codec volume (`10`), light mode, a disabled `07:30` alarm, 60-second Timer and Interval presets, 24-hour time, Celsius, and the larger transcript font. Existing persisted values are retained; firmware settings schema 2 still migrates only the former stored 1500-second interval default to 90 seconds.
 
 ```http
 GET /v1/audio

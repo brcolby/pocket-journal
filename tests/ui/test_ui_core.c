@@ -7,6 +7,7 @@
 #include "pj_font_ibm_plex_mono_bold.h"
 
 #include <assert.h>
+#include <limits.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -551,11 +552,12 @@ static void test_playback_uses_only_full_screen_play_and_pause(void)
     assert(!context.note_detail_transcript);
 
     const pj_asset_bitmap_t *play = pj_carbon_icon_lookup(
-        PJ_CARBON_ICON_PLAY_FILLED, 144);
+        PJ_CARBON_ICON_PLAY_FILLED, 96);
     const pj_asset_bitmap_t *pause = pj_carbon_icon_lookup(
-        PJ_CARBON_ICON_PAUSE_FILLED, 144);
+        PJ_CARBON_ICON_PAUSE_FILLED, 96);
     assert(play != NULL && pause != NULL);
     assert(pj_carbon_icon_lookup(PJ_CARBON_ICON_PLAY_FILLED, 64) == NULL);
+    assert(pj_carbon_icon_lookup(PJ_CARBON_ICON_PLAY_FILLED, 144) == NULL);
 
     pj_framebuffer_t play_frame;
     pj_framebuffer_t pause_frame;
@@ -783,7 +785,7 @@ static void test_typed_preferences_revisions_and_theme_inversion(void)
     assert(context.alarm_hour == 23);
     assert(context.alarm_minute == 0);
     assert(context.timer_preset_seconds == 30);
-    assert(context.interval_preset_seconds == 60);
+    assert(context.interval_preset_seconds == 30);
     assert(context.transcript_font_size == 3);
 }
 
@@ -940,41 +942,41 @@ static void test_stopwatch_timer_interval_commands(void)
     pj_ui_init(&context);
     context.state = PJ_UI_STATE_TIMER;
     assert(pj_ui_handle_touch(&context, 50, 125, PJ_TOUCH_TAP));
-    assert(context.timer_seconds == 330);
-    consume_expected_command(&context, PJ_UI_TIME_COMMAND_TIMER_SET, 330000, 0);
+    assert(context.timer_seconds == 90);
+    consume_expected_command(&context, PJ_UI_TIME_COMMAND_TIMER_SET, 90000, 0);
     assert(pj_ui_handle_touch(&context, 50, 175, PJ_TOUCH_TAP));
-    assert(context.timer_seconds == 300);
-    consume_expected_command(&context, PJ_UI_TIME_COMMAND_TIMER_SET, 300000, 0);
+    assert(context.timer_seconds == 60);
+    consume_expected_command(&context, PJ_UI_TIME_COMMAND_TIMER_SET, 60000, 0);
     assert(pj_ui_handle_touch(&context, 150, 125, PJ_TOUCH_TAP));
-    consume_expected_command(&context, PJ_UI_TIME_COMMAND_TIMER_START, 300000, 0);
-    projection = time_projection(0, 299, 90);
+    consume_expected_command(&context, PJ_UI_TIME_COMMAND_TIMER_START, 60000, 0);
+    projection = time_projection(0, 59, 60);
     projection.timer_running = 1;
     pj_ui_set_time_projection(&context, &projection);
     assert(pj_ui_handle_touch(&context, 150, 125, PJ_TOUCH_TAP));
-    consume_expected_command(&context, PJ_UI_TIME_COMMAND_TIMER_PAUSE, 299000, 0);
+    consume_expected_command(&context, PJ_UI_TIME_COMMAND_TIMER_PAUSE, 59000, 0);
     assert(pj_ui_handle_touch(&context, 150, 175, PJ_TOUCH_TAP));
     consume_expected_command(&context, PJ_UI_TIME_COMMAND_TIMER_RESET, 0, 0);
 
     pj_ui_init(&context);
     context.state = PJ_UI_STATE_INTERVAL;
     assert(pj_ui_handle_touch(&context, 50, 125, PJ_TOUCH_TAP));
-    assert(context.interval_seconds == 150);
-    consume_expected_command(&context, PJ_UI_TIME_COMMAND_INTERVAL_SET,
-                             150000, 150000);
-    assert(pj_ui_handle_touch(&context, 50, 175, PJ_TOUCH_TAP));
     assert(context.interval_seconds == 90);
     consume_expected_command(&context, PJ_UI_TIME_COMMAND_INTERVAL_SET,
                              90000, 90000);
+    assert(pj_ui_handle_touch(&context, 50, 175, PJ_TOUCH_TAP));
+    assert(context.interval_seconds == 60);
+    consume_expected_command(&context, PJ_UI_TIME_COMMAND_INTERVAL_SET,
+                             60000, 60000);
     assert(pj_ui_handle_touch(&context, 150, 125, PJ_TOUCH_TAP));
     consume_expected_command(&context, PJ_UI_TIME_COMMAND_INTERVAL_START,
-                             90000, 90000);
-    projection = time_projection(0, 300, 89);
+                             60000, 60000);
+    projection = time_projection(0, 60, 59);
     projection.interval_running = 1;
     projection.interval_phase = 2;
     pj_ui_set_time_projection(&context, &projection);
     assert(pj_ui_handle_touch(&context, 150, 125, PJ_TOUCH_TAP));
     consume_expected_command(&context, PJ_UI_TIME_COMMAND_INTERVAL_PAUSE,
-                             89000, 90000);
+                             59000, 60000);
     assert(pj_ui_handle_touch(&context, 150, 175, PJ_TOUCH_TAP));
     consume_expected_command(&context, PJ_UI_TIME_COMMAND_INTERVAL_RESET, 0, 0);
 
@@ -1015,6 +1017,95 @@ static void test_timer_adjustment_sequence(void)
                                  (uint64_t)downward[index] * 1000u, 0);
         presenter_accept_partial(&fixture, &context);
     }
+}
+
+static void test_interval_adjustment_sequence(void)
+{
+    static const int upward[] = {60, 90, 120};
+    static const int downward[] = {90, 60, 30};
+    pj_ui_context_t context;
+    pj_ui_init(&context);
+    context.state = PJ_UI_STATE_INTERVAL;
+    pj_ui_preferences_t preferences = current_preferences(&context);
+    preferences.interval_seconds = 30;
+    pj_ui_apply_preferences(&context, &preferences);
+    assert(context.interval_seconds == 30);
+    assert(context.interval_preset_seconds == 30);
+
+    presenter_fixture_t fixture;
+    presenter_start(&fixture, &context);
+    for (size_t index = 0; index < ARRAY_LEN(upward); index++) {
+        assert(pj_ui_handle_touch(&context, 50, 125, PJ_TOUCH_TAP));
+        assert(context.interval_seconds == upward[index]);
+        assert(context.interval_preset_seconds == upward[index]);
+        consume_expected_command(&context, PJ_UI_TIME_COMMAND_INTERVAL_SET,
+                                 (uint64_t)upward[index] * 1000u,
+                                 (uint64_t)upward[index] * 1000u);
+        presenter_accept_partial(&fixture, &context);
+    }
+    for (size_t index = 0; index < ARRAY_LEN(downward); index++) {
+        assert(pj_ui_handle_touch(&context, 50, 175, PJ_TOUCH_TAP));
+        assert(context.interval_seconds == downward[index]);
+        assert(context.interval_preset_seconds == downward[index]);
+        consume_expected_command(&context, PJ_UI_TIME_COMMAND_INTERVAL_SET,
+                                 (uint64_t)downward[index] * 1000u,
+                                 (uint64_t)downward[index] * 1000u);
+        presenter_accept_partial(&fixture, &context);
+    }
+}
+
+static void test_stopwatch_play_pause_is_same_layout_partial(void)
+{
+    pj_ui_context_t context;
+    pj_ui_init(&context);
+    context.state = PJ_UI_STATE_STOPWATCH;
+    presenter_fixture_t fixture;
+    presenter_start(&fixture, &context);
+    uint32_t layout = context.layout_epoch;
+    uint32_t full = context.full_refresh_revision;
+
+    assert(pj_ui_handle_touch(&context, 50, 150, PJ_TOUCH_TAP));
+    consume_expected_command(&context, PJ_UI_TIME_COMMAND_STOPWATCH_START, 0, 0);
+    pj_ui_time_projection_t projection = time_projection(0, 60, 60);
+    projection.stopwatch_running = 1;
+    pj_ui_set_time_projection(&context, &projection);
+    assert(context.layout_epoch == layout);
+    assert(context.full_refresh_revision == full);
+    pj_ui_dirty_region_t dirty = presenter_accept_partial(&fixture, &context);
+    assert(dirty.x >= 0 && dirty.x + dirty.width <= 100);
+    assert(dirty.y >= 100);
+
+    assert(pj_ui_handle_touch(&context, 50, 150, PJ_TOUCH_TAP));
+    consume_expected_command(&context, PJ_UI_TIME_COMMAND_STOPWATCH_PAUSE, 0, 0);
+    projection.stopwatch_running = 0;
+    pj_ui_set_time_projection(&context, &projection);
+    assert(context.layout_epoch == layout);
+    assert(context.full_refresh_revision == full);
+    dirty = presenter_accept_partial(&fixture, &context);
+    assert(dirty.x >= 0 && dirty.x + dirty.width <= 100);
+    assert(dirty.y >= 100);
+}
+
+static void test_interval_round_uses_duration_type_size_and_fits(void)
+{
+    pj_ui_context_t context;
+    pj_ui_init(&context);
+    context.state = PJ_UI_STATE_INTERVAL;
+    pj_ui_time_projection_t projection = time_projection(0, 60, 60);
+    projection.interval_phase = 1;
+    pj_ui_set_time_projection(&context, &projection);
+    pj_framebuffer_t frame;
+    pj_ui_compose_frame(&context, &frame);
+    assert_glyph_region(
+        &frame, pj_carbon_glyph_lookup(PJ_CARBON_GLYPH_DIGIT_1, 64),
+        100, 20);
+
+    projection.interval_phase = INT_MAX;
+    pj_ui_set_time_projection(&context, &projection);
+    pj_ui_compose_frame(&context, &frame);
+    assert(count_black_pixels_in_region(&frame, 0, 0, 200, 40) > 0);
+    assert(count_black_pixels_in_region(&frame, 0, 0, 5, 40) == 0);
+    assert(count_black_pixels_in_region(&frame, 195, 0, 5, 40) == 0);
 }
 
 static void assert_stopwatch_transition(int from, int to)
@@ -1287,6 +1378,9 @@ int main(void)
     test_alarm_caret_and_toggle_controls();
     test_stopwatch_timer_interval_commands();
     test_timer_adjustment_sequence();
+    test_interval_adjustment_sequence();
+    test_stopwatch_play_pause_is_same_layout_partial();
+    test_interval_round_uses_duration_type_size_and_fits();
     test_all_digit_carries_in_both_directions();
     test_sync_compact_common_scale_phases_and_transactions();
     test_exact_presenter_reconstruction_for_dynamic_screens();

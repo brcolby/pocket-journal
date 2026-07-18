@@ -265,6 +265,21 @@ assert.equal(api.pj_sim_touch_tap(20, 80), 1);
 assertRendered("time");
 assert.equal(api.pj_sim_touch_tap(160, 40), 1);
 assertRendered("stopwatch");
+const stoppedStopwatch = framebufferSnapshot();
+api.pj_sim_set_time_runtime(1, 0, 0, 0, 0, 0, 1);
+const runningStopwatch = framebufferSnapshot();
+assert.notDeepEqual(runningStopwatch, stoppedStopwatch);
+assert.equal(api.pj_sim_frame_result(), 2,
+  "Stopwatch Play must be an exact same-layout partial");
+assert.equal(api.pj_sim_dirty_partial(), 1);
+assert.ok(api.pj_sim_dirty_x() + api.pj_sim_dirty_width() <= 100);
+assert.ok(api.pj_sim_dirty_y() >= 100);
+api.pj_sim_set_time_runtime(0, 0, 0, 0, 0, 0, 1);
+assert.deepEqual(framebufferSnapshot(), stoppedStopwatch);
+assert.equal(api.pj_sim_frame_result(), 2,
+  "Stopwatch Pause must be an exact same-layout partial");
+assert.ok(api.pj_sim_dirty_x() + api.pj_sim_dirty_width() <= 100);
+assert.ok(api.pj_sim_dirty_y() >= 100);
 assert.equal(api.pj_sim_aux_short(), 1);
 assert.equal(api.pj_sim_aux_double(), 0);
 assertRendered("stopwatch");

@@ -90,6 +90,9 @@ The inline bootstrap logger writes to the same endpoint before `src/main.js` loa
   Clock parent.
 - `notes`: record, listen, read.
 - `time`: alarm, stopwatch, timer, interval.
+- `timer` and `interval`: both start from a 60-second fresh-device preset;
+  Interval adjusts in 30-second steps down to 30 seconds. Stopwatch
+  Play/Pause remains an exact same-layout partial.
 - `settings`: four DXF sectors for Volume, Light/Dark (the invariant
   `AsleepFilled` icon), compact 12h/24h, and Sync.
 - `volume`: a 0–10 numeric counter uses the upper half; the lower minus and
@@ -100,6 +103,8 @@ The inline bootstrap logger writes to the same endpoint before `src/main.js` loa
   elapsed playable PCM duration is reserved on a hard one-second cadence. AUX
   stops/saves and returns home while processing continues asynchronously.
 - `listen` and `read`: show three dummy recordings per page ordered newest first; tap a note to enter detail or use the bottom arrows to move one full page.
+- Listen detail uses exact 96 px Play/Pause assets to limit e-paper ghosting;
+  the square Stop icon is never compiled or rendered.
 - AUX double-click jumps directly into Record only from Home or Clock. It is
   ignored elsewhere and during active media/time work.
 - AUX single-click actions wait 350 ms so a second click can be recognized. A long press fires once at the 500 ms threshold while AUX remains held; release is consumed and does not emit another action.

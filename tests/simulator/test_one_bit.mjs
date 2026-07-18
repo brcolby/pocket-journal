@@ -57,7 +57,7 @@ for (const [id, size] of [
   ["PJ_CARBON_ICON_TIME", 64],
   ["PJ_CARBON_ICON_WAVEFORM", 64],
   ["PJ_CARBON_ICON_PLAY_FILLED", 40],
-  ["PJ_CARBON_ICON_PLAY_FILLED", 144],
+  ["PJ_CARBON_ICON_PLAY_FILLED", 96],
   ["PJ_CARBON_ICON_BATTERY_HALF", 28],
 ]) {
   assert.ok(icon(id, size)?.rows.join("").includes("1"), `${id} ${size}`);

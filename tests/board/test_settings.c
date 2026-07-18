@@ -220,8 +220,8 @@ int main(void)
     assert(settings.dark_mode == 0);
     assert(settings.alarm_hour == 7);
     assert(settings.alarm_minute == 30);
-    assert(settings.timer_seconds == 300);
-    assert(settings.interval_seconds == 90);
+    assert(settings.timer_seconds == 60);
+    assert(settings.interval_seconds == 60);
     assert(settings.clock_24h == 1);
     assert(settings.temperature_fahrenheit == 0);
     assert(settings.transcript_font_size == 3);
@@ -241,6 +241,11 @@ int main(void)
     pj_settings_defaults(&settings);
     settings.timer_seconds = 29;
     assert(!pj_settings_valid(&settings));
+    pj_settings_defaults(&settings);
+    settings.interval_seconds = 29;
+    assert(!pj_settings_valid(&settings));
+    settings.interval_seconds = 30;
+    assert(pj_settings_valid(&settings));
     pj_settings_defaults(&settings);
     settings.interval_seconds = 86401;
     assert(!pj_settings_valid(&settings));

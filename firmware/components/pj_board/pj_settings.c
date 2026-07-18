@@ -63,8 +63,8 @@ void pj_settings_defaults(pj_settings_t *settings)
         .alarm_enabled = 0,
         .alarm_hour = 7,
         .alarm_minute = 30,
-        .timer_seconds = 300,
-        .interval_seconds = 90,
+        .timer_seconds = 60,
+        .interval_seconds = 60,
         .clock_24h = 1,
         .temperature_fahrenheit = 0,
         .transcript_font_size = 3,
@@ -80,7 +80,7 @@ int pj_settings_valid(const pj_settings_t *settings)
            settings->alarm_hour >= 0 && settings->alarm_hour <= 23 &&
            settings->alarm_minute >= 0 && settings->alarm_minute <= 59 &&
            settings->timer_seconds >= 30 && settings->timer_seconds <= 86400 &&
-           settings->interval_seconds >= 60 && settings->interval_seconds <= 86400 &&
+           settings->interval_seconds >= 30 && settings->interval_seconds <= 86400 &&
            (settings->clock_24h == 0 || settings->clock_24h == 1) &&
            (settings->temperature_fahrenheit == 0 || settings->temperature_fahrenheit == 1) &&
            settings->transcript_font_size >= 2 && settings->transcript_font_size <= 3;

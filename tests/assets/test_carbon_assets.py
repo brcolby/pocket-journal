@@ -189,7 +189,8 @@ int main(void) {
     assert(PJ_CARBON_DERIVED_GLYPH_COUNT == 72);
     assert(pj_carbon_icon_lookup(PJ_CARBON_ICON_TIME, 64) != 0);
     assert(pj_carbon_icon_lookup(PJ_CARBON_ICON_TIME, 40) == 0);
-    assert(pj_carbon_icon_lookup(PJ_CARBON_ICON_PLAY_FILLED, 144) != 0);
+    assert(pj_carbon_icon_lookup(PJ_CARBON_ICON_PLAY_FILLED, 96) != 0);
+    assert(pj_carbon_icon_lookup(PJ_CARBON_ICON_PLAY_FILLED, 144) == 0);
     assert(pj_carbon_glyph_lookup_codepoint('A', 32) != 0);
     assert(pj_carbon_glyph_lookup_codepoint('a', 32) != 0);
     assert(pj_carbon_glyph_lookup_codepoint('A', 31) == 0);

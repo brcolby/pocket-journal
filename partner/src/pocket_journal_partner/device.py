@@ -135,7 +135,7 @@ _SETTINGS_INTEGER_RANGES = {
     "alarm_hour": (0, 23),
     "alarm_minute": (0, 59),
     "timer_seconds": (30, 86400),
-    "interval_seconds": (60, 86400),
+    "interval_seconds": (30, 86400),
     "transcript_font_size": (2, 3),
 }
 

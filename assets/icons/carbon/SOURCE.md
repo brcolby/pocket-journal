@@ -15,8 +15,8 @@ Arrow direction SVGs remain in the reference section for provenance but are
 not compiled and cannot resolve through the typed asset API.
 
 The exact compiled semantic pairs total 30: 13 launcher records at 64px, 11
-control records at 40px, four battery records at 28px, and full-screen
-Play/Pause at 144px. `VolumeUp` intentionally has both a launcher and a
+control records at 40px, four battery records at 28px, and Listen-detail
+Play/Pause at 96px. `VolumeUp` intentionally has both a launcher and a
 control record. The generator also derives 52 case-preserving letters, 20
 digit variants, and the 12H/24H Settings composites.
 

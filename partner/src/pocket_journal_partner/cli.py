@@ -766,7 +766,7 @@ def _parse_settings_assignments(assignments: list[str]) -> dict[str, object]:
         "alarm_hour": (0, 23),
         "alarm_minute": (0, 59),
         "timer_seconds": (30, 86400),
-        "interval_seconds": (60, 86400),
+        "interval_seconds": (30, 86400),
         "transcript_font_size": (2, 3),
     }
     for key, (minimum, maximum) in ranges.items():

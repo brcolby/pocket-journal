@@ -9,7 +9,7 @@ make ui-gallery
 The output is written to `build/ui-gallery/`. `gallery.png` is a contact sheet
 for visual review; 51 individual PNGs cover primary menus, both clock/unit
 modes, battery thresholds, recording, empty and populated Listen/Read lists,
-compact timestamp rows, paging, playback and transcript detail, time tools,
+compact timestamp rows, paging, compact 96 px playback and transcript detail, time tools,
 light/dark Settings with compact 12h/24h, numeric Volume extrema, and Sync
 phases. `manifest.json` records pixel metrics for each frame.
 
