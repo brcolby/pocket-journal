@@ -118,8 +118,9 @@ class NoteLibraryTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             library = NoteLibrary(root)
-            audio = root / "audio" / "sample.wav"
-            audio.parent.mkdir()
+            store = PartnerStore(root)
+            audio = store.audio_path("device", "audio", "sample.wav")
+            audio.parent.mkdir(parents=True, exist_ok=True)
             audio.write_bytes(b"RIFF-audio")
             note = library.upsert_discovered(
                 "device", "audio", "sample.wav", label="Device label", duration_ms=1234
@@ -202,8 +203,8 @@ class NoteLibraryTests(unittest.TestCase):
             store = PartnerStore(root)
             library = NoteLibrary(root)
             note = library.upsert_discovered("device", "audio", "sample.wav")
-            audio = root / "audio" / "sample.wav"
-            audio.parent.mkdir()
+            audio = store.audio_path("device", "audio", "sample.wav")
+            audio.parent.mkdir(parents=True, exist_ok=True)
             audio.write_bytes(b"RIFF")
             library.attach_audio(note.note_id, audio)
             library.attach_transcript(note.note_id, {"text": "Private words"})
@@ -229,13 +230,34 @@ class NoteLibraryTests(unittest.TestCase):
             self.assertFalse(job_path.exists())
             self.assertFalse(transcript_path.exists())
 
-    def test_delete_retains_shared_audio_until_last_reference_is_removed(self) -> None:
+    def test_delete_accepts_exact_legacy_managed_audio_path(self) -> None:
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
+            store = PartnerStore(root)
+            library = NoteLibrary(root)
+            note = library.upsert_discovered("device", "audio", "sample.wav")
+            current, legacy = store.note_audio_paths(
+                "device", "audio", "sample.wav"
+            )
+            legacy.parent.mkdir(parents=True, exist_ok=True)
+            legacy.write_bytes(b"legacy RIFF")
+            library.attach_audio(note.note_id, legacy)
+
+            result = library.delete_note(note.note_id)
+
+            self.assertTrue(result.audio_removed)
+            self.assertFalse(legacy.exists())
+            self.assertFalse(current.exists())
+
+    def test_delete_never_unlinks_cross_identity_shared_audio(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = PartnerStore(root)
             library = NoteLibrary(root)
             first = library.upsert_discovered("device", "first", "shared.wav")
             second = library.upsert_discovered("device", "second", "shared.wav")
-            audio = root / "shared.wav"
+            audio = store.audio_path("device", "first", "shared.wav")
+            audio.parent.mkdir(parents=True, exist_ok=True)
             audio.write_bytes(b"RIFF")
             library.attach_audio(first.note_id, audio)
             library.attach_audio(second.note_id, audio)
@@ -245,8 +267,26 @@ class NoteLibraryTests(unittest.TestCase):
             self.assertIn("shared", first_result.audio_retained_reason or "")
             self.assertTrue(audio.exists())
             second_result = library.delete_note(second.note_id)
-            self.assertTrue(second_result.audio_removed)
-            self.assertFalse(audio.exists())
+            self.assertFalse(second_result.audio_removed)
+            self.assertIn("exact managed path", " ".join(second_result.cleanup_errors))
+            self.assertTrue(audio.exists())
+
+    def test_delete_retains_unrelated_in_root_file_attached_as_audio(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            library = NoteLibrary(root)
+            note = library.upsert_discovered("device", "audio", "sample.wav")
+            config = root / "config.json"
+            config.write_text('{"private": true}', encoding="utf-8")
+            library.attach_audio(note.note_id, config)
+
+            result = library.delete_note(note.note_id)
+
+            self.assertIsNone(library.get(note.note_id))
+            self.assertTrue(config.exists())
+            self.assertEqual(config.read_text(encoding="utf-8"), '{"private": true}')
+            self.assertFalse(result.audio_removed)
+            self.assertIn("exact managed path", " ".join(result.cleanup_errors))
 
     def test_delete_commits_row_but_does_not_follow_unsafe_audio_path(self) -> None:
         with TemporaryDirectory() as tmp, TemporaryDirectory() as elsewhere:
@@ -255,11 +295,15 @@ class NoteLibraryTests(unittest.TestCase):
             note = library.upsert_discovered("device", "audio", "sample.wav")
             external = Path(elsewhere) / "outside.wav"
             external.write_bytes(b"do not delete")
-            with sqlite3.connect(library.path) as connection:
+            connection = sqlite3.connect(library.path)
+            try:
                 connection.execute(
                     "UPDATE notes SET audio_path = ? WHERE note_id = ?",
                     (f"../{Path(elsewhere).name}/outside.wav", note.note_id),
                 )
+                connection.commit()
+            finally:
+                connection.close()
 
             result = library.delete_note(note.note_id)
 
@@ -272,7 +316,8 @@ class NoteLibraryTests(unittest.TestCase):
             root = Path(tmp)
             library = NoteLibrary(root)
             note = library.upsert_discovered("device", "audio", "sample.wav")
-            audio = root / "sample.wav"
+            audio = PartnerStore(root).audio_path("device", "audio", "sample.wav")
+            audio.parent.mkdir(parents=True, exist_ok=True)
             audio.write_bytes(b"RIFF")
             library.attach_audio(note.note_id, audio)
 
@@ -328,6 +373,92 @@ class NoteLibraryTests(unittest.TestCase):
             restored = reopened.upsert_discovered("device", "audio", "sample.wav")
             self.assertEqual(restored.note_id, note.note_id)
             self.assertEqual(reopened.import_partner_store(store), 1)
+
+    def test_import_waits_for_workflow_lock_and_rechecks_delete_tombstone(self) -> None:
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = PartnerStore(root)
+            library = NoteLibrary(root)
+            note = library.upsert_discovered("device", "audio", "sample.wav")
+            current_audio, legacy_audio = store.note_audio_paths(
+                "device", "audio", "sample.wav"
+            )
+            sidecars = store.note_sidecar_paths("device", "audio")
+            current_transcript, legacy_transcript, current_job, legacy_job = sidecars
+            legacy_audio.parent.mkdir(parents=True, exist_ok=True)
+            legacy_audio.write_bytes(b"legacy audio")
+            legacy_transcript.parent.mkdir(parents=True, exist_ok=True)
+            legacy_transcript.write_text('{"text": "legacy words"}', encoding="utf-8")
+            legacy_job.parent.mkdir(parents=True, exist_ok=True)
+            legacy_job.write_text(
+                json.dumps(
+                    {
+                        "device_id": "device",
+                        "audio_id": "audio",
+                        "filename": "sample.wav",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            library.attach_audio(note.note_id, legacy_audio)
+            retained = {
+                legacy_audio.resolve(),
+                legacy_transcript.resolve(),
+                legacy_job.resolve(),
+            }
+            original_unlink = Path.unlink
+
+            def retain_legacy(path: Path, *args, **kwargs):  # type: ignore[no-untyped-def]
+                if path.resolve(strict=False) in retained:
+                    raise PermissionError("retain legacy artifact")
+                return original_unlink(path, *args, **kwargs)
+
+            original_lock = PartnerStore.workflow_lock
+            attempted = threading.Event()
+            finished = threading.Event()
+            import_results: list[int] = []
+
+            @contextmanager
+            def observed_lock(active_store, device_id, audio_id):  # type: ignore[no-untyped-def]
+                attempted.set()
+                with original_lock(active_store, device_id, audio_id):
+                    yield
+
+            def import_store() -> None:
+                try:
+                    import_results.append(library.import_partner_store(store))
+                finally:
+                    finished.set()
+
+            with original_lock(store, "device", "audio"):
+                with mock.patch.object(
+                    type(legacy_job),
+                    "unlink",
+                    autospec=True,
+                    side_effect=retain_legacy,
+                ):
+                    result = library._delete_note_locked(note.note_id, store)
+                self.assertTrue(result.cleanup_errors)
+                with mock.patch.object(
+                    PartnerStore,
+                    "workflow_lock",
+                    observed_lock,
+                ):
+                    thread = threading.Thread(target=import_store)
+                    thread.start()
+                    self.assertTrue(attempted.wait(1))
+                    self.assertFalse(finished.wait(0.05))
+
+            self.assertTrue(finished.wait(1))
+            thread.join(1)
+            self.assertEqual(import_results, [0])
+            self.assertIsNone(library.get(note.note_id))
+            self.assertTrue(legacy_audio.exists())
+            self.assertTrue(legacy_transcript.exists())
+            self.assertTrue(legacy_job.exists())
+            self.assertFalse(current_audio.exists())
+            self.assertFalse(current_transcript.exists())
+            self.assertFalse(current_job.exists())
 
     def test_delete_waits_for_the_matching_sync_workflow_lock(self) -> None:
         with TemporaryDirectory() as tmp:
@@ -490,7 +621,8 @@ class LibraryCliAndTuiTests(unittest.TestCase):
             library = NoteLibrary(root)
             note = library.upsert_discovered("device", "audio", "sample.wav")
             library.attach_transcript(note.note_id, {"text": "Transcript\x1b[2J remains readable"})
-            audio = root / "sample.wav"
+            audio = PartnerStore(root).audio_path("device", "audio", "sample.wav")
+            audio.parent.mkdir(parents=True, exist_ok=True)
             audio.write_bytes(b"RIFF")
             library.attach_audio(note.note_id, audio)
             opened: list[Path] = []

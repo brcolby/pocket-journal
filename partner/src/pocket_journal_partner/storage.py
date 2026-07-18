@@ -134,7 +134,12 @@ class PartnerStore:
     def audio_dir(self, device_id: str) -> Path:
         return self.root / "audio" / _path_component(device_id)
 
-    def audio_path(self, device_id: str, audio_id: str, filename: str) -> Path:
+    def _audio_paths(
+        self,
+        device_id: str,
+        audio_id: str,
+        filename: str,
+    ) -> tuple[Path, Path]:
         path = self.audio_dir(device_id) / _audio_filename(audio_id, filename)
         legacy_path = (
             self.root
@@ -142,8 +147,21 @@ class PartnerStore:
             / _legacy_path_component(device_id)
             / _legacy_audio_filename(audio_id, filename)
         )
+        return path, legacy_path
+
+    def audio_path(self, device_id: str, audio_id: str, filename: str) -> Path:
+        path, legacy_path = self._audio_paths(device_id, audio_id, filename)
         _migrate_legacy_file(legacy_path, path)
         return path
+
+    def note_audio_paths(
+        self,
+        device_id: str,
+        audio_id: str,
+        filename: str,
+    ) -> tuple[Path, Path]:
+        """Return exact current and legacy audio paths without migrating them."""
+        return self._audio_paths(device_id, audio_id, filename)
 
     def transcript_dir(self, device_id: str) -> Path:
         return self.root / "transcripts" / _path_component(device_id)

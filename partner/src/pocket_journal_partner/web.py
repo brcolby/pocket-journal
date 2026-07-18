@@ -5,6 +5,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import html
 import ipaddress
 import json
+import os
 from pathlib import Path
 import secrets
 import socket
@@ -430,28 +431,38 @@ def create_server(
             self._error(HTTPStatus.NOT_FOUND, "Page not found.")
 
         def _serve_audio(self, path: Path) -> None:
-            size = path.stat().st_size
-            selected = _parse_range(self.headers.get("Range"), size)
-            if selected is None:
-                self.send_response(HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE)
+            try:
+                handle = path.open("rb")
+            except OSError:
+                self._error(HTTPStatus.NOT_FOUND, "Audio not found.")
+                return
+            try:
+                size = os.fstat(handle.fileno()).st_size
+            except OSError:
+                handle.close()
+                self._error(HTTPStatus.NOT_FOUND, "Audio not found.")
+                return
+            with handle:
+                selected = _parse_range(self.headers.get("Range"), size)
+                if selected is None:
+                    self.send_response(HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE)
+                    self._security_headers()
+                    self.send_header("Content-Range", f"bytes */{size}")
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                start, end, partial = selected
+                length = max(0, end - start + 1)
+                self.send_response(HTTPStatus.PARTIAL_CONTENT if partial else HTTPStatus.OK)
                 self._security_headers()
-                self.send_header("Content-Range", f"bytes */{size}")
-                self.send_header("Content-Length", "0")
+                self.send_header("Content-Type", "audio/wav")
+                self.send_header("Accept-Ranges", "bytes")
+                self.send_header("Content-Length", str(length))
+                if partial:
+                    self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
                 self.end_headers()
-                return
-            start, end, partial = selected
-            length = max(0, end - start + 1)
-            self.send_response(HTTPStatus.PARTIAL_CONTENT if partial else HTTPStatus.OK)
-            self._security_headers()
-            self.send_header("Content-Type", "audio/wav")
-            self.send_header("Accept-Ranges", "bytes")
-            self.send_header("Content-Length", str(length))
-            if partial:
-                self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
-            self.end_headers()
-            if self.command == "HEAD":
-                return
-            with path.open("rb") as handle:
+                if self.command == "HEAD":
+                    return
                 handle.seek(start)
                 remaining = length
                 while remaining:
@@ -499,6 +510,9 @@ def create_server(
             if title_action:
                 try:
                     library.update_title(note.note_id, form.get("title", [""])[0])
+                except KeyError:
+                    self._error(HTTPStatus.NOT_FOUND, "Note not found.")
+                    return
                 except ValueError as error:
                     self._error(HTTPStatus.BAD_REQUEST, str(error))
                     return

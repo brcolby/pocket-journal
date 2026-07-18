@@ -397,7 +397,11 @@ class NoteLibrary:
         assert note is not None
         return note
 
-    def _managed_audio_candidate(self, relative_path: str) -> tuple[Path | None, str | None]:
+    def _managed_audio_candidate(
+        self,
+        relative_path: str,
+        allowed_paths: tuple[Path, ...],
+    ) -> tuple[Path | None, str | None]:
         if not isinstance(relative_path, str):
             return None, "audio path is not a safe library-relative path"
         pure = PurePosixPath(relative_path)
@@ -408,6 +412,8 @@ class NoteLibrary:
         ):
             return None, "audio path is not a safe library-relative path"
         candidate = self.root.joinpath(*pure.parts)
+        if candidate not in allowed_paths:
+            return None, "audio path is not the exact managed path for this note identity"
         current = self.root
         for part in pure.parts:
             current /= part
@@ -485,7 +491,7 @@ class NoteLibrary:
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
-                "SELECT note_id, device_id, audio_id, title, audio_path "
+                "SELECT note_id, device_id, audio_id, filename, title, audio_path "
                 "FROM notes WHERE note_id = ?",
                 (note_id,),
             ).fetchone()
@@ -516,7 +522,20 @@ class NoteLibrary:
         if audio_path and shared_audio:
             retained_reason = "audio is shared by another library note"
         elif audio_path:
-            candidate, unsafe_reason = self._managed_audio_candidate(audio_path)
+            try:
+                allowed_audio_paths = store.note_audio_paths(
+                    row["device_id"],
+                    row["audio_id"],
+                    row["filename"],
+                )
+            except (OSError, TypeError, ValueError) as error:
+                candidate = None
+                unsafe_reason = f"managed audio path could not be derived: {error}"
+            else:
+                candidate, unsafe_reason = self._managed_audio_candidate(
+                    audio_path,
+                    allowed_audio_paths,
+                )
             if candidate is None:
                 errors.append(unsafe_reason or "audio path was not safe to remove")
             else:
@@ -629,48 +648,80 @@ class NoteLibrary:
             ).fetchone()
         return int(row[0])
 
+    @staticmethod
+    def _read_import_job(job_path: Path) -> dict[str, Any] | None:
+        try:
+            job = json.loads(job_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            return None
+        return job if isinstance(job, dict) else None
+
     def import_partner_store(self, store: Any) -> int:
-        """Index legacy job/transcript files without rewriting or deleting them."""
+        """Index cached partner jobs while serialized with sync and deletion."""
         imported = 0
         for job_path in sorted((store.root / "jobs").glob("*/*.json")):
-            try:
-                job = json.loads(job_path.read_text(encoding="utf-8"))
-            except (OSError, UnicodeError, json.JSONDecodeError):
+            preliminary = self._read_import_job(job_path)
+            if preliminary is None:
                 continue
-            if not isinstance(job, dict):
+            device_id = preliminary.get("device_id")
+            audio_id = preliminary.get("audio_id")
+            if not all(
+                isinstance(value, str) and value
+                for value in (device_id, audio_id)
+            ):
                 continue
-            device_id = job.get("device_id")
-            audio_id = job.get("audio_id")
-            filename = job.get("filename")
-            if not all(isinstance(value, str) and value for value in (device_id, audio_id, filename)):
-                continue
-            source = job.get("source") if isinstance(job.get("source"), dict) else {}
-            source_sha256 = source.get("sha256") if isinstance(source.get("sha256"), str) else None
-            try:
-                note = self.upsert_discovered(
-                    device_id,
-                    audio_id,
-                    filename,
-                    source_sha256=source_sha256,
-                    created_at=(
-                        job.get("updated_at")
-                        if isinstance(job.get("updated_at"), str)
-                        else None
-                    ),
-                    device_synced=job.get("stage") == "uploaded",
-                    restore_deleted=False,
-                )
-                audio_path = store.audio_path(device_id, audio_id, filename)
-                if audio_path.is_file():
-                    self.attach_audio(note.note_id, audio_path, source_sha256=source_sha256)
-                transcript = store.load_transcript(device_id, audio_id)
+            with store.workflow_lock(device_id, audio_id):
+                job = self._read_import_job(job_path)
                 if (
-                    isinstance(transcript, dict)
-                    and isinstance(transcript.get("text"), str)
-                    and transcript["text"].strip()
+                    job is None
+                    or job.get("device_id") != device_id
+                    or job.get("audio_id") != audio_id
                 ):
-                    self.attach_transcript(note.note_id, transcript)
-            except (KeyError, ValueError):
-                continue
-            imported += 1
+                    continue
+                filename = job.get("filename")
+                if not isinstance(filename, str) or not filename:
+                    continue
+                source = (
+                    job.get("source")
+                    if isinstance(job.get("source"), dict)
+                    else {}
+                )
+                source_sha256 = (
+                    source.get("sha256")
+                    if isinstance(source.get("sha256"), str)
+                    else None
+                )
+                try:
+                    # This tombstone-aware upsert intentionally precedes every
+                    # legacy-path migration and attachment under the same lock.
+                    note = self.upsert_discovered(
+                        device_id,
+                        audio_id,
+                        filename,
+                        source_sha256=source_sha256,
+                        created_at=(
+                            job.get("updated_at")
+                            if isinstance(job.get("updated_at"), str)
+                            else None
+                        ),
+                        device_synced=job.get("stage") == "uploaded",
+                        restore_deleted=False,
+                    )
+                    audio_path = store.audio_path(device_id, audio_id, filename)
+                    if audio_path.is_file():
+                        self.attach_audio(
+                            note.note_id,
+                            audio_path,
+                            source_sha256=source_sha256,
+                        )
+                    transcript = store.load_transcript(device_id, audio_id)
+                    if (
+                        isinstance(transcript, dict)
+                        and isinstance(transcript.get("text"), str)
+                        and transcript["text"].strip()
+                    ):
+                        self.attach_transcript(note.note_id, transcript)
+                except (KeyError, ValueError):
+                    continue
+                imported += 1
         return imported

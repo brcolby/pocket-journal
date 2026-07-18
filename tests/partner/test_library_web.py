@@ -8,8 +8,10 @@ from tempfile import TemporaryDirectory
 import threading
 from urllib.parse import urlencode
 import unittest
+from unittest import mock
 
 from pocket_journal_partner.library import NoteLibrary
+from pocket_journal_partner.storage import PartnerStore
 from pocket_journal_partner.web import create_server
 
 
@@ -20,7 +22,10 @@ class LibraryWebTests(unittest.TestCase):
         self.library = NoteLibrary(self.root)
         self.note = self.library.upsert_discovered("device", "audio", "sample.wav")
         self.library.attach_transcript(self.note.note_id, {"text": "A <private> transcript"})
-        self.audio = self.root / "sample.wav"
+        self.audio = PartnerStore(self.root).audio_path(
+            "device", "audio", "sample.wav"
+        )
+        self.audio.parent.mkdir(parents=True, exist_ok=True)
         self.audio.write_bytes(b"0123456789")
         self.library.attach_audio(self.note.note_id, self.audio)
         self.server = create_server(self.library, "127.0.0.1", 0)
@@ -135,6 +140,48 @@ class LibraryWebTests(unittest.TestCase):
         self.assertEqual(response.status, 303)
         self.assertEqual(response.getheader("Location"), f"/note/{self.note.note_id}")
         self.assertEqual(self.library.get(self.note.note_id).title, "Web title")  # type: ignore[union-attr]
+
+    def test_title_race_with_local_delete_returns_not_found(self) -> None:
+        _, note_page = self.request("GET", f"/note/{self.note.note_id}")
+        match = re.search(rb"name='csrf' value='([^']+)'", note_page)
+        self.assertIsNotNone(match)
+        assert match is not None
+        body = urlencode(
+            {"csrf": match.group(1).decode(), "title": "Too late"}
+        ).encode()
+
+        with mock.patch.object(self.library, "update_title", side_effect=KeyError("gone")):
+            response, payload = self.request(
+                "POST",
+                f"/note/{self.note.note_id}/title",
+                body,
+                {
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "Content-Length": str(len(body)),
+                },
+            )
+
+        self.assertEqual(response.status, 404)
+        self.assertIn(b"Note not found", payload)
+
+    def test_audio_disappearing_before_open_returns_clean_not_found(self) -> None:
+        original_resolve = self.library.resolve_audio_path
+
+        def remove_after_resolve(note):  # type: ignore[no-untyped-def]
+            path = original_resolve(note)
+            assert path is not None
+            path.unlink()
+            return path
+
+        with mock.patch.object(
+            self.library,
+            "resolve_audio_path",
+            side_effect=remove_after_resolve,
+        ):
+            response, payload = self.request("GET", f"/audio/{self.note.note_id}")
+
+        self.assertEqual(response.status, 404)
+        self.assertIn(b"Audio not found", payload)
 
     def test_delete_requires_confirmation_and_csrf_then_removes_local_note(self) -> None:
         response, confirmation = self.request(
