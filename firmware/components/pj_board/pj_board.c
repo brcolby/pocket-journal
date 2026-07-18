@@ -3592,7 +3592,7 @@ static void label_from_filename(char *out, size_t out_size, const char *filename
 typedef struct {
     char filename[96];
     char label[PJ_UI_NOTE_LABEL_LEN];
-    char transcript_label[PJ_UI_NOTE_LABEL_LEN];
+    char transcript_text[PJ_UI_NOTE_TEXT_LEN];
     long size_bytes;
     uint32_t data_bytes;
     uint32_t sample_rate;
@@ -3772,13 +3772,14 @@ static int note_metadata_load(pj_note_metadata_t *note)
     return 1;
 }
 
-static int transcript_label_for_audio(const char *filename, char *label, size_t label_size,
-                                      char *path, size_t path_size)
+static int transcript_text_for_audio(const char *filename, char *text,
+                                     size_t text_size, char *path,
+                                     size_t path_size)
 {
     if (!transcript_path_for_audio(path, path_size, filename)) {
         return 0;
     }
-    return pj_transcript_marker_load(path, label, label_size);
+    return pj_transcript_text_load(path, text, text_size);
 }
 
 static void write_recording_metadata(const char *final_path, uint32_t data_bytes)
@@ -3911,9 +3912,10 @@ static int probe_audio_entry_unlocked(const char *filename, pj_audio_entry_t *en
         (void)snprintf(entry->note.created_at, sizeof(entry->note.created_at), "%s", derived.created_at);
     }
     char transcript_path[PJ_NOTE_TRANSCRIPT_PATH_LEN];
-    if (transcript_label_for_audio(filename, entry->transcript_label,
-                                   sizeof(entry->transcript_label), transcript_path,
-                                   sizeof(transcript_path))) {
+    if (transcript_text_for_audio(filename, entry->transcript_text,
+                                  sizeof(entry->transcript_text),
+                                  transcript_path,
+                                  sizeof(transcript_path))) {
         entry->note.synced = 1;
         (void)snprintf(entry->note.transcript_path, sizeof(entry->note.transcript_path), "%s",
                        transcript_path);
@@ -4499,17 +4501,28 @@ static int next_recording_path(char *out, size_t out_size)
 
 static void refresh_ui_notes_from_sd(pj_ui_context_t *ui)
 {
-    char labels[PJ_UI_MAX_NOTES][PJ_UI_NOTE_LABEL_LEN];
+    typedef struct {
+        char labels[PJ_UI_MAX_NOTES][PJ_UI_NOTE_LABEL_LEN];
+        char transcripts[PJ_UI_MAX_NOTES][PJ_UI_NOTE_TEXT_LEN];
+    } pj_ui_note_projection_t;
+    pj_ui_note_projection_t *projection = heap_caps_calloc(
+        1, sizeof(*projection), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     pj_audio_entry_t *entries = NULL;
-    memset(labels, 0, sizeof(labels));
+    if (projection == NULL) {
+        g_ui_note_audio_count = 0;
+        pj_ui_set_note_content(ui, 0, NULL, NULL);
+        return;
+    }
     int count = collect_audio_entries(&entries);
     if (count == PJ_AUDIO_COLLECT_NO_MEMORY) {
         g_ui_note_audio_count = 0;
-        pj_ui_set_notes(ui, 0, labels);
+        pj_ui_set_note_content(ui, 0, NULL, NULL);
+        free(projection);
         return;
     }
     if (count < 0) {
         free(entries);
+        free(projection);
         return;
     }
     pj_ui_state_t state = pj_ui_current_state(ui);
@@ -4521,11 +4534,18 @@ static void refresh_ui_notes_from_sd(pj_ui_context_t *ui)
     int transcript_view = g_ui_note_transcript_view;
     int displayed = 0;
     for (int i = 0; i < count && displayed < PJ_UI_MAX_NOTES; i++) {
-        if (transcript_view && (!entries[i].note.synced || entries[i].transcript_label[0] == '\0')) {
+        if (transcript_view &&
+            (!entries[i].note.synced || entries[i].transcript_text[0] == '\0')) {
             continue;
         }
-        const char *label = transcript_view ? entries[i].transcript_label : entries[i].label;
-        (void)snprintf(labels[displayed], sizeof(labels[displayed]), "%s", label);
+        (void)snprintf(projection->labels[displayed],
+                       sizeof(projection->labels[displayed]), "%s",
+                       entries[i].label);
+        if (transcript_view) {
+            (void)snprintf(projection->transcripts[displayed],
+                           sizeof(projection->transcripts[displayed]), "%s",
+                           entries[i].transcript_text);
+        }
         g_ui_note_audio_indices[displayed] = i;
         displayed++;
     }
@@ -4533,7 +4553,10 @@ static void refresh_ui_notes_from_sd(pj_ui_context_t *ui)
     free(entries);
     ESP_LOGI(TAG, "%s note list refreshed: visible=%d playable=%d",
              transcript_view ? "Transcript" : "Audio", displayed, count);
-    pj_ui_set_notes(ui, displayed, labels);
+    pj_ui_set_note_content(
+        ui, displayed, projection->labels,
+        transcript_view ? projection->transcripts : NULL);
+    free(projection);
 }
 
 static int ui_state_uses_note_inventory(pj_ui_state_t state)

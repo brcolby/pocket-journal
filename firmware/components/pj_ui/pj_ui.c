@@ -745,28 +745,52 @@ static void clamp_note_page(pj_ui_context_t *ctx)
     }
 }
 
-void pj_ui_set_notes(pj_ui_context_t *ctx, int count, const char labels[][PJ_UI_NOTE_LABEL_LEN])
+void pj_ui_set_note_content(
+    pj_ui_context_t *ctx, int count,
+    const char labels[][PJ_UI_NOTE_LABEL_LEN],
+    const char transcripts[][PJ_UI_NOTE_TEXT_LEN])
 {
+    if (ctx == NULL) {
+        return;
+    }
     if (count < 0) {
         count = 0;
     } else if (count > PJ_UI_MAX_NOTES) {
         count = PJ_UI_MAX_NOTES;
     }
-    int changed = ctx->note_count != count;
-    for (int i = 0; i < count && !changed; i++) {
+    if (labels == NULL && count > 0) {
+        count = 0;
+    }
+    int identity_changed = ctx->note_count != count;
+    int transcript_changed = 0;
+    int selected_transcript_changed = 0;
+    for (int i = 0; i < count; i++) {
+        const char *transcript = transcripts == NULL ? "" : transcripts[i];
         if (strncmp(ctx->note_labels[i], labels[i], PJ_UI_NOTE_LABEL_LEN) != 0) {
-            changed = 1;
+            identity_changed = 1;
+        }
+        if (strncmp(ctx->note_transcripts[i], transcript,
+                    PJ_UI_NOTE_TEXT_LEN) != 0) {
+            transcript_changed = 1;
+            if (i == ctx->selected_note) {
+                selected_transcript_changed = 1;
+            }
         }
     }
-    if (!changed) {
+    if (!identity_changed && !transcript_changed) {
         return;
     }
     ctx->note_count = count;
     for (int i = 0; i < PJ_UI_MAX_NOTES; i++) {
         ctx->note_labels[i][0] = '\0';
+        ctx->note_transcripts[i][0] = '\0';
     }
     for (int i = 0; i < count; i++) {
         (void)snprintf(ctx->note_labels[i], PJ_UI_NOTE_LABEL_LEN, "%s", labels[i]);
+        if (transcripts != NULL) {
+            (void)snprintf(ctx->note_transcripts[i], PJ_UI_NOTE_TEXT_LEN,
+                           "%s", transcripts[i]);
+        }
     }
     clamp_note_page(ctx);
     if (ctx->selected_note >= count) {
@@ -774,9 +798,21 @@ void pj_ui_set_notes(pj_ui_context_t *ctx, int count, const char labels[][PJ_UI_
     }
     if (ctx->state == PJ_UI_STATE_LISTEN || ctx->state == PJ_UI_STATE_READ ||
         ctx->state == PJ_UI_STATE_NOTE_DETAIL) {
-        interaction_changed(ctx);
-        visual_changed(ctx);
+        if (identity_changed) {
+            interaction_changed(ctx);
+            visual_changed(ctx);
+        } else if (ctx->state == PJ_UI_STATE_NOTE_DETAIL &&
+                   ctx->note_detail_transcript &&
+                   selected_transcript_changed) {
+            visual_changed(ctx);
+        }
     }
+}
+
+void pj_ui_set_notes(pj_ui_context_t *ctx, int count,
+                     const char labels[][PJ_UI_NOTE_LABEL_LEN])
+{
+    pj_ui_set_note_content(ctx, count, labels, NULL);
 }
 
 void pj_ui_wake(pj_ui_context_t *ctx)
@@ -1851,10 +1887,8 @@ static void draw_notes_list(const pj_ui_context_t *ctx, pj_framebuffer_t *fb, co
         const char *label = ctx->note_labels[note_index][0] != '\0'
             ? ctx->note_labels[note_index] : "RECORDING";
         char audio_label[PJ_UI_NOTE_LABEL_LEN];
-        if (strcmp(kind, "AUD") == 0) {
-            audio_note_display_label(audio_label, sizeof(audio_label), label);
-            label = audio_label;
-        }
+        audio_note_display_label(audio_label, sizeof(audio_label), label);
+        label = audio_label;
         int row_height = next_y - y;
         int scale = largest_text_scale_that_fits(
             label, PJ_DISPLAY_WIDTH - 10,
@@ -2103,9 +2137,12 @@ static void render_scene(const pj_ui_context_t *ctx, pj_framebuffer_t *fb)
         if (ctx->note_detail_transcript) {
             int scale = ctx->transcript_font_size;
             int max_lines = 192 / (font_size_for_scale(scale) + 5);
+            const char *transcript =
+                ctx->selected_note >= 0 && ctx->selected_note < ctx->note_count &&
+                ctx->note_transcripts[ctx->selected_note][0] != '\0' ?
+                ctx->note_transcripts[ctx->selected_note] : "Transcript pending";
             draw_wrapped_text(fb, 4, 4,
-                ctx->note_labels[ctx->selected_note][0] != '\0' ? ctx->note_labels[ctx->selected_note] : "Transcript pending",
-                scale, 192, max_lines);
+                              transcript, scale, 192, max_lines);
         } else {
             draw_icon(fb, ctx->playback_state == PJ_PLAYBACK_IDLE ?
                            PJ_CARBON_ICON_PLAY_FILLED :

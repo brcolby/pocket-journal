@@ -23,6 +23,57 @@ int main(void)
     assert(pj_transcript_body_validate("{\"text\":\"\"}", 11, 11) ==
            PJ_TRANSCRIPT_BODY_INVALID_CONTENT);
 
+    const char escaped[] =
+        "{\"title\":\"/sdcard/pj/notes/internal.json\","
+        "\"text\":\"First line\\nquoted \\\"words\\\" and caf\\u00e9\","
+        "\"metadata\":{\"path\":\"/sdcard/private\",\"status\":\"synced\"}}";
+    char transcript[128];
+    assert(pj_transcript_text_extract(escaped, strlen(escaped), transcript,
+                                      sizeof(transcript)));
+    assert(strcmp(transcript,
+                  "First line quoted \"words\" and caf\xc3\xa9") == 0);
+    assert(strstr(transcript, "sdcard") == NULL);
+    assert(strstr(transcript, "metadata") == NULL);
+    char metadata_label[64];
+    assert(pj_transcript_label_extract(escaped, strlen(escaped),
+                                       metadata_label,
+                                       sizeof(metadata_label)));
+    assert(strcmp(metadata_label, "/sdcard/pj/notes/internal.json") == 0);
+
+    const char utf8_boundary_body[] = "{\"text\":\"12345\\u00e9Z\"}";
+    char utf8_truncated[7];
+    assert(pj_transcript_text_extract(
+        utf8_boundary_body, strlen(utf8_boundary_body), utf8_truncated,
+        sizeof(utf8_truncated)));
+    assert(strcmp(utf8_truncated, "12345") == 0);
+    char utf8_complete[8];
+    assert(pj_transcript_text_extract(
+        utf8_boundary_body, strlen(utf8_boundary_body), utf8_complete,
+        sizeof(utf8_complete)));
+    assert(strcmp(utf8_complete, "12345\xc3\xa9") == 0);
+
+    const char title_only[] = "{\"title\":\"metadata only\"}";
+    assert(!pj_transcript_text_extract(title_only, strlen(title_only),
+                                       transcript, sizeof(transcript)));
+    const char blank_text[] = "{\"text\":\" \\n \\t \"}";
+    assert(!pj_transcript_text_extract(blank_text, strlen(blank_text),
+                                       transcript, sizeof(transcript)));
+
+    static const char transcript_path[] = "build/test-transcript-display.json";
+    FILE *transcript_file = fopen(transcript_path, "wb");
+    assert(transcript_file != NULL);
+    assert(fwrite(escaped, 1, strlen(escaped), transcript_file) ==
+           strlen(escaped));
+    assert(fclose(transcript_file) == 0);
+    assert(pj_transcript_text_load(transcript_path, transcript,
+                                   sizeof(transcript)));
+    assert(strcmp(transcript,
+                  "First line quoted \"words\" and caf\xc3\xa9") == 0);
+    assert(pj_transcript_marker_load(transcript_path, metadata_label,
+                                     sizeof(metadata_label)));
+    assert(strcmp(metadata_label, "/sdcard/pj/notes/internal.json") == 0);
+    assert(remove(transcript_path) == 0);
+
     const char matching_source[] =
         "{\"text\":\"hello\",\"source\":{"
         "\"sha256\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\","

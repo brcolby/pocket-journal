@@ -657,12 +657,19 @@ static void test_case_punctuation_and_long_transcript(void)
     const char upper_only[][PJ_UI_NOTE_LABEL_LEN] = {
         "AA II LL TT RR FF MM WW JJ YGJ PQ!?.,:-/% MIXED CASE",
     };
+    const char labels[][PJ_UI_NOTE_LABEL_LEN] = {
+        "REC 20260717 0909 1",
+    };
+    char mixed_text[1][PJ_UI_NOTE_TEXT_LEN] = {{0}};
+    char upper_text[1][PJ_UI_NOTE_TEXT_LEN] = {{0}};
+    (void)snprintf(mixed_text[0], sizeof(mixed_text[0]), "%s", mixed[0]);
+    (void)snprintf(upper_text[0], sizeof(upper_text[0]), "%s", upper_only[0]);
     pj_ui_context_t context;
     pj_ui_init(&context);
     context.state = PJ_UI_STATE_NOTE_DETAIL;
     context.note_detail_transcript = 1;
     context.selected_note = 0;
-    pj_ui_set_notes(&context, 1, mixed);
+    pj_ui_set_note_content(&context, 1, labels, mixed_text);
     pj_framebuffer_t first;
     pj_framebuffer_t repeat;
     pj_framebuffer_t uppercase;
@@ -670,7 +677,7 @@ static void test_case_punctuation_and_long_transcript(void)
     pj_ui_compose_frame(&context, &repeat);
     assert(memcmp(&first, &repeat, sizeof(first)) == 0);
     assert(count_black_pixels(&first) > 100);
-    pj_ui_set_notes(&context, 1, upper_only);
+    pj_ui_set_note_content(&context, 1, labels, upper_text);
     pj_ui_compose_frame(&context, &uppercase);
     assert(framebuffer_differences(&first, &uppercase) > 0);
 }
@@ -754,6 +761,86 @@ static void test_audio_note_timestamps_are_compact(void)
     pj_ui_set_notes(&old_layout, 1, spaced);
     pj_ui_compose_frame(&old_layout, &old_frame);
     assert(framebuffer_differences(&actual_frame, &old_frame) > 0);
+}
+
+static void test_read_titles_match_listen_and_detail_uses_transcript_body(void)
+{
+    char labels[2][PJ_UI_NOTE_LABEL_LEN] = {
+        "REC 20260717 0909 1",
+        "REC 20260716 1642 2",
+    };
+    char transcripts[2][PJ_UI_NOTE_TEXT_LEN] = {
+        "Actual spoken words from the first note.",
+        "Second note transcript body.",
+    };
+    pj_ui_context_t listen;
+    pj_ui_context_t read;
+    pj_framebuffer_t listen_list;
+    pj_framebuffer_t read_list;
+
+    pj_ui_init(&listen);
+    listen.state = PJ_UI_STATE_LISTEN;
+    pj_ui_set_note_content(&listen, 2, labels, transcripts);
+    pj_ui_compose_frame(&listen, &listen_list);
+
+    pj_ui_init(&read);
+    read.state = PJ_UI_STATE_READ;
+    pj_ui_set_note_content(&read, 2, labels, transcripts);
+    pj_ui_compose_frame(&read, &read_list);
+    assert(memcmp(&listen_list, &read_list, sizeof(listen_list)) == 0);
+
+    assert(pj_ui_handle_touch(&read, 50, 25, PJ_TOUCH_TAP));
+    assert(read.state == PJ_UI_STATE_NOTE_DETAIL);
+    assert(read.note_detail_transcript);
+    assert(read.selected_note == 0);
+    pj_framebuffer_t detail;
+    pj_framebuffer_t renamed_detail;
+    pj_framebuffer_t metadata_detail;
+    pj_ui_compose_frame(&read, &detail);
+
+    pj_ui_context_t renamed = read;
+    (void)snprintf(renamed.note_labels[0], sizeof(renamed.note_labels[0]),
+                   "%s", "INTERNAL /sdcard/path metadata");
+    pj_ui_compose_frame(&renamed, &renamed_detail);
+    assert(memcmp(&detail, &renamed_detail, sizeof(detail)) == 0);
+
+    pj_ui_context_t metadata = read;
+    (void)snprintf(metadata.note_transcripts[0],
+                   sizeof(metadata.note_transcripts[0]), "%s",
+                   "INTERNAL /sdcard/path metadata");
+    pj_ui_compose_frame(&metadata, &metadata_detail);
+    assert(framebuffer_differences(&detail, &metadata_detail) > 0);
+
+    presenter_fixture_t fixture;
+    presenter_start(&fixture, &read);
+    uint32_t layout = read.layout_epoch;
+    uint32_t full = read.full_refresh_revision;
+    uint32_t interaction = read.interaction_generation;
+    (void)snprintf(transcripts[0], sizeof(transcripts[0]), "%s",
+                   "Updated actual transcript text for this note.");
+    pj_ui_set_note_content(&read, 2, labels, transcripts);
+    assert(read.layout_epoch == layout);
+    assert(read.full_refresh_revision == full);
+    assert(read.interaction_generation == interaction);
+    presenter_accept_partial(&fixture, &read);
+
+    (void)snprintf(labels[0], sizeof(labels[0]), "%s",
+                   "INTERNAL METADATA TITLE");
+    pj_ui_set_note_content(&read, 2, labels, transcripts);
+    assert(read.layout_epoch == layout);
+    assert(read.full_refresh_revision == full);
+    assert(read.interaction_generation != interaction);
+    pj_ui_presenter_frame_t barrier;
+    pj_ui_presenter_revision_t revision = pj_ui_presenter_revision(&read);
+    assert(pj_ui_presenter_prepare(&fixture.presenter, &read, &revision,
+                                   &barrier) == PJ_UI_FRAME_BARRIER);
+    assert(barrier.dirty.width == 0 && barrier.dirty.height == 0);
+    assert(pj_ui_presenter_accept(&fixture.presenter, barrier.token));
+
+    assert(!pj_ui_handle_touch(&read, 100, 100, PJ_TOUCH_TAP));
+    assert(read.playback_state == PJ_PLAYBACK_IDLE);
+    assert(pj_ui_handle_aux_long(&read));
+    assert(read.state == PJ_UI_STATE_READ);
 }
 
 static void test_typed_preferences_revisions_and_theme_inversion(void)
@@ -1433,6 +1520,7 @@ int main(void)
     test_case_punctuation_and_long_transcript();
     test_note_pages_selection_and_content_partials();
     test_audio_note_timestamps_are_compact();
+    test_read_titles_match_listen_and_detail_uses_transcript_body();
     test_typed_preferences_revisions_and_theme_inversion();
     test_settings_mapping_and_volume_extrema();
     test_battery_thresholds_and_clock_partials();

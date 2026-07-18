@@ -179,6 +179,14 @@ for (const [name, expectedState, setup, validationOptions] of scenarios) {
   rendered.push({ name, ...image, metrics });
 }
 
+const listenRows = rendered.find(({ name }) => name === "listen-page-1");
+const readRows = rendered.find(({ name }) => name === "read-page-1");
+if (!listenRows || !readRows) {
+  failures.push("Listen/Read note-row parity scenarios are missing");
+} else if (!listenRows.pixels.every((pixel, index) => pixel === readRows.pixels[index])) {
+  failures.push("Read and Listen rows must render identical note identities");
+}
+
 const columns = 4; const gap = 8; const cell = 200;
 const rows = Math.ceil(rendered.length / columns);
 const sheetWidth = columns * cell + (columns - 1) * gap;

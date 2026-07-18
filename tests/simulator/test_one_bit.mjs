@@ -183,6 +183,17 @@ assert.ok(
 );
 assert.match(boardSource, /ram=0x24->0x26->0x24/);
 
+const noteRefreshSource = boardSource.slice(
+  boardSource.indexOf("static void refresh_ui_notes_from_sd"),
+  boardSource.indexOf("static int ui_state_uses_note_inventory"),
+);
+assert.match(noteRefreshSource, /projection->labels\[displayed\][\s\S]*entries\[i\]\.label/);
+assert.match(noteRefreshSource, /projection->transcripts\[displayed\][\s\S]*entries\[i\]\.transcript_text/);
+assert.match(noteRefreshSource, /pj_ui_set_note_content\(/);
+assert.doesNotMatch(noteRefreshSource, /transcript_label/);
+assert.match(wasmBridge, /void pj_sim_set_note_transcript\(/);
+assert.match(makefile, /'_pj_sim_set_note_transcript'/);
+
 const cadenceEndSource = appMain.slice(
   appMain.indexOf("static void end_seconds_cadence"),
   appMain.indexOf("static void reconcile_seconds_cadence"),
@@ -214,7 +225,9 @@ for (const scenario of [
   "record-arming",
   "record-active",
   "alarm-on",
+  "read-page-1",
   "note-detail-playing",
+  "transcript-detail",
   "transcript-punctuation",
   "transcript-long",
   "stopwatch-running-10",

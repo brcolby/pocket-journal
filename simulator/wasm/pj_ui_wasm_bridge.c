@@ -1,6 +1,7 @@
 #include "pj_ui.h"
 #include "pj_ui_presenter.h"
 
+#include <stdio.h>
 #include <string.h>
 
 #ifdef __EMSCRIPTEN__
@@ -15,6 +16,7 @@ static pj_framebuffer_t g_fb;
 static pj_ui_dirty_region_t g_dirty;
 static pj_ui_frame_result_t g_frame_result;
 static char g_note_labels[PJ_UI_MAX_NOTES][PJ_UI_NOTE_LABEL_LEN];
+static char g_note_transcripts[PJ_UI_MAX_NOTES][PJ_UI_NOTE_TEXT_LEN];
 static int g_note_count;
 
 static pj_ui_preferences_t current_preferences(void)
@@ -55,7 +57,10 @@ static void present_current_frame(void)
 
 static void sync_notes(void)
 {
-    pj_ui_set_notes(&g_ctx, g_note_count, (const char (*)[PJ_UI_NOTE_LABEL_LEN])g_note_labels);
+    pj_ui_set_note_content(
+        &g_ctx, g_note_count,
+        (const char (*)[PJ_UI_NOTE_LABEL_LEN])g_note_labels,
+        (const char (*)[PJ_UI_NOTE_TEXT_LEN])g_note_transcripts);
 }
 
 EMSCRIPTEN_KEEPALIVE
@@ -67,6 +72,7 @@ void pj_sim_init(void)
     memset(&g_dirty, 0, sizeof(g_dirty));
     g_frame_result = PJ_UI_FRAME_IDLE;
     memset(g_note_labels, 0, sizeof(g_note_labels));
+    memset(g_note_transcripts, 0, sizeof(g_note_transcripts));
     g_note_count = 0;
     pj_ui_compose_frame(&g_ctx, &g_fb);
     g_dirty = (pj_ui_dirty_region_t) {
@@ -269,9 +275,29 @@ void pj_sim_set_note_label(int index, const char *label)
 }
 
 EMSCRIPTEN_KEEPALIVE
+void pj_sim_set_note_transcript(int index, const char *transcript)
+{
+    if (index < 0 || index >= PJ_UI_MAX_NOTES || transcript == NULL) {
+        return;
+    }
+    strncpy(g_note_transcripts[index], transcript, PJ_UI_NOTE_TEXT_LEN - 1);
+    g_note_transcripts[index][PJ_UI_NOTE_TEXT_LEN - 1] = '\0';
+    sync_notes();
+}
+
+EMSCRIPTEN_KEEPALIVE
 void pj_sim_seed_review_notes(void)
 {
     static const char *labels[] = {
+        "REC 20260717 0909 1",
+        "REC 20260716 1642 2",
+        "REC 20260715 2141 3",
+        "REC 20260714 1215 4",
+        "REC 20260713 0830 5",
+        "REC 20260712 1745 6",
+        "REC 20260711 1010 7",
+    };
+    static const char *transcripts[] = {
         "Walked by the river after the rain and remembered the cedar trees.",
         "Project reflection",
         "Morning idea",
@@ -281,9 +307,12 @@ void pj_sim_seed_review_notes(void)
         "Sunday walk",
     };
     memset(g_note_labels, 0, sizeof(g_note_labels));
+    memset(g_note_transcripts, 0, sizeof(g_note_transcripts));
     g_note_count = (int)(sizeof(labels) / sizeof(labels[0]));
     for (int i = 0; i < g_note_count; i++) {
         strncpy(g_note_labels[i], labels[i], PJ_UI_NOTE_LABEL_LEN - 1);
+        strncpy(g_note_transcripts[i], transcripts[i],
+                PJ_UI_NOTE_TEXT_LEN - 1);
     }
     sync_notes();
 }
@@ -297,9 +326,12 @@ void pj_sim_seed_timestamp_notes(void)
         "REC 20261231 1909 3",
     };
     memset(g_note_labels, 0, sizeof(g_note_labels));
+    memset(g_note_transcripts, 0, sizeof(g_note_transcripts));
     g_note_count = (int)(sizeof(labels) / sizeof(labels[0]));
     for (int i = 0; i < g_note_count; i++) {
         strncpy(g_note_labels[i], labels[i], PJ_UI_NOTE_LABEL_LEN - 1);
+        (void)snprintf(g_note_transcripts[i], PJ_UI_NOTE_TEXT_LEN,
+                       "Transcript body for note %d", i + 1);
     }
     sync_notes();
 }
@@ -308,9 +340,13 @@ EMSCRIPTEN_KEEPALIVE
 void pj_sim_seed_punctuation_note(void)
 {
     memset(g_note_labels, 0, sizeof(g_note_labels));
+    memset(g_note_transcripts, 0, sizeof(g_note_transcripts));
     g_note_count = 1;
-    (void)strncpy(g_note_labels[0], "Wait: 09:19? Yes - #1 (ready)!",
+    (void)strncpy(g_note_labels[0], "REC 20260119 0919 1",
                   PJ_UI_NOTE_LABEL_LEN - 1);
+    (void)strncpy(g_note_transcripts[0],
+                  "Wait: 09:19? Yes - #1 (ready)!",
+                  PJ_UI_NOTE_TEXT_LEN - 1);
     sync_notes();
 }
 
@@ -318,10 +354,13 @@ EMSCRIPTEN_KEEPALIVE
 void pj_sim_seed_long_note(void)
 {
     memset(g_note_labels, 0, sizeof(g_note_labels));
+    memset(g_note_transcripts, 0, sizeof(g_note_transcripts));
     g_note_count = 1;
-    (void)strncpy(g_note_labels[0],
-                  "A long field note with punctuation: rain, cedar trees, river sounds, and a reminder to follow up at 09:19.",
+    (void)strncpy(g_note_labels[0], "REC 20260715 2141 2",
                   PJ_UI_NOTE_LABEL_LEN - 1);
+    (void)strncpy(g_note_transcripts[0],
+                  "A long field note with punctuation: rain, cedar trees, river sounds, and a reminder to follow up at 09:19.",
+                  PJ_UI_NOTE_TEXT_LEN - 1);
     sync_notes();
 }
 

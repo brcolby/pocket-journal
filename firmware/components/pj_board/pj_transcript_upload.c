@@ -39,6 +39,98 @@ pj_transcript_body_result_t pj_transcript_body_validate(const char *body,
     return result;
 }
 
+static int utf8_continuation(unsigned char value)
+{
+    return value >= 0x80U && value <= 0xbfU;
+}
+
+static size_t utf8_sequence_length(const unsigned char *cursor)
+{
+    unsigned char first = cursor[0];
+    if (first < 0x80U) {
+        return 1U;
+    }
+    if (first >= 0xc2U && first <= 0xdfU &&
+        utf8_continuation(cursor[1])) {
+        return 2U;
+    }
+    if (first >= 0xe0U && first <= 0xefU &&
+        cursor[1] != '\0' && cursor[2] != '\0' &&
+        utf8_continuation(cursor[1]) &&
+        utf8_continuation(cursor[2]) &&
+        !(first == 0xe0U && cursor[1] < 0xa0U) &&
+        !(first == 0xedU && cursor[1] > 0x9fU)) {
+        return 3U;
+    }
+    if (first >= 0xf0U && first <= 0xf4U &&
+        cursor[1] != '\0' && cursor[2] != '\0' && cursor[3] != '\0' &&
+        utf8_continuation(cursor[1]) &&
+        utf8_continuation(cursor[2]) &&
+        utf8_continuation(cursor[3]) &&
+        !(first == 0xf0U && cursor[1] < 0x90U) &&
+        !(first == 0xf4U && cursor[1] > 0x8fU)) {
+        return 4U;
+    }
+    return 0U;
+}
+
+static int copy_display_text(const char *source, char *output,
+                             size_t output_size)
+{
+    if (source == NULL || output == NULL || output_size == 0U) {
+        return 0;
+    }
+    output[0] = '\0';
+    size_t used = 0U;
+    int pending_space = 0;
+    const unsigned char *cursor = (const unsigned char *)source;
+    while (*cursor != '\0') {
+        unsigned char ch = *cursor;
+        if (isspace(ch)) {
+            pending_space = used > 0U;
+            cursor++;
+            continue;
+        }
+        size_t sequence_length = utf8_sequence_length(cursor);
+        int replace_invalid = sequence_length == 0U;
+        if (replace_invalid) {
+            sequence_length = 1U;
+        }
+        size_t required = sequence_length + (pending_space ? 1U : 0U);
+        if (used + required >= output_size) {
+            break;
+        }
+        if (pending_space) {
+            output[used++] = ' ';
+        }
+        if (replace_invalid) {
+            output[used++] = '?';
+        } else {
+            memcpy(output + used, cursor, sequence_length);
+            used += sequence_length;
+        }
+        pending_space = 0;
+        cursor += sequence_length;
+    }
+    output[used] = '\0';
+    return used > 0U;
+}
+
+static cJSON *parse_transcript_body(const char *body, size_t body_length)
+{
+    if (body == NULL || body_length == 0U ||
+        body_length > PJ_TRANSCRIPT_MAX_BODY_BYTES ||
+        memchr(body, '\0', body_length) != NULL) {
+        return NULL;
+    }
+    cJSON *json = cJSON_ParseWithLengthOpts(body, body_length + 1U, NULL, true);
+    if (json == NULL || !cJSON_IsObject(json)) {
+        cJSON_Delete(json);
+        return NULL;
+    }
+    return json;
+}
+
 int pj_transcript_label_extract(const char *body, size_t body_length,
                                 char *label, size_t label_size)
 {
@@ -46,14 +138,8 @@ int pj_transcript_label_extract(const char *body, size_t body_length,
         return 0;
     }
     label[0] = '\0';
-    if (body == NULL || body_length == 0U ||
-        body_length > PJ_TRANSCRIPT_MAX_BODY_BYTES ||
-        memchr(body, '\0', body_length) != NULL) {
-        return 0;
-    }
-    cJSON *json = cJSON_ParseWithLengthOpts(body, body_length + 1U, NULL, true);
-    if (json == NULL || !cJSON_IsObject(json)) {
-        cJSON_Delete(json);
+    cJSON *json = parse_transcript_body(body, body_length);
+    if (json == NULL) {
         return 0;
     }
     const cJSON *title = cJSON_GetObjectItemCaseSensitive(json, "title");
@@ -66,31 +152,34 @@ int pj_transcript_label_extract(const char *body, size_t body_length,
         cJSON_Delete(json);
         return 0;
     }
-    size_t used = 0U;
-    int pending_space = 0;
-    for (const char *cursor = display;
-         *cursor != '\0' && used + 1U < label_size; cursor++) {
-        unsigned char ch = (unsigned char)*cursor;
-        if (isspace(ch)) {
-            pending_space = used > 0U;
-            continue;
-        }
-        if (pending_space && used + 1U < label_size) {
-            label[used++] = ' ';
-        }
-        label[used++] = (char)ch;
-        pending_space = 0;
-    }
-    label[used] = '\0';
+    int extracted = copy_display_text(display, label, label_size);
     cJSON_Delete(json);
-    return used > 0U;
+    return extracted;
 }
 
-int pj_transcript_marker_load(const char *path, char *label,
-                              size_t label_size)
+int pj_transcript_text_extract(const char *body, size_t body_length,
+                               char *text, size_t text_size)
+{
+    if (text == NULL || text_size == 0U) {
+        return 0;
+    }
+    text[0] = '\0';
+    cJSON *json = parse_transcript_body(body, body_length);
+    if (json == NULL) {
+        return 0;
+    }
+    const cJSON *value = cJSON_GetObjectItemCaseSensitive(json, "text");
+    int extracted = cJSON_IsString(value) && value->valuestring != NULL &&
+                    copy_display_text(value->valuestring, text, text_size);
+    cJSON_Delete(json);
+    return extracted;
+}
+
+static int transcript_value_load(const char *path, char *output,
+                                 size_t output_size, int text_only)
 {
     struct stat st;
-    if (path == NULL || label == NULL || label_size == 0U ||
+    if (path == NULL || output == NULL || output_size == 0U ||
         stat(path, &st) != 0 || st.st_size <= 0 ||
         (uint64_t)st.st_size > PJ_TRANSCRIPT_MAX_BODY_BYTES) {
         return 0;
@@ -108,11 +197,23 @@ int pj_transcript_marker_load(const char *path, char *label,
     int read_ok = body_size == (size_t)st.st_size && ferror(file) == 0;
     int close_ok = fclose(file) == 0;
     body[body_size] = '\0';
-    int loaded = read_ok && close_ok &&
-                 pj_transcript_label_extract(body, body_size, label,
-                                             label_size);
+    int loaded = read_ok && close_ok && (text_only ?
+        pj_transcript_text_extract(body, body_size, output, output_size) :
+        pj_transcript_label_extract(body, body_size, output, output_size));
     free(body);
     return loaded;
+}
+
+int pj_transcript_marker_load(const char *path, char *label,
+                              size_t label_size)
+{
+    return transcript_value_load(path, label, label_size, 0);
+}
+
+int pj_transcript_text_load(const char *path, char *text,
+                            size_t text_size)
+{
+    return transcript_value_load(path, text, text_size, 1);
 }
 
 static int sha256_hex_digit(unsigned char value)

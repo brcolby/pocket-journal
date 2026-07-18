@@ -231,6 +231,7 @@ function bindApi(module) {
     playbackState: module.cwrap("pj_sim_playback_state", "number", []),
     setNoteCount: module.cwrap("pj_sim_set_note_count", null, ["number"]),
     setNoteLabel: module.cwrap("pj_sim_set_note_label", null, ["number", "string"]),
+    setNoteTranscript: module.cwrap("pj_sim_set_note_transcript", null, ["number", "string"]),
     seedReviewNotes: module.cwrap("pj_sim_seed_review_notes", null, []),
     render: module.cwrap("pj_sim_render", null, []),
     framebuffer: module.cwrap("pj_sim_framebuffer", "number", []),

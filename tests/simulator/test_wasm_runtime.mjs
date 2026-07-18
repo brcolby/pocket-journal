@@ -10,6 +10,7 @@ const { instance } = await WebAssembly.instantiate(wasmBytes, {
 });
 const api = instance.exports;
 const decoder = new TextDecoder();
+const encoder = new TextEncoder();
 const RECORD_IDLE = 0;
 const RECORD_ARMING = 1;
 const RECORD_ACTIVE = 2;
@@ -25,6 +26,18 @@ function stateName() {
     end += 1;
   }
   return decoder.decode(bytes.subarray(start, end));
+}
+
+function callWithWasmString(callback, value) {
+  const stack = api.emscripten_stack_get_current();
+  const bytes = encoder.encode(`${value}\0`);
+  const pointer = api._emscripten_stack_alloc(bytes.length);
+  new Uint8Array(api.memory.buffer, pointer, bytes.length).set(bytes);
+  try {
+    callback(pointer);
+  } finally {
+    api._emscripten_stack_restore(stack);
+  }
 }
 
 function assertRendered(expectedState) {
@@ -214,6 +227,57 @@ api.pj_sim_seed_timestamp_notes();
 api.pj_sim_touch_tap(100, 180);
 api.pj_sim_touch_tap(20, 120);
 assertRendered("listen");
+
+api.pj_sim_reset();
+api.pj_sim_wake();
+api.pj_sim_seed_review_notes();
+api.pj_sim_touch_tap(100, 180);
+api.pj_sim_touch_tap(20, 120);
+const listenNoteRows = framebufferSnapshot();
+assert.equal(api.pj_sim_aux_long(), 1);
+assertRendered("notes");
+assert.equal(api.pj_sim_touch_tap(180, 120), 1);
+const readNoteRows = framebufferSnapshot();
+assert.equal(stateName(), "read");
+assert.deepEqual(
+  readNoteRows, listenNoteRows,
+  "Read and Listen must render the same identity for the same note",
+);
+assert.equal(api.pj_sim_touch_tap(100, 25), 1);
+const transcriptBody = framebufferSnapshot();
+assert.equal(stateName(), "note_detail");
+callWithWasmString(
+  (pointer) => api.pj_sim_set_note_label(0, pointer),
+  "INTERNAL /sdcard/path metadata",
+);
+const renamedTranscriptBody = framebufferSnapshot();
+assert.deepEqual(
+  renamedTranscriptBody, transcriptBody,
+  "Read detail must not render the list title or internal metadata",
+);
+assert.equal(api.pj_sim_frame_result(), 4,
+  "A pixel-identical note identity mutation must remain a semantic barrier");
+callWithWasmString(
+  (pointer) => api.pj_sim_set_note_transcript(0, pointer),
+  "Updated actual transcript text for this note.",
+);
+const updatedTranscriptBody = framebufferSnapshot();
+assert.notDeepEqual(updatedTranscriptBody, transcriptBody);
+assert.equal(api.pj_sim_frame_result(), 2,
+  "Transcript body changes must remain exact same-layout partials");
+assert.deepEqual(
+  {
+    x: api.pj_sim_dirty_x(),
+    y: api.pj_sim_dirty_y(),
+    width: api.pj_sim_dirty_width(),
+    height: api.pj_sim_dirty_height(),
+  },
+  exactChangedBounds(transcriptBody, updatedTranscriptBody),
+);
+assert.equal(api.pj_sim_aux_short(), 0);
+assert.equal(api.pj_sim_playback_state(), 0);
+assert.equal(api.pj_sim_aux_long(), 1);
+assertRendered("read");
 
 api.pj_sim_reset();
 api.pj_sim_wake();

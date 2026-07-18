@@ -33,8 +33,12 @@ pj_transcript_body_result_t pj_transcript_body_validate(const char *body,
                                                         size_t declared_length);
 int pj_transcript_label_extract(const char *body, size_t body_length,
                                 char *label, size_t label_size);
+int pj_transcript_text_extract(const char *body, size_t body_length,
+                               char *text, size_t text_size);
 int pj_transcript_marker_load(const char *path, char *label,
                               size_t label_size);
+int pj_transcript_text_load(const char *path, char *text,
+                            size_t text_size);
 pj_transcript_source_result_t pj_transcript_source_check(
     const char *body, size_t body_length, const char expected_sha256[65],
     uint64_t expected_bytes);

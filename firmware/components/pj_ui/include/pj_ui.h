@@ -14,6 +14,10 @@ extern "C" {
 #define PJ_FRAMEBUFFER_BYTES ((PJ_DISPLAY_WIDTH * PJ_DISPLAY_HEIGHT) / 8)
 #define PJ_UI_MAX_NOTES 12
 #define PJ_UI_NOTE_LABEL_LEN 96
+/* At the smallest transcript font, the 192x192 text viewport shows at most
+ * 6 lines of 16 fixed-advance glyph cells. Retain additional source bytes so
+ * the compositor can detect overflow and render its final-line ellipsis. */
+#define PJ_UI_NOTE_TEXT_LEN 128
 #define PJ_UI_SYNC_PHASE_LEN 16
 #define PJ_UI_SYNC_ERROR_LEN 64
 
@@ -182,6 +186,7 @@ typedef struct {
     int selected_note;
     int note_detail_transcript;
     char note_labels[PJ_UI_MAX_NOTES][PJ_UI_NOTE_LABEL_LEN];
+    char note_transcripts[PJ_UI_MAX_NOTES][PJ_UI_NOTE_TEXT_LEN];
     pj_record_state_t record_state;
     int recording_seconds;
     pj_playback_state_t playback_state;
@@ -213,6 +218,10 @@ void pj_ui_apply_preferences(pj_ui_context_t *ctx,
                              const pj_ui_preferences_t *preferences);
 void pj_ui_set_time(pj_ui_context_t *ctx, int hour, int minute, int year, int month, int day);
 void pj_ui_set_notes(pj_ui_context_t *ctx, int count, const char labels[][PJ_UI_NOTE_LABEL_LEN]);
+void pj_ui_set_note_content(
+    pj_ui_context_t *ctx, int count,
+    const char labels[][PJ_UI_NOTE_LABEL_LEN],
+    const char transcripts[][PJ_UI_NOTE_TEXT_LEN]);
 void pj_ui_set_audio_state(pj_ui_context_t *ctx, int recording, int playback_active);
 void pj_ui_set_recording_elapsed(pj_ui_context_t *ctx, uint64_t elapsed_ms);
 void pj_ui_set_time_projection(pj_ui_context_t *ctx, const pj_ui_time_projection_t *projection);
