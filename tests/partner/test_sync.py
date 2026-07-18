@@ -810,8 +810,28 @@ class SyncTests(unittest.TestCase):
                 return {"device_id": self.device_id, "result": result}
 
         results = [
-            {"audio_id": "good.wav", "status": "uploaded"},
-            {"audio_id": "bad.wav", "status": "failed", "error": "invalid WAV"},
+            {
+                "audio_id": "good.wav",
+                "status": "uploaded",
+                "downloaded": True,
+                "transcribed": True,
+                "uploaded": True,
+            },
+            {
+                "audio_id": "current.wav",
+                "status": "skipped",
+                "downloaded": False,
+                "transcribed": False,
+                "uploaded": False,
+            },
+            {
+                "audio_id": "bad.wav",
+                "status": "failed",
+                "error": "invalid WAV",
+                "downloaded": False,
+                "transcribed": False,
+                "uploaded": False,
+            },
         ]
         args = SimpleNamespace(
             data_dir=None, backend="fake", reprocess=False
@@ -824,10 +844,13 @@ class SyncTests(unittest.TestCase):
 
         payload = json.loads(stdout.getvalue())
         self.assertEqual(exit_code, 1)
+        self.assertEqual(payload["result"]["downloaded_count"], 1)
         self.assertEqual(payload["result"]["uploaded_count"], 1)
         self.assertEqual(payload["result"]["failed_count"], 1)
+        self.assertEqual(payload["result"]["skipped_count"], 1)
+        self.assertEqual(payload["result"]["transcribed_count"], 1)
         self.assertEqual(payload["result"]["synced"], results)
-        self.assertEqual(payload["result"]["count"], 2)
+        self.assertEqual(payload["result"]["count"], 3)
         self.assertEqual(payload["result"]["results"], results)
 
     def test_cli_has_no_fake_upload_escape_hatch(self) -> None:

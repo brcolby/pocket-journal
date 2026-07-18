@@ -414,15 +414,25 @@ def cmd_sync(args: argparse.Namespace) -> int:
         )
     except RuntimeError as exc:
         raise DeviceError(str(exc)) from exc
-    uploaded_count = sum(result.get("status") == "uploaded" for result in results)
+    downloaded_count = sum(result.get("downloaded") is True for result in results)
+    uploaded_count = sum(
+        result.get("uploaded", result.get("status") == "uploaded") is True
+        for result in results
+    )
     failed_count = sum(result.get("status") == "failed" for result in results)
-    transcribed_count = sum(result.get("status") == "transcribed" for result in results)
+    skipped_count = sum(result.get("status") == "skipped" for result in results)
+    transcribed_count = sum(
+        result.get("transcribed", result.get("status") == "transcribed") is True
+        for result in results
+    )
     _print_json(session.envelope({
         "results": results,
         "count": len(results),
         "synced": results,
+        "downloaded_count": downloaded_count,
         "uploaded_count": uploaded_count,
         "failed_count": failed_count,
+        "skipped_count": skipped_count,
         "transcribed_count": transcribed_count,
         "dry_run": not upload_transcripts,
     }))
