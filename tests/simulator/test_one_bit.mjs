@@ -58,10 +58,14 @@ for (const [id, size] of [
   ["PJ_CARBON_ICON_WAVEFORM", 64],
   ["PJ_CARBON_ICON_PLAY_FILLED", 40],
   ["PJ_CARBON_ICON_PLAY_FILLED", 96],
+  ["PJ_CARBON_ICON_TOGGLE_OFF", 56],
+  ["PJ_CARBON_ICON_TOGGLE_ON", 56],
   ["PJ_CARBON_ICON_BATTERY_HALF", 28],
 ]) {
   assert.ok(icon(id, size)?.rows.join("").includes("1"), `${id} ${size}`);
 }
+assert.equal(icon("PJ_CARBON_ICON_TOGGLE_OFF", 40), undefined);
+assert.equal(icon("PJ_CARBON_ICON_TOGGLE_ON", 40), undefined);
 
 const simulatorHtml = await readFile("simulator/index.html", "utf8");
 const simulatorJs = await readFile("simulator/src/main.js", "utf8");
@@ -209,6 +213,7 @@ for (const scenario of [
   "time-temp-dark",
   "record-arming",
   "record-active",
+  "alarm-on",
   "note-detail-playing",
   "transcript-punctuation",
   "transcript-long",

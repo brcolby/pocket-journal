@@ -64,7 +64,9 @@ PUNCTUATION = " " + string.punctuation
 
 # Each semantic icon has exactly the sizes authorized by the UI contract.  The
 # duplicate VolumeUp size is intentional: it is a 64px Settings launcher and a
-# 40px Volume control.  These pairs total 30 compiled semantic records.
+# 40px Volume control. Alarm toggles use their own 56px control size so their
+# state remains legible beside explicit OFF/ON labels. These pairs total 30
+# compiled semantic records.
 SEMANTIC_ICONS: tuple[tuple[str, str, tuple[int, ...]], ...] = (
     ("TIME", "time.svg", (64,)),
     ("DATA_ENRICHMENT", "data-enrichment.svg", (64,)),
@@ -80,8 +82,8 @@ SEMANTIC_ICONS: tuple[tuple[str, str, tuple[int, ...]], ...] = (
     ("TIMER", "timer.svg", (64,)),
     ("HOURGLASS", "hourglass.svg", (64,)),
     ("REPEAT", "repeat.svg", (64,)),
-    ("TOGGLE_ON", "toggle-on.svg", (40,)),
-    ("TOGGLE_OFF", "toggle-off.svg", (40,)),
+    ("TOGGLE_ON", "toggle-on.svg", (56,)),
+    ("TOGGLE_OFF", "toggle-off.svg", (56,)),
     ("CARET_UP", "caret--up.svg", (40,)),
     ("CARET_DOWN", "caret--down.svg", (40,)),
     ("RESET_ALT", "reset--alt.svg", (40,)),

@@ -138,6 +138,10 @@ class CarbonAssetContractTest(unittest.TestCase):
         self.assertEqual(len(actual), 30)
         self.assertIn(("PJ_CARBON_ICON_VOLUME_UP", 40), actual)
         self.assertIn(("PJ_CARBON_ICON_VOLUME_UP", 64), actual)
+        self.assertIn(("PJ_CARBON_ICON_TOGGLE_OFF", 56), actual)
+        self.assertIn(("PJ_CARBON_ICON_TOGGLE_ON", 56), actual)
+        self.assertNotIn(("PJ_CARBON_ICON_TOGGLE_OFF", 40), actual)
+        self.assertNotIn(("PJ_CARBON_ICON_TOGGLE_ON", 40), actual)
         self.assertNotIn(("PJ_CARBON_ICON_STOP", 40), actual)
 
     def test_punctuation_asset_contains_no_letters_or_numbers(self) -> None:

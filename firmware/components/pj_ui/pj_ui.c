@@ -2054,9 +2054,13 @@ static void render_scene(const pj_ui_context_t *ctx, pj_framebuffer_t *fb)
             draw_text_center_at(fb, 164, 36,
                                 ctx->alarm_hour < 12 ? "AM" : "PM", 2);
         }
+        int toggle_center_y =
+            (PJ_UI_ALARM_TOGGLE_TOP + PJ_UI_ALARM_CONTROLS_TOP) / 2;
+        draw_text_center_at(fb, 28, toggle_center_y, "OFF", 2);
         draw_icon(fb, ctx->alarm_on ? PJ_CARBON_ICON_TOGGLE_ON :
                                       PJ_CARBON_ICON_TOGGLE_OFF, 100,
-                  (PJ_UI_ALARM_TOGGLE_TOP + PJ_UI_ALARM_CONTROLS_TOP) / 2, 40);
+                  toggle_center_y, 56);
+        draw_text_center_at(fb, 172, toggle_center_y, "ON", 2);
         draw_adjustment_controls(fb, PJ_UI_ALARM_CONTROLS_TOP);
         break;
     }

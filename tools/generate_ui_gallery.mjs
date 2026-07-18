@@ -113,6 +113,12 @@ const scenarios = [
   }, { maxImbalance: 1 }],
   ["time", "time", () => { resetToHome(); api.pj_sim_touch_tap(20, 80); }, fullBleed(4)],
   ["alarm", "alarm", () => { resetToHome(); api.pj_sim_touch_tap(20, 80); api.pj_sim_touch_tap(40, 40); }],
+  ["alarm-on", "alarm", () => {
+    resetToHome();
+    api.pj_sim_touch_tap(20, 80);
+    api.pj_sim_touch_tap(40, 40);
+    api.pj_sim_touch_tap(100, 92);
+  }],
   ["alarm-12h-pm", "alarm", () => {
     resetToHome();
     api.pj_sim_set_preferences(0, 0, 3);

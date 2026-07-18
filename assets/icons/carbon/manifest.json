@@ -1886,7 +1886,7 @@
     },
     {
       "allowed_sizes": [
-        40
+        56
       ],
       "kind": "semantic_icon",
       "path": "svg/32/toggle-off.svg",
@@ -1898,7 +1898,7 @@
     },
     {
       "allowed_sizes": [
-        40
+        56
       ],
       "kind": "semantic_icon",
       "path": "svg/32/toggle-on.svg",

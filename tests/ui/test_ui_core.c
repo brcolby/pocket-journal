@@ -942,10 +942,22 @@ static void test_alarm_caret_and_toggle_controls(void)
                     PJ_LAYOUT_SLOT_TIME_ALARM));
     assert(context.state == PJ_UI_STATE_ALARM);
     assert(context.alarm_hour == 7 && context.alarm_minute == 30);
+    presenter_fixture_t fixture;
+    presenter_start(&fixture, &context);
     int original_toggle = context.alarm_on;
+    uint32_t layout_epoch = context.layout_epoch;
+    uint32_t full_refresh_revision = context.full_refresh_revision;
     assert(pj_ui_handle_touch(&context, 100, 90, PJ_TOUCH_TAP));
     assert(context.alarm_on == !original_toggle);
-    assert(pj_ui_handle_touch(&context, 50, 130, PJ_TOUCH_TAP));
+    assert(context.layout_epoch == layout_epoch);
+    assert(context.full_refresh_revision == full_refresh_revision);
+    pj_ui_dirty_region_t toggle_dirty =
+        presenter_accept_partial(&fixture, &context);
+    assert(toggle_dirty.x >= 72 &&
+           toggle_dirty.x + toggle_dirty.width <= 128);
+    assert(toggle_dirty.y >= 72 &&
+           toggle_dirty.y + toggle_dirty.height <= 112);
+    assert(pj_ui_handle_touch(&context, 50, 112, PJ_TOUCH_TAP));
     assert(context.alarm_hour == 8);
     assert(pj_ui_handle_touch(&context, 50, 180, PJ_TOUCH_TAP));
     assert(context.alarm_hour == 7);
@@ -956,10 +968,17 @@ static void test_alarm_caret_and_toggle_controls(void)
 
     pj_framebuffer_t frame;
     pj_ui_compose_frame(&context, &frame);
-    assert(count_black_pixels_in_region(&frame, 0, 110, 100, 45) > 0);
-    assert(count_black_pixels_in_region(&frame, 0, 155, 100, 45) > 0);
-    assert(count_black_pixels_in_region(&frame, 100, 110, 100, 45) > 0);
-    assert(count_black_pixels_in_region(&frame, 100, 155, 100, 45) > 0);
+    assert_asset_region(
+        &frame,
+        pj_carbon_icon_lookup(context.alarm_on ? PJ_CARBON_ICON_TOGGLE_ON :
+                                                PJ_CARBON_ICON_TOGGLE_OFF, 56),
+        100, 92);
+    assert(count_black_pixels_in_region(&frame, 0, 80, 56, 24) > 0);
+    assert(count_black_pixels_in_region(&frame, 144, 80, 56, 24) > 0);
+    assert(count_black_pixels_in_region(&frame, 0, 112, 100, 44) > 0);
+    assert(count_black_pixels_in_region(&frame, 0, 156, 100, 44) > 0);
+    assert(count_black_pixels_in_region(&frame, 100, 112, 100, 44) > 0);
+    assert(count_black_pixels_in_region(&frame, 100, 156, 100, 44) > 0);
 }
 
 static void test_stopwatch_timer_interval_commands(void)
