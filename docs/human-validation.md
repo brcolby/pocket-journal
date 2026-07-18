@@ -5,34 +5,41 @@ low-frequency, large-batch hardware pass. Human notes may be mildly lossy:
 record what you actually observed, including blockers, and agents will map that
 evidence to the exact Bead acceptance criteria.
 
-Last synchronized with `bd human list`: 2026-07-17 (35 human-validation Beads).
+Last synchronized with `bd human list`: 2026-07-17 (37 human-validation Beads).
 Do not repeat a failed check on unchanged firmware.
 
 ## Nominated Build
 
-- Source commit and reported firmware version: `f57d49b` / `f57d49b-dirty`.
-  The dirty suffix is caused by preserved unrelated local partner/documentation
-  changes; the firmware sources are committed through `f57d49b`.
-- Image: `firmware/build-carbon-fixes/pocket_journal.bin`.
+- Source commit and reported firmware version: `8622c24` / `8622c24`.
+- Image: `firmware/build-v1-8622c24/pocket_journal.bin`.
 - Size: 1,511,424 bytes (`0x171000`).
 - SHA-256:
-  `581be34f098f43f671de9dc22b8ea31843aa08934519ad147af7661e692a9f28`.
+  `108a197282981e8f9c28cee64c6bc7828d246d1e8d219d6a3daf862f5437d40b`.
 - ESP image validation hash:
-  `7657b851b3bae085f0d8e51a67caab07f393913bb0ebe90970a5d47cd63c34c4`.
+  `4be1eec0510af7295e116d4755b6c898ab1526361ca5536df46ca78173bda124`.
+- ELF SHA-256:
+  `17346a10c9feb29991352c83ed23d9e309bd5a25fa33577f347637c5f278d813`.
 - Built with ESP-IDF 6.0.1 and 28% (`0x8f000`) free in each 2 MiB
   application partition. A clean build contains no LVGL component or symbol.
 - Flashed and byte-verified as a development image on `pj-d45d34`, ESP32-S3
   MAC `14:C1:9F:D4:5D:34`, at `/dev/cu.usbmodem1101`.
-- Live no-reset probe after flashing: exact firmware answered `PJ_STATUS` with
-  boot ID `1779544349`; SD storage, audio, Wi-Fi/DHCP, and fixed-offset time
+- Live USB probe after boot verification: exact firmware answered `PJ_STATUS`
+  without another reset, with boot ID `2811516533`; SD storage, audio,
+  Wi-Fi/DHCP, and fixed-offset time
   synchronization were ready. USB recovery was neither needed nor attempted.
 - Automated evidence: deterministic Carbon generation verified 73 active and
   26 reference sources, 72 glyph identities, and 30 semantic bitmaps; all 13
-  asset and 7 exhaustive DXF tests passed. All 32 native C executables and 344
-  Python cases passed, including 328 partner tests. Combined ASan/UBSan
-  UI/worker/pipeline/refresh runs, WASM runtime, one-bit/AUX simulator tests,
-  exact Timer partial reconstruction, and image analysis passed. All 51
-  gallery frames and the contact sheet were inspected.
+  asset and 7 exhaustive DXF tests passed. All 32 native C executables and 362
+  Python cases passed, including 333 partner tests. Combined ASan/UBSan runs
+  passed for all 32 native C executables (the vendored cJSON build suppresses
+  only macOS SDK deprecation diagnostics). WASM runtime, one-bit/AUX simulator
+  tests, exact Timer/Stopwatch partial reconstruction, and image analysis
+  passed. All 51 gallery frames and the contact sheet were inspected.
+- Owner validation on the preceding `f57d49b` image confirmed the digit/time
+  rendering corruption and Timer adjustment regressions are fixed. Because
+  `8622c24` changes cadence cancellation and task priority, repeat only the
+  targeted cadence, Record exit, and UI-refinement checks below rather than
+  the already-passed broad digit diagnosis.
 - This is development validation, not a release. No tag or release has been
   created.
 
@@ -63,16 +70,16 @@ section (stop with Ctrl-]):
 ```bash
 cd firmware
 source "$HOME/.espressif/v6.0.1/esp-idf/export.sh"
-idf.py -B build-carbon-fixes -p /dev/cu.usbmodem1101 monitor \
+idf.py -B build-v1-8622c24 -p /dev/cu.usbmodem1101 monitor \
   --no-reset --timestamps --disable-auto-color 2>&1 | \
-  tee /private/tmp/pj-carbon-hardware.log
+  tee /private/tmp/pj-8622c24-hardware.log
 ```
 
 Afterward, preserve the output of:
 
 ```bash
 rg 'Seconds cadence (start|end)|Display metrics|Display generations' \
-  /private/tmp/pj-carbon-hardware.log
+  /private/tmp/pj-8622c24-hardware.log
 ```
 
 - [ ] Exercise every sector of Home `3_1`, Notes `3_1m`, Time `4_1`, and
@@ -90,7 +97,8 @@ rg 'Seconds cadence (start|end)|Display metrics|Display generations' \
   legible note paging, and a centered three-line Sync stack using one font
   size. Confirm Volume shows only a 0–10 number above its controls and no
   square Stop icon appears anywhere (`pocket-journal-nz5`,
-  `pocket-journal-nz5.6`, `pocket-journal-nz5.8`, `pocket-journal-2ji`).
+  `pocket-journal-nz5.6`, `pocket-journal-nz5.8`,
+  `pocket-journal-nz5.10`, `pocket-journal-2ji`).
 - [ ] Run Record, Stopwatch, Timer, and Interval for at least 120 consecutive
   displayed seconds each. Record must first present a complete `00:00` screen,
   then measure playable captured PCM duration. For every clock, observe each
@@ -102,11 +110,12 @@ rg 'Seconds cadence (start|end)|Display metrics|Display generations' \
   `late_max_ms <= 75`, and zero overruns and misses (`pocket-journal-cjx`,
   `pocket-journal-zi6`, `pocket-journal-9by`, `pocket-journal-nz5.8`).
 - [ ] Keep one seconds clock active for at least 30 partial updates. Confirm no
-  cleanup full refresh interrupts the cadence; pause or leave afterward and
-  confirm exactly one safe deferred cleanup. The log must show cleanup deferred
-  while active and promoted on cadence end. Across this and Volume number
-  changes, confirm no ghosting, reordered digits, displaced pixels, or stale
-  neighboring content (`pocket-journal-e43`, `pocket-journal-9by`).
+  cleanup full refresh interrupts the cadence. Pause must remain a localized
+  partial with cleanup still pending; the next navigation/full presentation
+  must satisfy that cleanup exactly once. Leaving a running clock may satisfy
+  it in the navigation full. Across this and Volume number changes, confirm no
+  ghosting, reordered digits, displaced pixels, or stale neighboring content
+  (`pocket-journal-e43`, `pocket-journal-9by`).
 - [ ] In Settings, switch 12h/24h and confirm only the localized content changes
   via partial refresh. Switch theme and confirm an immediate full inversion;
   the top-right `AsleepFilled` icon must retain the same shape. Battery changes,
@@ -141,10 +150,14 @@ diagnostic before asking for calibration evidence.
   long note text cleanly without overlapping controls (`pocket-journal-nz5`,
   `pocket-journal-nz5.8`, `pocket-journal-te0`).
 - [ ] Record continuously for at least two minutes. Stop/save with AUX and
-  confirm immediate return with no Saving screen or blocking display load.
-  As soon as the durable raw note appears, enter Record again and create a
-  second note while optional processing of the first continues. Exactly one
-  valid playable note must result from each capture (`pocket-journal-sm1`,
+  confirm immediate return with no Saving screen, late cadence retry loop, or
+  blocking note-inventory/display load. Re-enter Record as soon as it becomes
+  available: it must first show a complete `00:00`, never the prior elapsed
+  value (for example `00:06`), while optional processing of the first note
+  continues. Also stop through sleep/power, wake quickly, and confirm Record
+  remains gated only until the old worker's audio completion arrives, then
+  arms a fresh `00:00`. Exactly one valid playable note must result from each
+  capture (`pocket-journal-nz5.9`, `pocket-journal-sm1`,
   `pocket-journal-sm1.1`, `pocket-journal-5eo`).
 - [ ] Play/pause both notes, navigate Back from active and paused playback, and
   play one through EOF. Confirm the compact Play/Pause control leaves no heavy
@@ -164,19 +177,21 @@ diagnostic before asking for calibration evidence.
 
 ### 4. Time Apps And Alerts
 
-- [ ] Start Interval at round 0 with the default 60-second duration. Adjust Down
-  once to the 30-second minimum, then Up once to 60 seconds; each step must be
-  exactly 30 seconds. Observe at least two boundaries. The round counter must
-  use the same type size as the duration when it fits, rounds must increment
-  once, timing must not drift, and no large square Stop/INTERVAL/Recovered
-  screen may appear. There must be no spontaneous or repeated beeping; reset
-  before leaving the device
-  (`pocket-journal-8q5`, `pocket-journal-xl8`).
+- [ ] Confirm fresh Timer and Interval screens both default to 60 seconds. Start
+  Interval at round 0, adjust Down once to the 30-second minimum, then Up once
+  to 60 seconds; each step must be exactly 30 seconds. Observe at least two
+  boundaries. The round counter must use the same type size as the duration
+  when it fits, rounds must increment once, timing must not drift, and no large
+  square Stop/INTERVAL/Recovered screen may appear. There must be no spontaneous
+  or repeated beeping; reset before leaving the device
+  (`pocket-journal-nz5.10`, `pocket-journal-8q5`, `pocket-journal-xl8`).
 - [ ] Start, pause, adjust, resume, leave, and revisit Stopwatch and Timer.
   From `00:30`, press Timer Up three times and confirm the exact visible series
   `01:00`, `01:30`, `02:00`; press Down three times and confirm the reverse.
-  Confirm large stable time and documented pause/reset/back behavior
-  (`pocket-journal-8q5`, `pocket-journal-nz5.8`).
+  Confirm Stopwatch Play/Pause remains a localized partial with no full flash,
+  plus large stable time and documented pause/reset/back behavior
+  (`pocket-journal-nz5.10`, `pocket-journal-8q5`,
+  `pocket-journal-nz5.8`).
 - [ ] At nonzero volume, trigger one Timer or Alarm alert. Confirm one short
   nonmodal sound, responsive navigation, exact alert clearing, and audio idle
   afterward. Repeat at volume zero and confirm silence. At volume 10, confirm
