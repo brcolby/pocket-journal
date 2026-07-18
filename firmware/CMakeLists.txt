@@ -1,5 +1,11 @@
 cmake_minimum_required(VERSION 3.16)
 
+# Keep source-archive builds aligned with the release even when Git metadata is
+# unavailable. Release builders may override this with -D PROJECT_VER=X.Y.Z.
+if(NOT DEFINED PROJECT_VER)
+    set(PROJECT_VER "0.0.0")
+endif()
+
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 project(pocket_journal)
 

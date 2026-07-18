@@ -18,18 +18,23 @@ node_modules/
 build/
 dist/
 coverage/
-firmware/build/
+firmware/build*/
 firmware/managed_components/
 simulator/generated/
 
 # Local firmware/tooling config
 eim_config.toml
 firmware/sdkconfig
-firmware/sdkconfig.old
+firmware/sdkconfig.*
+!firmware/sdkconfig.defaults
+!firmware/sdkconfig.ota-signed.defaults
 
 # Runtime data/logs
 .logs/
+*.log
 partner/data/
+art.png
+/human-validation-nodes.d
 
 # Beads / Dolt files (added by bd init)
 .beads/
@@ -42,5 +47,7 @@ partner/data/
 .agents/
 .claude/
 .codex/
-AGENTS.md
 CLAUDE.md
+
+# bv (beads viewer) local config and caches
+.bv/

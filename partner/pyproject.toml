@@ -1,13 +1,22 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77.0.3"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "pocket-journal-partner"
-version = "0.1.0"
+version = "0.0.0"
 description = "Partner CLI for Pocket Journal"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.11"
 dependencies = ["esptool>=5.3,<6", "pyserial>=3.5", "zeroconf>=0.132"]
+classifiers = [
+  "Operating System :: MacOS",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+]
 
 [project.optional-dependencies]
 ble = ["bleak>=0.22"]
@@ -18,6 +27,11 @@ dev = []
 
 [project.scripts]
 pj = "pocket_journal_partner.cli:main"
+
+[project.urls]
+Documentation = "https://github.com/brcolby/pocket-journal/tree/main/docs"
+Issues = "https://github.com/brcolby/pocket-journal/issues"
+Repository = "https://github.com/brcolby/pocket-journal"
 
 [tool.setuptools.packages.find]
 where = ["src"]
