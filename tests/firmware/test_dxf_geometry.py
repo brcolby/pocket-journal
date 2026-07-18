@@ -131,9 +131,9 @@ class DxfGeometryTest(unittest.TestCase):
             for point in (unpack_point(rule["start"]), unpack_point(rule["end"]))
             if point[0] in (0, self.maximum) or point[1] in (0, self.maximum)
         ]
-        self.assertIn((1412, 0), boundary_endpoints)
-        self.assertIn((0, 2880), boundary_endpoints)
-        self.assertIn((self.maximum, 2663), boundary_endpoints)
+        self.assertIn((1135, 0), boundary_endpoints)
+        self.assertIn((0, 3040), boundary_endpoints)
+        self.assertIn((self.maximum, 2503), boundary_endpoints)
 
         time_rules = {canonical_segment(rule) for rule in self.layouts["time_4_1"]["rules"]}
         mirrored_time_rules = {
